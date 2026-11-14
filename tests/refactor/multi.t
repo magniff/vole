@@ -71,7 +71,7 @@ applied 4 blocks: replaced crate::shapes::area; added crate::shapes::perimeter; 
 33	    2 * (r.w + r.h)
 note edit.imports: added the imports the new text needs (fix --only imports)
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (2 files, 0 shaders)
 $ undo
 undid applied 4 blocks: replaced crate::shapes::area; added crate::shapes::perimeter; inserted after crate::describe; replaced crate::main	2 files	+13 -5 lines
 ## `new in MODULE`, `new before NAME`, `delete NAME`; from stdin.
@@ -148,7 +148,7 @@ try: volec refactor rename crate::shapes::area surface
 try: volec edit replace area --no-check
 [exit 1]
 $ edit patch area < $T/inputs/multi_area_bool.pairs
-main.vl:16:18: error[type error] expected 'bool', got 'i64' | help: a condition is a bool: compare (`x != 0`); bitwise not is `~x` | try: describe(kind(r)) != 0 | try: volec fix --suggested main.vl  [in crate::main]
+main.vl:16:18: error[type error] expected 'bool', got 'i64' | help: a condition is a bool: compare (`x != 0`); bitwise not is `!x` | try: describe(kind(r)) != 0 | try: volec fix --suggested main.vl  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written; the error: main.vl:16:18: expected 'bool', got 'i64'
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
 try: volec query show crate::main

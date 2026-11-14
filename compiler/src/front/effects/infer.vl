@@ -37,7 +37,7 @@
 // local source or call that brings a given effect.
 
 use crate::arch::{intrinsic_effect_bits, intrinsic_of_fn};
-use crate::base::{IntVec, alloc_array, intern_c, sym_text};
+use crate::base::{intern_c, sized_table, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::timer::{T_CHECK, T_EFFECTS, timer_now, timer_sub};
@@ -61,7 +61,7 @@ use crate::front::modules::within_std;
 use crate::front::modules::lookup::std_item_key;
 use crate::front::threadlocal::is_thread_local;
 use crate::front::traits::{impl_of_fn, std_trait};
-use crate::front::types::{REF_SHARED, TyKind, is_integer, struct_type, vec_lanes};
+use crate::front::types::{REF_SHARED, TyKind, is_integer, struct_field, struct_type, vec_lanes};
 use crate::middle::lower::atomic::atomic_intrinsic;
 use crate::middle::lower::ssa::HMap;
 
@@ -103,15 +103,13 @@ pub fn template_of(f: i64, pcx: &Ctx<Comp>) -> i64 {
 }
 
 // The type of std's struct `name`, or 0.
-pub fn std_struct_type(name: *mut u8, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        if pcx.std_module < 0 {
-            return 0;
-        }
-        let key = std_item_key(intern_c(name, pcx), pcx);
-        let s: i64 = if key < 0 { -1 } else { (*pcx.sym_struct.add(key as usize)) - 1 };
-        if s < 0 || pcx.structs[s as usize].generic != 0 { 0 } else { struct_type(s, pcx) }
+pub fn std_struct_type(name: *const u8, pcx: &mut Ctx<Comp>) -> i64 {
+    if pcx.std_module < 0 {
+        return 0;
     }
+    let key = std_item_key(intern_c(name, pcx), pcx);
+    let s: i64 = if key < 0 { -1 } else { (pcx.sym_struct[key as usize]) - 1 };
+    if s < 0 || pcx.structs[s as usize].generic != 0 { 0 } else { struct_type(s, pcx) }
 }
 
 // Whether function f is a method of an `impl Allocator for X` (X its
@@ -212,11 +210,11 @@ pub fn through(e: Effects, kind: i64, add: i64, pcx: &mut Ctx<Comp>) -> Effects 
     let mut allocs = e.allocs;
     if kind == E_SCOPE {
         if pcx.scoped_type != 0 && (allocs & ALLOC_ANY) == 0 {
-            allocs = allocs & ~allocator_bit(pcx.scoped_type, pcx);
+            allocs = allocs & !allocator_bit(pcx.scoped_type, pcx);
         }
         allocs = allocs | add;
     }
-    Effects { bits: e.bits & ~EFF_UNSAFE, allocs: allocs }
+    Effects { bits: e.bits & !EFF_UNSAFE, allocs: allocs }
 }
 
 // Whether e has the effect (bit, alloc): an EFF_* bit, or with bit 0 the
@@ -237,84 +235,81 @@ pub fn has_effect(e: Effects, bit: i64, alloc: i64) -> bool {
 // check_program, before exit_if_errors).
 pub fn infer_effects(pcx: &mut Ctx<Comp>) {
     let t = timer_now(pcx);
-    unsafe {
-        init_walk(pcx);
-        let n = pcx.fns.len() as i64;
-        pcx.graph_fns = n;
-        pcx.failed = alloc_array::<i64>(n + 1);
-        for i in 0..pcx.failed_list.count {
-            if (*pcx.failed_list.data.add(i as usize)) < n {
-                (*pcx.failed.add((*pcx.failed_list.data.add(i as usize)) as usize)) = 1;
-            }
+    init_walk(pcx);
+    let n = pcx.fns.len() as i64;
+    pcx.graph_fns = n;
+    sized_table(&mut pcx.failed, n + 1, 0);
+    for i in 0..pcx.failed_list.len() as i64 {
+        if (pcx.failed_list[i as usize]) < n {
+            (pcx.failed[(pcx.failed_list[i as usize]) as usize]) = 1;
         }
-        // (a closure of a function that failed is unknown too: its
-        // enclosing function is made before it)
-        for c in 0..pcx.closures.len() as i64 {
-            let e = pcx.closures[c as usize].encl_fn;
-            let f = pcx.closures[c as usize].f;
-            if e >= 0 && e < n && f >= 0 && f < n && (*pcx.failed.add(e as usize)) != 0 {
-                (*pcx.failed.add(f as usize)) = 1;
-            }
-        }
-        // (E4.3a: a closure has its enclosing function's Formatter)
-        pcx.fmt_encl = alloc_array::<i64>(n + 1);
-        for c in 0..pcx.closures.len() as i64 {
-            let e = pcx.closures[c as usize].encl_fn;
-            let f = pcx.closures[c as usize].f;
-            if e >= 0 && e < n && f >= 0 && f < n {
-                (*pcx.fmt_encl.add(f as usize)) = e + 1;
-            }
-        }
-        pcx.local_fx = alloc_array::<Effects>(n + 1);
-        pcx.callee_info = alloc_array::<i64>(n + 1);
-        pcx.static_uses.count = 0;
-        pcx.static_use_start.count = 0;
-        pcx.sa_memo = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
-        pcx.sa_seen = 0 as *mut i64;
-        pcx.sa_top = alloc_array::<i64>(n + 1);
-        for f in 0..n {
-            pcx.edge_start.push(pcx.edges.count);
-            pcx.static_use_start.push(pcx.static_uses.count);
-            (*pcx.local_fx.add(f as usize)) = node_locals(f, pcx);
-        }
-        pcx.static_use_start.push(pcx.static_uses.count);
-        // The virtual nodes' edges, in the order they were made.
-        let addr = pcx.address_taken.count;
-        for k in 0..pcx.virtual_type.count {
-            pcx.edge_start.push(pcx.edges.count);
-            let vt = (*pcx.virtual_type.data.add(k as usize));
-            let mut i: i64 = 0;
-            while i < addr {
-                let t = (*pcx.address_taken.data.add(i as usize));
-                let f = (*pcx.address_taken.data.add((i + 1) as usize));
-                let callback = vt == -1 && pcx.types[t as usize].kind == TyKind::Fn
-                    && crate::front::types::fn_ty_c(t, pcx);
-                // (E4.3a: the join of a Formatter's sinks)
-                let sink = vt == FMT_JOIN && t == pcx.fmt_sink_ty;
-                // (0.27.2.1: an instance of the error type, made in query
-                // mode, never runs: its ⊤ would make every fn value's call ⊤)
-                if (t == vt || callback || sink) && !error_instance(f, pcx) {
-                    push_edge(f, E_CALL, 0, pcx);
-                }
-                i += 2;
-            }
-        }
-        pcx.graph_size = n + pcx.virtual_type.count;
-        pcx.edge_start.push(pcx.edges.count);
-        crate::front::effects::check::note_declarations(n, pcx);
-        components(pcx);
-        pcx.fn_effects = pcx.node_fx;
-        pcx.fn_effects_count = n;
     }
+    // (a closure of a function that failed is unknown too: its
+    // enclosing function is made before it)
+    for c in 0..pcx.closures.len() as i64 {
+        let e = pcx.closures[c as usize].encl_fn;
+        let f = pcx.closures[c as usize].f;
+        if e >= 0 && e < n && f >= 0 && f < n && (pcx.failed[e as usize]) != 0 {
+            (pcx.failed[f as usize]) = 1;
+        }
+    }
+    // (E4.3a: a closure has its enclosing function's Formatter)
+    sized_table(&mut pcx.fmt_encl, n + 1, 0);
+    for c in 0..pcx.closures.len() as i64 {
+        let e = pcx.closures[c as usize].encl_fn;
+        let f = pcx.closures[c as usize].f;
+        if e >= 0 && e < n && f >= 0 && f < n {
+            (pcx.fmt_encl[f as usize]) = e + 1;
+        }
+    }
+    sized_table(&mut pcx.local_fx, n + 1, Effects { bits: 0, allocs: 0 });
+    sized_table(&mut pcx.callee_info, n + 1, 0);
+    pcx.static_uses.clear();
+    pcx.static_use_start.clear();
+    pcx.sa_memo = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+    pcx.sa_seen = 0 as *mut i64;
+    sized_table(&mut pcx.sa_top, n + 1, 0);
+    for f in 0..n {
+        pcx.edge_start.push(pcx.edges.len() as i64);
+        pcx.static_use_start.push(pcx.static_uses.len() as i64);
+        (pcx.local_fx[f as usize]) = node_locals(f, pcx);
+    }
+    pcx.static_use_start.push(pcx.static_uses.len() as i64);
+    // The virtual nodes' edges, in the order they were made.
+    let addr = pcx.address_taken.len() as i64;
+    for k in 0..pcx.virtual_type.len() as i64 {
+        pcx.edge_start.push(pcx.edges.len() as i64);
+        let vt = (pcx.virtual_type[k as usize]);
+        let mut i: i64 = 0;
+        while i < addr {
+            let t = (pcx.address_taken[i as usize]);
+            let f = (pcx.address_taken[(i + 1) as usize]);
+            let callback = vt == -1 && pcx.types[t as usize].kind == TyKind::Fn
+                && crate::front::types::fn_ty_c(t, pcx);
+            // (E4.3a: the join of a Formatter's sinks)
+            let sink = vt == FMT_JOIN && t == pcx.fmt_sink_ty;
+            // (0.27.2.1: an instance of the error type, made in query
+            // mode, never runs: its ⊤ would make every fn value's call ⊤)
+            if (t == vt || callback || sink) && !error_instance(f, pcx) {
+                push_edge(f, E_CALL, 0, pcx);
+            }
+            i += 2;
+        }
+    }
+    pcx.graph_size = n + pcx.virtual_type.len() as i64;
+    pcx.edge_start.push(pcx.edges.len() as i64);
+    crate::front::effects::check::note_declarations(n, pcx);
+    components(pcx);
+    pcx.fn_effects_count = n;
     timer_sub(T_CHECK, T_EFFECTS, t, pcx);
 }
 
 fn init_walk(pcx: &mut Ctx<Comp>) {
-    pcx.edge_start.count = 0;
-    pcx.edges.count = 0;
+    pcx.edge_start.clear();
+    pcx.edges.clear();
     pcx.scope_add.clear();
-    pcx.virtual_type.count = 0;
-    pcx.address_taken.count = 0;
+    pcx.virtual_type.clear();
+    pcx.address_taken.clear();
     pcx.infer_dispatch.clear();
     pcx.c_unknown = -1;
     pcx.infer_allocator_trait = std_trait(c"Allocator", pcx);
@@ -326,13 +321,12 @@ fn init_walk(pcx: &mut Ctx<Comp>) {
     pcx.arena_scope_sym = intern_c(c"arena_scope", pcx);
     pcx.arena_unlend_sym = intern_c(c"arena_unlend", pcx);
     pcx.len_sym = intern_c(c"len", pcx);
-    // (E1.6: std2's, a rust program's)
-    let std2 = crate::front::known::on_std2(pcx);
-    pcx.panic_sym = if std2 { intern_c(c"std.panic.panic", pcx) } else { 0 };
-    pcx.assert_failed_sym = if std2 { intern_c(c"std.panic.assert_failed", pcx) } else { 0 };
-    pcx.std2_assert_sym = if std2 { intern_c(c"std.panic.assert", pcx) } else { 0 };
+    // (E1.6: std's)
+    pcx.panic_sym = intern_c(c"std.panic.panic", pcx);
+    pcx.assert_failed_sym = intern_c(c"std.panic.assert_failed", pcx);
+    pcx.std_assert_sym = intern_c(c"std.panic.assert", pcx);
     pcx.search = false;
-    fmt_setup(std2, pcx);
+    fmt_setup(pcx);
 }
 
 // ---- A Formatter's sink (0.28.0) ----
@@ -361,7 +355,7 @@ const CALL_FMT_RET: i64 = 32;
 const CALL_FMT_OK: i64 = 64;
 const FMT_JOIN: i64 = -2;
 
-fn fmt_setup(std2: bool, pcx: &mut Ctx<Comp>) {
+fn fmt_setup(pcx: &mut Ctx<Comp>) {
     pcx.fmt_struct = -1;
     pcx.fmt_sink_ty = 0;
     pcx.fmt_join = -1;
@@ -369,27 +363,22 @@ fn fmt_setup(std2: bool, pcx: &mut Ctx<Comp>) {
     pcx.fmt_cut = 0;
     pcx.fmt_touch = 0;
     pcx.fmt_made = false;
-    if !std2 || pcx.std_module < 0 {
+    if pcx.std_module < 0 {
         return;
     }
     let key = std_item_key(intern_c(c"Formatter", pcx), pcx);
-    // UNSAFE: SYM_STRUCT's word of a symbol, and a struct's field.
-    // SAFETY: key is a symbol's index (std_item_key's, checked); the field
-    // index is find_field's, within the struct's count.
-    unsafe {
-        let s: i64 = if key < 0 { -1 } else { (*pcx.sym_struct.add(key as usize)) - 1 };
-        if s < 0 {
-            return;
-        }
-        let i = crate::front::types::find_field(s, intern_c(c"write", pcx), pcx);
-        if i < 0 {
-            return;
-        }
-        let t = (*crate::front::types::struct_field(s, i, pcx)).ty;
-        if t > 0 && pcx.types[t as usize].kind == TyKind::Fn {
-            pcx.fmt_struct = s;
-            pcx.fmt_sink_ty = t;
-        }
+    let s: i64 = if key < 0 { -1 } else { (pcx.sym_struct[key as usize]) - 1 };
+    if s < 0 {
+        return;
+    }
+    let i = crate::front::types::find_field(s, intern_c(c"write", pcx), pcx);
+    if i < 0 {
+        return;
+    }
+    let t = (struct_field(s, i, pcx)).ty;
+    if t > 0 && pcx.types[t as usize].kind == TyKind::Fn {
+        pcx.fmt_struct = s;
+        pcx.fmt_sink_ty = t;
     }
 }
 
@@ -422,9 +411,7 @@ fn holds_formatter(t: i64, pcx: &mut Ctx<Comp>) -> bool {
         got = holds_formatter(pcx.types[t as usize].a, pcx);
     } else if k == TyKind::Tuple {
         for i in 0..pcx.types[t as usize].count {
-            // UNSAFE: TLISTS' words of a tuple's elements, by index.
-            // SAFETY: i is below the tuple's count; its list is in TLISTS.
-            let e = unsafe { (*pcx.tlists.data.add((pcx.types[t as usize].list + i) as usize)) };
+            let e = (pcx.tlists[(pcx.types[t as usize].list + i) as usize]);
             if !got && holds_formatter(e, pcx) {
                 got = true;
             }
@@ -435,20 +422,16 @@ fn holds_formatter(t: i64, pcx: &mut Ctx<Comp>) -> bool {
             else { s };
         got = s == pcx.fmt_struct || of == pcx.fmt_struct;
         for i in 0..pcx.structs[s as usize].field_count {
-            // UNSAFE: a struct's field, by index.
-            // SAFETY: i is below its field count.
-            let ft = unsafe { (*crate::front::types::struct_field(s, i, pcx)).ty };
+            let ft = (struct_field(s, i, pcx)).ty;
             if !got && holds_formatter(ft, pcx) {
                 got = true;
             }
         }
     } else {
         let e = pcx.types[t as usize].a;
-        // UNSAFE: ENUMS' entry of an enum type.
-        // SAFETY: e is an enum type's index, made by the checker.
-        let count = unsafe { (*crate::front::types::get_enums().add(e as usize)).variant_count };
+        let count = (pcx.enums[e as usize]).variant_count;
         for i in 0..count {
-            let v = crate::front::types::enum_variant(e, i);
+            let v = crate::front::types::enum_variant(e, i, pcx);
             for j in 0..pcx.variants[v as usize].field_count {
                 if !got && holds_formatter(crate::front::types::variant_field(v, j, pcx), pcx) {
                     got = true;
@@ -465,7 +448,7 @@ fn holds_formatter(t: i64, pcx: &mut Ctx<Comp>) -> bool {
 // sight may write through.
 fn fmt_join_node(pcx: &mut Ctx<Comp>) -> i64 {
     if pcx.fmt_join < 0 {
-        pcx.fmt_join = pcx.graph_fns + pcx.virtual_type.count;
+        pcx.fmt_join = pcx.graph_fns + pcx.virtual_type.len() as i64;
         pcx.virtual_type.push(FMT_JOIN);
     }
     pcx.fmt_join
@@ -485,21 +468,17 @@ fn fmt_call(n: i64, info: i64, pcx: &mut Ctx<Comp>) {
 // a closure, its enclosing function (CALL_FMT_OK, kept for its
 // closures); `made`: its body made one.
 fn fmt_ok(f: i64, made: bool, pcx: &mut Ctx<Comp>) -> bool {
-    // UNSAFE: CALLEE_INFO and FMT_ENCL, a word per function.
-    // SAFETY: f is below GRAPH_FNS, both tables' size (infer_effects).
-    unsafe {
-        let info = callee_info(f, pcx);
-        if (info & CALL_FMT_OK) != 0 {
-            return true;
-        }
-        let e = (*pcx.fmt_encl.add(f as usize)) - 1;
-        let ok = made || (info & CALL_FMT_PARAM) != 0
-            || e >= 0 && ((*pcx.callee_info.add(e as usize)) & CALL_FMT_OK) != 0;
-        if ok {
-            (*pcx.callee_info.add(f as usize)) = info | CALL_FMT_OK;
-        }
-        ok
+    let info = callee_info(f, pcx);
+    if (info & CALL_FMT_OK) != 0 {
+        return true;
     }
+    let e = (pcx.fmt_encl[f as usize]) - 1;
+    let ok = made || (info & CALL_FMT_PARAM) != 0
+        || e >= 0 && ((pcx.callee_info[e as usize]) & CALL_FMT_OK) != 0;
+    if ok {
+        (pcx.callee_info[f as usize]) = info | CALL_FMT_OK;
+    }
+    ok
 }
 
 // After function f's body is walked: the join's edge, when it used a
@@ -514,9 +493,7 @@ fn fmt_settle(f: i64, pcx: &mut Ctx<Comp>) {
     pcx.fmt_made = false;
     if pcx.search {
         // (the graph is made: what the walk recorded is in CALLEE_INFO)
-        // UNSAFE: CALLEE_INFO's word of f.
-        // SAFETY: f is below GRAPH_FNS (find_step checked).
-        let ok = unsafe { ((*pcx.callee_info.add(f as usize)) & CALL_FMT_OK) != 0 };
+        let ok = ((pcx.callee_info[f as usize]) & CALL_FMT_OK) != 0;
         if !ok && touch != 0 {
             call_edge(touch, pcx.fmt_join, E_CALL, 0, pcx);
         }
@@ -543,36 +520,30 @@ pub fn body_walked(f: i64, pcx: &Ctx<Comp>) -> bool {
 // Whether function f's effects are ⊤: a template, a body that failed or
 // was not checked, an instance of the error type (query mode).
 fn is_top(f: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        if (*pcx.failed.add(f as usize)) != 0 || pcx.fns[f as usize].node == 0 {
-            return true;
-        }
-        if pcx.fns[f as usize].is_extern {
-            return false;
-        }
-        if !body_walked(f, pcx) {
-            return true;
-        }
-        for i in 0..pcx.fns[f as usize].targ_count {
-            if (*pcx.tlists.data.add((pcx.fns[f as usize].targs + i) as usize)) == pcx.ty_error {
-                return true;
-            }
-        }
-        false
+    if (pcx.failed[f as usize]) != 0 || pcx.fns[f as usize].node == 0 {
+        return true;
     }
+    if pcx.fns[f as usize].is_extern {
+        return false;
+    }
+    if !body_walked(f, pcx) {
+        return true;
+    }
+    for i in 0..pcx.fns[f as usize].targ_count {
+        if (pcx.tlists[(pcx.fns[f as usize].targs + i) as usize]) == pcx.ty_error {
+            return true;
+        }
+    }
+    false
 }
 
 // (0.27.2.1) Whether function f is an instance with the error type in a
 // type argument (query mode's, never run).
 pub fn error_instance(f: i64, pcx: &Ctx<Comp>) -> bool {
-    // UNSAFE: TLISTS' words of f's type arguments, by index.
-    // SAFETY: f's targs..targs + targ_count are in TLISTS, as the checker made them.
-    unsafe {
-        for i in 0..pcx.fns[f as usize].targ_count {
-            if ty_mentions((*pcx.tlists.data.add((pcx.fns[f as usize].targs + i) as usize)),
-                pcx.ty_error, 0, pcx) {
-                return true;
-            }
+    for i in 0..pcx.fns[f as usize].targ_count {
+        if ty_mentions((pcx.tlists[(pcx.fns[f as usize].targs + i) as usize]),
+            pcx.ty_error, 0, pcx) {
+            return true;
         }
     }
     false
@@ -580,60 +551,58 @@ pub fn error_instance(f: i64, pcx: &Ctx<Comp>) -> bool {
 
 // The local effects of function f, its edges pushed.
 fn node_locals(f: i64, pcx: &mut Ctx<Comp>) -> Effects {
-    unsafe {
-        // (0.19: a declaration of std::arch's has its table's effects)
-        let intr = intrinsic_of_fn(f, pcx);
-        if intr >= 0 && pcx.nodes[pcx.fns[f as usize].node as usize].c == 0 {
-            // (a raw:: pointer form, one parameter fewer, is unsafe)
-            let raw = pcx.fns[f as usize].param_count < (*pcx.intrs.add(intr as usize)).nparams;
-            return Effects { bits: if raw { EFF_UNSAFE } else { intrinsic_effect_bits(intr, pcx) },
-                allocs: 0 };
-        }
-        // (0.21: std's atomic intrinsics synchronize, and their bodies
-        // are never compiled; unsafe stays with their callers)
-        if atomic_intrinsic(f, pcx) >= 0 {
-            return Effects { bits: EFF_SYNC | EFF_UNSAFE, allocs: 0 };
-        }
-        // (0.21: the lock std's printing holds once threads run is part of
-        // its io, as waiting for a pipe is; 0.26.1: its state is an
-        // immutable static in a cell, not `global`: printing is `io panic`)
-        if is_print_lock(f, pcx) {
-            return Effects { bits: EFF_IO | EFF_INTERIOR, allocs: 0 };
-        }
-        if is_top(f, pcx) {
-            // (0.25: static_access, a callee that may do anything)
-            if pcx.sa_top != 0 as *mut i64 {
-                (*pcx.sa_top.add(f as usize)) = 1;
-            }
-            return effects_top();
-        }
-        if pcx.fns[f as usize].is_extern {
-            let e = extern_effects(f, pcx);
-            if (e.bits & EFF_UNKNOWN) != 0 {
-                // (unknown C: its callbacks)
-                push_edge(c_unknown_node(pcx), E_CALL, 0, pcx);
-                return Effects { bits: e.bits & ~EFF_UNKNOWN, allocs: e.allocs };
-            }
-            return e;
-        }
-        pcx.walk_node = f;
-        pcx.acc = effects_none();
-        if (pcx.fns[f as usize].attrs & FN_UNSAFE) != 0 {
-            pcx.acc.bits |= EFF_UNSAFE;
-        }
-        pcx.loops.count = 0;
-        pcx.fmt_touch = 0;
-        pcx.fmt_made = false;
-        walk(pcx.nodes[pcx.fns[f as usize].node as usize].c, pcx);
-        if is_cell_root(f, pcx) {
-            // (0.26.1: the address UnsafeCell::get gives is written through
-            // a shared reference)
-            pcx.acc.bits |= EFF_INTERIOR;
-        }
-        fmt_settle(f, pcx);
-        drop_edges(f, pcx);
-        pcx.acc
+    // (0.19: a declaration of std::arch's has its table's effects)
+    let intr = intrinsic_of_fn(f, pcx);
+    if intr >= 0 && pcx.nodes[pcx.fns[f as usize].node as usize].c == 0 {
+        // (a raw:: pointer form, one parameter fewer, is unsafe)
+        let raw = pcx.fns[f as usize].param_count < (pcx.intrs[intr as usize]).nparams;
+        return Effects { bits: if raw { EFF_UNSAFE } else { intrinsic_effect_bits(intr, pcx) },
+            allocs: 0 };
     }
+    // (0.21: std's atomic intrinsics synchronize, and their bodies
+    // are never compiled; unsafe stays with their callers)
+    if atomic_intrinsic(f, pcx) >= 0 {
+        return Effects { bits: EFF_SYNC | EFF_UNSAFE, allocs: 0 };
+    }
+    // (0.21: the lock std's printing holds once threads run is part of
+    // its io, as waiting for a pipe is; 0.26.1: its state is an
+    // immutable static in a cell, not `global`: printing is `io panic`)
+    if is_print_lock(f, pcx) {
+        return Effects { bits: EFF_IO | EFF_INTERIOR, allocs: 0 };
+    }
+    if is_top(f, pcx) {
+        // (0.25: static_access, a callee that may do anything)
+        if pcx.sa_top.len() > 0 {
+            (pcx.sa_top[f as usize]) = 1;
+        }
+        return effects_top();
+    }
+    if pcx.fns[f as usize].is_extern {
+        let e = extern_effects(f, pcx);
+        if (e.bits & EFF_UNKNOWN) != 0 {
+            // (unknown C: its callbacks)
+            push_edge(c_unknown_node(pcx), E_CALL, 0, pcx);
+            return Effects { bits: e.bits & !EFF_UNKNOWN, allocs: e.allocs };
+        }
+        return e;
+    }
+    pcx.walk_node = f;
+    pcx.acc = effects_none();
+    if (pcx.fns[f as usize].attrs & FN_UNSAFE) != 0 {
+        pcx.acc.bits |= EFF_UNSAFE;
+    }
+    pcx.loops.clear();
+    pcx.fmt_touch = 0;
+    pcx.fmt_made = false;
+    walk(pcx.nodes[pcx.fns[f as usize].node as usize].c, pcx);
+    if is_cell_root(f, pcx) {
+        // (0.26.1: the address UnsafeCell::get gives is written through
+        // a shared reference)
+        pcx.acc.bits |= EFF_INTERIOR;
+    }
+    fmt_settle(f, pcx);
+    drop_edges(f, pcx);
+    pcx.acc
 }
 
 // (0.21) Whether f is one of std::fmt's print lock functions
@@ -655,13 +624,9 @@ fn is_print_lock(f: i64, pcx: &Ctx<Comp>) -> bool {
 // (0.26.1) Whether f is std::cell::UnsafeCell::get (an instance of it):
 // the one root of EFF_INTERIOR.
 pub fn is_cell_root(f: i64, pcx: &Ctx<Comp>) -> bool {
-    // UNSAFE: FNS is the checker's raw table of functions (*FnInfo).
-    // SAFETY: f and its template are function ids below FN_COUNT.
-    unsafe {
-        let t = template_of(f, pcx);
-        within_std(pcx.fns[t as usize].module, pcx)
-            && sym_text(pcx.fns[t as usize].name, pcx) == b"std.cell.UnsafeCell.get"
-    }
+    let t = template_of(f, pcx);
+    within_std(pcx.fns[t as usize].module, pcx)
+        && sym_text(pcx.fns[t as usize].name, pcx) == b"std.cell.UnsafeCell.get"
 }
 
 // The virtual node of calls through values of fn type t.
@@ -670,7 +635,7 @@ fn dispatch_node(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if v != 0 {
         return v - 1;
     }
-    let node = pcx.graph_fns + pcx.virtual_type.count;
+    let node = pcx.graph_fns + pcx.virtual_type.len() as i64;
     pcx.virtual_type.push(t);
     pcx.infer_dispatch.put(t + 1, node + 1);
     node
@@ -679,7 +644,7 @@ fn dispatch_node(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // The virtual node of unknown C.
 fn c_unknown_node(pcx: &mut Ctx<Comp>) -> i64 {
     if pcx.c_unknown < 0 {
-        pcx.c_unknown = pcx.graph_fns + pcx.virtual_type.count;
+        pcx.c_unknown = pcx.graph_fns + pcx.virtual_type.len() as i64;
         pcx.virtual_type.push(-1);
     }
     pcx.c_unknown
@@ -693,7 +658,7 @@ pub fn dispatch_of(t: i64, pcx: &Ctx<Comp>) -> i64 {
 fn push_edge(to: i64, kind: i64, add: i64, pcx: &mut Ctx<Comp>) {
     if kind == E_CALL && panic_root(to, pcx) {
         // RULE: E1.6 (0.28.0, as MVS's std::panic_str, effects-
-        // allocation.md §2.2) a call of std2's panic is `panic`, no
+        // allocation.md §2.2) a call of std's panic is `panic`, no
         // `diverge` (a panic is just a panic: `diverge` is a loop or a
         // recursion that may not end):
         // its message is the panic's, written into its own buffer and
@@ -704,34 +669,28 @@ fn push_edge(to: i64, kind: i64, add: i64, pcx: &mut Ctx<Comp>) {
         return;
     }
     if kind == E_SCOPE {
-        pcx.scope_add.put(pcx.edges.count + 1, add);
+        pcx.scope_add.put(pcx.edges.len() as i64 + 1, add);
     }
     pcx.edges.push(to * 4 + kind);
 }
 
 // The node edge e goes to, its kind, and what it adds.
 fn edge_to(e: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (*pcx.edges.data.add(e as usize)) >> 2 }
+    (pcx.edges[e as usize]) >> 2
 }
 
 fn edge_through(e: i64, pcx: &mut Ctx<Comp>) -> Effects {
-    unsafe {
-        let kind = (*pcx.edges.data.add(e as usize)) & 3;
-        let add: i64 = if kind == E_SCOPE { pcx.scope_add.get(e + 1) } else { 0 };
-        through((*pcx.node_fx.add(((*pcx.edges.data.add(e as usize)) >> 2) as usize)), kind, add,
-            pcx)
-    }
+    let kind = (pcx.edges[e as usize]) & 3;
+    let add: i64 = if kind == E_SCOPE { pcx.scope_add.get(e + 1) } else { 0 };
+    through((pcx.node_fx[((pcx.edges[e as usize]) >> 2) as usize]), kind, add,
+        pcx)
 }
 
 // (0.27.2.1) Effects fx as seen through edge e (its kind's filter).
 fn edge_pass(e: i64, fx: Effects, pcx: &mut Ctx<Comp>) -> Effects {
-    // UNSAFE: EDGES' word and SCOPE_ADD, by index.
-    // SAFETY: e is an edge of the graph (below EDGES' count).
-    unsafe {
-        let kind = (*pcx.edges.data.add(e as usize)) & 3;
-        let add: i64 = if kind == E_SCOPE { pcx.scope_add.get(e + 1) } else { 0 };
-        through(fx, kind, add, pcx)
-    }
+    let kind = (pcx.edges[e as usize]) & 3;
+    let add: i64 = if kind == E_SCOPE { pcx.scope_add.get(e + 1) } else { 0 };
+    through(fx, kind, add, pcx)
 }
 
 // ---- The walk ----
@@ -757,7 +716,7 @@ fn local(n: i64, bits: i64, allocs: i64, pcx: &mut Ctx<Comp>) {
     pcx.acc.allocs |= allocs;
 }
 
-// RULE: E1.6 (0.28.0) Node n calls std2's panic: `panic`, its
+// RULE: E1.6 (0.28.0) Node n calls std's panic: `panic`, its
 // own (a search finds it there, with no callee to go into).
 fn panic_here(n: i64, pcx: &mut Ctx<Comp>) {
     if !pcx.search {
@@ -774,42 +733,40 @@ fn panic_here(n: i64, pcx: &mut Ctx<Comp>) {
 
 // Call n of graph node `to`, by an edge of kind `kind`.
 fn call_edge(n: i64, to: i64, kind: i64, add: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if kind == E_CALL && (pcx.search || pcx.eval) && panic_root(to, pcx) {
-            // RULE: E1.6 (the search and expr_effects read the callee's
-            // effects, not the graph's edges: the same `panic diverge`
-            // as push_edge's, whatever the instance's message formats)
-            panic_here(n, pcx);
-            return;
-        }
-        if pcx.search {
-            if pcx.found_node != 0 || to < 0 || to >= pcx.graph_size {
-                return;
-            }
-            let e = through((*pcx.node_fx.add(to as usize)), kind, add, pcx);
-            let recursive = pcx.search_bit == EFF_DIVERGE
-                && (*pcx.component.add(to as usize))
-                == (*pcx.component.add(pcx.walk_node as usize));
-            if has_effect(e, pcx.search_bit, pcx.search_alloc) || recursive {
-                pcx.found_node = n;
-                pcx.found_callee = to;
-                pcx.found_kind = kind;
-            }
-            return;
-        }
-        if pcx.eval {
-            // (expr_effects: the callee's effects now; -1: no function of
-            // that fn type is reached)
-            if to < 0 || to >= pcx.graph_size {
-                return;
-            }
-            let e = through((*pcx.node_fx.add(to as usize)), kind, add, pcx);
-            pcx.acc.bits |= e.bits;
-            pcx.acc.allocs |= e.allocs;
-            return;
-        }
-        push_edge(to, kind, add, pcx);
+    if kind == E_CALL && (pcx.search || pcx.eval) && panic_root(to, pcx) {
+        // RULE: E1.6 (the search and expr_effects read the callee's
+        // effects, not the graph's edges: the same `panic diverge`
+        // as push_edge's, whatever the instance's message formats)
+        panic_here(n, pcx);
+        return;
     }
+    if pcx.search {
+        if pcx.found_node != 0 || to < 0 || to >= pcx.graph_size {
+            return;
+        }
+        let e = through((pcx.node_fx[to as usize]), kind, add, pcx);
+        let recursive = pcx.search_bit == EFF_DIVERGE
+            && (pcx.component[to as usize])
+            == (pcx.component[pcx.walk_node as usize]);
+        if has_effect(e, pcx.search_bit, pcx.search_alloc) || recursive {
+            pcx.found_node = n;
+            pcx.found_callee = to;
+            pcx.found_kind = kind;
+        }
+        return;
+    }
+    if pcx.eval {
+        // (expr_effects: the callee's effects now; -1: no function of
+        // that fn type is reached)
+        if to < 0 || to >= pcx.graph_size {
+            return;
+        }
+        let e = through((pcx.node_fx[to as usize]), kind, add, pcx);
+        pcx.acc.bits |= e.bits;
+        pcx.acc.allocs |= e.allocs;
+        return;
+    }
+    push_edge(to, kind, add, pcx);
 }
 
 // (0.26.1) The functions function f's drops call, through their shims:
@@ -839,7 +796,7 @@ fn walk(n: i64, pcx: &mut Ctx<Comp>) {
     let kind = pcx.nodes[n as usize].kind;
     if kind == NodeKind::Ident && pcx.nodes[n as usize].res == Res::Local {
         // (0.28.0: unless a loop's end hangs on it, walk_loop, walk_while)
-        if pcx.loops.count > 0 {
+        if pcx.loops.len() as i64 > 0 {
             local_used(n, pcx);
         }
         return;
@@ -869,10 +826,10 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
         NodeKind::While => walk_while(n, pcx),
         NodeKind::Continue => {
             // (a `continue` may skip a counted `while`'s step)
-            let mut k = pcx.loops.count - 3;
+            let mut k = pcx.loops.len() as i64 - 3;
             while k >= 0 {
-                if pcx.loops.get(k + 1) == LOOP_COUNT {
-                    pcx.loops.set(k + 1, LOOP_BROKEN);
+                if pcx.loops[(k + 1) as usize] == LOOP_COUNT {
+                    pcx.loops[(k + 1) as usize] = LOOP_BROKEN;
                 }
                 k -= 3;
             }
@@ -919,7 +876,7 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
             }
             walk(pcx.nodes[n as usize].a, pcx);
         }
-        NodeKind::TupleField | NodeKind::ExprStmt | NodeKind::Return | NodeKind::Defer => {
+        NodeKind::TupleField | NodeKind::ExprStmt | NodeKind::Return => {
             walk(pcx.nodes[n as usize].a, pcx);
         }
         NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit | NodeKind::VariantLit => {
@@ -1066,10 +1023,10 @@ fn walk_call(n: i64, pcx: &mut Ctx<Comp>) {
             }
             return;
         }
-        // (0.28.0: std2's assert, a call, as MVS's assertion: true as
+        // (0.28.0: std's assert, a call, as MVS's assertion: true as
         // written, it cannot fail, no panic)
-        if pcx.std2_assert_sym != 0 && pcx.nodes[n as usize].count > 0
-            && pcx.fns[template_of(f, pcx) as usize].name == pcx.std2_assert_sym
+        if pcx.std_assert_sym != 0 && pcx.nodes[n as usize].count > 0
+            && pcx.fns[template_of(f, pcx) as usize].name == pcx.std_assert_sym
             && proven_true(child(n, 0, pcx), pcx) {
             return;
         }
@@ -1130,9 +1087,7 @@ fn walk_call(n: i64, pcx: &mut Ctx<Comp>) {
     if pcx.fmt_struct >= 0 {
         // (a fn value whose type names a Formatter: a use of one)
         for i in 0..pcx.types[t as usize].count {
-            // UNSAFE: TLISTS' words of a fn type's list, by index.
-            // SAFETY: i is below the type's count; its list is in TLISTS.
-            let p = unsafe { (*pcx.tlists.data.add((pcx.types[t as usize].list + i) as usize)) };
+            let p = (pcx.tlists[(pcx.types[t as usize].list + i) as usize]);
             if pcx.fmt_touch == 0 && holds_formatter(p, pcx) {
                 pcx.fmt_touch = n;
             }
@@ -1232,54 +1187,52 @@ fn raw_to_borrow(n: i64, f: i64, info: i64, pcx: &Ctx<Comp>) -> bool {
 // BORROW_SHIFT on the mask of its borrowed parameters (the first
 // BORROW_PARAMS; past them all are, to look at).
 fn callee_info(f: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let known = (*pcx.callee_info.add(f as usize));
-        if known != 0 {
-            return known;
-        }
-        let kind = if is_allocator_method(f, pcx) || is_arena_internal(f, pcx) { E_ALLOC }
-            else if scope_parent(f, pcx) != 0 { E_SCOPE } else { E_CALL };
-        let mut info = kind + 1;
-        if pcx.fns[f as usize].is_extern || (pcx.fns[f as usize].attrs & FN_UNSAFE) != 0 {
-            info |= CALL_UNSAFE;
-        }
-        if !pcx.fns[f as usize].is_extern {
-            let item = pcx.fns[f as usize].node;
-            for i in 0..pcx.nodes[item as usize].count {
-                if i >= BORROW_PARAMS || is_borrow_param(child(item, i, pcx), pcx) {
-                    info |= 1 << (BORROW_SHIFT + if i < BORROW_PARAMS { i } else { BORROW_PARAMS });
-                }
-                if i >= BORROW_PARAMS {
-                    break;
-                }
-            }
-        }
-        if pcx.fmt_struct >= 0 {
-            // (E4.3a: a Formatter in a parameter or a type argument, or
-            // returned)
-            let mut takes = false;
-            for i in 0..pcx.fns[f as usize].param_count {
-                if !takes && holds_formatter(crate::front::types::fn_param(f, i, pcx), pcx) {
-                    takes = true;
-                }
-            }
-            for i in 0..pcx.fns[f as usize].targ_count {
-                if !takes
-                    && holds_formatter(
-                        (*pcx.tlists.data.add((pcx.fns[f as usize].targs + i) as usize)), pcx) {
-                    takes = true;
-                }
-            }
-            if takes {
-                info |= CALL_FMT_PARAM;
-            }
-            if holds_formatter(pcx.fns[f as usize].ret, pcx) {
-                info |= CALL_FMT_RET;
-            }
-        }
-        (*pcx.callee_info.add(f as usize)) = info;
-        info
+    let known = (pcx.callee_info[f as usize]);
+    if known != 0 {
+        return known;
     }
+    let kind = if is_allocator_method(f, pcx) || is_arena_internal(f, pcx) { E_ALLOC }
+        else if scope_parent(f, pcx) != 0 { E_SCOPE } else { E_CALL };
+    let mut info = kind + 1;
+    if pcx.fns[f as usize].is_extern || (pcx.fns[f as usize].attrs & FN_UNSAFE) != 0 {
+        info |= CALL_UNSAFE;
+    }
+    if !pcx.fns[f as usize].is_extern {
+        let item = pcx.fns[f as usize].node;
+        for i in 0..pcx.nodes[item as usize].count {
+            if i >= BORROW_PARAMS || is_borrow_param(child(item, i, pcx), pcx) {
+                info |= 1 << (BORROW_SHIFT + if i < BORROW_PARAMS { i } else { BORROW_PARAMS });
+            }
+            if i >= BORROW_PARAMS {
+                break;
+            }
+        }
+    }
+    if pcx.fmt_struct >= 0 {
+        // (E4.3a: a Formatter in a parameter or a type argument, or
+        // returned)
+        let mut takes = false;
+        for i in 0..pcx.fns[f as usize].param_count {
+            if !takes && holds_formatter(crate::front::types::fn_param(f, i, pcx), pcx) {
+                takes = true;
+            }
+        }
+        for i in 0..pcx.fns[f as usize].targ_count {
+            if !takes
+                && holds_formatter(
+                    (pcx.tlists[(pcx.fns[f as usize].targs + i) as usize]), pcx) {
+                takes = true;
+            }
+        }
+        if takes {
+            info |= CALL_FMT_PARAM;
+        }
+        if holds_formatter(pcx.fns[f as usize].ret, pcx) {
+            info |= CALL_FMT_RET;
+        }
+    }
+    (pcx.callee_info[f as usize]) = info;
+    info
 }
 
 fn walk_index(n: i64, pcx: &mut Ctx<Comp>) {
@@ -1332,35 +1285,33 @@ fn walk_index(n: i64, pcx: &mut Ctx<Comp>) {
 // immutable slice binding, or `for i in 0..N` with N at most the array's
 // length (which is how the `for` desugarings index).
 fn in_bounds(base: i64, bt: i64, index: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let array = bt > 0 && pcx.types[bt as usize].kind == TyKind::Array;
-        if pcx.nodes[index as usize].kind == NodeKind::Int {
-            return array && pcx.nodes[index as usize].a >= 0
-                && pcx.nodes[index as usize].a < pcx.types[bt as usize].b;
-        }
-        if pcx.nodes[index as usize].kind != NodeKind::Ident
-            || pcx.nodes[index as usize].res != Res::Local {
-            return false;
-        }
-        let i = pcx.nodes[index as usize].y;
-        let mut k = pcx.loops.count - 3;
-        while k >= 0 {
-            if (*pcx.loops.data.add(k as usize)) == i {
-                let kind = (*pcx.loops.data.add((k + 1) as usize));
-                let what = (*pcx.loops.data.add((k + 2) as usize));
-                if kind == LOOP_SLICE {
-                    return pcx.nodes[base as usize].kind == NodeKind::Ident
-                        && pcx.nodes[base as usize].res == Res::Local
-                        && pcx.nodes[base as usize].y == what;
-                }
-                if kind == LOOP_LENGTH {
-                    return array && what <= pcx.types[bt as usize].b;
-                }
-            }
-            k -= 3;
-        }
-        false
+    let array = bt > 0 && pcx.types[bt as usize].kind == TyKind::Array;
+    if pcx.nodes[index as usize].kind == NodeKind::Int {
+        return array && pcx.nodes[index as usize].a >= 0
+            && pcx.nodes[index as usize].a < pcx.types[bt as usize].b;
     }
+    if pcx.nodes[index as usize].kind != NodeKind::Ident
+        || pcx.nodes[index as usize].res != Res::Local {
+        return false;
+    }
+    let i = pcx.nodes[index as usize].y;
+    let mut k = pcx.loops.len() as i64 - 3;
+    while k >= 0 {
+        if (pcx.loops[k as usize]) == i {
+            let kind = (pcx.loops[(k + 1) as usize]);
+            let what = (pcx.loops[(k + 2) as usize]);
+            if kind == LOOP_SLICE {
+                return pcx.nodes[base as usize].kind == NodeKind::Ident
+                    && pcx.nodes[base as usize].res == Res::Local
+                    && pcx.nodes[base as usize].y == what;
+            }
+            if kind == LOOP_LENGTH {
+                return array && what <= pcx.types[bt as usize].b;
+            }
+        }
+        k -= 3;
+    }
+    false
 }
 
 // (0.28.0) Call n as `s.NAME()` of std's slice method NAME (`len`,
@@ -1390,13 +1341,13 @@ fn slice_call(n: i64, name: &[u8], pcx: &Ctx<Comp>) -> i64 {
 
 // RULE: E2.1 (0.28.0) `if s.is_empty() { .. } else { .. }`, s an immutable
 // slice binding: in the else branch s has an element, so `s[0]` and
-// `s[1..]` are in bounds there (LOOP_NONEMPTY; std2's split_first, which
+// `s[1..]` are in bounds there (LOOP_NONEMPTY; std's split_first, which
 // a slice's iterator is: iterating is no `panic`).
 fn walk_if(n: i64, pcx: &mut Ctx<Comp>) {
     let cond = pcx.nodes[n as usize].a;
     walk(cond, pcx);
     walk(pcx.nodes[n as usize].b, pcx);
-    let mark = pcx.loops.count;
+    let mark = pcx.loops.len() as i64;
     let s = slice_call(cond, "is_empty".as_bytes(), pcx);
     if s >= 0 {
         pcx.loops.push(-1);
@@ -1404,7 +1355,7 @@ fn walk_if(n: i64, pcx: &mut Ctx<Comp>) {
         pcx.loops.push(s);
     }
     walk(pcx.nodes[n as usize].c, pcx);
-    pcx.loops.count = mark;
+    pcx.loops.truncate(mark as usize);
 }
 
 // Whether base is a slice binding known not to be empty here (walk_if).
@@ -1413,24 +1364,20 @@ fn nonempty(base: i64, pcx: &Ctx<Comp>) -> bool {
         || pcx.nodes[base as usize].res != Res::Local {
         return false;
     }
-    // UNSAFE: LOOPS is a raw IntVec (base/comp.vl), as every table.
-    // SAFETY: k + 2 < count: triples, pushed by walk_for and walk_if.
-    unsafe {
-        let mut k = pcx.loops.count - 3;
-        while k >= 0 {
-            if (*pcx.loops.data.add((k + 1) as usize)) == LOOP_NONEMPTY
-                && (*pcx.loops.data.add((k + 2) as usize)) == pcx.nodes[base as usize].y {
-                return true;
-            }
-            k -= 3;
+    let mut k = pcx.loops.len() as i64 - 3;
+    while k >= 0 {
+        if (pcx.loops[(k + 1) as usize]) == LOOP_NONEMPTY
+            && (pcx.loops[(k + 2) as usize]) == pcx.nodes[base as usize].y {
+            return true;
         }
+        k -= 3;
     }
     false
 }
 
 // Whether e is `s.len() - 1`, s the immutable slice binding that base is
 // (the last index of a slice that is not empty, and the end of the rest
-// before it: std2's split_last).
+// before it: std's split_last).
 fn last_of(e: i64, base: i64, pcx: &Ctx<Comp>) -> bool {
     e > 0 && pcx.nodes[e as usize].kind == NodeKind::Binary
         && pcx.nodes[e as usize].op == Tok::Minus
@@ -1447,14 +1394,14 @@ fn last_of(e: i64, base: i64, pcx: &Ctx<Comp>) -> bool {
 // other than its step, take the proof away.
 fn local_used(n: i64, pcx: &mut Ctx<Comp>) {
     let y = pcx.nodes[n as usize].y;
-    let mut k = pcx.loops.count - 3;
+    let mut k = pcx.loops.len() as i64 - 3;
     while k >= 0 {
-        let kind = pcx.loops.get(k + 1);
-        if pcx.loops.get(k) == y
+        let kind = pcx.loops[(k + 1) as usize];
+        if pcx.loops[k as usize] == y
             && (kind == LOOP_NEXT
-                || kind == LOOP_COUNT && pcx.loops.get(k + 2) != n
+                || kind == LOOP_COUNT && pcx.loops[(k + 2) as usize] != n
                 && (pcx.static_write > 0 || (pcx.nodes[n as usize].p & NODE_CAPTURE) != 0)) {
-            pcx.loops.set(k + 1, LOOP_BROKEN);
+            pcx.loops[(k + 1) as usize] = LOOP_BROKEN;
         }
         k -= 3;
     }
@@ -1518,15 +1465,15 @@ fn walk_loop(n: i64, pcx: &mut Ctx<Comp>) {
     }
     let m = pcx.nodes[pcx.nodes[n as usize].b as usize].a;
     walk(pcx.nodes[m as usize].a, pcx);
-    let mark = pcx.loops.count;
+    let mark = pcx.loops.len() as i64;
     pcx.loops.push(x);
     pcx.loops.push(LOOP_NEXT);
     pcx.loops.push(0);
     let arm = child(m, 0, pcx);
     walk(pcx.nodes[arm as usize].b, pcx);
     walk(pcx.nodes[arm as usize].c, pcx);
-    let broken = pcx.loops.get(mark + 1) != LOOP_NEXT;
-    pcx.loops.count = mark;
+    let broken = pcx.loops[(mark + 1) as usize] != LOOP_NEXT;
+    pcx.loops.truncate(mark as usize);
     if broken {
         local(n, EFF_DIVERGE, 0, pcx);
     }
@@ -1619,13 +1566,13 @@ fn walk_while(n: i64, pcx: &mut Ctx<Comp>) {
         walk(body, pcx);
         return;
     }
-    let mark = pcx.loops.count;
+    let mark = pcx.loops.len() as i64;
     pcx.loops.push(pcx.nodes[step as usize].y);
     pcx.loops.push(LOOP_COUNT);
     pcx.loops.push(step);
     walk(body, pcx);
-    let broken = pcx.loops.get(mark + 1) != LOOP_COUNT;
-    pcx.loops.count = mark;
+    let broken = pcx.loops[(mark + 1) as usize] != LOOP_COUNT;
+    pcx.loops.truncate(mark as usize);
     if broken {
         local(n, EFF_DIVERGE, 0, pcx);
     }
@@ -1642,7 +1589,7 @@ fn walk_for(n: i64, pcx: &mut Ctx<Comp>) {
     }
     walk(pcx.nodes[range as usize].a, pcx);
     walk(pcx.nodes[range as usize].b, pcx);
-    let mark = pcx.loops.count;
+    let mark = pcx.loops.len() as i64;
     let pattern = pcx.nodes[n as usize].b;
     let low = pcx.nodes[range as usize].a;
     let high = pcx.nodes[range as usize].b;
@@ -1676,7 +1623,7 @@ fn walk_for(n: i64, pcx: &mut Ctx<Comp>) {
         }
     }
     walk(pcx.nodes[n as usize].d, pcx);
-    pcx.loops.count = mark;
+    pcx.loops.truncate(mark as usize);
 }
 
 fn walk_vecop(n: i64, pcx: &mut Ctx<Comp>) {
@@ -1699,77 +1646,82 @@ fn walk_vecop(n: i64, pcx: &mut Ctx<Comp>) {
 // Tarjan's algorithm, iterative, over the graph; each component's effects
 // as it completes (its callees' are known then).
 fn components(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let size = pcx.graph_size;
-        pcx.node_fx = alloc_array::<Effects>(size + 1);
-        // (0.27.2.1, E3.3a: a rust program's sets split by where they come from)
-        if crate::front::known::on_std2(pcx) && !pcx.search && !pcx.eval {
-            pcx.fx_fixed = alloc_array::<Effects>(size + 1);
-            pcx.fx_dyn = alloc_array::<Effects>(size + 1);
-        } else {
-            pcx.fx_fixed = 0 as *mut Effects;
-            pcx.fx_dyn = 0 as *mut Effects;
+    let size = pcx.graph_size;
+    sized_table(&mut pcx.node_fx, size + 1, Effects { bits: 0, allocs: 0 });
+    // (0.27.2.1, E3.3a: a rust program's sets split by where they come from)
+    if !pcx.search && !pcx.eval {
+        sized_table(&mut pcx.fx_fixed, size + 1, Effects { bits: 0, allocs: 0 });
+        sized_table(&mut pcx.fx_dyn, size + 1, Effects { bits: 0, allocs: 0 });
+    } else {
+        pcx.fx_fixed.clear();
+        pcx.fx_dyn.clear();
+    }
+    sized_table(&mut pcx.component, size + 1, 0);
+    let mut index_room: Vec<i64, Comp> = Vec::new_in(Comp {});
+    index_room.resize((size + 1) as usize, 0);
+    let index = index_room.as_mut_slice();
+    let mut low_room: Vec<i64, Comp> = Vec::new_in(Comp {});
+    low_room.resize((size + 1) as usize, 0);
+    let low = low_room.as_mut_slice();
+    let mut on_stack_room: Vec<i64, Comp> = Vec::new_in(Comp {});
+    on_stack_room.resize((size + 1) as usize, 0);
+    let on_stack = on_stack_room.as_mut_slice();
+    pcx.stack.clear();
+    let mut calls: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut counter: i64 = 0;
+    let mut comp: i64 = 0;
+    for root in 0..size {
+        if (index[root as usize]) != 0 {
+            continue;
         }
-        pcx.component = alloc_array::<i64>(size + 1);
-        let index = alloc_array::<i64>(size + 1);
-        let low = alloc_array::<i64>(size + 1);
-        let on_stack = alloc_array::<i64>(size + 1);
-        pcx.stack.count = 0;
-        let mut calls = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut counter: i64 = 0;
-        let mut comp: i64 = 0;
-        for root in 0..size {
-            if (*index.add(root as usize)) != 0 {
+        counter += 1;
+        (index[root as usize]) = counter;
+        (low[root as usize]) = counter;
+        pcx.stack.push(root);
+        (on_stack[root as usize]) = 1;
+        calls.push(root);
+        calls.push((pcx.edge_start[root as usize]));
+        while calls.len() as i64 > 0 {
+            let v = (calls[(calls.len() as i64 - 2) as usize]);
+            let e = (calls[(calls.len() as i64 - 1) as usize]);
+            if e < (pcx.edge_start[(v + 1) as usize]) {
+                let top = calls.len() - 1;
+                calls[top] = e + 1;
+                let w = edge_to(e, pcx);
+                if (index[w as usize]) == 0 {
+                    counter += 1;
+                    (index[w as usize]) = counter;
+                    (low[w as usize]) = counter;
+                    pcx.stack.push(w);
+                    (on_stack[w as usize]) = 1;
+                    calls.push(w);
+                    calls.push((pcx.edge_start[w as usize]));
+                }
+                else if (on_stack[w as usize]) != 0
+                    && (index[w as usize]) < (low[v as usize]) {
+                    (low[v as usize]) = (index[w as usize]);
+                }
                 continue;
             }
-            counter += 1;
-            (*index.add(root as usize)) = counter;
-            (*low.add(root as usize)) = counter;
-            pcx.stack.push(root);
-            (*on_stack.add(root as usize)) = 1;
-            calls.push(root);
-            calls.push((*pcx.edge_start.data.add(root as usize)));
-            while calls.count > 0 {
-                let v = (*calls.data.add((calls.count - 2) as usize));
-                let e = (*calls.data.add((calls.count - 1) as usize));
-                if e < (*pcx.edge_start.data.add((v + 1) as usize)) {
-                    (*calls.data.add((calls.count - 1) as usize)) = e + 1;
-                    let w = edge_to(e, pcx);
-                    if (*index.add(w as usize)) == 0 {
-                        counter += 1;
-                        (*index.add(w as usize)) = counter;
-                        (*low.add(w as usize)) = counter;
-                        pcx.stack.push(w);
-                        (*on_stack.add(w as usize)) = 1;
-                        calls.push(w);
-                        calls.push((*pcx.edge_start.data.add(w as usize)));
-                    }
-                    else if (*on_stack.add(w as usize)) != 0
-                        && (*index.add(w as usize)) < (*low.add(v as usize)) {
-                        (*low.add(v as usize)) = (*index.add(w as usize));
-                    }
-                    continue;
+            calls.truncate(calls.len() - 2);
+            if calls.len() as i64 > 0 {
+                let p = (calls[(calls.len() as i64 - 2) as usize]);
+                if (low[v as usize]) < (low[p as usize]) {
+                    (low[p as usize]) = (low[v as usize]);
                 }
-                calls.count -= 2;
-                if calls.count > 0 {
-                    let p = (*calls.data.add((calls.count - 2) as usize));
-                    if (*low.add(v as usize)) < (*low.add(p as usize)) {
-                        (*low.add(p as usize)) = (*low.add(v as usize));
-                    }
+            }
+            if (low[v as usize]) == (index[v as usize]) {
+                let mut first = pcx.stack.len() as i64 - 1;
+                while (pcx.stack[first as usize]) != v {
+                    first -= 1;
                 }
-                if (*low.add(v as usize)) == (*index.add(v as usize)) {
-                    let mut first = pcx.stack.count - 1;
-                    while (*pcx.stack.data.add(first as usize)) != v {
-                        first -= 1;
-                    }
-                    comp += 1;
-                    for k in first..pcx.stack.count {
-                        (*on_stack.add((*pcx.stack.data.add(k as usize)) as usize)) = 0;
-                        (*pcx.component.add((*pcx.stack.data.add(k as usize)) as usize)) = comp;
-                    }
-                    component_effects(first, comp, pcx);
-                    pcx.stack.count = first;
+                comp += 1;
+                for k in first..pcx.stack.len() as i64 {
+                    (on_stack[(pcx.stack[k as usize]) as usize]) = 0;
+                    (pcx.component[(pcx.stack[k as usize]) as usize]) = comp;
                 }
+                component_effects(first, comp, pcx);
+                pcx.stack.truncate(first as usize);
             }
         }
     }
@@ -1777,23 +1729,21 @@ fn components(pcx: &mut Ctx<Comp>) {
 
 // The local effects of graph node v.
 fn local_of(v: i64, pcx: &Ctx<Comp>) -> Effects {
-    unsafe {
-        if v < pcx.graph_fns {
-            return (*pcx.local_fx.add(v as usize));
-        }
-        // (0.27.4: but the shared-static rule's raw_global, which each call of
-        // unknown C adds where it is made, the rust edition's exempt: F19.6)
-        if v == pcx.c_unknown {
-            let e = unknown_c_effects();
-            Effects { bits: e.bits & ~EFF_RAW_GLOBAL, allocs: e.allocs }
-        } else { effects_none() }
+    if v < pcx.graph_fns {
+        return (pcx.local_fx[v as usize]);
     }
+    // (0.27.4: but the shared-static rule's raw_global, which each call of
+    // unknown C adds where it is made, the rust edition's exempt: F19.6)
+    if v == pcx.c_unknown {
+        let e = unknown_c_effects();
+        Effects { bits: e.bits & !EFF_RAW_GLOBAL, allocs: e.allocs }
+    } else { effects_none() }
 }
 
 // The effects of component number comp, the nodes of STACK from first
 // on. (0.27.2.1, E3.3a: in a rust program also each member's part that
 // comes from a fn value's call, FX_DYN, and the rest, FX_FIXED.)
-// (0.28.0, E1.6) Whether function m is std2's panic or assert_failed (an
+// (0.28.0, E1.6) Whether function m is std's panic or assert_failed (an
 // instance of either): the functions that format a panic's message.
 fn panic_root(m: i64, pcx: &Ctx<Comp>) -> bool {
     if m < 0 || m >= pcx.fns.len() as i64 || pcx.panic_sym == 0 {
@@ -1807,80 +1757,77 @@ fn panic_root(m: i64, pcx: &Ctx<Comp>) -> bool {
 }
 
 fn component_effects(first: i64, comp: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let mut acc = effects_none();
-        let track = pcx.fx_fixed != 0 as *mut Effects;
-        let mut fixed = effects_none();
-        let mut dynamic = effects_none();
-        let mut cyclic = pcx.stack.count - first > 1;
-        for k in first..pcx.stack.count {
-            let m = (*pcx.stack.data.add(k as usize));
-            let own = local_of(m, pcx);
-            acc.bits |= own.bits & ~EFF_UNSAFE;
-            acc.allocs |= own.allocs;
-            fixed.bits |= own.bits & ~EFF_UNSAFE;
-            fixed.allocs |= own.allocs;
-            for e in (*pcx.edge_start.data.add(m as usize))..(
-                *pcx.edge_start.data.add((m + 1) as usize)) {
-                let w = edge_to(e, pcx);
-                if (*pcx.component.add(w as usize)) == comp {
-                    cyclic = true;
-                    continue;
-                }
-                let t = edge_through(e, pcx);
-                acc.bits |= t.bits;
-                acc.allocs |= t.allocs;
-                if track {
-                    // (unknown C's callbacks are the program's, as a fn
-                    // value's targets: closed world, E4.3)
-                    if dispatch_edge(w, pcx) || m == pcx.c_unknown {
-                        dynamic = effects_union(dynamic, t);
-                    } else {
-                        fixed = effects_union(fixed,
-                            edge_pass(e, (*pcx.fx_fixed.add(w as usize)), pcx));
-                        dynamic = effects_union(dynamic,
-                            edge_pass(e, (*pcx.fx_dyn.add(w as usize)), pcx));
-                    }
-                }
+    let mut acc = effects_none();
+    let track = pcx.fx_fixed.len() > 0;
+    let mut fixed = effects_none();
+    let mut dynamic = effects_none();
+    let mut cyclic = pcx.stack.len() as i64 - first > 1;
+    for k in first..pcx.stack.len() as i64 {
+        let m = (pcx.stack[k as usize]);
+        let own = local_of(m, pcx);
+        acc.bits |= own.bits & !EFF_UNSAFE;
+        acc.allocs |= own.allocs;
+        fixed.bits |= own.bits & !EFF_UNSAFE;
+        fixed.allocs |= own.allocs;
+        for e in (pcx.edge_start[m as usize])..(pcx.edge_start[(m + 1) as usize]) {
+            let w = edge_to(e, pcx);
+            if (pcx.component[w as usize]) == comp {
+                cyclic = true;
+                continue;
             }
-        }
-        if cyclic {
-            acc.bits |= EFF_DIVERGE | EFF_RAW_DIVERGE;
-            fixed.bits |= EFF_DIVERGE | EFF_RAW_DIVERGE;
-        }
-        for k in first..pcx.stack.count {
-            let m = (*pcx.stack.data.add(k as usize));
-            (*pcx.node_fx.add(m as usize)) = Effects {
-                bits: acc.bits | (local_of(m, pcx).bits & EFF_UNSAFE),
-                allocs: acc.allocs,
-            };
+            let t = edge_through(e, pcx);
+            acc.bits |= t.bits;
+            acc.allocs |= t.allocs;
             if track {
-                // (the members' locals and the cycle are the fixed part)
-                (*pcx.fx_dyn.add(m as usize)) = dynamic;
-                (*pcx.fx_fixed.add(m as usize)) = fixed;
-            }
-        }
-        if track && cyclic {
-            split_cycle(first, pcx);
-        }
-        // RULE: E2.2 (0.28.0: before a declared member's signature is made
-        // of its set)
-        for k in first..pcx.stack.count {
-            let m = (*pcx.stack.data.add(k as usize));
-            if m < pcx.graph_fns && terminates(m, pcx)
-                && ((*pcx.node_fx.add(m as usize)).bits & EFF_UNKNOWN) == 0 {
-                trusted_to_end(m, comp, pcx);
-            }
-        }
-        // (0.27.2.1, E3.1a: a declared member gets its signature, after
-        // every member has the component's set)
-        if pcx.fx_decl != 0 as *mut i64 {
-            // (in the unsafe block above: STACK and FX_DECL by index)
-            for k in first..pcx.stack.count {
-                let m = (*pcx.stack.data.add(k as usize));
-                if m < pcx.graph_fns && (*pcx.fx_decl.add(m as usize)) != 0 {
-                    signature_of(m, pcx);
+                // (unknown C's callbacks are the program's, as a fn
+                // value's targets: closed world, E4.3)
+                if dispatch_edge(w, pcx) || m == pcx.c_unknown {
+                    dynamic = effects_union(dynamic, t);
+                } else {
+                    fixed = effects_union(fixed,
+                        edge_pass(e, (pcx.fx_fixed[w as usize]), pcx));
+                    dynamic = effects_union(dynamic,
+                        edge_pass(e, (pcx.fx_dyn[w as usize]), pcx));
                 }
+            }
+        }
+    }
+    if cyclic {
+        acc.bits |= EFF_DIVERGE | EFF_RAW_DIVERGE;
+        fixed.bits |= EFF_DIVERGE | EFF_RAW_DIVERGE;
+    }
+    for k in first..pcx.stack.len() as i64 {
+        let m = (pcx.stack[k as usize]);
+        (pcx.node_fx[m as usize]) = Effects {
+            bits: acc.bits | (local_of(m, pcx).bits & EFF_UNSAFE),
+            allocs: acc.allocs,
+        };
+        if track {
+            // (the members' locals and the cycle are the fixed part)
+            (pcx.fx_dyn[m as usize]) = dynamic;
+            (pcx.fx_fixed[m as usize]) = fixed;
+        }
+    }
+    if track && cyclic {
+        split_cycle(first, pcx);
+    }
+    // RULE: E2.2 (0.28.0: before a declared member's signature is made
+    // of its set)
+    for k in first..pcx.stack.len() as i64 {
+        let m = (pcx.stack[k as usize]);
+        if m < pcx.graph_fns && terminates(m, pcx)
+            && ((pcx.node_fx[m as usize]).bits & EFF_UNKNOWN) == 0 {
+            trusted_to_end(m, comp, pcx);
+        }
+    }
+    // (0.27.2.1, E3.1a: a declared member gets its signature, after
+    // every member has the component's set)
+    if pcx.fx_decl.len() > 0 {
+        // (in the unsafe block above: STACK and FX_DECL by index)
+        for k in first..pcx.stack.len() as i64 {
+            let m = (pcx.stack[k as usize]);
+            if m < pcx.graph_fns && (pcx.fx_decl[m as usize]) != 0 {
+                signature_of(m, pcx);
             }
         }
     }
@@ -1905,53 +1852,44 @@ pub fn terminates(m: i64, pcx: &Ctx<Comp>) -> bool {
 // raw bit, the optimizer's WILLRETURN, is left as the body shows it: no
 // code is compiled on the promise.
 fn trusted_to_end(m: i64, comp: i64, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: the effect graph's tables (EDGE_START, EDGES, COMPONENT,
-    // NODE_FX, FX_FIXED, FX_DYN) and TLISTS, by index.
-    // SAFETY: m is below GRAPH_FNS, so EDGE_START has m + 1; its edges'
-    // targets are graph nodes, whose sets are made (callees first) unless
-    // in m's component, which is skipped; m's targs..targs + targ_count
-    // are in TLISTS; FX_FIXED and FX_DYN, when made, have a word per node.
-    unsafe {
-        let track = pcx.fx_fixed != 0 as *mut Effects;
-        let count = pcx.fns[m as usize].targ_count;
-        let mut kept: i64 = 0;
-        for e in (*pcx.edge_start.data.add(m as usize))..(
-            *pcx.edge_start.data.add((m + 1) as usize)) {
-            let w = edge_to(e, pcx);
-            if (*pcx.component.add(w as usize)) == comp {
-                continue;
+    let track = pcx.fx_fixed.len() > 0;
+    let count = pcx.fns[m as usize].targ_count;
+    let mut kept: i64 = 0;
+    for e in (pcx.edge_start[m as usize])..(pcx.edge_start[(m + 1) as usize]) {
+        let w = edge_to(e, pcx);
+        if (pcx.component[w as usize]) == comp {
+            continue;
+        }
+        if dispatch_edge(w, pcx) {
+            if !track {
+                kept |= edge_through(e, pcx).bits & EFF_DIVERGE;
             }
-            if dispatch_edge(w, pcx) {
-                if !track {
-                    kept |= edge_through(e, pcx).bits & EFF_DIVERGE;
-                }
-                continue;
-            }
-            let mut made = ((*pcx.edges.data.add(e as usize)) & 3) == E_DROP && count > 0;
-            for j in 0..count {
-                if node_made_for(w,
-                    (*pcx.tlists.data.add((pcx.fns[m as usize].targs + j) as usize)), pcx) {
-                    made = true;
-                }
-            }
-            if made {
-                let t = if track { edge_pass(e, (*pcx.fx_fixed.add(w as usize)), pcx) }
-                    else { edge_through(e, pcx) };
-                kept |= t.bits & EFF_DIVERGE;
+            continue;
+        }
+        let mut made = ((pcx.edges[e as usize]) & 3) == E_DROP && count > 0;
+        for j in 0..count {
+            if node_made_for(w,
+                (pcx.tlists[(pcx.fns[m as usize].targs + j) as usize]), pcx) {
+                made = true;
             }
         }
-        if track {
-            let fixed = (*pcx.fx_fixed.add(m as usize));
-            (*pcx.fx_fixed.add(m as usize)) = Effects {
-                bits: (fixed.bits & ~EFF_DIVERGE) | kept, allocs: fixed.allocs,
-            };
-            kept |= (*pcx.fx_dyn.add(m as usize)).bits & EFF_DIVERGE;
+        if made {
+            let t = if track { edge_pass(e, (pcx.fx_fixed[w as usize]), pcx) }
+                else { edge_through(e, pcx) };
+            kept |= t.bits & EFF_DIVERGE;
         }
-        let all = (*pcx.node_fx.add(m as usize));
-        (*pcx.node_fx.add(m as usize)) = Effects {
-            bits: (all.bits & ~EFF_DIVERGE) | kept, allocs: all.allocs,
-        };
     }
+    if track {
+        let fixed = (pcx.fx_fixed[m as usize]);
+        (pcx.fx_fixed[m as usize]) = Effects {
+            bits: (fixed.bits & !EFF_DIVERGE) | kept, allocs: fixed.allocs,
+        };
+        kept |= (pcx.fx_dyn[m as usize]).bits & EFF_DIVERGE;
+    }
+    let all = (pcx.node_fx[m as usize]);
+    (pcx.node_fx[m as usize]) = Effects {
+        bits: (all.bits & !EFF_DIVERGE) | kept, allocs: all.allocs,
+    };
 }
 
 // (0.27.2.1, E3.3a) A cyclic component's split per member, to a fixed
@@ -1961,46 +1899,40 @@ fn trusted_to_end(m: i64, comp: i64, pcx: &mut Ctx<Comp>) {
 // (A cycle through a fn value, Formatter's writer and an adapter's
 // write_str, keeps what one writer does out of the others' fixed part.)
 fn split_cycle(first: i64, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: STACK, NODE_FX, FX_FIXED, FX_DYN and the edges, by index.
-    // SAFETY: the members are STACK[first..], graph nodes; the tables have
-    // a word per graph node (components made them).
-    unsafe {
-        for k in first..pcx.stack.count {
-            let m = (*pcx.stack.data.add(k as usize));
-            let own = local_of(m, pcx);
-            (*pcx.fx_fixed.add(m as usize)) = Effects { bits: (own.bits & ~EFF_UNSAFE) | EFF_DIVERGE
-                | EFF_RAW_DIVERGE, allocs: own.allocs };
-            (*pcx.fx_dyn.add(m as usize)) = effects_none();
-        }
-        let mut changed = true;
-        let mut rounds: i64 = 0;
-        while changed && rounds < 64 {
-            changed = false;
-            rounds += 1;
-            for k in first..pcx.stack.count {
-                let m = (*pcx.stack.data.add(k as usize));
-                let mut fixed = (*pcx.fx_fixed.add(m as usize));
-                let mut dynamic = (*pcx.fx_dyn.add(m as usize));
-                for e in (*pcx.edge_start.data.add(m as usize))..(
-                    *pcx.edge_start.data.add((m + 1) as usize)) {
-                    let w = edge_to(e, pcx);
-                    if dispatch_edge(w, pcx) || m == pcx.c_unknown {
-                        dynamic = effects_union(dynamic, edge_through(e, pcx));
-                    } else {
-                        fixed = effects_union(fixed,
-                            edge_pass(e, (*pcx.fx_fixed.add(w as usize)), pcx));
-                        dynamic = effects_union(dynamic,
-                            edge_pass(e, (*pcx.fx_dyn.add(w as usize)), pcx));
-                    }
+    for k in first..pcx.stack.len() as i64 {
+        let m = (pcx.stack[k as usize]);
+        let own = local_of(m, pcx);
+        (pcx.fx_fixed[m as usize]) = Effects { bits: (own.bits & !EFF_UNSAFE) | EFF_DIVERGE
+            | EFF_RAW_DIVERGE, allocs: own.allocs };
+        (pcx.fx_dyn[m as usize]) = effects_none();
+    }
+    let mut changed = true;
+    let mut rounds: i64 = 0;
+    while changed && rounds < 64 {
+        changed = false;
+        rounds += 1;
+        for k in first..pcx.stack.len() as i64 {
+            let m = (pcx.stack[k as usize]);
+            let mut fixed = (pcx.fx_fixed[m as usize]);
+            let mut dynamic = (pcx.fx_dyn[m as usize]);
+            for e in (pcx.edge_start[m as usize])..(pcx.edge_start[(m + 1) as usize]) {
+                let w = edge_to(e, pcx);
+                if dispatch_edge(w, pcx) || m == pcx.c_unknown {
+                    dynamic = effects_union(dynamic, edge_through(e, pcx));
+                } else {
+                    fixed = effects_union(fixed,
+                        edge_pass(e, (pcx.fx_fixed[w as usize]), pcx));
+                    dynamic = effects_union(dynamic,
+                        edge_pass(e, (pcx.fx_dyn[w as usize]), pcx));
                 }
-                if fixed.bits != (*pcx.fx_fixed.add(m as usize)).bits
-                    || fixed.allocs != (*pcx.fx_fixed.add(m as usize)).allocs
-                    || dynamic.bits != (*pcx.fx_dyn.add(m as usize)).bits
-                    || dynamic.allocs != (*pcx.fx_dyn.add(m as usize)).allocs {
-                    changed = true;
-                    (*pcx.fx_fixed.add(m as usize)) = fixed;
-                    (*pcx.fx_dyn.add(m as usize)) = dynamic;
-                }
+            }
+            if fixed.bits != (pcx.fx_fixed[m as usize]).bits
+                || fixed.allocs != (pcx.fx_fixed[m as usize]).allocs
+                || dynamic.bits != (pcx.fx_dyn[m as usize]).bits
+                || dynamic.allocs != (pcx.fx_dyn[m as usize]).allocs {
+                changed = true;
+                (pcx.fx_fixed[m as usize]) = fixed;
+                (pcx.fx_dyn[m as usize]) = dynamic;
             }
         }
     }
@@ -2013,115 +1945,107 @@ fn split_cycle(first: i64, pcx: &mut Ctx<Comp>) {
 // from a fn value's call, E3.3a), I(m)'s hidden bits and unsafe (the
 // optimizer's); I(m) is kept for check_effects. RULE: E3.1a
 fn signature_of(m: i64, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: NODE_FX, the declaration tables and the effect graph's, by index.
-    // SAFETY: m < GRAPH_FNS, a declared function (FX_DECL[m] != 0), so
-    // FX_DECL_TPS holds its count and types at FX_DECL[m] - 1; FX_FIXED and
-    // FX_DYN, when made, have a word per graph node.
-    unsafe {
-        let i = (*pcx.node_fx.add(m as usize));
-        (*pcx.fx_inferred.add(m as usize)) = i;
-        if (i.bits & EFF_UNKNOWN) != 0 {
-            return;
-        }
-        let at = (*pcx.fx_decl.add(m as usize)) - 1;
-        let track = pcx.fx_fixed != 0 as *mut Effects;
-        let mut pf = effects_none();
-        let mut pd = effects_none();
-        // RULE: E3.3b (0.28.0) what passes the declaration: the edges made
-        // for a listed parameter, their fn values' parts too (pf, pp); a
-        // fn value's call made for none (a println's formatting, a closure
-        // the body makes) is the body's own, checked as MVS's
-        let mut pp = effects_none();
-        for e in (*pcx.edge_start.data.add(m as usize))..(
-            *pcx.edge_start.data.add((m + 1) as usize)) {
-            let w = edge_to(e, pcx);
-            let dropped = ((*pcx.edges.data.add(e as usize)) & 3) == E_DROP
-                && (*pcx.fx_decl_tps.data.add(at as usize)) > 0;
-            let made = dropped || made_for(w, at, pcx);
-            if dispatch_edge(w, pcx) {
-                pd = effects_union(pd, edge_through(e, pcx));
-                if made {
-                    pp = effects_union(pp, edge_through(e, pcx));
-                }
-            } else if made {
-                if track {
-                    pf = effects_union(pf, edge_pass(e, (*pcx.fx_fixed.add(w as usize)), pcx));
-                    pd = effects_union(pd, edge_pass(e, (*pcx.fx_dyn.add(w as usize)), pcx));
-                    pp = effects_union(pp, edge_pass(e, (*pcx.fx_dyn.add(w as usize)), pcx));
-                } else {
-                    pf = effects_union(pf, edge_through(e, pcx));
-                }
-            } else if track {
-                pd = effects_union(pd, edge_pass(e, (*pcx.fx_dyn.add(w as usize)), pcx));
-            }
-        }
-        for j in 0..(*pcx.fx_decl_tps.data.add(at as usize)) {
-            pf.allocs |= allocs_through((*pcx.local_fx.add(m as usize)).allocs,
-                (*pcx.fx_decl_tps.data.add((at + 1 + j) as usize)), pcx);
-        }
-        // (std2's own declarations keep E3.3a's form: a fn value's call
-        // passes, its sinks and hooks the closed world's)
-        let std = within_std(pcx.fns[m as usize].module, pcx);
-        (*pcx.fx_decl_px.add(m as usize)) = effects_union(pf, if std { pd } else { pp });
-        if track && !std {
-            // RULE: E3.3b (what is checked, I(m): its body's own, a
-            // cycle's diverge, and each edge's; a declared std function's
-            // fn values' part, a Formatter's sink, is in its declaration)
-            let mut checked = local_of(m, pcx);
-            checked.bits |= (*pcx.fx_fixed.add(m as usize)).bits & (EFF_DIVERGE | EFF_RAW_DIVERGE);
-            for e in (*pcx.edge_start.data.add(m as usize))..(
-                *pcx.edge_start.data.add((m + 1) as usize)) {
-                let w = edge_to(e, pcx);
-                if dispatch_edge(w, pcx) || !within_std(pcx.fns[w as usize].module, pcx) {
-                    checked = effects_union(checked, edge_through(e, pcx));
-                } else if w < pcx.graph_fns && (*pcx.fx_decl.add(w as usize)) != 0 {
-                    // (a declared std function: its list, and what it
-                    // does hidden, S(w)'s)
-                    let s = Effects {
-                        bits: ((*pcx.fx_fixed.add(w as usize)).bits
-                            & crate::front::effects::EFF_VISIBLE)
-                            | ((*pcx.node_fx.add(w as usize)).bits
-                                & ~crate::front::effects::EFF_VISIBLE),
-                        allocs: (*pcx.fx_fixed.add(w as usize)).allocs,
-                    };
-                    checked = effects_union(checked, edge_pass(e, s, pcx));
-                } else {
-                    // (an undeclared std function: all it does, its fn
-                    // values' part too: a Vec's drop of a T that prints;
-                    // a panic's formatting is no longer any, E1.6)
-                    checked = effects_union(checked, edge_pass(e,
-                        effects_union((*pcx.fx_fixed.add(w as usize)),
-                            (*pcx.fx_dyn.add(w as usize))), pcx));
-                }
-            }
-            (*pcx.fx_inferred.add(m as usize)) = checked;
-        }
-        let mut d = (*pcx.fx_decl_e.add(m as usize));
-        // RULE: E3.1b (0.28.0: a chain with no list forbids and declares
-        // nothing: the signature is what the body does, within it; `query
-        // effects` of a #[no_alloc] sort prints `panic diverge`, not every
-        // effect but alloc)
-        if !crate::front::effects::check::has_list(pcx.fns[m as usize].effect_decl, pcx) {
-            d.bits &= i.bits;
-            d.allocs = if d.allocs < 0 { i.allocs } else { d.allocs & i.allocs };
-        }
-        let hidden = EFF_RAW_PANIC | EFF_RAW_DIVERGE | EFF_RAW_GLOBAL | EFF_INTERIOR | EFF_UNSAFE;
-        if track {
-            // (a list allows a cell's write, set_bound: that is no write of
-            // m's; a caller's fixed part takes the bit from what m does,
-            // or a #[pure] caller of an undeclared std function over a
-            // listed one, a `for` over a slice, was refused, gap 97)
-            let mut fixed = effects_union(d, pf);
-            fixed.bits = (fixed.bits & ~EFF_INTERIOR) | ((i.bits | pf.bits) & EFF_INTERIOR);
-            (*pcx.fx_fixed.add(m as usize)) = fixed;
-            (*pcx.fx_dyn.add(m as usize)) = pd;
-        }
-        (*pcx.node_fx.add(m as usize)) = Effects {
-            bits: ((d.bits | pf.bits | pd.bits) & crate::front::effects::EFF_VISIBLE & ~EFF_UNSAFE)
-                | (i.bits & hidden),
-            allocs: d.allocs | pf.allocs | pd.allocs,
-        };
+    let i = (pcx.node_fx[m as usize]);
+    (pcx.fx_inferred[m as usize]) = i;
+    if (i.bits & EFF_UNKNOWN) != 0 {
+        return;
     }
+    let at = (pcx.fx_decl[m as usize]) - 1;
+    let track = pcx.fx_fixed.len() > 0;
+    let mut pf = effects_none();
+    let mut pd = effects_none();
+    // RULE: E3.3b (0.28.0) what passes the declaration: the edges made
+    // for a listed parameter, their fn values' parts too (pf, pp); a
+    // fn value's call made for none (a println's formatting, a closure
+    // the body makes) is the body's own, checked as MVS's
+    let mut pp = effects_none();
+    for e in (pcx.edge_start[m as usize])..(pcx.edge_start[(m + 1) as usize]) {
+        let w = edge_to(e, pcx);
+        let dropped = ((pcx.edges[e as usize]) & 3) == E_DROP
+            && (pcx.fx_decl_tps[at as usize]) > 0;
+        let made = dropped || made_for(w, at, pcx);
+        if dispatch_edge(w, pcx) {
+            pd = effects_union(pd, edge_through(e, pcx));
+            if made {
+                pp = effects_union(pp, edge_through(e, pcx));
+            }
+        } else if made {
+            if track {
+                pf = effects_union(pf, edge_pass(e, (pcx.fx_fixed[w as usize]), pcx));
+                pd = effects_union(pd, edge_pass(e, (pcx.fx_dyn[w as usize]), pcx));
+                pp = effects_union(pp, edge_pass(e, (pcx.fx_dyn[w as usize]), pcx));
+            } else {
+                pf = effects_union(pf, edge_through(e, pcx));
+            }
+        } else if track {
+            pd = effects_union(pd, edge_pass(e, (pcx.fx_dyn[w as usize]), pcx));
+        }
+    }
+    for j in 0..(pcx.fx_decl_tps[at as usize]) {
+        pf.allocs |= allocs_through((pcx.local_fx[m as usize]).allocs,
+            (pcx.fx_decl_tps[(at + 1 + j) as usize]), pcx);
+    }
+    // (std's own declarations keep E3.3a's form: a fn value's call
+    // passes, its sinks and hooks the closed world's)
+    let std = within_std(pcx.fns[m as usize].module, pcx);
+    (pcx.fx_decl_px[m as usize]) = effects_union(pf, if std { pd } else { pp });
+    if track && !std {
+        // RULE: E3.3b (what is checked, I(m): its body's own, a
+        // cycle's diverge, and each edge's; a declared std function's
+        // fn values' part, a Formatter's sink, is in its declaration)
+        let mut checked = local_of(m, pcx);
+        checked.bits |= (pcx.fx_fixed[m as usize]).bits & (EFF_DIVERGE | EFF_RAW_DIVERGE);
+        for e in (pcx.edge_start[m as usize])..(pcx.edge_start[(m + 1) as usize]) {
+            let w = edge_to(e, pcx);
+            if dispatch_edge(w, pcx) || !within_std(pcx.fns[w as usize].module, pcx) {
+                checked = effects_union(checked, edge_through(e, pcx));
+            } else if w < pcx.graph_fns && (pcx.fx_decl[w as usize]) != 0 {
+                // (a declared std function: its list, and what it
+                // does hidden, S(w)'s)
+                let s = Effects {
+                    bits: ((pcx.fx_fixed[w as usize]).bits
+                        & crate::front::effects::EFF_VISIBLE)
+                        | ((pcx.node_fx[w as usize]).bits
+                            & !crate::front::effects::EFF_VISIBLE),
+                    allocs: (pcx.fx_fixed[w as usize]).allocs,
+                };
+                checked = effects_union(checked, edge_pass(e, s, pcx));
+            } else {
+                // (an undeclared std function: all it does, its fn
+                // values' part too: a Vec's drop of a T that prints;
+                // a panic's formatting is no longer any, E1.6)
+                checked = effects_union(checked, edge_pass(e,
+                    effects_union((pcx.fx_fixed[w as usize]),
+                        (pcx.fx_dyn[w as usize])), pcx));
+            }
+        }
+        (pcx.fx_inferred[m as usize]) = checked;
+    }
+    let mut d = (pcx.fx_decl_e[m as usize]);
+    // RULE: E3.1b (0.28.0: a chain with no list forbids and declares
+    // nothing: the signature is what the body does, within it; `query
+    // effects` of a #[no_alloc] sort prints `panic diverge`, not every
+    // effect but alloc)
+    if !crate::front::effects::check::has_list(pcx.fns[m as usize].effect_decl, pcx) {
+        d.bits &= i.bits;
+        d.allocs = if d.allocs < 0 { i.allocs } else { d.allocs & i.allocs };
+    }
+    let hidden = EFF_RAW_PANIC | EFF_RAW_DIVERGE | EFF_RAW_GLOBAL | EFF_INTERIOR | EFF_UNSAFE;
+    if track {
+        // (a list allows a cell's write, set_bound: that is no write of
+        // m's; a caller's fixed part takes the bit from what m does,
+        // or a #[pure] caller of an undeclared std function over a
+        // listed one, a `for` over a slice, was refused, gap 97)
+        let mut fixed = effects_union(d, pf);
+        fixed.bits = (fixed.bits & !EFF_INTERIOR) | ((i.bits | pf.bits) & EFF_INTERIOR);
+        (pcx.fx_fixed[m as usize]) = fixed;
+        (pcx.fx_dyn[m as usize]) = pd;
+    }
+    (pcx.node_fx[m as usize]) = Effects {
+        bits: ((d.bits | pf.bits | pd.bits) & crate::front::effects::EFF_VISIBLE & !EFF_UNSAFE)
+            | (i.bits & hidden),
+        allocs: d.allocs | pf.allocs | pd.allocs,
+    };
 }
 
 // (0.27.2.1, E3.3a) Whether graph node w is a fn type's virtual node (not
@@ -2137,15 +2061,11 @@ fn dispatch_edge(w: i64, pcx: &Ctx<Comp>) -> bool {
 // type argument's parts (a drop of a T = Vec<_, Gpa> frees through Gpa).
 fn allocs_through(allocs: i64, tau: i64, pcx: &Ctx<Comp>) -> i64 {
     let mut got: i64 = 0;
-    // UNSAFE: ALLOCATORS' words, by index.
-    // SAFETY: i < its count.
-    unsafe {
-        for i in 0..pcx.allocators.count {
-            let t = (*pcx.allocators.data.add(i as usize));
-            if i < 63 && (allocs & (1 << i)) != 0
-                && (ty_mentions(tau, t, 0, pcx) || ty_mentions(t, tau, 0, pcx)) {
-                got |= 1 << i;
-            }
+    for i in 0..pcx.allocators.len() as i64 {
+        let t = (pcx.allocators[i as usize]);
+        if i < 63 && (allocs & (1 << i)) != 0
+            && (ty_mentions(tau, t, 0, pcx) || ty_mentions(t, tau, 0, pcx)) {
+            got |= 1 << i;
         }
     }
     got
@@ -2156,14 +2076,9 @@ fn allocs_through(allocs: i64, tau: i64, pcx: &Ctx<Comp>) -> i64 {
 // argument mentions it, it is the body of a closure whose type does, or a
 // fn type's virtual node whose type does. RULE: E3.3a
 fn made_for(w: i64, at: i64, pcx: &Ctx<Comp>) -> bool {
-    // UNSAFE: FX_DECL_TPS' words, by index.
-    // SAFETY: at is a declaration's start in it: its count, then that many
-    // types (note_declarations).
-    unsafe {
-        for j in 0..(*pcx.fx_decl_tps.data.add(at as usize)) {
-            if node_made_for(w, (*pcx.fx_decl_tps.data.add((at + 1 + j) as usize)), pcx) {
-                return true;
-            }
+    for j in 0..(pcx.fx_decl_tps[at as usize]) {
+        if node_made_for(w, (pcx.fx_decl_tps[(at + 1 + j) as usize]), pcx) {
+            return true;
         }
     }
     false
@@ -2178,65 +2093,58 @@ fn made_for(w: i64, at: i64, pcx: &Ctx<Comp>) -> bool {
 // names an allocator through it (at most 63). For `fix --only effects`,
 // after infer_effects.
 pub fn own_effects(f: i64, pcx: &mut Ctx<Comp>) -> (Effects, i64) {
-    // UNSAFE: the effect graph's tables (EDGE_START, EDGES, COMPONENT,
-    // LOCAL_FX, FX_FIXED) and TLISTS, by index.
-    // SAFETY: f is below GRAPH_FNS, so EDGE_START has f + 1; its edges' targets
-    // are graph nodes; f's targs..targs + targ_count are in TLISTS.
-    unsafe {
-        let mut local = (*pcx.local_fx.add(f as usize));
-        let mut fx = effects_none();
-        let mut params: i64 = 0;
-        let track = pcx.fx_fixed != 0 as *mut Effects;
-        let count: i64 = if pcx.fns[f as usize].targ_count < 63 { pcx.fns[f as usize].targ_count }
-            else { 63 };
-        for e in (*pcx.edge_start.data.add(f as usize))..(
-            *pcx.edge_start.data.add((f + 1) as usize)) {
-            let w = edge_to(e, pcx);
-            if dispatch_edge(w, pcx) {
-                continue;
-            }
-            let mut mask: i64 = 0;
-            for j in 0..count {
-                if ((*pcx.edges.data.add(e as usize)) & 3) == E_DROP
-                    || node_made_for(w,
-                        (*pcx.tlists.data.add((pcx.fns[f as usize].targs + j) as usize)), pcx) {
-                    mask |= 1 << j;
-                }
-            }
-            if mask != 0 {
-                params |= mask;
-                continue;
-            }
-            if (*pcx.component.add(w as usize)) == (*pcx.component.add(f as usize)) {
-                fx.bits |= EFF_DIVERGE | EFF_RAW_DIVERGE;
-            }
-            let t = if track { edge_pass(e, (*pcx.fx_fixed.add(w as usize)), pcx) }
-                else { edge_through(e, pcx) };
-            fx = effects_union(fx, t);
+    let mut local = (pcx.local_fx[f as usize]);
+    let mut fx = effects_none();
+    let mut params: i64 = 0;
+    let track = pcx.fx_fixed.len() > 0;
+    let count: i64 = if pcx.fns[f as usize].targ_count < 63 { pcx.fns[f as usize].targ_count }
+        else { 63 };
+    for e in (pcx.edge_start[f as usize])..(pcx.edge_start[(f + 1) as usize]) {
+        let w = edge_to(e, pcx);
+        if dispatch_edge(w, pcx) {
+            continue;
         }
+        let mut mask: i64 = 0;
         for j in 0..count {
-            let tau = (*pcx.tlists.data.add((pcx.fns[f as usize].targs + j) as usize));
-            // (an allocator that is the argument itself stays: alloc(P))
-            let mut parts = allocs_through(local.allocs, tau, pcx);
-            for i in 0..pcx.allocators.count {
-                if i < 63 && (*pcx.allocators.data.add(i as usize)) == tau {
-                    parts &= ~(1 << i);
-                }
-            }
-            if parts != 0 {
-                params |= 1 << j;
-                local.allocs &= ~parts;
+            if ((pcx.edges[e as usize]) & 3) == E_DROP
+                || node_made_for(w,
+                    (pcx.tlists[(pcx.fns[f as usize].targs + j) as usize]), pcx) {
+                mask |= 1 << j;
             }
         }
-        fx.bits |= local.bits;
-        fx.allocs |= local.allocs;
-        // RULE: E2.2 (a `#[terminates]` function's own loops, recursion
-        // and named callees: no `diverge` in the list `fix` writes)
-        if terminates(f, pcx) {
-            fx.bits &= ~EFF_DIVERGE;
+        if mask != 0 {
+            params |= mask;
+            continue;
         }
-        (fx, params)
+        if (pcx.component[w as usize]) == (pcx.component[f as usize]) {
+            fx.bits |= EFF_DIVERGE | EFF_RAW_DIVERGE;
+        }
+        let t = if track { edge_pass(e, (pcx.fx_fixed[w as usize]), pcx) }
+            else { edge_through(e, pcx) };
+        fx = effects_union(fx, t);
     }
+    for j in 0..count {
+        let tau = (pcx.tlists[(pcx.fns[f as usize].targs + j) as usize]);
+        // (an allocator that is the argument itself stays: alloc(P))
+        let mut parts = allocs_through(local.allocs, tau, pcx);
+        for i in 0..pcx.allocators.len() as i64 {
+            if i < 63 && (pcx.allocators[i as usize]) == tau {
+                parts &= !(1 << i);
+            }
+        }
+        if parts != 0 {
+            params |= 1 << j;
+            local.allocs &= !parts;
+        }
+    }
+    fx.bits |= local.bits;
+    fx.allocs |= local.allocs;
+    // RULE: E2.2 (a `#[terminates]` function's own loops, recursion
+    // and named callees: no `diverge` in the list `fix` writes)
+    if terminates(f, pcx) {
+        fx.bits &= !EFF_DIVERGE;
+    }
+    (fx, params)
 }
 
 // RULE: E3.4a (0.28.0) What node v does when the methods of root's type
@@ -2248,92 +2156,79 @@ pub fn own_effects(f: i64, pcx: &mut Ctx<Comp>) -> (Effects, i64) {
 // what an impl does itself (effects/check.vl: check_effects). STACK is
 // the path: a function on it adds nothing new.
 pub fn own_part(v: i64, root: i64, first: i64, pcx: &mut Ctx<Comp>) -> Effects {
-    // UNSAFE: the effect graph's tables (LOCAL_FX, EDGE_START, EDGES,
-    // COMPONENT), STACK and TLISTS, by index.
-    // SAFETY: v and root are below GRAPH_FNS, so EDGE_START has v + 1 and
-    // LOCAL_FX has v; an edge's target is a graph node; k is below STACK's
-    // count; root's targs..targs + targ_count are in TLISTS.
-    unsafe {
-        let mut fx = (*pcx.local_fx.add(v as usize));
-        pcx.stack.push(v);
-        let from = pcx.fns[root as usize].targs;
-        let count = pcx.fns[root as usize].targ_count;
-        for e in (*pcx.edge_start.data.add(v as usize))..(
-            *pcx.edge_start.data.add((v + 1) as usize)) {
-            let w = edge_to(e, pcx);
-            if w >= pcx.graph_fns {
-                fx = effects_union(fx, edge_through(e, pcx));
-                continue;
-            }
-            if (*pcx.component.add(w as usize)) == (*pcx.component.add(v as usize)) {
-                fx.bits |= EFF_DIVERGE | EFF_RAW_DIVERGE;
-            }
-            let mut on_path = false;
-            for k in 0..pcx.stack.count {
-                if (*pcx.stack.data.add(k as usize)) == w {
-                    on_path = true;
-                }
-            }
-            if on_path {
-                continue;
-            }
-            let mut theirs = false;
-            let mut made = false;
-            for j in first..count {
-                let tau = (*pcx.tlists.data.add((from + j) as usize));
-                if pcx.fns[w as usize].self_ty == tau {
-                    theirs = true;
-                }
-                if node_made_for(w, tau, pcx) {
-                    made = true;
-                }
-            }
-            if theirs {
-                continue;
-            }
-            let t = if made && pcx.stack.count < 32 {
-                let part = own_part(w, root, first, pcx);
-                edge_pass(e, part, pcx)
-            } else {
-                edge_through(e, pcx)
-            };
-            fx = effects_union(fx, t);
+    let mut fx = (pcx.local_fx[v as usize]);
+    pcx.stack.push(v);
+    let from = pcx.fns[root as usize].targs;
+    let count = pcx.fns[root as usize].targ_count;
+    for e in (pcx.edge_start[v as usize])..(pcx.edge_start[(v + 1) as usize]) {
+        let w = edge_to(e, pcx);
+        if w >= pcx.graph_fns {
+            fx = effects_union(fx, edge_through(e, pcx));
+            continue;
         }
-        pcx.stack.count -= 1;
-        fx
+        if (pcx.component[w as usize]) == (pcx.component[v as usize]) {
+            fx.bits |= EFF_DIVERGE | EFF_RAW_DIVERGE;
+        }
+        let mut on_path = false;
+        for k in 0..pcx.stack.len() as i64 {
+            if (pcx.stack[k as usize]) == w {
+                on_path = true;
+            }
+        }
+        if on_path {
+            continue;
+        }
+        let mut theirs = false;
+        let mut made = false;
+        for j in first..count {
+            let tau = (pcx.tlists[(from + j) as usize]);
+            if pcx.fns[w as usize].self_ty == tau {
+                theirs = true;
+            }
+            if node_made_for(w, tau, pcx) {
+                made = true;
+            }
+        }
+        if theirs {
+            continue;
+        }
+        let t = if made && pcx.stack.len() as i64 < 32 {
+            let part = own_part(w, root, first, pcx);
+            edge_pass(e, part, pcx)
+        } else {
+            edge_through(e, pcx)
+        };
+        fx = effects_union(fx, t);
     }
+    pcx.stack.pop().unwrap();
+    fx
 }
 
 // (0.27.2.1) Whether graph node w is made for type tau (E3.3a).
 fn node_made_for(w: i64, tau: i64, pcx: &Ctx<Comp>) -> bool {
-    // UNSAFE: VIRTUAL_TYPE and TLISTS' words, by index.
-    // SAFETY: w is a graph node: a function below GRAPH_FNS, else a virtual
-    // node of VIRTUAL_TYPE (checked); a function's targs are in TLISTS.
-    unsafe {
-        if w >= pcx.graph_fns {
-            let k = w - pcx.graph_fns;
-            return k < pcx.virtual_type.count
-                && ty_mentions((*pcx.virtual_type.data.add(k as usize)), tau, 0, pcx);
-        }
-        if ty_mentions(pcx.fns[w as usize].self_ty, tau, 0, pcx) {
+    if w >= pcx.graph_fns {
+        let k = w - pcx.graph_fns;
+        return k < pcx.virtual_type.len() as i64
+            && ty_mentions((pcx.virtual_type[k as usize]), tau, 0, pcx);
+    }
+    if ty_mentions(pcx.fns[w as usize].self_ty, tau, 0, pcx) {
+        return true;
+    }
+    for a in 0..pcx.fns[w as usize].targ_count {
+        if ty_mentions((pcx.tlists[(pcx.fns[w as usize].targs + a) as usize]), tau, 0,
+            pcx) {
             return true;
         }
-        for a in 0..pcx.fns[w as usize].targ_count {
-            if ty_mentions((*pcx.tlists.data.add((pcx.fns[w as usize].targs + a) as usize)), tau, 0,
-                pcx) {
-                return true;
-            }
-        }
-        for c in 0..pcx.closures.len() as i64 {
-            // (either way: F bound to `&mut C` calls C's body)
-            if pcx.closures[c as usize].f == w
-                && (ty_mentions(pcx.closures[c as usize].ty, tau, 0, pcx)
-                    || ty_mentions(tau, pcx.closures[c as usize].ty, 0, pcx)) {
-                return true;
-            }
-        }
-        false
     }
+    for c in 0..pcx.closures.len() as i64 {
+        // (either way: F bound to `&mut C` calls C's body)
+        if pcx.closures[c as usize].f == w
+            && (ty_mentions(pcx.closures[c as usize].ty, tau, 0, pcx)
+                || ty_mentions(tau, pcx.closures[c as usize].ty, 0, pcx)) {
+            return true;
+        }
+    }
+    false
 }
 
 // (0.27.2.1) Whether type t is tau or has it as a part: a pointer's or a
@@ -2350,32 +2245,27 @@ pub fn ty_mentions(t: i64, tau: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
     if k == TyKind::Ptr || k == TyKind::Array || k == TyKind::Slice || k == TyKind::Vector {
         return ty_mentions(pcx.types[t as usize].a, tau, depth + 1, pcx);
     }
-    // UNSAFE: TLISTS' words and ENUMS, the checker's tables, by index.
-    // SAFETY: t is an interned type; its list, its struct's and its enum's
-    // type arguments are in TLISTS, as the checker made them.
-    unsafe {
-        if k == TyKind::Tuple || k == TyKind::Fn {
-            for i in 0..pcx.types[t as usize].count {
-                if ty_mentions((*pcx.tlists.data.add((pcx.types[t as usize].list + i) as usize)),
-                    tau, depth + 1, pcx) {
-                    return true;
-                }
-            }
-            return false;
-        }
-        let mut targs: i64 = 0;
-        let mut count: i64 = 0;
-        if k == TyKind::Struct {
-            targs = pcx.structs[pcx.types[t as usize].a as usize].targs;
-            count = pcx.structs[pcx.types[t as usize].a as usize].targ_count;
-        } else if k == TyKind::Enum {
-            targs = (*crate::front::types::get_enums().add(pcx.types[t as usize].a as usize)).targs;
-            count = (*crate::front::types::get_enums().add(pcx.types[t as usize].a as usize)).targ_count;
-        }
-        for i in 0..count {
-            if ty_mentions((*pcx.tlists.data.add((targs + i) as usize)), tau, depth + 1, pcx) {
+    if k == TyKind::Tuple || k == TyKind::Fn {
+        for i in 0..pcx.types[t as usize].count {
+            if ty_mentions((pcx.tlists[(pcx.types[t as usize].list + i) as usize]),
+                tau, depth + 1, pcx) {
                 return true;
             }
+        }
+        return false;
+    }
+    let mut targs: i64 = 0;
+    let mut count: i64 = 0;
+    if k == TyKind::Struct {
+        targs = pcx.structs[pcx.types[t as usize].a as usize].targs;
+        count = pcx.structs[pcx.types[t as usize].a as usize].targ_count;
+    } else if k == TyKind::Enum {
+        targs = (pcx.enums[pcx.types[t as usize].a as usize]).targs;
+        count = (pcx.enums[pcx.types[t as usize].a as usize]).targ_count;
+    }
+    for i in 0..count {
+        if ty_mentions((pcx.tlists[(targs + i) as usize]), tau, depth + 1, pcx) {
+            return true;
         }
     }
     false
@@ -2390,14 +2280,14 @@ pub fn find_step(f: i64, bit: i64, alloc: i64, pcx: &mut Ctx<Comp>) {
     pcx.found_node = 0;
     pcx.found_callee = -1;
     pcx.found_kind = 0;
-    if f < 0 || f >= pcx.graph_fns || pcx.node_fx == 0 as *mut Effects || !body_walked(f, pcx) {
+    if f < 0 || f >= pcx.graph_fns || pcx.node_fx.len() == 0 || !body_walked(f, pcx) {
         return;
     }
     pcx.search = true;
     pcx.search_bit = bit;
     pcx.search_alloc = alloc;
     pcx.walk_node = f;
-    pcx.loops.count = 0;
+    pcx.loops.clear();
     if bit == EFF_UNSAFE && (pcx.fns[f as usize].attrs & FN_UNSAFE) != 0 {
         pcx.found_node = pcx.fns[f as usize].node;
     }
@@ -2414,16 +2304,16 @@ pub fn find_step(f: i64, bit: i64, alloc: i64, pcx: &mut Ctx<Comp>) {
 // through fn values (contracts' conditions, check_contracts); a closure's
 // body is its own function, not part of n.
 pub fn expr_effects(n: i64, pcx: &mut Ctx<Comp>) -> Effects {
-    if n <= 0 || pcx.node_fx == 0 as *mut Effects {
+    if n <= 0 || pcx.node_fx.len() == 0 {
         return effects_top();
     }
     let saved = pcx.acc;
-    let mark = pcx.loops.count;
+    let mark = pcx.loops.len() as i64;
     pcx.acc = effects_none();
     pcx.eval = true;
     walk(n, pcx);
     pcx.eval = false;
-    pcx.loops.count = mark;
+    pcx.loops.truncate(mark as usize);
     let e = pcx.acc;
     pcx.acc = saved;
     e

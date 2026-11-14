@@ -13,8 +13,7 @@
 // were removed.
 
 use crate::base::{
-    IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd, strlen,
-    sym_text,
+    STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_ptr, buf_str, buf_write_fd, strlen, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -22,9 +21,14 @@ use crate::cli::line::{Call, Leaf, is_opt, option, short_option, table};
 use crate::front::contracts::sites::site_count;
 use crate::gen0::target::{PANIC_RANGE_UNSIGNED, kind_is_enum, rt_panic_sym};
 use crate::middle::ctx::{FnCtx, main_cx};
-use crate::middle::ir::{Op, get_irfuncs, ir_enter};
+use crate::middle::ir::{Op, fn_block, fn_block_count, ir_enter};
 use crate::tools::ctx::Tcx;
 
+// UNSAFE: C's system: --print-checks runs the compiler again.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
     fn system(command: *mut u8) -> i32;
 }
@@ -39,48 +43,38 @@ pub fn note_check(fi: i64, site: i64, kind: i64, pcx: &mut Ctx<Comp>) {
     pcx.checks_noted.push(kind);
 }
 
-// The checks the range analysis removed: (IR function, site, kind) each.
-static mut REMOVED: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-
 // Block b, a branch's successor that the range analysis found never taken:
 // the check failing there, if it is one, noted as removed.
-pub fn note_removed(cx: &mut FnCtx, b: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        let mut v = (*cx.blocks.add(b as usize)).first;
-        while v != 0 {
-            if (*cx.insts.add(v as usize)).op == Op::CallC
-                && (*cx.insts.add(v as usize)).imm == rt_panic_sym(pcx)
-                && (*cx.insts.add(v as usize)).nargs >= 5 {
-                let k = (*cx.args.data.add((*cx.insts.add(v as usize)).args as usize));
-                let s = (*cx.args.data.add(((*cx.insts.add(v as usize)).args + 4) as usize));
-                { let mut removed_copy = get_removed(); removed_copy.push(cx.irf);
-                    set_removed(removed_copy); }
-                { let mut removed_copy = get_removed();
-                    removed_copy.push(front_number(cx, s, 0, pcx)); set_removed(removed_copy); }
-                { let mut removed_copy = get_removed();
-                    removed_copy.push(front_number(cx, k, -1, pcx)); set_removed(removed_copy); }
-                return;
-            }
-            v = (*cx.insts.add(v as usize)).next;
+pub fn note_removed(cx: &mut FnCtx<Comp>, b: i64, pcx: &Ctx<Comp>) {
+    let mut v = (cx.blocks[b as usize]).first;
+    while v != 0 {
+        if (cx.insts[v as usize]).op == Op::CallC
+            && (cx.insts[v as usize]).imm == rt_panic_sym(pcx)
+            && (cx.insts[v as usize]).nargs >= 5 {
+            let k = (cx.args[(cx.insts[v as usize]).args as usize]);
+            let s = (cx.args[((cx.insts[v as usize]).args + 4) as usize]);
+            push_removed(cx.irf, pcx);
+            push_removed(front_number(cx, s, 0, pcx), pcx);
+            push_removed(front_number(cx, k, -1, pcx), pcx);
+            return;
         }
+        v = (cx.insts[v as usize]).next;
     }
 }
 
 // The front end's kind or site that value v of a panic call is (a
 // constant, or an RTID value since 0.18.1), or `none`.
-fn front_number(cx: &mut FnCtx, v: i64, none: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if (*cx.insts.add(v as usize)).op == Op::Const {
-            return (*cx.insts.add(v as usize)).imm;
-        }
-        if (*cx.insts.add(v as usize)).op == Op::RtId {
-            return crate::middle::ir::rtid_value((*cx.insts.add(v as usize)).imm, pcx);
-        }
-        none
+fn front_number(cx: &mut FnCtx<Comp>, v: i64, none: i64, pcx: &Ctx<Comp>) -> i64 {
+    if (cx.insts[v as usize]).op == Op::Const {
+        return (cx.insts[v as usize]).imm;
     }
+    if (cx.insts[v as usize]).op == Op::RtId {
+        return crate::middle::ir::rtid_value((cx.insts[v as usize]).imm, pcx);
+    }
+    none
 }
 
-fn kind_name(kind: i64, pcx: &Ctx<Comp>) -> *mut u8 {
+fn kind_name(kind: i64, pcx: &Ctx<Comp>) -> *const u8 {
     if kind < 0 {
         c"check"
     } else if kind < 2 {
@@ -96,6 +90,11 @@ fn kind_name(kind: i64, pcx: &Ctx<Comp>) -> *mut u8 {
 
 // Whether function f (a FNS index) is one --print-checks asks for.
 fn wanted(f: i64, pcx: &Ctx<Comp>) -> bool {
+    // UNSAFE: strlen is C's; --print-checks's value is a C string, read
+    // through its raw pointer.
+    // SAFETY: print_checks is called only when pcx.print_checks is not null
+    // (gen0's compile_program); its bytes are read below its strlen, and the
+    // first one at least is there (the 0).
     unsafe {
         let want = pcx.print_checks;
         if (*want.add(0)) == 0 {
@@ -117,50 +116,51 @@ fn wanted(f: i64, pcx: &Ctx<Comp>) -> bool {
 }
 
 fn put_site(out: i64, site: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        if site <= 0 || site >= site_count(pcx) {
-            buf_str(out, c"?");
-            return;
-        }
-        let path = pcx.files[(*pcx.site_file.data.add(site as usize)) as usize].path;
-        buf_str(out,
-            if (*path.add(0)) == b'.' && (*path.add(1)) == b'/' { path.add(2) } else { path });
-        buf_byte(out, b':');
-        buf_int(out, (*pcx.site_line.data.add(site as usize)));
-        buf_byte(out, b':');
-        buf_int(out, (*pcx.site_col.data.add(site as usize)));
+    if site <= 0 || site >= site_count(pcx) {
+        buf_str(out, c"?");
+        return;
     }
+    let path = crate::base::source_path((pcx.site_file[site as usize]), pcx);
+    buf_bytes(out,
+        if path.len() > 2 && path[0] == b'.' && path[1] == b'/' { &path[2..] } else { path });
+    buf_byte(out, b':');
+    buf_int(out, (pcx.site_line[site as usize]));
+    buf_byte(out, b':');
+    buf_int(out, (pcx.site_col[site as usize]));
 }
 
 // The checks of the optimized program's functions, printed (after
 // optimize_program, before the code is emitted).
 pub fn print_checks(pcx: &mut Ctx<Comp>) {
+    // UNSAFE: the main function context, reached through its raw pointer (main_cx)
+    // SAFETY: cx is the main context (main_cx: made once, never freed); --print-checks runs
+    // this report on one thread after the passes, and each reference made of cx here is for
+    // one call or one read, with no other reference to that context in use
     unsafe {
         let cx = main_cx(pcx);
         let out = buf_new();
         let mut left: i64 = 0;
         let mut removed: i64 = 0;
-        let mut seen = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
         for fi in 0..pcx.irfunc_count {
-            let f = (*get_irfuncs().add(fi as usize)).f;
-            if (*pcx.fn_live.add(fi as usize)) == 0 || !wanted(f, pcx) {
+            let f = pcx.ir_fn[fi as usize];
+            if (pcx.fn_live[fi as usize]) == 0 || !wanted(f, pcx) {
                 continue;
             }
             ir_enter(&mut *cx, fi, pcx);
-            seen.count = 0;
-            for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-                let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-                if (*cx.blocks.add(b as usize)).removed != 0 {
+            seen.clear();
+            for i in 0..fn_block_count(&*cx, fi) {
+                let b = fn_block(&*cx, fi, i);
+                if (cx.blocks[b as usize]).removed != 0 {
                     continue;
                 }
-                let mut v = (*cx.blocks.add(b as usize)).first;
+                let mut v = (cx.blocks[b as usize]).first;
                 while v != 0 {
-                    if (*cx.insts.add(v as usize)).op == Op::CallC
-                        && (*cx.insts.add(v as usize)).imm == rt_panic_sym(pcx)
-                        && (*cx.insts.add(v as usize)).nargs >= 5 {
-                        let k = (*cx.args.data.add((*cx.insts.add(v as usize)).args as usize));
-                        let s = (
-                            *cx.args.data.add(((*cx.insts.add(v as usize)).args + 4) as usize));
+                    if (cx.insts[v as usize]).op == Op::CallC
+                        && (cx.insts[v as usize]).imm == rt_panic_sym(pcx)
+                        && (cx.insts[v as usize]).nargs >= 5 {
+                        let k = (cx.args[(cx.insts[v as usize]).args as usize]);
+                        let s = (cx.args[((cx.insts[v as usize]).args + 4) as usize]);
                         let kind = front_number(&mut *cx, k, -1, pcx);
                         let site = front_number(&mut *cx, s, 0, pcx);
                         put_site(out, site, pcx);
@@ -168,31 +168,31 @@ pub fn print_checks(pcx: &mut Ctx<Comp>) {
                         seen.push(site);
                         left += 1;
                     }
-                    v = (*cx.insts.add(v as usize)).next;
+                    v = (cx.insts[v as usize]).next;
                 }
             }
             // Removed by the range analysis (here, or in a function inlined
             // here), then the others made here and gone.
             let mut j: i64 = 0;
-            while j < get_removed().count {
-                if (*get_removed().data.add(j as usize)) == fi {
-                    put_site(out, (*get_removed().data.add((j + 1) as usize)), pcx);
-                    buf_fmt_fn(out, f, kind_name((*get_removed().data.add((j + 2) as usize)), pcx),
+            while j < removed_len(pcx) {
+                if (removed_at(j, pcx)) == fi {
+                    put_site(out, (removed_at(j + 1, pcx)), pcx);
+                    buf_fmt_fn(out, f, kind_name((removed_at(j + 2, pcx)), pcx),
                         c"removed (ranges)", pcx);
-                    seen.push((*get_removed().data.add((j + 1) as usize)));
+                    seen.push((removed_at(j + 1, pcx)));
                     removed += 1;
                 }
                 j += 3;
             }
             j = 0;
-            while j < pcx.checks_noted.count {
-                if (*pcx.checks_noted.data.add(j as usize)) == fi
-                    && (*pcx.checks_noted.data.add((j + 1) as usize)) > 0
-                    && !(0i64..seen.count).any(|q| (*seen.data.add(q as usize))
-                        == (*pcx.checks_noted.data.add((j + 1) as usize))) {
-                    put_site(out, (*pcx.checks_noted.data.add((j + 1) as usize)), pcx);
+            while j < pcx.checks_noted.len() as i64 {
+                if (pcx.checks_noted[j as usize]) == fi
+                    && (pcx.checks_noted[(j + 1) as usize]) > 0
+                    && !(0i64..seen.len() as i64).any(|q| (seen[q as usize])
+                        == (pcx.checks_noted[(j + 1) as usize])) {
+                    put_site(out, (pcx.checks_noted[(j + 1) as usize]), pcx);
                     buf_fmt_fn(out, f,
-                        kind_name((*pcx.checks_noted.data.add((j + 2) as usize)), pcx), c"removed",
+                        kind_name((pcx.checks_noted[(j + 2) as usize]), pcx), c"removed",
                         pcx);
                     removed += 1;
                 }
@@ -209,7 +209,7 @@ pub fn print_checks(pcx: &mut Ctx<Comp>) {
 }
 
 // `\tFN\tKIND\tSTATE\n`
-fn buf_fmt_fn(out: i64, f: i64, kind: *mut u8, state: *mut u8, pcx: &Ctx<Comp>) {
+fn buf_fmt_fn(out: i64, f: i64, kind: *const u8, state: *const u8, pcx: &Ctx<Comp>) {
     buf_byte(out, b'\t');
     buf_bytes(out, sym_text(pcx.fns[f as usize].display, pcx));
     buf_byte(out, b'\t');
@@ -233,8 +233,8 @@ pub fn checks_leaf(gpa: Gpa) -> Leaf<'static, Gpa> {
 // written) with --print-checks=NAME. Its exit status.
 pub fn run_query_checks(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     let cmd = buf_new();
-    let mut name = 0 as *mut u8;
-    let mut root = 0 as *mut u8;
+    let mut name = 0 as *const u8;
+    let mut root = 0 as *const u8;
     let mut level = c"-O2";
     for ev in c.evs.iter().copied() {
         if is_opt(ev, "O") {
@@ -254,6 +254,9 @@ pub fn run_query_checks(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>)
             name = a;
         }
     }
+    // UNSAFE: system is C's.
+    // SAFETY: cmd ends with a 0 byte (buf_byte) and is not written again
+    // before its bytes are passed as a C string.
     unsafe {
         root = crate::tools::query::roots::program_root(root, tcx, pcx);
         if name == 0 as *mut u8 || root == 0 as *mut u8 {
@@ -270,44 +273,33 @@ pub fn run_query_checks(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>)
         quote(cmd, root);
         buf_str(cmd, c" -o /dev/null");
         buf_byte(cmd, 0);
-        let status = system(buf_slice(cmd).ptr);
+        let status = system(buf_ptr(cmd));
         if status == 0 { 0 } else { 1 }
     }
 }
 
-fn quote(out: i64, s: *mut u8) {
-    unsafe {
-        buf_byte(out, b'\'');
-        let mut k: i64 = 0;
-        while (*s.add(k as usize)) != 0 {
-            if (*s.add(k as usize)) == b'\'' {
-                buf_str(out, c"'\\''");
-            } else {
-                buf_byte(out, (*s.add(k as usize)));
-            }
-            k += 1;
+fn quote(out: i64, s: *const u8) {
+    buf_byte(out, b'\'');
+    for &c in crate::base::cstr(s).as_slice() {
+        if c == b'\'' {
+            buf_str(out, c"'\\''");
+        } else {
+            buf_byte(out, c);
         }
-        buf_byte(out, b'\'');
     }
+    buf_byte(out, b'\'');
 }
 
-// (0.28.0) REMOVED's accessors: every use of it is one of them.
-fn get_removed() -> IntVec {
-    // UNSAFE: --print-checks's removed list, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: pushed only by note_removed, whose only call is under
-    // pcx.print_checks != 0, and --print-checks makes the compile serial
-    // (parallel::serial_only), so one thread only
-    unsafe { REMOVED }
+// (0.29) The removed list is the context's (pcx.checks_removed), behind
+// its lock: a copy of entry j, and its length.
+fn removed_at(j: i64, pcx: &Ctx<Comp>) -> i64 {
+    pcx.checks_removed.lock().unwrap()[j as usize]
 }
 
-fn set_removed(v: IntVec) {
-    // UNSAFE: --print-checks's removed list, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: pushed only by note_removed, whose only call is under
-    // pcx.print_checks != 0, and --print-checks makes the compile serial
-    // (parallel::serial_only), so one thread only
-    unsafe {
-        REMOVED = v;
-    }
+fn removed_len(pcx: &Ctx<Comp>) -> i64 {
+    pcx.checks_removed.lock().unwrap().len() as i64
+}
+
+fn push_removed(x: i64, pcx: &Ctx<Comp>) {
+    pcx.checks_removed.lock().unwrap().push(x);
 }

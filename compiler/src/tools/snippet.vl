@@ -16,23 +16,30 @@
 //   volec try --file snippet.vl      (`-`: from stdin)
 
 use crate::base::{
-    IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
-    get_bufs, intern, strlen,
+    STDOUT, buf_append, buf_at, buf_byte, buf_bytes, buf_copy, buf_int, buf_len, buf_new, buf_str,
+    buf_write_fd, intern,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, EV_WORD, Leaf, flag, is_flag, is_missing, is_opt, option, table};
 use crate::front::modules::lookup::is_prelude_name;
-use crate::front::stdsrc_rust::std2_source;
-use crate::tools::ctx::Tcx;
+use crate::front::stdsrc::std_source;
+use crate::tools::ctx::{Tcx, cptrs};
 use crate::tools::proc::{
     buf_cstr, make_dirs, read_file_if, read_stdin, remove_dir, remove_file, run_capture,
     write_file_if,
 };
+use crate::tools::query::c_slice;
 use crate::tools::query::diagnostics::{diag, put_word, try_begin, try_end, write_diags};
 
+// UNSAFE: POSIX's getenv, getpid, mkdir, kill and chmod: the snippets'
+// scratch directories and their slots, held by live processes.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
-    fn getenv(name: *mut u8) -> *mut u8;
+    fn getenv(name: *const u8) -> *mut u8;
     fn getpid() -> i32;
     fn mkdir(path: *mut u8, mode: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
@@ -43,10 +50,6 @@ extern "C" {
 // are told apart by it).
 fn mark() -> &'static [u8] {
     b"<<volec-try-value>>"
-}
-
-fn c_slice(s: *mut u8) -> &'static [u8] {
-    unsafe { std::slice::from_raw_parts(s.add((0) as usize), (strlen(s) as i64 - (0)) as usize) }
 }
 
 fn is_word(c: u8) -> bool {
@@ -166,7 +169,7 @@ fn skip_blank(s: &[u8], i0: i64) -> i64 {
 
 // The snippet's leading items, as (start, end) pairs into items; the
 // start of its statements.
-fn split_items(s: &[u8], items: &mut IntVec) -> i64 {
+fn split_items(s: &[u8], items: &mut Vec<i64, Comp>) -> i64 {
     let mut i = skip_blank(s, 0);
     while i < s.len() as i64 && item_at(s, i) {
         let e = item_end(s, i);
@@ -180,10 +183,10 @@ fn split_items(s: &[u8], items: &mut IntVec) -> i64 {
 // ---- Imports ----
 
 // The names std's source defines at its top level, `pub`.
-fn std_names(out: &mut IntVec, pcx: &mut Ctx<Comp>) {
+fn std_names(out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
     let b = buf_new();
-    std2_source(b);
-    let s = buf_slice(b);
+    std_source(b);
+    let s = buf_copy(b);
     let mut i: i64 = 0;
     while i < s.len() as i64 {
         let mut e = i;
@@ -218,100 +221,97 @@ fn std_names(out: &mut IntVec, pcx: &mut Ctx<Comp>) {
     }
 }
 
-fn has(v: IntVec, x: i64) -> bool {
-    unsafe {
-        for i in 0..v.count {
-            if (*v.data.add(i as usize)) == x {
-                return true;
-            }
+fn has(v: &[i64], x: i64) -> bool {
+    for i in 0..v.len() as i64 {
+        if (v[i as usize]) == x {
+            return true;
         }
-        false
     }
+    false
 }
 
 // `use std::{...};` for the std names the snippet uses (not after `.` or
 // `::`), but the prelude's, those it defines and those it imports.
-fn std_imports(s: &[u8], items: IntVec, out: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let mut std = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        std_names(&mut std, pcx);
-        // (what the snippet's items define or import)
-        let mut own = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut k: i64 = 0;
-        while k < items.count {
-            let t = &s[
-                (*items.data.add(k as usize)) as usize..(*items.data.add((k + 1) as usize)) as usize];
-            let is_use = starts(t, b"use ") || starts(t, b"pub use ");
-            let mut i: i64 = 0;
-            let mut next_own = false;
-            while i < t.len() as i64 {
-                let l = skip_literal(t, i);
-                if l > i {
-                    i = l;
-                    continue;
-                }
-                if is_word(t[i as usize]) && (i == 0 || !is_word(t[(i - 1) as usize])) {
-                    let mut e = i;
-                    while e < t.len() as i64 && is_word(t[e as usize]) {
-                        e += 1;
-                    }
-                    let w = &t[i as usize..e as usize];
-                    if is_use || (next_own && w != b"mut") {
-                        own.push(intern(w, pcx));
-                    }
-                    if w != b"mut" {
-                        next_own = w == b"fn" || w == b"struct" || w == b"enum" || w == b"trait"
-                            || w == b"const" || w == b"static" || w == b"type";
-                    }
-                    i = e;
-                    continue;
-                }
-                i += 1;
-            }
-            k += 2;
-        }
-        let mut names = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+fn std_imports(s: &[u8], items: &[i64], out: i64, pcx: &mut Ctx<Comp>) {
+    let mut std: Vec<i64, Comp> = Vec::new_in(Comp {});
+    std_names(&mut std, pcx);
+    // (what the snippet's items define or import)
+    let mut own: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut k: i64 = 0;
+    while k < items.len() as i64 {
+        let t = &s[
+            (items[k as usize]) as usize..(items[(k + 1) as usize]) as usize];
+        let is_use = starts(t, b"use ") || starts(t, b"pub use ");
         let mut i: i64 = 0;
-        while i < s.len() as i64 {
-            let l = skip_literal(s, i);
+        let mut next_own = false;
+        while i < t.len() as i64 {
+            let l = skip_literal(t, i);
             if l > i {
                 i = l;
                 continue;
             }
-            if is_word(s[i as usize]) && (i == 0 || !is_word(s[(i - 1) as usize]))
-                && !(s[i as usize] >= b'0' && s[i as usize] <= b'9') {
+            if is_word(t[i as usize]) && (i == 0 || !is_word(t[(i - 1) as usize])) {
                 let mut e = i;
-                while e < s.len() as i64 && is_word(s[e as usize]) {
+                while e < t.len() as i64 && is_word(t[e as usize]) {
                     e += 1;
                 }
-                let mut b = i;
-                while b > 0 && (s[(b - 1) as usize] == b' ' || s[(b - 1) as usize] == b'\t') {
-                    b -= 1;
+                let w = &t[i as usize..e as usize];
+                if is_use || (next_own && w != b"mut") {
+                    own.push(intern(w, pcx));
                 }
-                let after_path = (b >= 1 && s[(b - 1) as usize] == b'.')
-                    || (b >= 2 && s[(b - 1) as usize] == b':' && s[(b - 2) as usize] == b':');
-                let n = intern(&s[i as usize..e as usize], pcx);
-                if !after_path && has(std, n) && !has(own, n) && !has(names, n)
-                    && !is_prelude_name(n, pcx) {
-                    names.push(n);
+                if w != b"mut" {
+                    next_own = w == b"fn" || w == b"struct" || w == b"enum" || w == b"trait"
+                        || w == b"const" || w == b"static" || w == b"type";
                 }
                 i = e;
                 continue;
             }
             i += 1;
         }
-        if names.count == 0 {
-            return;
-        }
-        buf_str(out, c"use std::{");
-        for j in 0..names.count {
-            if j > 0 {
-                buf_str(out, c", ");
-            }
-            buf_bytes(out, crate::base::sym_text((*names.data.add(j as usize)), pcx));
-        }
-        buf_str(out, c"};");
+        k += 2;
     }
+    let mut names: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut i: i64 = 0;
+    while i < s.len() as i64 {
+        let l = skip_literal(s, i);
+        if l > i {
+            i = l;
+            continue;
+        }
+        if is_word(s[i as usize]) && (i == 0 || !is_word(s[(i - 1) as usize]))
+            && !(s[i as usize] >= b'0' && s[i as usize] <= b'9') {
+            let mut e = i;
+            while e < s.len() as i64 && is_word(s[e as usize]) {
+                e += 1;
+            }
+            let mut b = i;
+            while b > 0 && (s[(b - 1) as usize] == b' ' || s[(b - 1) as usize] == b'\t') {
+                b -= 1;
+            }
+            let after_path = (b >= 1 && s[(b - 1) as usize] == b'.')
+                || (b >= 2 && s[(b - 1) as usize] == b':' && s[(b - 2) as usize] == b':');
+            let n = intern(&s[i as usize..e as usize], pcx);
+            if !after_path && has(std.as_slice(), n) && !has(own.as_slice(), n)
+                && !has(names.as_slice(), n)
+                && !is_prelude_name(n, pcx) {
+                names.push(n);
+            }
+            i = e;
+            continue;
+        }
+        i += 1;
+    }
+    if names.len() as i64 == 0 {
+        return;
+    }
+    buf_str(out, c"use std::{");
+    for j in 0..names.len() as i64 {
+        if j > 0 {
+            buf_str(out, c", ");
+        }
+        buf_bytes(out, crate::base::sym_text((names[j as usize]), pcx));
+    }
+    buf_str(out, c"};");
 }
 
 // ---- The programs ----
@@ -319,7 +319,7 @@ fn std_imports(s: &[u8], items: IntVec, out: i64, pcx: &mut Ctx<Comp>) {
 // Appends text (a part of the snippet starting at offset `from`) to the
 // program, its first line indented to its column in the snippet, each
 // line's snippet line into lines (1-based; 0 for the wrapper's).
-fn put_part(prog: i64, lines: &mut IntVec, s: &[u8], from: i64, to: i64) {
+fn put_part(prog: i64, lines: &mut Vec<i64, Comp>, s: &[u8], from: i64, to: i64) {
     let mut col = from;
     while col > 0 && s[(col - 1) as usize] != b'\n' {
         col -= 1;
@@ -344,7 +344,7 @@ fn put_part(prog: i64, lines: &mut IntVec, s: &[u8], from: i64, to: i64) {
     lines.push(line);
 }
 
-fn put_line(prog: i64, lines: &mut IntVec, text: &[u8]) {
+fn put_line(prog: i64, lines: &mut Vec<i64, Comp>, text: &[u8]) {
     buf_bytes(prog, text);
     buf_byte(prog, b'\n');
     lines.push(0);
@@ -390,7 +390,7 @@ fn trim(t: &[u8]) -> &[u8] {
     &t[a as usize..b as usize]
 }
 
-fn put_name(out: i64, base: *mut u8, tcx: &Tcx<Comp>) {
+fn put_name(out: i64, base: *const u8, tcx: &Tcx<Comp>) {
     buf_str(out, base);
     buf_int(out, tcx.depth);
 }
@@ -428,7 +428,7 @@ fn printer(out: i64, expr: &[u8], t: &[u8], tcx: &mut Tcx<Comp>) -> bool {
     put_name(v, c"_try_v", tcx);
     let i = buf_new();
     put_name(i, c"_try_i", tcx);
-    let ok = compound(out, expr, t, buf_slice(v), buf_slice(i), tcx);
+    let ok = compound(out, expr, t, &buf_copy(v), &buf_copy(i), tcx);
     tcx.depth -= 1;
     ok
 }
@@ -445,11 +445,11 @@ fn compound(out: i64, expr: &[u8], t: &[u8], v: &[u8], i: &[u8], tcx: &mut Tcx<C
         buf_byte(at, b'[');
         buf_bytes(at, i);
         buf_byte(at, b']');
-        if !printer(body, buf_slice(at), elem, tcx) {
+        if !printer(body, &buf_copy(at), elem, tcx) {
             return false;
         }
         put_seq(out, expr, if e < t.len() as i64 - 1 { b"[..]" } else { b"" }, b".len", v, i,
-            buf_slice(body));
+            &buf_copy(body));
         return true;
     }
     if starts(t, b"Vec<") && t[(t.len() as i64 - 1) as usize] == b'>' {
@@ -461,10 +461,10 @@ fn compound(out: i64, expr: &[u8], t: &[u8], v: &[u8], i: &[u8], tcx: &mut Tcx<C
         buf_bytes(at, b".get(");
         buf_bytes(at, i);
         buf_byte(at, b')');
-        if !printer(body, buf_slice(at), elem, tcx) {
+        if !printer(body, &buf_copy(at), elem, tcx) {
             return false;
         }
-        put_seq(out, expr, b"", b".len()", v, i, buf_slice(body));
+        put_seq(out, expr, b"", b".len()", v, i, &buf_copy(body));
         return true;
     }
     if starts(t, b"Option<") && t[(t.len() as i64 - 1) as usize] == b'>' {
@@ -478,7 +478,7 @@ fn compound(out: i64, expr: &[u8], t: &[u8], v: &[u8], i: &[u8], tcx: &mut Tcx<C
         buf_bytes(out, b" { Some(");
         buf_bytes(out, v);
         buf_bytes(out, b") => { print(\"Some(\"); ");
-        buf_bytes(out, buf_slice(body));
+        buf_append(out, body);
         buf_bytes(out, b"print(\")\"); } None => { print(\"None\"); } } ");
         return true;
     }
@@ -495,7 +495,7 @@ fn compound(out: i64, expr: &[u8], t: &[u8], v: &[u8], i: &[u8], tcx: &mut Tcx<C
             if n > 0 {
                 buf_bytes(body, b"print(\", \"); ");
             }
-            if !printer(body, buf_slice(field), trim(&t[k as usize..e as usize]), tcx) {
+            if !printer(body, &buf_copy(field), trim(&t[k as usize..e as usize]), tcx) {
                 return false;
             }
             n += 1;
@@ -506,7 +506,7 @@ fn compound(out: i64, expr: &[u8], t: &[u8], v: &[u8], i: &[u8], tcx: &mut Tcx<C
         buf_bytes(out, b" = ");
         buf_bytes(out, expr);
         buf_bytes(out, b"; print(\"(\"); ");
-        buf_bytes(out, buf_slice(body));
+        buf_append(out, body);
         buf_bytes(out, b"print(\")\"); } ");
         return true;
     }
@@ -537,6 +537,9 @@ fn put_seq(out: i64, expr: &[u8], suffix: &[u8], len: &[u8], v: &[u8], i: &[u8],
 
 // The scratch directory, made anew.
 fn scratch_dir() -> *mut u8 {
+    // UNSAFE: getenv and getpid are C's; the variable's first byte is read.
+    // SAFETY: the name is a literal; tmp is checked not null before its
+    // first byte is read.
     unsafe {
         let b = buf_new();
         let tmp = getenv(c"TMPDIR");
@@ -545,7 +548,7 @@ fn scratch_dir() -> *mut u8 {
         } else {
             buf_str(b, c"/tmp");
         }
-        if buf_slice(b)[(buf_slice(b).len() as i64 - 1) as usize] != b'/' {
+        if buf_at(b, buf_len(b) - 1) != b'/' {
             buf_byte(b, b'/');
         }
         buf_str(b, c"volec-try-");
@@ -556,7 +559,7 @@ fn scratch_dir() -> *mut u8 {
     }
 }
 
-fn path_in(dir: *mut u8, name: *mut u8) -> *mut u8 {
+fn path_in(dir: *mut u8, name: *const u8) -> *mut u8 {
     let b = buf_new();
     buf_str(b, dir);
     buf_byte(b, b'/');
@@ -566,67 +569,63 @@ fn path_in(dir: *mut u8, name: *mut u8) -> *mut u8 {
 
 // Runs PROG with the arguments (a 0-ended list), its stdout and stderr
 // into out: its exit status.
-fn run_self(args: *mut *mut u8, n: i64, out: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let argv = crate::base::alloc_array::<*mut u8>(n + 2);
-        (*argv.add(0)) = pcx.prog;
-        for k in 0..n {
-            (*argv.add((k + 1) as usize)) = (*args.add(k as usize));
-        }
-        (*argv.add((n + 1) as usize)) = 0 as *mut u8;
-        run_capture(argv, out)
+fn run_self(args: &[*const u8], n: i64, out: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut argv = cptrs(n + 2);
+    (argv[0]) = pcx.prog;
+    for k in 0..n {
+        (argv[(k + 1) as usize]) = args[k as usize];
     }
+    (argv[(n + 1) as usize]) = 0 as *mut u8;
+    run_capture(argv.as_slice(), out)
 }
 
 // The compiler's diagnostics about the program (path `file`), its
 // positions as the snippet's (`name:LINE:COL`, by lines), into out.
-fn put_mapped(out: i64, text: &[u8], file: &[u8], name: &[u8], lines: IntVec) {
-    unsafe {
-        let mut i: i64 = 0;
-        while i < text.len() as i64 {
-            let mut e = i;
-            while e < text.len() as i64 && text[e as usize] != b'\n' {
-                e += 1;
-            }
-            let line = &text[i as usize..e as usize];
-            i = e + 1;
-            if line.len() == 0 {
-                continue;
-            }
-            if starts(line, file) && line.len() > file.len()
-                && line[file.len()] == b':' {
-                let mut k = file.len() as i64 + 1;
-                let mut l: i64 = 0;
-                while k < line.len() as i64 && line[k as usize] >= b'0'
-                    && line[k as usize] <= b'9' {
-                    l = l * 10 + (line[k as usize] - b'0') as i64;
-                    k += 1;
-                }
-                let at: i64 = if l >= 1 && l <= lines.count { (*lines.data.add((l - 1) as usize)) }
-                    else { 0 };
-                buf_bytes(out, name);
-                if at > 0 {
-                    buf_byte(out, b':');
-                    buf_int(out, at);
-                    buf_bytes(out, &line[k as usize..]);
-                } else {
-                    // (in the wrapper: no position of the snippet's)
-                    let mut c = k;
-                    while c < line.len() as i64 && line[c as usize] != b' ' {
-                        c += 1;
-                    }
-                    buf_bytes(out, b":");
-                    buf_bytes(out, &line[c as usize..]);
-                }
-            } else {
-                buf_bytes(out, line);
-            }
-            buf_byte(out, b'\n');
+fn put_mapped(out: i64, text: &[u8], file: &[u8], name: &[u8], lines: &[i64]) {
+    let mut i: i64 = 0;
+    while i < text.len() as i64 {
+        let mut e = i;
+        while e < text.len() as i64 && text[e as usize] != b'\n' {
+            e += 1;
         }
+        let line = &text[i as usize..e as usize];
+        i = e + 1;
+        if line.len() == 0 {
+            continue;
+        }
+        if starts(line, file) && line.len() > file.len()
+            && line[file.len()] == b':' {
+            let mut k = file.len() as i64 + 1;
+            let mut l: i64 = 0;
+            while k < line.len() as i64 && line[k as usize] >= b'0'
+                && line[k as usize] <= b'9' {
+                l = l * 10 + (line[k as usize] - b'0') as i64;
+                k += 1;
+            }
+            let at: i64 = if l >= 1 && l <= lines.len() as i64 { (lines[(l - 1) as usize]) }
+                else { 0 };
+            buf_bytes(out, name);
+            if at > 0 {
+                buf_byte(out, b':');
+                buf_int(out, at);
+                buf_bytes(out, &line[k as usize..]);
+            } else {
+                // (in the wrapper: no position of the snippet's)
+                let mut c = k;
+                while c < line.len() as i64 && line[c as usize] != b' ' {
+                    c += 1;
+                }
+                buf_bytes(out, b":");
+                buf_bytes(out, &line[c as usize..]);
+            }
+        } else {
+            buf_bytes(out, line);
+        }
+        buf_byte(out, b'\n');
     }
 }
 
-fn usage(why: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+fn usage(why: *const u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     let d = diag(c"error", c"try.usage", tcx);
     buf_str(d, why);
     buf_byte(d, b'\n');
@@ -646,7 +645,7 @@ fn usage(why: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
 
 const SLOTS: i64 = 16;
 
-fn slot_path(base: *mut u8, k: i64, ext: *mut u8) -> *mut u8 {
+fn slot_path(base: *mut u8, k: i64, ext: *const u8) -> *mut u8 {
     let b = buf_new();
     buf_str(b, base);
     buf_str(b, c"/slot-");
@@ -658,6 +657,9 @@ fn slot_path(base: *mut u8, k: i64, ext: *mut u8) -> *mut u8 {
 // The slots' directory, $TMPDIR/volec-try (made once); 0 when it
 // cannot be made.
 fn slots_dir() -> *mut u8 {
+    // UNSAFE: getenv is C's; the variable's first byte is read.
+    // SAFETY: the name is a literal; tmp is checked not null before its
+    // first byte is read.
     unsafe {
         let b = buf_new();
         let tmp = getenv(c"TMPDIR");
@@ -666,7 +668,7 @@ fn slots_dir() -> *mut u8 {
         } else {
             buf_str(b, c"/tmp");
         }
-        if buf_slice(b)[(buf_slice(b).len() as i64 - 1) as usize] != b'/' {
+        if buf_at(b, buf_len(b) - 1) != b'/' {
             buf_byte(b, b'/');
         }
         buf_str(b, c"volec-try");
@@ -677,6 +679,11 @@ fn slots_dir() -> *mut u8 {
 
 // Takes a slot: its number, or -1 when none is free.
 fn take_slot(base: *mut u8) -> i64 {
+    // UNSAFE: mkdir, kill and getpid are C's: a slot is a directory made
+    // atomically, held by a live process.
+    // SAFETY: lock is a C string (slot_path); kill with signal 0 sends
+    // nothing, it asks whether the process exists, and only for a pid > 0
+    // read from the slot's file.
     unsafe {
         for k in 0..SLOTS {
             let lock = slot_path(base, k, c".lock");
@@ -686,7 +693,7 @@ fn take_slot(base: *mut u8) -> i64 {
                 let held = buf_new();
                 let mut pid: i64 = 0;
                 if read_file_if(pid_file, held) {
-                    let h = buf_slice(held);
+                    let h = buf_copy(held);
                     for i in 0..h.len() {
                         if h[i] >= b'0' && h[i] <= b'9' {
                             pid = pid * 10 + (h[i] - b'0') as i64;
@@ -704,7 +711,7 @@ fn take_slot(base: *mut u8) -> i64 {
             }
             let me = buf_new();
             buf_int(me, getpid() as i64);
-            write_file_if(pid_file, buf_slice(me));
+            write_file_if(pid_file, &buf_copy(me));
             return k;
         }
         -1
@@ -720,9 +727,11 @@ fn release_slot(base: *mut u8, k: i64) {
 // The binary `bin` as the executable to run: copied over slot k's file
 // in place (made executable).
 fn into_slot(bin: *mut u8, slot: *mut u8) -> bool {
+    // UNSAFE: chmod is C's.
+    // SAFETY: slot is a C string of the caller's.
     unsafe {
         let bytes = buf_new();
-        if !read_file_if(bin, bytes) || !write_file_if(slot, buf_slice(bytes)) {
+        if !read_file_if(bin, bytes) || !write_file_if(slot, &buf_copy(bytes)) {
             return false;
         }
         chmod(slot, 493) == 0
@@ -751,7 +760,7 @@ pub fn try_leaf(gpa: Gpa) -> Leaf<'static, Gpa> {
 
 fn try_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     let sb = buf_new();
-    let mut file = 0 as *mut u8;
+    let mut file = 0 as *const u8;
     let mut keep = false;
     for ev in c.evs.iter().copied() {
         let a = ev.value;
@@ -776,85 +785,83 @@ fn try_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64
             buf_str(d, c"' (--file FILE, --keep, -)\n");
             return 2;
         } else {
-            if buf_slice(sb).len() > 0 {
+            if (buf_len(sb) as usize) > 0 {
                 buf_byte(sb, b' ');
             }
             buf_str(sb, a);
         }
     }
-    unsafe {
-        if file != 0 as *mut u8 && !read_file_if(file, sb) {
-            let d = diag(c"error", c"try.no-file", tcx);
-            buf_str(d, c"cannot read '");
-            buf_str(d, file);
-            buf_str(d, c"'\n");
-            return 1;
-        }
-        let s = buf_slice(sb);
-        let mut blank = true;
-        for i in 0..s.len() {
-            if s[i] != b' ' && s[i] != b'\n' && s[i] != b'\t' {
-                blank = false;
-            }
-        }
-        if blank {
-            return usage(c"a snippet is needed: STATEMENTS, --file FILE, or - (stdin)", tcx, pcx);
-        }
-        let name = if file != 0 as *mut u8 { c_slice(file) } else { b"snippet" };
-        // The program: imports, the items, main around the statements.
-        let mut items = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let body = split_items(s, &mut items);
-        let mut whole = false;
-        let mut j: i64 = 0;
-        while j < items.count {
-            let t = &s[
-                (*items.data.add(j as usize)) as usize..(*items.data.add((j + 1) as usize)) as usize];
-            if starts(t, b"fn main(") || starts(t, b"pub fn main(") {
-                whole = true;
-            }
-            j += 2;
-        }
-        let head = buf_new();
-        let mut lines = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let imports = buf_new();
-        std_imports(s, items, imports, pcx);
-        if buf_slice(imports).len() > 0 {
-            put_line(head, &mut lines, buf_slice(imports));
-        }
-        j = 0;
-        while j < items.count {
-            put_part(head, &mut lines, s, (*items.data.add(j as usize)),
-                (*items.data.add((j + 1) as usize)));
-            j += 2;
-        }
-        let mut value_line: i64 = 0;
-        if !whole {
-            put_line(head, &mut lines, b"fn main(gpa: Gpa) {");
-            put_line(head, &mut lines, b"    let _try_value = {");
-            value_line = lines.count;
-        }
-        if body < s.len() as i64 {
-            put_part(head, &mut lines, s, body, s.len() as i64);
-        }
-        if !whole {
-            put_line(head, &mut lines, b"    };");
-        }
-        let dir = scratch_dir();
-        let src = path_in(dir, c"snippet.vl");
-        let bin = path_in(dir, c"snippet");
-        let status = check_and_run(head, lines, whole, value_line, src, bin, name, tcx, pcx);
-        if keep {
-            let d = diag(c"note", c"try.kept", tcx);
-            buf_str(d, c"the program and its binary: ");
-            buf_str(d, src);
-            buf_byte(d, b'\n');
-        } else {
-            remove_file(src);
-            remove_file(bin);
-            remove_dir(dir);
-        }
-        status
+    if file != 0 as *mut u8 && !read_file_if(file, sb) {
+        let d = diag(c"error", c"try.no-file", tcx);
+        buf_str(d, c"cannot read '");
+        buf_str(d, file);
+        buf_str(d, c"'\n");
+        return 1;
     }
+    let s = buf_copy(sb);
+    let mut blank = true;
+    for i in 0..s.len() {
+        if s[i] != b' ' && s[i] != b'\n' && s[i] != b'\t' {
+            blank = false;
+        }
+    }
+    if blank {
+        return usage(c"a snippet is needed: STATEMENTS, --file FILE, or - (stdin)", tcx, pcx);
+    }
+    let name = if file != 0 as *mut u8 { crate::base::c_kept(file) } else { b"snippet" };
+    // The program: imports, the items, main around the statements.
+    let mut items: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let body = split_items(&s, &mut items);
+    let mut whole = false;
+    let mut j: i64 = 0;
+    while j < items.len() as i64 {
+        let t = &s[
+            (items[j as usize]) as usize..(items[(j + 1) as usize]) as usize];
+        if starts(t, b"fn main(") || starts(t, b"pub fn main(") {
+            whole = true;
+        }
+        j += 2;
+    }
+    let head = buf_new();
+    let mut lines: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let imports = buf_new();
+    std_imports(&s, items.as_slice(), imports, pcx);
+    if (buf_len(imports) as usize) > 0 {
+        put_line(head, &mut lines, &buf_copy(imports));
+    }
+    j = 0;
+    while j < items.len() as i64 {
+        put_part(head, &mut lines, &s, (items[j as usize]),
+            (items[(j + 1) as usize]));
+        j += 2;
+    }
+    let mut value_line: i64 = 0;
+    if !whole {
+        put_line(head, &mut lines, b"fn main(gpa: Gpa) {");
+        put_line(head, &mut lines, b"    let _try_value = {");
+        value_line = lines.len() as i64;
+    }
+    if body < s.len() as i64 {
+        put_part(head, &mut lines, &s, body, s.len() as i64);
+    }
+    if !whole {
+        put_line(head, &mut lines, b"    };");
+    }
+    let dir = scratch_dir();
+    let src = path_in(dir, c"snippet.vl");
+    let bin = path_in(dir, c"snippet");
+    let status = check_and_run(head, lines.as_slice(), whole, value_line, src, bin, name, tcx, pcx);
+    if keep {
+        let d = diag(c"note", c"try.kept", tcx);
+        buf_str(d, c"the program and its binary: ");
+        buf_str(d, src);
+        buf_byte(d, b'\n');
+    } else {
+        remove_file(src);
+        remove_file(bin);
+        remove_dir(dir);
+    }
+    status
 }
 
 // The end of the program: the mark, the statements that print the value
@@ -881,138 +888,136 @@ fn put_printing(b: i64, shows: bool, printed: bool, whole: bool, print: &[u8], t
 // Checks the program (head, then `}` for a snippet), asks its value's
 // type, builds it with the value printed, runs it, prints what it did:
 // the exit status.
-fn check_and_run(head: i64, lines: IntVec, whole: bool, value_line: i64, src: *mut u8, bin: *mut u8,
+fn check_and_run(head: i64, lines: &[i64], whole: bool, value_line: i64, src: *mut u8, bin: *mut u8,
     name: &[u8], tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let a = buf_new();
-        buf_bytes(a, buf_slice(head));
-        if !whole {
-            buf_bytes(a, b"}\n");
-        }
-        if !write_file_if(src, buf_slice(a)) {
-            let d = diag(c"error", c"try.no-file", tcx);
-            buf_str(d, c"cannot write '");
-            buf_str(d, src);
-            buf_str(d, c"'\n");
-            return 1;
-        }
-        let errs = buf_new();
-        let args = crate::base::alloc_array::<*mut u8>(6i64);
-        (*args.add(0)) = c"check";
-        (*args.add(1)) = src;
-        let checked = run_self(args, 2, errs, pcx);
-        if buf_slice(errs).len() > 0 {
-            let out = buf_new();
-            put_mapped(out, buf_slice(errs), c_slice(src), name, lines);
-            buf_write_fd(out, crate::base::STDERR);
-        }
-        if checked != 0 {
-            return 1;
-        }
-        // The value's type: the block's, at `{` of `let _try_value = {`.
-        let ty = buf_new();
-        if !whole {
-            let at = buf_new();
-            buf_str(at, src);
-            buf_byte(at, b':');
-            buf_int(at, value_line);
-            buf_str(at, c":22");
-            (*args.add(0)) = c"query";
-            (*args.add(1)) = c"type";
-            (*args.add(2)) = buf_cstr(at);
-            (*args.add(3)) = c"--root";
-            (*args.add(4)) = src;
-            let got = buf_new();
-            if run_self(args, 5, got, pcx) == 0 {
-                let g = buf_slice(got);
-                let mut e: i64 = 0;
-                while e < g.len() as i64 && g[e as usize] != b'\t' && g[e as usize] != b'\n' {
-                    e += 1;
-                }
-                buf_bytes(ty, &g[0..e as usize]);
-            }
-        }
-        let t = buf_slice(ty);
-        let shows = t.len() > 0 && t != b"()";
-        // The program again, with the value printed.
-        let b = buf_new();
-        buf_bytes(b, buf_slice(head));
-        let print = buf_new();
-        tcx.needs_c = false;
-        // (0.28.0: a rust program prints its value by Debug)
-        let mut printed = shows;
-        buf_bytes(print, b"print(\"{:?}\", _try_value);");
-        put_printing(b, shows, printed, whole, buf_slice(print), tcx);
-        write_file_if(src, buf_slice(b));
-        let mut built = buf_new();
-        (*args.add(0)) = src;
-        (*args.add(1)) = c"-o";
-        (*args.add(2)) = bin;
-        (*args.add(3)) = c"--diagnostics=short";
-        let mut status = run_self(args, 4, built, pcx);
-        if status != 0 && printed {
-            // (the value has no Debug: its type alone, as for a type the
-            // old edition has no printer for)
-            printed = false;
-            let again = buf_new();
-            buf_bytes(again, buf_slice(head));
-            put_printing(again, shows, printed, whole, buf_slice(print), tcx);
-            write_file_if(src, buf_slice(again));
-            built = buf_new();
-            status = run_self(args, 4, built, pcx);
-        }
-        if status != 0 {
-            let out = buf_new();
-            put_mapped(out, buf_slice(built), c_slice(src), name, lines);
-            buf_write_fd(out, crate::base::STDERR);
-            return 1;
-        }
-        // Run it (from a slot, when one is free: see SLOTS).
-        let ran = buf_new();
-        let run = crate::base::alloc_array::<*mut u8>(2i64);
-        (*run.add(0)) = bin;
-        (*run.add(1)) = 0 as *mut u8;
-        let base = slots_dir();
-        let k: i64 = if base != 0 as *mut u8 { take_slot(base) } else { -1 };
-        if k >= 0 && into_slot(bin, slot_path(base, k, c"")) {
-            (*run.add(0)) = slot_path(base, k, c"");
-        }
-        let rc = run_capture(run, ran);
-        if k >= 0 {
-            release_slot(base, k);
-        }
-        let r = buf_slice(ran);
-        let m = mark();
-        let mut cut = r.len() as i64;
-        let mut i: i64 = 0;
-        while i + m.len() as i64 <= r.len() as i64 {
-            if &r[i as usize..(i + m.len() as i64) as usize] == m {
-                cut = i;
-            }
-            i += 1;
-        }
-        let out = buf_new();
-        // (0.18: a failed check names its position: the snippet's line;
-        // the binary writes the path relative to the root's directory)
-        put_mapped(out, &r[0..cut as usize], b"snippet.vl", name, lines);
-        if cut > 0 && r[(cut - 1) as usize] != b'\n' && (*get_bufs().add(out as usize)).len > 0
-            && buf_slice(out)[((*get_bufs().add(out as usize)).len - 1) as usize] != b'\n' {
-            buf_byte(out, b'\n');
-        }
-        if shows && cut < r.len() as i64 {
-            buf_bytes(out, t);
-            if printed {
-                buf_bytes(out, b" = ");
-                buf_bytes(out, &r[(cut + m.len() as i64) as usize..]);
-            }
-            buf_byte(out, b'\n');
-        }
-        if rc != 0 {
-            buf_str(out, c"exit ");
-            buf_int(out, rc);
-            buf_byte(out, b'\n');
-        }
-        buf_write_fd(out, STDOUT);
-        rc
+    let a = buf_new();
+    buf_append(a, head);
+    if !whole {
+        buf_bytes(a, b"}\n");
     }
+    if !write_file_if(src, &buf_copy(a)) {
+        let d = diag(c"error", c"try.no-file", tcx);
+        buf_str(d, c"cannot write '");
+        buf_str(d, src);
+        buf_str(d, c"'\n");
+        return 1;
+    }
+    let errs = buf_new();
+    let mut args = cptrs(6i64);
+    (args[0]) = c"check";
+    (args[1]) = src;
+    let checked = run_self(args.as_slice(), 2, errs, pcx);
+    if (buf_len(errs) as usize) > 0 {
+        let out = buf_new();
+        put_mapped(out, &buf_copy(errs), &c_slice(src), name, lines);
+        buf_write_fd(out, crate::base::STDERR);
+    }
+    if checked != 0 {
+        return 1;
+    }
+    // The value's type: the block's, at `{` of `let _try_value = {`.
+    let ty = buf_new();
+    if !whole {
+        let at = buf_new();
+        buf_str(at, src);
+        buf_byte(at, b':');
+        buf_int(at, value_line);
+        buf_str(at, c":22");
+        (args[0]) = c"query";
+        (args[1]) = c"type";
+        (args[2]) = buf_cstr(at);
+        (args[3]) = c"--root";
+        (args[4]) = src;
+        let got = buf_new();
+        if run_self(args.as_slice(), 5, got, pcx) == 0 {
+            let g = buf_copy(got);
+            let mut e: i64 = 0;
+            while e < g.len() as i64 && g[e as usize] != b'\t' && g[e as usize] != b'\n' {
+                e += 1;
+            }
+            buf_bytes(ty, &g[0..e as usize]);
+        }
+    }
+    let t = buf_copy(ty);
+    let shows = t.len() > 0 && t != b"()";
+    // The program again, with the value printed.
+    let b = buf_new();
+    buf_append(b, head);
+    let print = buf_new();
+    tcx.needs_c = false;
+    // (0.28.0: a rust program prints its value by Debug)
+    let mut printed = shows;
+    buf_bytes(print, b"print(\"{:?}\", _try_value);");
+    put_printing(b, shows, printed, whole, &buf_copy(print), tcx);
+    write_file_if(src, &buf_copy(b));
+    let mut built = buf_new();
+    (args[0]) = src;
+    (args[1]) = c"-o";
+    (args[2]) = bin;
+    (args[3]) = c"--diagnostics=short";
+    let mut status = run_self(args.as_slice(), 4, built, pcx);
+    if status != 0 && printed {
+        // (the value has no Debug: its type alone, as for a type the
+        // old edition has no printer for)
+        printed = false;
+        let again = buf_new();
+        buf_append(again, head);
+        put_printing(again, shows, printed, whole, &buf_copy(print), tcx);
+        write_file_if(src, &buf_copy(again));
+        built = buf_new();
+        status = run_self(args.as_slice(), 4, built, pcx);
+    }
+    if status != 0 {
+        let out = buf_new();
+        put_mapped(out, &buf_copy(built), &c_slice(src), name, lines);
+        buf_write_fd(out, crate::base::STDERR);
+        return 1;
+    }
+    // Run it (from a slot, when one is free: see SLOTS).
+    let ran = buf_new();
+    let mut run = cptrs(2i64);
+    (run[0]) = bin;
+    (run[1]) = 0 as *mut u8;
+    let base = slots_dir();
+    let k: i64 = if base != 0 as *mut u8 { take_slot(base) } else { -1 };
+    if k >= 0 && into_slot(bin, slot_path(base, k, c"")) {
+        (run[0]) = slot_path(base, k, c"");
+    }
+    let rc = run_capture(run.as_slice(), ran);
+    if k >= 0 {
+        release_slot(base, k);
+    }
+    let r = buf_copy(ran);
+    let m = mark();
+    let mut cut = r.len() as i64;
+    let mut i: i64 = 0;
+    while i + m.len() as i64 <= r.len() as i64 {
+        if &r[i as usize..(i + m.len() as i64) as usize] == m {
+            cut = i;
+        }
+        i += 1;
+    }
+    let out = buf_new();
+    // (0.18: a failed check names its position: the snippet's line;
+    // the binary writes the path relative to the root's directory)
+    put_mapped(out, &r[0..cut as usize], b"snippet.vl", name, lines);
+    if cut > 0 && r[(cut - 1) as usize] != b'\n' && buf_len(out) > 0
+        && buf_at(out, buf_len(out) - 1) != b'\n' {
+        buf_byte(out, b'\n');
+    }
+    if shows && cut < r.len() as i64 {
+        buf_bytes(out, &t);
+        if printed {
+            buf_bytes(out, b" = ");
+            buf_bytes(out, &r[(cut + m.len() as i64) as usize..]);
+        }
+        buf_byte(out, b'\n');
+    }
+    if rc != 0 {
+        buf_str(out, c"exit ");
+        buf_int(out, rc);
+        buf_byte(out, b'\n');
+    }
+    buf_write_fd(out, STDOUT);
+    rc
 }

@@ -2887,6 +2887,63 @@ unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
 chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
 hello world 1.00x, std 0.99x, check of the compiler 1.01x.
 
+### 0.29.0
+
+The release gate, macOS only. The gate schedules itself from this
+release (docs/releases.md, "What runs at once"), so it was run whole,
+`gate.sh --release --no-linux -j 4`, with nothing else building, not a
+step at a time as 0.28.0's was: its 38 steps, the heavy ones one at a
+time. Three starts. The first was stopped after ten minutes to take an
+example into the release; the second was stopped at 80 minutes with four
+rows failed (abi-plain and abi-header: the generator derived `Copy` for
+a struct with a union field that was not; layout: the check cast a
+reference to an integer; objcheck: 3 of 12940 compilations, a test build
+at -O2 with an empty line table), all fixed, the last one in the
+compiler; the third ran whole on the fixed tree and every row passed on
+its first run: 264 minutes of wall time, of which chain-diverse 107, the
+load at most 56 and never under 4.4 GB of memory free. Against 0.28.0's
+rows: fuzz-sem is back (the semantic fuzzer, ported to the one language:
+four runs of 300 programs); std2-check and std2-tests are std-check and
+std-tests; mvs-census is gone with its tools (it was 0 and what it
+watched for is deleted); compile-cost has no hello-0.27 row, and its std
+row is skipped, since 0.28.0 cannot build that program (it names
+`FixedState` from the prelude); unsafe-audit no longer compares with a
+baseline: it fails on any unjustified site of compiler/src or std and on
+any unneeded block of compiler/src. The rows: the suite 6385 passed at
+each of -O0, -O1 and -O2, 731 XFAIL, 0 failed, 1 SKIPPED: no spirv-val
+(0.28.0: 6273, 732 XFAIL), std-tests 1571 passed at -O0 and -O2 under
+--check-alloc, 62 XFAIL (0.28.0: 1541, 15 XFAIL), std-check 3967 bodies,
+3964 clean, 0 with borrowck errors, 3 not solved (0.28.0: 3964 bodies,
+3962 clean, 0, 2), threads 15940 compilations (0.28.0: 15808),
+incremental 172 series, as in 0.28.0, objcheck 12940 of 12940, and 260
+for x86_64-macos (0.28.0: 12808 and 260), layout 111 records and 582
+fields, as in 0.28.0 (the floor is 100 records), compiler-memcheck 755
+compilations clean (0.28.0: 727), examples-checkalloc 196 (0.28.0: 185),
+every fuzz and ABI row passed (twelve fuzz modes of 60 programs, three
+ABI modes of 100 programs, 0 failing), fuzz-sem 4 runs of 300 programs,
+0 failing, voltty-fuzz 2108 scripts (0.28.0: 1821), stress-grow (the
+self-compile the same, the suite passing at -O0 and -O2), cachediff 1447
+lines, 441 from the cache (0.28.0: 1373 and 422), borrowck-twin 462
+cases, 419 agree, 10 named divergences, 33 outside the subset, 0
+mismatches (0.28.0: 460 and 417), unsafe-audit 316 sites in
+compiler/src, 0 unjustified, 0 unneeded, and 915 in std, 0 unjustified
+(0.28.0: 2573 unjustified against a baseline of 2769, 0 in std),
+chain-fresh 51 releases from the seed, each the same bytes as recorded,
+chain-diverse (the normal, unoptimized and -j1 paths give the same
+compiler). compile-cost against v0.28.0: hello 173.8 M 1.00x, check
+24,814.5 M 0.97x, regions 1130.9 M 0.93x (0.28.0 against 0.27.8: 0.98x,
+0.13x, 0.13x); std skipped. The bench row, run after the gate on the
+idle machine: its iterator check still fails, iterchain 2.057 times
+iterloop (the limit is 1.05; 0.28.0: 2.37); the geomean against `cc -O2`
+is 1.131 at -O2, 2.275 at -O1 and 13.131 at -O0 (0.28.0: 1.162, 2.282,
+13.375). The self-build and the compiler's own check against 0.28.0,
+each compiler on its own source: the self-build at -O2 126.2 G of
+instructions against 103.6 G (+21.9%), the check 24.8 G against 21.3 G
+(+16.1%). Not run: any Linux row. For a bisect: three commits in the
+history of the release are a side branch's (an example's, merged with
+the release branch into it, so `git log --first-parent` leaves the
+release branch there for a few merges).
+
 ### 0.28.0
 
 The release gate, macOS only (the steps of `gate.sh --list --release

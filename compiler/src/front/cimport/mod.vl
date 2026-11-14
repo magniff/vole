@@ -31,8 +31,8 @@ mod specifiers;
 
 use crate::host_target;
 use crate::base::{
-    IntVec, _setjmp, add_source, buf_byte, buf_fmt, buf_new, buf_str, buf_write_file, cstr, die,
-    exit, get_bufs, grow, intern_c, streq, sym_name,
+    _setjmp, add_source, buf_byte, buf_fmt, buf_new, buf_ptr, buf_str, buf_write_file, c_starts,
+    cstr, die, exit_now, intern_c, streq, sym_name,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -44,7 +44,7 @@ use crate::front::ast::{NodeKind, child, list_begin, list_end, list_push};
 use crate::front::cimport::ctx::{CImportCx, cimport_cx_new};
 use crate::front::cimport::decls::cdecl_parse;
 use crate::front::cimport::emit::cimport_emit;
-use crate::front::cpp::{CK, ctok_text, init_cpp, macro_of, macro_tok, strtoull};
+use crate::front::cpp::{CK, c_ull, ctok_bytes, ctok_text, init_cpp, macro_of, macro_tok};
 use crate::front::cpp::cc::{c_compiler_given, cpp_query_compiler};
 use crate::front::cpp::directives::{path_dir, path_join};
 use crate::front::cpp::expand::cpp_next;
@@ -59,20 +59,16 @@ use CT::{Array, Bad, Bool, Enum, Float, Func, Int, Named, Ptr, Record, Void};
     Void, Int, Bool, Float, Ptr, Array, Func, Record, Enum, Named, Bad,
 }
 
-// Int: a=bits b=signed. Float: a=bits. Ptr: a=pointee. Array: a=element
+// Int: a=bits b=signed. Float: a=bits. Ptr: a=pointee b=1 for
+// `_Nonnull` c=1 for a const pointee (0.29: a `*const T`). Array: a=element
 // b=length (-1: unknown). Func: a=result b=params (CINTS) c=count
 // d=variadic. Record: a=record. Enum: a=enum. Named: a=typedef.
 // Bad: a=the reason (a symbol).
 #[derive(Clone, Copy)] pub struct CType { kind: CT, a: i64, b: i64, c: i64, d: i64 }
 
 fn cty_new(kind: CT, a: i64, b: i64, c: i64, d: i64, ccx: &mut CImportCx<Comp>) -> i64 {
-    unsafe {
-        ccx.ctypes = grow(ccx.ctypes, ccx.ctype_count, &mut ccx.ctype_cap);
-        { let at_ix = ccx.ctype_count as usize;
-            (*ccx.ctypes.add(at_ix)) = CType { kind, a, b, c, d } };
-    }
-    ccx.ctype_count += 1;
-    ccx.ctype_count - 1
+    ccx.ctypes.push(CType { kind, a, b, c, d });
+    ccx.ctypes.len() as i64 - 1
 }
 
 fn bits_index(bits: i64) -> i64 {
@@ -83,7 +79,7 @@ pub fn cty_int(bits: i64, signed: bool, ccx: &CImportCx<Comp>) -> i64 {
     ccx.cty_ints[(bits_index(bits) * 2 + signed as i64) as usize]
 }
 
-fn cty_bad(reason: *mut u8, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+fn cty_bad(reason: *const u8, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     cty_new(Bad, intern_c(reason, pcx), 0, 0, 0, ccx)
 }
 
@@ -93,37 +89,33 @@ fn cty_ptr(t: i64, ccx: &mut CImportCx<Comp>) -> i64 {
 
 // Through typedefs.
 fn cty_resolve(t: i64, ccx: &CImportCx<Comp>) -> i64 {
-    unsafe {
-        let mut r = t;
-        while (*ccx.ctypes.add(r as usize)).kind == Named {
-            r = (*ccx.ctypedefs.add((*ccx.ctypes.add(r as usize)).a as usize)).ty;
-        }
-        r
+    let mut r = t;
+    while (ccx.ctypes[r as usize]).kind == Named {
+        r = (ccx.ctypedefs[(ccx.ctypes[r as usize]).a as usize]).ty;
     }
+    r
 }
 
 // Integer-like: integers, bool, enums (as their integer type).
 fn cty_integer(t: i64, ccx: &CImportCx<Comp>) -> i64 {
-    unsafe {
-        let r = cty_resolve(t, ccx);
-        match (*ccx.ctypes.add(r as usize)).kind {
-            Int => r,
-            Bool => cty_int(8, signed: false, ccx: ccx),
-            Enum => cty_integer(
-                (*ccx.cenums.add((*ccx.ctypes.add(r as usize)).a as usize)).underlying, ccx),
-            _ => 0,
-        }
+    let r = cty_resolve(t, ccx);
+    match (ccx.ctypes[r as usize]).kind {
+        Int => r,
+        Bool => cty_int(8, signed: false, ccx: ccx),
+        Enum => cty_integer(
+            (ccx.cenums[(ccx.ctypes[r as usize]).a as usize]).underlying, ccx),
+        _ => 0,
     }
 }
 
 pub fn cty_bits(t: i64, ccx: &CImportCx<Comp>) -> i64 {
     let r = cty_integer(t, ccx);
-    if r == 0 { 64 } else { unsafe { (*ccx.ctypes.add(r as usize)).a } }
+    if r == 0 { 64 } else { (ccx.ctypes[r as usize]).a }
 }
 
 pub fn cty_signed(t: i64, ccx: &CImportCx<Comp>) -> bool {
     let r = cty_integer(t, ccx);
-    unsafe { r != 0 && (*ccx.ctypes.add(r as usize)).b != 0 }
+    r != 0 && (ccx.ctypes[r as usize]).b != 0
 }
 
 // ---- Declarations ----
@@ -151,23 +143,20 @@ pub fn cty_signed(t: i64, ccx: &CImportCx<Comp>) -> bool {
 #[derive(Clone, Copy)] pub struct CEnumerator { name: i64, value: i64, ty: i64 }
 
 fn crec_new(tag: i64, is_union: bool, ccx: &mut CImportCx<Comp>) -> i64 {
-    unsafe {
-        ccx.crecs = grow(ccx.crecs, ccx.crec_count, &mut ccx.crec_cap);
-        let r = ccx.crec_count;
-        ccx.crec_count += 1;
-        (*ccx.crecs.add(r as usize)) = CRec {
-            tag, is_union: is_union as i64, complete: 0, packed: 0, align_attr: 0,
-            fields: 0, field_count: 0, size: -1, align: 1, state: 0, opaque: -1, name: -1,
-            ty: 0, parent: -1, emit_packed: 0, emit_align: 0, pack: 0,
-        };
-        (*ccx.crecs.add(r as usize)).ty = cty_new(Record, r, 0, 0, 0, ccx);
-        r
-    }
+    let r = ccx.crecs.len() as i64;
+    ccx.crecs.push(CRec {
+        tag, is_union: is_union as i64, complete: 0, packed: 0, align_attr: 0,
+        fields: 0, field_count: 0, size: -1, align: 1, state: 0, opaque: -1, name: -1,
+        ty: 0, parent: -1, emit_packed: 0, emit_align: 0, pack: 0,
+    });
+    let ty = cty_new(Record, r, 0, 0, 0, ccx);
+    ccx.crecs[r as usize].ty = ty;
+    r
 }
 
-fn cfield(r: i64, i: i64, ccx: &mut CImportCx<Comp>, pcx: &Ctx<Comp>) -> *mut CField {
-    unsafe { ccx.cfields.add(
-        (*pcx.cints.data.add(((*ccx.crecs.add(r as usize)).fields + i) as usize)) as usize) }
+// Field `i` of record `r`: its index in ccx.cfields.
+fn cfield(r: i64, i: i64, ccx: &CImportCx<Comp>, pcx: &Ctx<Comp>) -> usize {
+    pcx.cints[(ccx.crecs[r as usize].fields + i) as usize] as usize
 }
 
 fn skip_reason(name: i64, reason: i64, pcx: &mut Ctx<Comp>) {
@@ -179,7 +168,7 @@ fn skip_reason(name: i64, reason: i64, pcx: &mut Ctx<Comp>) {
 // ---- The token cursor ----
 
 fn dpeek(k: i64, ccx: &CImportCx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    if ccx.d_pos + k < ccx.d_n { unsafe { (*ccx.d_toks.add((ccx.d_pos + k) as usize)) } }
+    if ccx.d_pos + k < ccx.d_n { ccx.d_toks[(ccx.d_pos + k) as usize] }
     else { pcx.c_eof }
 }
 
@@ -187,23 +176,19 @@ fn dcur(ccx: &CImportCx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     dpeek(0, ccx, pcx)
 }
 
-fn d_is(text: *mut u8, ccx: &CImportCx<Comp>, pcx: &Ctx<Comp>) -> bool {
+fn d_is(text: *const u8, ccx: &CImportCx<Comp>, pcx: &Ctx<Comp>) -> bool {
     let t = dcur(ccx, pcx);
-    unsafe {
-        t != pcx.c_eof && (*pcx.ctoks.add(t as usize)).kind != CK::Str
-            && (*pcx.ctoks.add(t as usize)).kind != CK::Char && streq(ctok_text(t, pcx), text)
-    }
+    t != pcx.c_eof && (pcx.ctoks[t as usize]).kind != CK::Str
+        && (pcx.ctoks[t as usize]).kind != CK::Char && streq(ctok_text(t, pcx), text)
 }
 
-fn d_is_at(k: i64, text: *mut u8, ccx: &CImportCx<Comp>, pcx: &Ctx<Comp>) -> bool {
+fn d_is_at(k: i64, text: *const u8, ccx: &CImportCx<Comp>, pcx: &Ctx<Comp>) -> bool {
     let t = dpeek(k, ccx, pcx);
-    unsafe {
-        t != pcx.c_eof && (*pcx.ctoks.add(t as usize)).kind != CK::Str
-            && (*pcx.ctoks.add(t as usize)).kind != CK::Char && streq(ctok_text(t, pcx), text)
-    }
+    t != pcx.c_eof && (pcx.ctoks[t as usize]).kind != CK::Str
+        && (pcx.ctoks[t as usize]).kind != CK::Char && streq(ctok_text(t, pcx), text)
 }
 
-fn d_eat(text: *mut u8, ccx: &mut CImportCx<Comp>, pcx: &Ctx<Comp>) -> bool {
+fn d_eat(text: *const u8, ccx: &mut CImportCx<Comp>, pcx: &Ctx<Comp>) -> bool {
     if d_is(text, ccx, pcx) {
         ccx.d_pos += 1;
         return true;
@@ -211,14 +196,14 @@ fn d_eat(text: *mut u8, ccx: &mut CImportCx<Comp>, pcx: &Ctx<Comp>) -> bool {
     false
 }
 
-fn d_fail(reason: *mut u8, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) {
+fn d_fail(reason: *const u8, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) {
     if ccx.d_bad < 0 {
         ccx.d_bad = intern_c(reason, pcx);
     }
     ccx.d_pos = ccx.d_n;
 }
 
-fn d_expect(text: *mut u8, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) {
+fn d_expect(text: *const u8, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) {
     if !d_eat(text, ccx, pcx) {
         d_fail(c"syntax vole cannot read", ccx, pcx);
     }
@@ -255,85 +240,79 @@ fn init_cimport(ccx: &mut CImportCx<Comp>) {
 }
 
 // The value of a predefined macro that is a number, or -1.
-fn builtin_number(name: *mut u8, ccx: &CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let m = macro_of(intern_c(name, pcx), ccx);
-        if m < 0 || (*pcx.macros.add(m as usize)).body_count != 1 {
-            return -1;
-        }
-        let t = macro_tok(m, 0, pcx);
-        if (*pcx.ctoks.add(t as usize)).kind != CK::Num {
-            return -1;
-        }
-        let mut end = 0 as *mut u8;
-        strtoull(ctok_text(t, pcx), &mut end, 10) as i64
+fn builtin_number(name: *const u8, ccx: &CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let m = macro_of(intern_c(name, pcx), ccx);
+    if m < 0 || (pcx.macros[m as usize]).body_count != 1 {
+        return -1;
     }
+    let t = macro_tok(m, 0, pcx);
+    if (pcx.ctoks[t as usize]).kind != CK::Num {
+        return -1;
+    }
+    c_ull(ctok_bytes(t, pcx), 10).0 as i64
 }
 
 // Imports the C headers named by the `import` items (`names`: C strings;
 // `relative`: whether each is relative to `dirs`, the directory of its
 // file) for target `target`; returns the vole source as a buffer.
-pub fn c_import(names: IntVec, dirs: IntVec, include_dirs: IntVec, target: i64,
+pub fn c_import(names: &[i64], dirs: &[i64], include_dirs: &[i64], target: i64,
     ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        init_cpp(ccx, pcx);
-        init_cimport(ccx);
-        ccx.c_target_x86 = target != T_AARCH64_MACOS && target != T_AARCH64_LINUX;
-        ccx.c_target_a64_linux = target == T_AARCH64_LINUX;
-        ccx.c_target_elf = target_is_linux(target);
-        let host = host_target();
-        let host_linux = target_is_linux(host);
-        let target_linux = target_is_linux(target);
-        if (host == 0 || host_linux != target_linux || (target_linux && host != target))
-            && !c_compiler_given() {
-            // (0.9) Cross-compiling: the target's headers and predefined
-            // macros come from a C compiler for it, named by $VOLE_CC.
-            let b = buf_new();
-            buf_fmt(b,
-                format_args("`import` of C headers for {}",
-                    str::from_utf8(cstr(target_name(target))).unwrap()));
-            buf_str(b, c" needs a C compiler for that target, with its headers: this host's cc is not one. Set VOLE_CC to one (for example `clang --target=x86_64-linux-gnu --sysroot=DIR`, DIR holding a Linux system's /usr/include), or write the declarations as vole source with `volec --emit-imports` on a host of the target's system");
-            buf_byte(b, 0);
-            die((*get_bufs().add(b as usize)).data);
-        }
-        for i in 0..include_dirs.count {
-            pcx.cdirs.push((*include_dirs.data.add(i as usize)));
-        }
-        let flags = if target == T_AARCH64_MACOS { c" -arch arm64" }
-            else if target == T_X86_64_MACOS { c" -arch x86_64" } else { c"" };
-        cpp_query_compiler(flags, ccx, pcx);
-        ccx.c_long_double_64 = builtin_number(c"__SIZEOF_LONG_DOUBLE__", ccx, pcx) == 8;
-        // The headers, as one translation unit of #includes.
-        let top = buf_new();
-        for i in 0..names.count {
-            let name = (*names.data.add(i as usize)) as *mut u8;
-            if (*name.add(0)) == b'.'
-                && ((*name.add(1)) == b'/' || ((*name.add(1)) == b'.' && (*name.add(2)) == b'/')) {
-                buf_fmt(top,
-                    format_args("#include \"{}\"\n",
-                        str::from_utf8(cstr(path_join((*dirs.data.add(i as usize)) as *mut u8,
-                            name))).unwrap()));
-            } else {
-                buf_fmt(top, format_args("#include <{}>\n", str::from_utf8(cstr(name)).unwrap()));
-            }
-        }
-        let f = c_load_text(c"<import>", top, ccx, pcx);
-        pcx.c_import_file = f;
-        push_frame(f, ccx, pcx);
-        let mut toks = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        loop {
-            let t = cpp_next(ccx, pcx);
-            if t == pcx.c_eof {
-                break;
-            }
-            toks.push(t);
-        }
-        cdecl_parse(toks, ccx, pcx);
+    init_cpp(ccx, pcx);
+    init_cimport(ccx);
+    ccx.c_target_x86 = target != T_AARCH64_MACOS && target != T_AARCH64_LINUX;
+    ccx.c_target_a64_linux = target == T_AARCH64_LINUX;
+    ccx.c_target_elf = target_is_linux(target);
+    let host = host_target();
+    let host_linux = target_is_linux(host);
+    let target_linux = target_is_linux(target);
+    if (host == 0 || host_linux != target_linux || (target_linux && host != target))
+        && !c_compiler_given() {
+        // (0.9) Cross-compiling: the target's headers and predefined
+        // macros come from a C compiler for it, named by $VOLE_CC.
         let b = buf_new();
-        buf_str(b, c"// Declarations imported from C headers by volec.\n");
-        cimport_emit(b, ccx, pcx);
-        b
+        buf_fmt(b,
+            format_args("`import` of C headers for {}",
+                str::from_utf8(&cstr(target_name(target))).unwrap()));
+        buf_str(b, c" needs a C compiler for that target, with its headers: this host's cc is not one. Set VOLE_CC to one (for example `clang --target=x86_64-linux-gnu --sysroot=DIR`, DIR holding a Linux system's /usr/include), or write the declarations as vole source with `volec --emit-imports` on a host of the target's system");
+        buf_byte(b, 0);
+        die(buf_ptr(b));
     }
+    for i in 0..include_dirs.len() as i64 {
+        pcx.cdirs.push((include_dirs[i as usize]));
+    }
+    let flags = if target == T_AARCH64_MACOS { c" -arch arm64" }
+        else if target == T_X86_64_MACOS { c" -arch x86_64" } else { c"" };
+    cpp_query_compiler(flags, ccx, pcx);
+    ccx.c_long_double_64 = builtin_number(c"__SIZEOF_LONG_DOUBLE__", ccx, pcx) == 8;
+    // The headers, as one translation unit of #includes.
+    let top = buf_new();
+    for i in 0..names.len() as i64 {
+        let name = (names[i as usize]) as *mut u8;
+        if c_starts(name, b"./") || c_starts(name, b"../") {
+            buf_fmt(top,
+                format_args("#include \"{}\"\n",
+                    str::from_utf8(&cstr(path_join((dirs[i as usize]) as *mut u8,
+                        name))).unwrap()));
+        } else {
+            buf_fmt(top, format_args("#include <{}>\n", str::from_utf8(&cstr(name)).unwrap()));
+        }
+    }
+    let f = c_load_text(c"<import>", top, ccx, pcx);
+    pcx.c_import_file = f;
+    push_frame(f, ccx, pcx);
+    let mut toks: Vec<i64, Comp> = Vec::new_in(Comp {});
+    loop {
+        let t = cpp_next(ccx, pcx);
+        if t == pcx.c_eof {
+            break;
+        }
+        toks.push(t);
+    }
+    cdecl_parse(&toks, ccx, pcx);
+    let b = buf_new();
+    buf_str(b, c"// Declarations imported from C headers by volec.\n");
+    cimport_emit(b, ccx, pcx);
+    b
 }
 
 // Imported declarations live in a module of their own (modules.vl), so
@@ -380,72 +359,79 @@ pub fn drop_shadowed_imports(program: i64, pcx: &mut Ctx<Comp>) {
 
 // Why `name` was not imported from the C headers (0: it was not
 // skipped), for the error when a program uses it.
-pub fn c_import_skip_reason(name: i64, pcx: &Ctx<Comp>) -> *mut u8 {
+pub fn c_import_skip_reason(name: i64, pcx: &Ctx<Comp>) -> *const u8 {
     let r = pcx.c_skipped.get(name + 1);
     if r == 0 { 0 as *mut u8 } else { sym_name(r - 1, pcx) }
 }
 
 // `import "header.h" as c;` items: the headers are read (cimport.vl) and
 // their declarations, as vole source, are added to the program.
-pub fn import_c_headers(target: i64, include_dirs: IntVec, emit: bool, output: *mut u8,
+pub fn import_c_headers(target: i64, include_dirs: &[i64], emit: bool, output: *const u8,
     pcx: &mut Ctx<Comp>) {
     let mut ccx = cimport_cx_new();
-    unsafe {
-        let mut names = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut dirs = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut names: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut dirs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..pcx.toks.len() as i64 {
+        if pcx.toks[i as usize].kind == Tok::Import && i + 1 < pcx.toks.len() as i64
+            && pcx.toks[(i + 1) as usize].kind == Tok::Str {
+            let name = str_at(pcx.toks[(i + 1) as usize].value as i64, pcx).as_ptr();
+            let mut file: i64 = 0;
+            while file + 1 < pcx.files.len() as i64
+                && pcx.toks[i as usize].start >= pcx.files[(file + 1) as usize].start {
+                file += 1;
+            }
+            names.push(name as i64);
+            pcx.c_import_pos.push(pcx.toks[(i + 1) as usize].start);
+            dirs.push(path_dir(pcx.files[file as usize].path) as i64);
+        }
+    }
+    if names.len() as i64 == 0 {
+        if emit {
+            buf_write_file(buf_new(), output);
+            exit_now(0);
+        }
+        return;
+    }
+    // A recovery point (0.10): after an error in the headers, the
+    // program is checked without them; the names they would have
+    // brought (`c` in `import "h.h" as c;`) are failed names.
+    let depth = pcx.recover_depth;
+    let mut text: i64 = -1;
+    // UNSAFE: the front end's error recovery is C's setjmp/longjmp (base::diag::err_jump):
+    // an error raised in what this guards returns here, and setjmp must be called in the
+    // frame that stays live, so no safe wrapper can make the call.
+    // SAFETY: recover_enter gives the jmp_buf of this frame's depth (512 zeroed bytes kept
+    // in pcx.recover_bufs, never freed); err_jump jumps only to the buffer of recover_depth
+    // - 1, and this function sets recover_depth back to the depth it entered with
+    // (recover_leave(depth) below) before it returns, on both paths, so no jump lands in a
+    // frame that has returned. A jump skips the destructors of the frames between: their
+    // allocations leak, nothing is freed twice.
+    if unsafe { _setjmp(recover_enter(pcx)) == 0 } {
+        text = c_import(&names, &dirs, include_dirs, target, &mut ccx, pcx);
+    }
+    recover_leave(depth, pcx);
+    if text < 0 {
         for i in 0..pcx.toks.len() as i64 {
-            if pcx.toks[i as usize].kind == Tok::Import && i + 1 < pcx.toks.len() as i64
-                && pcx.toks[(i + 1) as usize].kind == Tok::Str {
-                let name = str_at(pcx.toks[(i + 1) as usize].value as i64).ptr;
-                let mut file: i64 = 0;
-                while file + 1 < pcx.files.len() as i64
-                    && pcx.toks[i as usize].start >= pcx.files[(file + 1) as usize].start {
-                    file += 1;
-                }
-                names.push(name as i64);
-                pcx.c_import_pos.push(pcx.toks[(i + 1) as usize].start);
-                dirs.push(path_dir(pcx.files[file as usize].path) as i64);
+            if pcx.toks[i as usize].kind == Tok::Import && i + 3 < pcx.toks.len() as i64
+                && pcx.toks[(i + 2) as usize].kind == Tok::As
+                && pcx.toks[(i + 3) as usize].kind == Tok::Ident {
+                fail_name(pcx.toks[(i + 3) as usize].value as i64, pcx);
             }
-        }
-        if names.count == 0 {
-            if emit {
-                buf_write_file(buf_new(), output);
-                exit(0);
-            }
-            return;
-        }
-        // A recovery point (0.10): after an error in the headers, the
-        // program is checked without them; the names they would have
-        // brought (`c` in `import "h.h" as c;`) are failed names.
-        let depth = pcx.recover_depth;
-        let mut text: i64 = -1;
-        if _setjmp(recover_enter(pcx)) == 0 {
-            text = c_import(names, dirs, include_dirs, target, &mut ccx, pcx);
-        }
-        recover_leave(depth, pcx);
-        if text < 0 {
-            for i in 0..pcx.toks.len() as i64 {
-                if pcx.toks[i as usize].kind == Tok::Import && i + 3 < pcx.toks.len() as i64
-                    && pcx.toks[(i + 2) as usize].kind == Tok::As
-                    && pcx.toks[(i + 3) as usize].kind == Tok::Ident {
-                    fail_name(pcx.toks[(i + 3) as usize].value as i64, pcx);
-                }
-            }
-            if emit {
-                exit_if_errors(pcx);
-            }
-            return;
         }
         if emit {
-            buf_write_file(text, output);
-            exit(0);
+            exit_if_errors(pcx);
         }
-        pcx.imported_start = add_source(c"<C import>", text, pcx, 0);
-        pcx.c_module = add_module(intern_c(c"<c>", pcx), 0, true, pcx);
-        { let at_ix = pcx.c_module as usize; pcx.modules[at_ix].is_c = true };
-        { let at_ix = (pcx.files.len() as i64 - 1) as usize;
-            pcx.files[at_ix].module = pcx.c_module };
-        lex_range(pcx.imported_start, pcx.files[(pcx.files.len() as i64 - 1) as usize].end,
-            last: false, pcx: pcx);
+        return;
     }
+    if emit {
+        buf_write_file(text, output);
+        exit_now(0);
+    }
+    pcx.imported_start = add_source(c"<C import>", text, pcx, 0);
+    pcx.c_module = add_module(intern_c(c"<c>", pcx), 0, true, pcx);
+    { let at_ix = pcx.c_module as usize; pcx.modules[at_ix].is_c = true };
+    { let at_ix = (pcx.files.len() as i64 - 1) as usize;
+        pcx.files[at_ix].module = pcx.c_module };
+    lex_range(pcx.imported_start, pcx.files[(pcx.files.len() as i64 - 1) as usize].end,
+        last: false, pcx: pcx);
 }

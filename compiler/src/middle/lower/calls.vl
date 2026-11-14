@@ -7,7 +7,7 @@ use crate::arch::intrinsic_of_fn;
 use crate::back::abi::{
     AbiClass, conv_classify, conv_returns_through_pointer, fn_type_uses_c, fn_uses_c, variadic_kind,
 };
-use crate::base::{IntVec, die, free, intern_c};
+use crate::base::{die, intern_c};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::get_x86;
@@ -24,7 +24,7 @@ use crate::middle::checkalloc::site_before_call;
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
     BITS_LEADING, BITS_ONES, BITS_TRAILING, Op, RT_KIND, RT_SITE, Term, VARIADIC_PIECE, emit_ir,
-    get_irfuncs, ir_const, ir_load, ir_new_block, ir_rtid, ir_slot_addr, ir_store, ir_type,
+    ir_const, ir_load, ir_new_block, ir_rtid, ir_slot_addr, ir_store, ir_type,
 };
 use crate::middle::ir::cfg::ir_terminate;
 use crate::middle::lower::{is_fresh, lower_branch, lower_copy, new_slot_for, start_dead_block};
@@ -37,48 +37,44 @@ use crate::tools::query::checks::note_check;
 
 // ---- Calls ----
 
-pub fn push_arg(cx: &mut FnCtx, value: i64, ty: i64) {
+pub fn push_arg(cx: &mut FnCtx<Comp>, value: i64, ty: i64) {
     cx.ssa_stack.push(value);
     cx.ssa_stack.push(ty);
 }
 
 // Moves the arguments pushed since `mark` into call `call`.
-pub fn take_args(cx: &mut FnCtx, call: i64, mark: i64) {
-    unsafe {
-        let count = (cx.ssa_stack.count - mark) / 2;
-        (*cx.insts.add(call as usize)).args = cx.args.count;
-        (*cx.insts.add(call as usize)).nargs = count;
-        for i in 0..count {
-            cx.args.push((*cx.ssa_stack.data.add((mark + 2 * i) as usize)));
-            cx.argty.push((*cx.ssa_stack.data.add((mark + 2 * i + 1) as usize)));
-        }
-        cx.ssa_stack.count = mark;
+pub fn take_args(cx: &mut FnCtx<Comp>, call: i64, mark: i64) {
+    let count = (cx.ssa_stack.len() as i64 - mark) / 2;
+    (cx.insts[call as usize]).args = cx.args.len() as i64;
+    (cx.insts[call as usize]).nargs = count;
+    for i in 0..count {
+        cx.args.push((cx.ssa_stack[(mark + 2 * i) as usize]));
+        cx.argty.push((cx.ssa_stack[(mark + 2 * i + 1) as usize]));
     }
+    cx.ssa_stack.truncate(mark as usize);
 }
 
 // (0.21) The address of static `sym` (its symbol): GADDR, or for a
 // thread-local this thread's copy, std::thread::__tls_addr(GADDR, size)
 // (front/threadlocal.vl).
-pub fn static_address(cx: &mut FnCtx, sym: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let g = emit_ir(cx, Op::GAddr, TY_U64, 0, 0, sym, pcx);
-        if !symbol_is_thread_local(sym, pcx) {
-            return g;
-        }
-        let f = tls_addr_fn(pcx);
-        if f < 0 {
-            die(c"internal error: a thread-local without std::thread");
-        }
-        let size = type_size(pcx.statics[((*pcx.sym_static.add(sym as usize)) - 1) as usize].ty,
-            pcx);
-        let mark = cx.ssa_stack.count;
-        push_arg(cx, g, TY_U64);
-        let ir_const_v = ir_const(cx, size, TY_I64, pcx);
-        push_arg(cx, ir_const_v, TY_I64);
-        let call = emit_ir(cx, Op::Call, TY_U64, 0, 0, f, pcx);
-        take_args(cx, call, mark);
-        call
+pub fn static_address(cx: &mut FnCtx<Comp>, sym: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let g = emit_ir(cx, Op::GAddr, TY_U64, 0, 0, sym, pcx);
+    if !symbol_is_thread_local(sym, pcx) {
+        return g;
     }
+    let f = tls_addr_fn(pcx);
+    if f < 0 {
+        die(c"internal error: a thread-local without std::thread");
+    }
+    let size = type_size(pcx.statics[((pcx.sym_static[sym as usize]) - 1) as usize].ty,
+        pcx);
+    let mark = cx.ssa_stack.len() as i64;
+    push_arg(cx, g, TY_U64);
+    let ir_const_v = ir_const(cx, size, TY_I64, pcx);
+    push_arg(cx, ir_const_v, TY_I64);
+    let call = emit_ir(cx, Op::Call, TY_U64, 0, 0, f, pcx);
+    take_args(cx, call, mark);
+    call
 }
 
 // (0.16) The count std's function f makes (BITS_ONES, BITS_LEADING,
@@ -115,54 +111,52 @@ fn is_std_mul_hi(f: i64, pcx: &mut Ctx<Comp>) -> bool {
         == item_symbol(pcx.fns[f as usize].module, intern_c(c"mul_hi", pcx), pcx)
 }
 
-pub fn lower_call(cx: &mut FnCtx, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let callee = pcx.nodes[n as usize].a;
-        // (--check-unsafe: malloc and the like go through the runtime)
-        let direct = redirect_alloc(pcx.nodes[n as usize].x - 1,
-            pcx.fns[(*get_irfuncs().add(cx.irf as usize)).f as usize].module, pcx);
-        // (0.19: std::arch's intrinsics, by their table's IR form)
-        let intr = intrinsic_of_fn(direct, pcx);
-        if intr >= 0 {
-            let value = lower_intrinsic(cx, n, direct, intr, pcx);
-            if value != NOT_LOWERED {
-                return value;
-            }
+pub fn lower_call(cx: &mut FnCtx<Comp>, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let callee = pcx.nodes[n as usize].a;
+    // (--check-unsafe: malloc and the like go through the runtime)
+    let direct = redirect_alloc(pcx.nodes[n as usize].x - 1,
+        pcx.fns[pcx.ir_fn[cx.irf as usize] as usize].module, pcx);
+    // (0.19: std::arch's intrinsics, by their table's IR form)
+    let intr = intrinsic_of_fn(direct, pcx);
+    if intr >= 0 {
+        let value = lower_intrinsic(cx, n, direct, intr, pcx);
+        if value != NOT_LOWERED {
+            return value;
         }
-        let kind = bits_kind(direct, pcx);
-        if kind >= 0 {
-            let operand_expr_v = operand_expr(cx, child(n, 0, pcx), pcx);
-            let x = need_value(cx, operand_expr_v, TY_U64, pcx);
-            return emit_ir(cx, Op::Bits, TY_I64, x, 0, kind, pcx);
-        }
-        if is_std_mul_hi(direct, pcx) {
-            let operand_expr_v1 = operand_expr(cx, child(n, 0, pcx), pcx);
-            // (0.20) std::num::mul_hi: one umulh
-            let a = need_value(cx, operand_expr_v1, TY_U64, pcx);
-            let operand_expr_v2 = operand_expr(cx, child(n, 1, pcx), pcx);
-            let b = need_value(cx, operand_expr_v2, TY_U64, pcx);
-            return emit_ir(cx, Op::MulH, TY_U64, a, b, 0, pcx);
-        }
-        // (0.21: std's atomic intrinsics, ATOMIC and FENCE)
-        let akind = atomic_intrinsic(direct, pcx);
-        if akind >= 0 {
-            return lower_atomic_call(cx, n, direct, akind, pcx);
-        }
-        let conv = call_conv(direct, if direct >= 0 { 0 } else { pcx.nodes[callee as usize].ty },
-            pcx);
-        let mark = cx.ssa_stack.count;
-        for i in 0..pcx.nodes[n as usize].count {
-            let arg = child(n, i, pcx);
-            let ty = call_param_ty(conv, i, pcx.nodes[arg as usize].ty, pcx);
-            let operand_expr_v3 = operand_expr(cx, arg, pcx);
-            push_call_arg(cx, conv, i, operand_expr_v3, ty, is_fresh(arg, pcx), pcx);
-        }
-        let mut callee_value: i64 = 0;
-        if direct < 0 {
-            callee_value = operand_value(cx, callee, pcx);
-        }
-        emit_call_of(cx, conv, callee_value, mark, n, pcx)
     }
+    let kind = bits_kind(direct, pcx);
+    if kind >= 0 {
+        let operand_expr_v = operand_expr(cx, child(n, 0, pcx), pcx);
+        let x = need_value(cx, operand_expr_v, TY_U64, pcx);
+        return emit_ir(cx, Op::Bits, TY_I64, x, 0, kind, pcx);
+    }
+    if is_std_mul_hi(direct, pcx) {
+        let operand_expr_v1 = operand_expr(cx, child(n, 0, pcx), pcx);
+        // (0.20) std::num::mul_hi: one umulh
+        let a = need_value(cx, operand_expr_v1, TY_U64, pcx);
+        let operand_expr_v2 = operand_expr(cx, child(n, 1, pcx), pcx);
+        let b = need_value(cx, operand_expr_v2, TY_U64, pcx);
+        return emit_ir(cx, Op::MulH, TY_U64, a, b, 0, pcx);
+    }
+    // (0.21: std's atomic intrinsics, ATOMIC and FENCE)
+    let akind = atomic_intrinsic(direct, pcx);
+    if akind >= 0 {
+        return lower_atomic_call(cx, n, direct, akind, pcx);
+    }
+    let conv = call_conv(direct, if direct >= 0 { 0 } else { pcx.nodes[callee as usize].ty },
+        pcx);
+    let mark = cx.ssa_stack.len() as i64;
+    for i in 0..pcx.nodes[n as usize].count {
+        let arg = child(n, i, pcx);
+        let ty = call_param_ty(conv, i, pcx.nodes[arg as usize].ty, pcx);
+        let operand_expr_v3 = operand_expr(cx, arg, pcx);
+        push_call_arg(cx, conv, i, operand_expr_v3, ty, is_fresh(arg, pcx), pcx);
+    }
+    let mut callee_value: i64 = 0;
+    if direct < 0 {
+        callee_value = operand_value(cx, callee, pcx);
+    }
+    emit_call_of(cx, conv, callee_value, mark, n, pcx)
 }
 
 // (0.26.1) A call's convention: its function (FNS; -1 for a call of a
@@ -176,22 +170,17 @@ pub fn lower_call(cx: &mut FnCtx, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
 }
 
 pub fn call_conv(direct: i64, callee_ty: i64, pcx: &Ctx<Comp>) -> CallConv {
-    // UNSAFE: FNS and TYPES are the checker's raw tables of functions and types.
-    // SAFETY: direct is a function the checker resolved (below FN_COUNT), callee_ty a
-    // function type of the checked call; both tables are read only after checking.
-    unsafe {
-        if direct >= 0 {
-            return CallConv {
-                direct, callee_ty: 0, param_count: pcx.fns[direct as usize].param_count,
-                ret: pcx.fns[direct as usize].ret,
-                variadic: pcx.fns[direct as usize].variadic, c: fn_uses_c(direct, pcx),
-            };
-        }
-        CallConv {
-            direct, callee_ty, param_count: pcx.types[callee_ty as usize].count,
-            ret: pcx.types[callee_ty as usize].a,
-            variadic: false, c: fn_type_uses_c(callee_ty, pcx),
-        }
+    if direct >= 0 {
+        return CallConv {
+            direct, callee_ty: 0, param_count: pcx.fns[direct as usize].param_count,
+            ret: pcx.fns[direct as usize].ret,
+            variadic: pcx.fns[direct as usize].variadic, c: fn_uses_c(direct, pcx),
+        };
+    }
+    CallConv {
+        direct, callee_ty, param_count: pcx.types[callee_ty as usize].count,
+        ret: pcx.types[callee_ty as usize].a,
+        variadic: false, c: fn_type_uses_c(callee_ty, pcx),
     }
 }
 
@@ -207,8 +196,8 @@ pub fn call_param_ty(conv: CallConv, i: i64, arg_ty: i64, pcx: &Ctx<Comp>) -> i6
 // Argument i of a call, `value` (0 when it has none) of type ty, pushed as
 // the convention passes it: a compound one copied unless it is `fresh` (a
 // new temporary), in pieces or by its address; a variadic f32 promoted.
-pub fn push_call_arg(cx: &mut FnCtx, conv: CallConv, i: i64, value0: i64, ty0: i64, fresh: bool,
-    pcx: &mut Ctx<Comp>) {
+pub fn push_call_arg(cx: &mut FnCtx<Comp>, conv: CallConv, i: i64, value0: i64, ty0: i64,
+    fresh: bool, pcx: &mut Ctx<Comp>) {
     if is_void(ty0) {
         return;
     }
@@ -227,19 +216,14 @@ pub fn push_call_arg(cx: &mut FnCtx, conv: CallConv, i: i64, value0: i64, ty0: i
         if kind == AbiClass::Pieces {
             // Its pieces, read from the (new) slot; a variadic one's
             // first piece carries its type (see call_locations).
-            // UNSAFE: cx is the lowering's raw *FnCtx; its ABI piece tables are fields of it.
-            // SAFETY: cx points at the function's live context for the whole lowering, and
-            // conv_classify just filled abi_piece_count (at most 4) pieces.
-            unsafe {
-                for k in 0..cx.abi_piece_count {
-                    let piece = ir_load(cx, cx.abi_piece_ty[k as usize], value,
-                        cx.abi_piece_offset[k as usize], pcx);
-                    let mut arg_ty = cx.abi_piece_ty[k as usize];
-                    if extra {
-                        arg_ty = if k == 0 { 0 - ty } else { VARIADIC_PIECE };
-                    }
-                    push_arg(cx, piece, arg_ty);
+            for k in 0..cx.abi_piece_count {
+                let piece = ir_load(cx, cx.abi_piece_ty[k as usize], value,
+                    cx.abi_piece_offset[k as usize], pcx);
+                let mut arg_ty = cx.abi_piece_ty[k as usize];
+                if extra {
+                    arg_ty = if k == 0 { 0 - ty } else { VARIADIC_PIECE };
                 }
+                push_arg(cx, piece, arg_ty);
             }
             return;
         }
@@ -259,59 +243,54 @@ pub fn push_call_arg(cx: &mut FnCtx, conv: CallConv, i: i64, value0: i64, ty0: i
 // the function value of an indirect one), for call node n (its
 // --check-alloc site): its value (a compound result's address; 0 for
 // none).
-pub fn emit_call_of(cx: &mut FnCtx, conv: CallConv, callee_value: i64, mark: i64, n: i64,
+pub fn emit_call_of(cx: &mut FnCtx<Comp>, conv: CallConv, callee_value: i64, mark: i64, n: i64,
     pcx: &mut Ctx<Comp>)
     -> i64 {
-    // UNSAFE: cx is the lowering's raw *FnCtx (its instructions and ABI piece tables).
-    // SAFETY: cx points at the function's live context for the whole lowering; call is
-    // the instruction emit_ir just made, and conv_classify fills at most 4 pieces.
-    unsafe {
-        let ret = conv.ret;
-        let c = conv.c;
-        let mut result_ptr: i64 = 0;
-        if is_compound(ret, pcx) {
-            result_ptr = if pcx.result_dest != 0 { pcx.result_dest }
-                else {
-                    let new_slot_for_v = new_slot_for(cx, ret, pcx);
-                    ir_slot_addr(cx, new_slot_for_v, pcx)
-                };
-        }
-        pcx.result_dest = 0;
-        let result_ty: i64 = if is_compound(ret, pcx) { 0 } else { ir_type(ret, pcx) };
-        // (0.16: --check-alloc's allocation site, the arguments lowered)
-        site_before_call(cx, n, pcx);
-        let mut call: i64 = 0;
-        if conv.direct >= 0 {
-            call = emit_ir(cx, Op::Call, result_ty, 0, 0, conv.direct, pcx);
-        } else {
-            call = emit_ir(cx, Op::CallI, result_ty, callee_value, 0, conv.callee_ty, pcx);
-        }
-        let in_registers = is_compound(ret, pcx) && !conv_returns_through_pointer(cx, c, ret, pcx);
-        (*cx.insts.add(call as usize)).c = if in_registers { 0 } else { result_ptr };
-        take_args(cx, call, mark);
-        if in_registers {
-            // Its pieces, from the result registers (PIECE instructions right
-            // after the call), stored into the result's slot.
-            conv_classify(cx, c, ret, pcx);
-            let count = cx.abi_piece_count;
-            let mut pieces: [i64; 4] = [0i64; 4];
-            for k in 0..count {
-                pieces[k as usize] = emit_ir(cx, Op::Piece, cx.abi_piece_ty[k as usize], call, 0, k,
-                    pcx);
-            }
-            for k in 0..count {
-                ir_store(cx, cx.abi_piece_ty[k as usize], result_ptr, pieces[k as usize],
-                    cx.abi_piece_offset[k as usize], pcx);
-            }
-        }
-        if is_compound(ret, pcx) {
-            return result_ptr;
-        }
-        if result_ty == 0 {
-            return 0;
-        }
-        call
+    let ret = conv.ret;
+    let c = conv.c;
+    let mut result_ptr: i64 = 0;
+    if is_compound(ret, pcx) {
+        result_ptr = if pcx.result_dest != 0 { pcx.result_dest }
+            else {
+                let new_slot_for_v = new_slot_for(cx, ret, pcx);
+                ir_slot_addr(cx, new_slot_for_v, pcx)
+            };
     }
+    pcx.result_dest = 0;
+    let result_ty: i64 = if is_compound(ret, pcx) { 0 } else { ir_type(ret, pcx) };
+    // (0.16: --check-alloc's allocation site, the arguments lowered)
+    site_before_call(cx, n, pcx);
+    let mut call: i64 = 0;
+    if conv.direct >= 0 {
+        call = emit_ir(cx, Op::Call, result_ty, 0, 0, conv.direct, pcx);
+    } else {
+        call = emit_ir(cx, Op::CallI, result_ty, callee_value, 0, conv.callee_ty, pcx);
+    }
+    let in_registers = is_compound(ret, pcx) && !conv_returns_through_pointer(cx, c, ret, pcx);
+    (cx.insts[call as usize]).c = if in_registers { 0 } else { result_ptr };
+    take_args(cx, call, mark);
+    if in_registers {
+        // Its pieces, from the result registers (PIECE instructions right
+        // after the call), stored into the result's slot.
+        conv_classify(cx, c, ret, pcx);
+        let count = cx.abi_piece_count;
+        let mut pieces: [i64; 4] = [0i64; 4];
+        for k in 0..count {
+            pieces[k as usize] = emit_ir(cx, Op::Piece, cx.abi_piece_ty[k as usize], call, 0, k,
+                pcx);
+        }
+        for k in 0..count {
+            ir_store(cx, cx.abi_piece_ty[k as usize], result_ptr, pieces[k as usize],
+                cx.abi_piece_offset[k as usize], pcx);
+        }
+    }
+    if is_compound(ret, pcx) {
+        return result_ptr;
+    }
+    if result_ty == 0 {
+        return 0;
+    }
+    call
 }
 
 // ---- Checks ----
@@ -321,7 +300,7 @@ pub fn emit_call_of(cx: &mut FnCtx, conv: CallConv, callee_value: i64, mark: i64
 // the check's site (front/contracts/sites.vl; 0: none), whose position
 // the helper prints first; `site_value`: the site as a value instead (a
 // requires' call site, a parameter of its check), or 0.
-pub fn lower_check(cx: &mut FnCtx, ok: i64, kind: i64, a: i64, b: i64, c: i64,
+pub fn lower_check(cx: &mut FnCtx<Comp>, ok: i64, kind: i64, a: i64, b: i64, c: i64,
     pcx: &mut Ctx<Comp>, site: i64, site_value: i64) {
     pcx.panic_used = true;
     let pass = ir_new_block(cx);
@@ -339,7 +318,7 @@ pub fn lower_check(cx: &mut FnCtx, ok: i64, kind: i64, a: i64, b: i64, c: i64,
 // an OVF (middle/ir: the range pass and the folder decide it, AArch64
 // fuses it with its operation) and a branch to the panic of `kind`, Rust's
 // message, at `site` when it holds.
-pub fn overflow_branch(cx: &mut FnCtx, op: Op, ty: i64, a: i64, b: i64, kind: i64, site: i64,
+pub fn overflow_branch(cx: &mut FnCtx<Comp>, op: Op, ty: i64, a: i64, b: i64, kind: i64, site: i64,
     pcx: &mut Ctx<Comp>) {
     pcx.panic_used = true;
     let ovf = emit_ir(cx, Op::Ovf, TY_BOOL, a, b, (op as i64) | (ir_type(ty, pcx) << 8), pcx);
@@ -356,7 +335,7 @@ pub fn overflow_branch(cx: &mut FnCtx, op: Op, ty: i64, a: i64, b: i64, kind: i6
 // (0.26.3, decision 6) Continues when `ok` holds; otherwise Rust's
 // arithmetic panic of `kind` at `site` (lower_check's, but noted and
 // passed by under $VOLE_OVF_CENSUS).
-pub fn arith_check(cx: &mut FnCtx, ok: i64, kind: i64, site: i64, pcx: &mut Ctx<Comp>) {
+pub fn arith_check(cx: &mut FnCtx<Comp>, ok: i64, kind: i64, site: i64, pcx: &mut Ctx<Comp>) {
     pcx.panic_used = true;
     let pass = ir_new_block(cx);
     let fail = ir_new_block(cx);
@@ -377,11 +356,11 @@ fn census_to(pass: i64, pcx: &Ctx<Comp>) -> i64 {
 // (0.18) The call of the run-time helper in the current (failing) block,
 // which ends it. (0.26.3, measuring) `note_to`: a block, rt.note called
 // instead ($VOLE_OVF_CENSUS: it returns) and a jump there.
-pub fn rt_panic_call(cx: &mut FnCtx, kind: i64, a: i64, b: i64, c: i64, site: i64, site_value: i64,
-    pcx: &mut Ctx<Comp>, note_to: i64) {
+pub fn rt_panic_call(cx: &mut FnCtx<Comp>, kind: i64, a: i64, b: i64, c: i64, site: i64,
+    site_value: i64, pcx: &mut Ctx<Comp>, note_to: i64) {
     pcx.panic_used = true;
     note_check(cx.irf, site, kind, pcx);
-    let mark = cx.ssa_stack.count;
+    let mark = cx.ssa_stack.len() as i64;
     let arg_v = if kind >= 4 { ir_rtid(cx, RT_KIND, kind, TY_U64, pcx) } else {
         ir_const(cx, kind, TY_U64, pcx)
     };
@@ -415,26 +394,19 @@ pub fn rt_panic_call(cx: &mut FnCtx, kind: i64, a: i64, b: i64, c: i64, site: i6
 // shown values a, b, c and its site the IR's (places.vl's
 // lower_contract_failure): the message, from the AST's text, and the
 // helper called.
-pub fn contract_failure_at(cx: &mut FnCtx, n: i64, conj: i64, site: i64, a: i64, b: i64,
+pub fn contract_failure_at(cx: &mut FnCtx<Comp>, n: i64, conj: i64, site: i64, a: i64, b: i64,
     c: i64, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: ops is a raw IntVec this function owns; NODES and IRFUNCS are raw
-    // tables.
-    // SAFETY: ops' data is made by check_values and freed once here; n is the
-    // check's call node, cx.irf the function being lowered.
-    unsafe {
-        let check = pcx.nodes[child(n, 2, pcx) as usize].a;
-        let mut ops = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        check_values(n, conj, &mut ops, pcx);
-        let kind = message_kind(check_message(check, conj, ops,
-            (*get_irfuncs().add(cx.irf as usize)).f, pcx), pcx);
-        free(ops.data as *mut u8);
-        rt_panic_call(cx, kind, a, b, c, 0, site, pcx, -1);
-    }
+    let check = pcx.nodes[child(n, 2, pcx) as usize].a;
+    let mut ops: Vec<i64, Comp> = Vec::new_in(Comp {});
+    check_values(n, conj, &mut ops, pcx);
+    let kind = message_kind(check_message(check, conj, &ops, pcx.ir_fn[cx.irf as usize], pcx),
+        pcx);
+    rt_panic_call(cx, kind, a, b, c, 0, site, pcx, -1);
 }
 
 // A failed `n as E`: the run-time helper with the value; does not return.
 // (0.18) site: as lower_check's.
-pub fn lower_panic(cx: &mut FnCtx, kind: i64, a: i64, pcx: &mut Ctx<Comp>, site: i64) {
+pub fn lower_panic(cx: &mut FnCtx<Comp>, kind: i64, a: i64, pcx: &mut Ctx<Comp>, site: i64) {
     rt_panic_call(cx, kind, a, 0, 0, site, 0, pcx, -1);
     start_dead_block(cx, pcx);
 }
@@ -443,44 +415,33 @@ pub fn lower_panic(cx: &mut FnCtx, kind: i64, a: i64, pcx: &mut Ctx<Comp>, site:
 
 // With --check-unsafe: the check of `size` bytes (an IR value) at addr,
 // for the raw-pointer access n.
-pub fn raw_check(cx: &mut FnCtx, n: i64, addr: i64, size: i64, pcx: &mut Ctx<Comp>) {
+pub fn raw_check(cx: &mut FnCtx<Comp>, n: i64, addr: i64, size: i64, pcx: &mut Ctx<Comp>) {
     if !pcx.check_unsafe {
         return;
     }
-    // UNSAFE: NODES is the parser's raw table of nodes.
-    // SAFETY: n is a node of the function being lowered, below the node count;
-    // read only, single-threaded.
-    unsafe {
-        if (pcx.nodes[n as usize].p & NODE_RAW) != 0 {
-            raw_check_at(cx, pcx.nodes[n as usize].start, addr, size, pcx);
-        }
+    if (pcx.nodes[n as usize].p & NODE_RAW) != 0 {
+        raw_check_at(cx, pcx.nodes[n as usize].start, addr, size, pcx);
     }
 }
 
 // (0.26.2) With --check-unsafe: the check of `size` bytes at addr, for a
 // raw-pointer access at source position pos (the places IR's: its
 // statement's).
-pub fn raw_check_at(cx: &mut FnCtx, pos: i64, addr: i64, size: i64, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: cx is the lowering's raw context pointer; FNS and IRFUNCS are
-    // raw tables.
-    // SAFETY: cx points at the live FnCtx, cx.irf its function's entry, whose
-    // f is below FN_COUNT; lowering is single-threaded.
-    unsafe {
-        let m = pcx.fns[(*get_irfuncs().add(cx.irf as usize)).f as usize].module;
-        if !pcx.check_unsafe || m == pcx.check_module || m == pcx.profile_module {
-            return;
-        }
-        let f = check_function(pcx);
-        if f < 0 {
-            return;
-        }
-        let mark = cx.ssa_stack.count;
-        push_arg(cx, addr, TY_U64);
-        push_arg(cx, size, TY_U64);
-        let emit_ir_v = emit_ir(cx, Op::SAddr, TY_U64, 0, 0, site_string(pos, pcx), pcx);
-        push_arg(cx, emit_ir_v,
-            pcx.ty_u8_ptr);
-        let call = emit_ir(cx, Op::Call, 0, 0, 0, f, pcx);
-        take_args(cx, call, mark);
+pub fn raw_check_at(cx: &mut FnCtx<Comp>, pos: i64, addr: i64, size: i64, pcx: &mut Ctx<Comp>) {
+    let m = pcx.fns[pcx.ir_fn[cx.irf as usize] as usize].module;
+    if !pcx.check_unsafe || m == pcx.check_module || m == pcx.profile_module {
+        return;
     }
+    let f = check_function(pcx);
+    if f < 0 {
+        return;
+    }
+    let mark = cx.ssa_stack.len() as i64;
+    push_arg(cx, addr, TY_U64);
+    push_arg(cx, size, TY_U64);
+    let emit_ir_v = emit_ir(cx, Op::SAddr, TY_U64, 0, 0, site_string(pos, pcx), pcx);
+    push_arg(cx, emit_ir_v,
+        pcx.ty_u8_ptr);
+    let call = emit_ir(cx, Op::Call, 0, 0, 0, f, pcx);
+    take_args(cx, call, mark);
 }

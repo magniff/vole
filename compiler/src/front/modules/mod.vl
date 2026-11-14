@@ -18,15 +18,15 @@
 // in lookup.vl: scopes, `use` items, lookups and paths.
 
 use std::mem; pub mod lookup;
-// (0.27.3: std2 parsed lazily)
-pub mod std2lazy;
+// (0.27.3: std parsed lazily)
+pub mod stdlazy;
 // (0.26.2: `pub(crate)`, `pub(super)`, `pub(in path)`)
 pub mod vis;
 
 use crate::arch::virtual::load_arch_modules;
 use crate::base::{
-    IntVec, add_source, buf_byte, buf_bytes, buf_clear, buf_fmt, buf_new, buf_slice, buf_str, cstr,
-    find_sym, get_bufs, intern, intern_c, read_file, streq, strlen, sym_text,
+    add_source, buf_append, buf_byte, buf_bytes, buf_clear, buf_copy, buf_fmt, buf_len, buf_new,
+    buf_ptr, buf_str, c_bytes, c_plain_path, cstr, intern_buf, intern_c, read_file, streq, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -34,7 +34,7 @@ use crate::base::diag::{
     err_begin, err_end_soft, err_fmt, err_help, err_help_fmt, err_try_tool, error_at_soft,
     fail_name,
 };
-use crate::front::cpp::directives::{file_exists, path_dir};
+use crate::front::cpp::directives::{file_exists, path_base, path_dir};
 use crate::front::lexer::{Tok, lex_range};
 use crate::middle::profile::profile_runtime_source;
 use crate::middle::trace::trace_runtime_source;
@@ -70,15 +70,15 @@ pub fn init_modules(pcx: &mut Ctx<Comp>) {
     }
 }
 
-pub fn join_sym(a: i64, sep: *mut u8, b: i64, pcx: &mut Ctx<Comp>) -> i64 {
+pub fn join_sym(a: i64, sep: *const u8, b: i64, pcx: &mut Ctx<Comp>) -> i64 {
     joined(a, sep, b, pcx);
-    intern(buf_slice(pcx.join_buf), pcx)
+    intern_buf(pcx.join_buf, pcx)
 }
 
 // `a`, `sep`, `b` written into pcx.join_buf, which is cleared each time:
 // its view lasts until the next call, so the consumer reads it in its own
 // call (src-buffer.md, views of other storage).
-fn joined(a: i64, sep: *mut u8, b: i64, pcx: &mut Ctx<Comp>) {
+fn joined(a: i64, sep: *const u8, b: i64, pcx: &mut Ctx<Comp>) {
     if pcx.join_buf < 0 {
         pcx.join_buf = buf_new();
     }
@@ -114,7 +114,7 @@ fn qualified_if_known(m: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return known - 1;
     }
     joined(pcx.modules[m as usize].key, c"::", name, pcx);
-    find_sym(buf_slice(pcx.join_buf), pcx)
+    crate::base::find_sym_buf(pcx.join_buf, pcx)
 }
 
 // The key of item `name` of module m, if it has one, else -1 (0.11:
@@ -154,79 +154,70 @@ pub fn module_of(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // around pos (inline modules nest or are disjoint), in O(log n) rather
 // than a scan of every inline module, std's included, for each token.
 pub fn module_at(pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        if pcx.im_indexed != pcx.inline_mods.count {
-            index_inline_mods(pcx);
-        }
-        let mut lo: i64 = 0;
-        let mut hi = pcx.im_order.count;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if (*pcx.inline_mods.data.add((3 * (*pcx.im_order.data.add(mid as usize))) as usize))
-                <= pos {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        let mut p = lo - 1;
-        while p >= 0 {
-            let e = 3 * (*pcx.im_order.data.add(p as usize));
-            if pos < (*pcx.inline_mods.data.add((e + 1) as usize)) {
-                return (*pcx.inline_mods.data.add((e + 2) as usize));
-            }
-            p = (*pcx.im_parent.data.add(p as usize));
-        }
-        pcx.files[file_of(pos, pcx) as usize].module
+    if pcx.im_indexed != pcx.inline_mods.len() as i64 {
+        index_inline_mods(pcx);
     }
+    let mut lo: i64 = 0;
+    let mut hi = pcx.im_order.len() as i64;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if (pcx.inline_mods[(3 * (pcx.im_order[mid as usize])) as usize])
+            <= pos {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut p = lo - 1;
+    while p >= 0 {
+        let e = 3 * (pcx.im_order[p as usize]);
+        if pos < (pcx.inline_mods[(e + 1) as usize]) {
+            return (pcx.inline_mods[(e + 2) as usize]);
+        }
+        p = (pcx.im_parent[p as usize]);
+    }
+    pcx.files[file_of(pos, pcx) as usize].module
 }
 
 fn index_inline_mods(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let n = pcx.inline_mods.count / 3;
-        pcx.im_order.count = 0;
-        pcx.im_parent.count = 0;
-        for k in 0..n {
-            pcx.im_order.push(k);
-        }
-        // by start (an insertion sort: stable, and the table is short and
-        // already in order but for modules added out of it)
-        for a in 1..n {
-            let mut b = a;
-            while b > 0
-                && (
-                    *pcx.inline_mods.data.add(
-                        (3 * (*pcx.im_order.data.add((b - 1) as usize))) as usize))
-                > (*pcx.inline_mods.data.add((3 * (*pcx.im_order.data.add(b as usize))) as usize)) {
-                let t = (*pcx.im_order.data.add((b - 1) as usize));
-                (*pcx.im_order.data.add((b - 1) as usize)) = (*pcx.im_order.data.add(b as usize));
-                (*pcx.im_order.data.add(b as usize)) = t;
-                b -= 1;
-            }
-        }
-        // parents: the open entries on a stack
-        let mut stack = mem::replace(&mut pcx.im_stack,
-            (IntVec { data: 0 as *mut i64, count: 0, cap: 0 }));
-        stack.count = 0;
-        for p in 0..n {
-            let start = (
-                *pcx.inline_mods.data.add((3 * (*pcx.im_order.data.add(p as usize))) as usize));
-            while stack.count > 0
-                && (
-                    *pcx.inline_mods.data.add(
-                        (3 * (
-                            *pcx.im_order.data.add(
-                                (*stack.data.add((stack.count - 1) as usize)) as usize)) + 1) as usize))
-                <= start {
-                stack.count -= 1;
-            }
-            pcx.im_parent.push(if stack.count > 0 { (*stack.data.add((stack.count - 1) as usize)) }
-                else { -1 });
-            stack.push(p);
-        }
-        pcx.im_stack = stack;
-        pcx.im_indexed = pcx.inline_mods.count;
+    let n = pcx.inline_mods.len() as i64 / 3;
+    pcx.im_order.clear();
+    pcx.im_parent.clear();
+    for k in 0..n {
+        pcx.im_order.push(k);
     }
+    // by start (an insertion sort: stable, and the table is short and
+    // already in order but for modules added out of it)
+    for a in 1..n {
+        let mut b = a;
+        while b > 0
+            && (pcx.inline_mods[(3 * (pcx.im_order[(b - 1) as usize])) as usize])
+            > (pcx.inline_mods[(3 * (pcx.im_order[b as usize])) as usize]) {
+            let t = (pcx.im_order[(b - 1) as usize]);
+            (pcx.im_order[(b - 1) as usize]) = (pcx.im_order[b as usize]);
+            (pcx.im_order[b as usize]) = t;
+            b -= 1;
+        }
+    }
+    // parents: the open entries on a stack
+    let mut stack = mem::replace(&mut pcx.im_stack, Vec::new_in(Comp {}));
+    stack.clear();
+    for p in 0..n {
+        let start = (pcx.inline_mods[(3 * (pcx.im_order[p as usize])) as usize]);
+        while stack.len() as i64 > 0
+            && (
+                pcx.inline_mods[
+                    (3 * (pcx.im_order[(stack[(stack.len() as i64 - 1) as usize]) as usize]) + 1) as usize])
+            <= start {
+            stack.pop();
+        }
+        pcx.im_parent.push(if stack.len() as i64
+            > 0 { (stack[(stack.len() as i64 - 1) as usize]) }
+            else { -1 });
+        stack.push(p);
+    }
+    pcx.im_stack = stack;
+    pcx.im_indexed = pcx.inline_mods.len() as i64;
 }
 
 pub fn module_count(pcx: &Ctx<Comp>) -> i64 {
@@ -280,23 +271,14 @@ pub fn within_std(m: i64, pcx: &Ctx<Comp>) -> bool {
 // arithmetic never checks overflow (places/build.vl binary_rv): Rust's
 // wrapping_add and its kin are written there with the operators.
 pub fn std_wraps(m: i64, pcx: &Ctx<Comp>) -> bool {
-    // UNSAFE: the module table (MODULES), the symbol table (SYMS) and
-    // STD_MODULE are the compiler's raw-pointer and static globals, which
-    // only unsafe code may read.
-    // SAFETY: MODULES is read at m and its parent only when m is a module of
-    // the table (m >= 0, below the count the loader made: every function's
-    // module is one) whose parent is a module too (num's, a child of std);
-    // a module's name is the SYMS index the parser interned it at.
-    unsafe {
-        if pcx.std_module < 0 || m < 0 || m == pcx.std_module
-            || !is_within(m, pcx.std_module, pcx) {
-            return false;
-        }
-        let parent = pcx.modules[m as usize].parent;
-        parent >= 0 && pcx.modules[parent as usize].parent == pcx.std_module
-            && sym_text(pcx.modules[m as usize].name, pcx) == b"wrapping"
-            && sym_text(pcx.modules[parent as usize].name, pcx) == b"num"
+    if pcx.std_module < 0 || m < 0 || m == pcx.std_module
+        || !is_within(m, pcx.std_module, pcx) {
+        return false;
     }
+    let parent = pcx.modules[m as usize].parent;
+    parent >= 0 && pcx.modules[parent as usize].parent == pcx.std_module
+        && sym_text(pcx.modules[m as usize].name, pcx) == b"wrapping"
+        && sym_text(pcx.modules[parent as usize].name, pcx) == b"num"
 }
 
 // ---- Loading ----
@@ -314,8 +296,8 @@ pub fn load_modules(pcx: &mut Ctx<Comp>) {
     let before = pcx.toks.len() as i64;
     load_std_if_named(pcx);
     scan_modules(before, pcx);
-    // (0.27.3) std2 parsed lazily: what the program cannot reach dropped
-    crate::front::modules::std2lazy::filter_std2(pcx);
+    // (0.27.3) std parsed lazily: what the program cannot reach dropped
+    crate::front::modules::stdlazy::filter_std(pcx);
     // (0.19: std::arch's virtual modules, when the program names them)
     load_arch_modules(pcx);
     // (0.10: --check-unsafe's runtime)
@@ -359,9 +341,9 @@ pub fn load_modules(pcx: &mut Ctx<Comp>) {
 fn scan_modules(from: i64, pcx: &mut Ctx<Comp>) {
     let mut i = from;
     while i + 2 < pcx.toks.len() as i64 {
-        // RULE: Z5.2 (std2's tail before its text is lexed: its modules
-        // made after the text's, std2_inline_modules)
-        if crate::front::modules::std2lazy::deferred(i) {
+        // RULE: Z5.2 (std's tail before its text is lexed: its modules
+        // made after the text's, std_inline_modules)
+        if crate::front::modules::stdlazy::deferred(i) {
             i += 1;
             continue;
         }
@@ -387,39 +369,39 @@ fn scan_modules(from: i64, pcx: &mut Ctx<Comp>) {
     }
 }
 
-// The standard library, once: std's whole text (load_std2), whether the
+// The standard library, once: std's whole text (load_std), whether the
 // program names std or not (RULE: Z1.1).
 fn load_std_if_named(pcx: &mut Ctx<Comp>) {
     if pcx.std_module >= 0 {
         return;
     }
-    load_std2(pcx);
+    load_std(pcx);
 }
 
-// (0.27.2) std2, the rust edition's std, as the module std: its built-in
-// text (stdsrc_rust.vl), every section. RULE: Z1.1
-fn load_std2(pcx: &mut Ctx<Comp>) {
+// (0.27.2) std, the rust edition's std, as the module std: its built-in
+// text (stdsrc.vl), every section. RULE: Z1.1
+fn load_std(pcx: &mut Ctx<Comp>) {
     let text = buf_new();
-    // RULE: Z4.2 (std's files read: std2's too, as embed.sh assembles them;
+    // RULE: Z4.2 (std's files read: std's too, as embed.sh assembles them;
     // the built-in text when the tree has none, or a file is missing)
     let own = buf_new();
-    let from_tree = crate::front::stdtree::std2_tree_text(own, pcx);
+    let from_tree = crate::front::stdtree::std_tree_text(own, pcx);
     let tree = if from_tree { pcx.std_tree } else { 0 as *mut u8 };
     if from_tree {
-        buf_bytes(text, buf_slice(own));
+        buf_append(text, own);
     } else {
-        crate::front::stdsrc_rust::std2_source(text);
+        crate::front::stdsrc::std_source(text);
     }
-    let body_len = buf_slice(text).len() as i64;
+    let body_len = buf_len(text);
     // (std is checked as the built-in std is, whichever text it is)
     pcx.std_tree = 0 as *mut u8;
     // RULE: Z5.1 (what the lowerings name: std::__rt)
-    crate::front::stdalloc::std2_tail(text, tree);
+    crate::front::stdalloc::std_tail(text, tree);
     let start = add_source(c"<std>", text, pcx, 0);
     pcx.std_module = add_module(intern_c(c"std", pcx), 0, public: true, pcx: pcx);
     pcx.std_file = pcx.files.len() as i64 - 1;
     { let at_ix = pcx.std_file as usize; pcx.files[at_ix].module = pcx.std_module };
-    // (0.26.2: its lines from std2_line_marks, base/diag: the built-in
+    // (0.26.2: its lines from std_line_marks, base/diag: the built-in
     // text's)
     if !from_tree {
         pcx.std_text_file = pcx.std_file;
@@ -427,15 +409,15 @@ fn load_std2(pcx: &mut Ctx<Comp>) {
     let first = pcx.toks.len() as i64;
     let end = pcx.files[pcx.std_file as usize].end;
     // RULE: Z5.2 (0.27.5: the built-in text lexed later by the units the
-    // build reaches, std2lazy.vl: filter_std2; the tail now)
-    if crate::front::modules::std2lazy::index_ready(body_len, from_tree, pcx) {
+    // build reaches, stdlazy.vl: filter_std; the tail now)
+    if crate::front::modules::stdlazy::index_ready(body_len, from_tree, pcx) {
         lex_range(start + body_len, end, last: false, pcx: pcx);
-        crate::front::modules::std2lazy::std2_tail_lexed(first, pcx.toks.len() as i64, start, end);
+        crate::front::modules::stdlazy::std_tail_lexed(first, pcx.toks.len() as i64, start, end);
         return;
     }
     lex_range(start, end, last: false, pcx: pcx);
-    // (0.27.3: its tokens, for the lazy read, std2lazy.vl)
-    crate::front::modules::std2lazy::std2_lexed(first, pcx.toks.len() as i64);
+    // (0.27.3: its tokens, for the lazy read, stdlazy.vl)
+    crate::front::modules::stdlazy::std_lexed(first, pcx.toks.len() as i64);
 }
 
 // `mod name { ... }` at token i (0.6): a child module of the module around
@@ -472,9 +454,9 @@ fn add_inline_module(i: i64, pcx: &mut Ctx<Comp>) {
     pcx.inline_mods.push(m);
 }
 
-// RULE: Z5.2 (0.27.5) std2's inline modules, tokens first..end, once
-// std2lazy.vl has lexed the units a build keeps (scan_modules left them).
-pub fn std2_inline_modules(first: i64, end: i64, pcx: &mut Ctx<Comp>) {
+// RULE: Z5.2 (0.27.5) std's inline modules, tokens first..end, once
+// stdlazy.vl has lexed the units a build keeps (scan_modules left them).
+pub fn std_inline_modules(first: i64, end: i64, pcx: &mut Ctx<Comp>) {
     for i in first..end - 2 {
         if pcx.toks[i as usize].kind == Tok::Mod && pcx.toks[(i + 1) as usize].kind == Tok::Ident
             && pcx.toks[(i + 2) as usize].kind == Tok::LBrace {
@@ -510,8 +492,8 @@ fn load_module(f: i64, i: i64, pcx: &mut Ctx<Comp>) {
         err_begin(pcx.toks[(i + 1) as usize].start, pcx);
         err_fmt(
             format_args("module '{}' has two files, {} and {}",
-                str::from_utf8(sym_text(name, pcx)).unwrap(), str::from_utf8(cstr(path)).unwrap(),
-                str::from_utf8(cstr(pcx.module_conflict)).unwrap()), pcx);
+                str::from_utf8(sym_text(name, pcx)).unwrap(), str::from_utf8(&cstr(path)).unwrap(),
+                str::from_utf8(&cstr(pcx.module_conflict)).unwrap()), pcx);
         err_help(
             c"a module is one file: delete or rename one of them (`.vl` is the extension from 0.24)", pcx);
         err_end_soft(pcx);
@@ -530,52 +512,45 @@ fn load_module(f: i64, i: i64, pcx: &mut Ctx<Comp>) {
 // `mod` line goes there, f imports it through `crate::`); else where the
 // compiler looked, and the command that makes the file.
 fn missing_module_help(f: i64, name: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        // (0.21: the file f's own extension, `.vl` or `.vl`)
-        let ext = if crate::base::source_ext_len(
-            std::slice::from_raw_parts(pcx.files[f as usize].path.add((0) as usize),
-                (strlen(pcx.files[f as usize].path) as i64 - (0)) as usize))
-            == 3 {
-            c".vl"
-        } else {
-            c".vl"
-        };
-        let flat = module_candidate(f, name, nested: false, ext: ext, pcx: pcx);
-        let shown = if (*flat.add(0)) == b'.' && (*flat.add(1)) == b'/' { flat.add(2) }
-            else { flat };
-        if pcx.files[f as usize].module > 0 && pcx.files[f as usize].module != pcx.std_module
-            && !is_mod_file(path_base(pcx.files[f as usize].path)) {
-            let side = buf_new();
-            buf_fmt(side,
-                format_args("{}/{}{}",
-                    str::from_utf8(cstr(path_dir(pcx.files[f as usize].path))).unwrap(),
-                    str::from_utf8(sym_text(name, pcx)).unwrap(),
-                    str::from_utf8(cstr(ext)).unwrap()));
-            buf_byte(side, 0);
-            let sp = (*get_bufs().add(side as usize)).data;
-            if file_exists(sp, pcx) {
-                let mut r: i64 = 0;
-                while r < pcx.files.len() as i64 && (*pcx.files[r as usize].path.add(0)) == b'<' {
-                    r += 1;
-                }
-                let root = if r < pcx.files.len() as i64 { pcx.files[r as usize].path }
-                    else { c"main.vl" };
-                err_help_fmt(
-                    format_args("{} is a module of the root: its `mod {};` goes in {}, and this file imports it as `use crate::{}::...;`", str::from_utf8(cstr(if (*sp.add(0)) == b'.' && (*sp.add(1)) == b'/' { sp.add(2) } else { sp })).unwrap(), str::from_utf8(sym_text(name, pcx)).unwrap(), str::from_utf8(cstr(path_base(root))).unwrap(), str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
-                return;
+    // (0.21: the file f's own extension, `.vl` or `.vl`)
+    let ext = if crate::base::source_ext_len(&cstr(pcx.files[f as usize].path)) == 3 {
+        c".vl"
+    } else {
+        c".vl"
+    };
+    let flat = module_candidate(f, name, nested: false, ext: ext, pcx: pcx);
+    let shown = c_plain_path(flat);
+    if pcx.files[f as usize].module > 0 && pcx.files[f as usize].module != pcx.std_module
+        && !is_mod_file(path_base(pcx.files[f as usize].path)) {
+        let side = buf_new();
+        buf_fmt(side,
+            format_args("{}/{}{}",
+                str::from_utf8(&cstr(path_dir(pcx.files[f as usize].path))).unwrap(),
+                str::from_utf8(sym_text(name, pcx)).unwrap(),
+                str::from_utf8(&cstr(ext)).unwrap()));
+        buf_byte(side, 0);
+        let sp = buf_ptr(side);
+        if file_exists(sp, pcx) {
+            let mut r: i64 = 0;
+            while r < pcx.files.len() as i64 && file_made(r, pcx) {
+                r += 1;
             }
+            let root = if r < pcx.files.len() as i64 { pcx.files[r as usize].path }
+                else { c"main.vl" };
+            err_help_fmt(
+                format_args("{} is a module of the root: its `mod {};` goes in {}, and this file imports it as `use crate::{}::...;`", str::from_utf8(&cstr(c_plain_path(sp))).unwrap(), str::from_utf8(sym_text(name, pcx)).unwrap(), str::from_utf8(&cstr(path_base(root))).unwrap(), str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+            return;
         }
-        err_help(c"looked for ", pcx);
-        err_help(shown, pcx);
-        err_help(c" and ", pcx);
-        let nested = module_candidate(f, name, nested: true, ext: ext, pcx: pcx);
-        err_help(if (*nested.add(0)) == b'.' && (*nested.add(1)) == b'/' { nested.add(2) }
-            else { nested }, pcx);
-        err_help(c": write the file (`edit new-file` takes its text on stdin)", pcx);
-        let args = buf_new();
-        buf_fmt(args, format_args("edit new-file {}", str::from_utf8(cstr(shown)).unwrap()));
-        err_try_tool(buf_slice(args), true, pcx);
     }
+    err_help(c"looked for ", pcx);
+    err_help(shown, pcx);
+    err_help(c" and ", pcx);
+    let nested = module_candidate(f, name, nested: true, ext: ext, pcx: pcx);
+    err_help(c_plain_path(nested), pcx);
+    err_help(c": write the file (`edit new-file` takes its text on stdin)", pcx);
+    let args = buf_new();
+    buf_fmt(args, format_args("edit new-file {}", str::from_utf8(&cstr(shown)).unwrap()));
+    err_try_tool(&buf_copy(args), true, pcx);
 }
 
 // (0.25.2.2, eval 0.25.2.1: qwen35, deferred) The help of `unknown module
@@ -603,14 +578,15 @@ pub fn beside_root_help(root: &[u8], name: &[u8], pcx: &Ctx<Comp>) -> bool {
         if dir.len() > 2 && dir[0] == b'.' && dir[1] == b'/' { &dir[2..dir.len()] }
         else { dir });
     buf_str(main, c"main.vl");
-    let shown = buf_slice(main);
+    let shown = buf_copy(main);
     let stem = if base.len() > 3 { &base[0..(base.len() as i64 - 3) as usize] } else { base };
     if base != b"main.vl" && file_exists(crate::tools::proc::buf_cstr(main), pcx) {
         err_help_fmt(
-            { let base = str::from_utf8(base).unwrap(); { let stem = str::from_utf8(stem).unwrap(); { let shown = str::from_utf8(shown).unwrap(); { let name = str::from_utf8(name).unwrap(); format_args("{base} was checked as a program of its own (no `mod {stem};` in {shown} names it), so {name}.vl beside it is not its module: a module is checked through its program's root, once the root has `mod {stem};`") } } } }, pcx);
+            { let base = str::from_utf8(base).unwrap(); { let stem = str::from_utf8(stem).unwrap(); { let shown = str::from_utf8(&shown).unwrap(); { let name = str::from_utf8(name).unwrap(); format_args("{base} was checked as a program of its own (no `mod {stem};` in {shown} names it), so {name}.vl beside it is not its module: a module is checked through its program's root, once the root has `mod {stem};`") } } } }, pcx);
         let args = buf_new();
-        buf_fmt(args, { let shown = str::from_utf8(shown).unwrap(); format_args("check {shown}") });
-        err_try_tool(buf_slice(args), false, pcx);
+        buf_fmt(args,
+            { let shown = str::from_utf8(&shown).unwrap(); format_args("check {shown}") });
+        err_try_tool(&buf_copy(args), false, pcx);
     } else {
         err_help_fmt(
             { let name = str::from_utf8(name).unwrap(); { let base = str::from_utf8(base).unwrap(); format_args("{name}.vl is beside {base} but not a module of the program: `mod {name};` in {base} makes it one") } }, pcx);
@@ -623,33 +599,27 @@ pub fn beside_root_help(root: &[u8], name: &[u8], pcx: &Ctx<Comp>) -> bool {
 // is std::NAME) or a `mod.vl`, else in the directory named after the file
 // (`a.vl`: `a/`); as `name.vl`, or `name/mod.vl` when `nested`.
 // (0.21) ext is the extension, `.vl` or `.vl`: `a.vl`, `mod.vl` likewise.
-fn module_candidate(f: i64, name: i64, nested: bool, ext: *mut u8, pcx: &Ctx<Comp>) -> *mut u8 {
-    unsafe {
-        let path = pcx.files[f as usize].path;
-        let out = buf_new();
-        buf_fmt(out, format_args("{}/", str::from_utf8(cstr(path_dir(path))).unwrap()));
-        let base = path_base(path);
-        if pcx.files[f as usize].module > 0 && pcx.files[f as usize].module != pcx.std_module
-            && !is_mod_file(base) {
-            let n = strlen(base) as i64;
-            let stem = n - crate::base::source_ext_len(
-                std::slice::from_raw_parts(base.add((0) as usize), (n - (0)) as usize));
-            buf_fmt(out,
-                format_args("{}/",
-                    str::from_utf8(std::slice::from_raw_parts(base.add((0) as usize),
-                        (stem - (0)) as usize)).unwrap()));
-        }
-        buf_bytes(out, sym_text(name, pcx));
-        buf_str(out, if nested { c"/mod" } else { c"" });
-        buf_str(out, ext);
-        buf_byte(out, 0);
-        (*get_bufs().add(out as usize)).data
+fn module_candidate(f: i64, name: i64, nested: bool, ext: *const u8, pcx: &Ctx<Comp>) -> *mut u8 {
+    let path = pcx.files[f as usize].path;
+    let out = buf_new();
+    buf_fmt(out, format_args("{}/", str::from_utf8(&cstr(path_dir(path))).unwrap()));
+    let base = path_base(path);
+    if pcx.files[f as usize].module > 0 && pcx.files[f as usize].module != pcx.std_module
+        && !is_mod_file(base) {
+        let name = cstr(base);
+        let stem = name.len() - crate::base::source_ext_len(&name) as usize;
+        buf_fmt(out, format_args("{}/", str::from_utf8(&name[..stem]).unwrap()));
     }
+    buf_bytes(out, sym_text(name, pcx));
+    buf_str(out, if nested { c"/mod" } else { c"" });
+    buf_str(out, ext);
+    buf_byte(out, 0);
+    buf_ptr(out)
 }
 
 // (0.21) Whether a file's base name is a module's folder file, `mod.vl`
 // or `mod.vl`.
-fn is_mod_file(base: *mut u8) -> bool {
+fn is_mod_file(base: *const u8) -> bool {
     streq(base, c"mod.vl") || streq(base, c"mod.vl")
 }
 
@@ -689,15 +659,21 @@ fn module_file(f: i64, name: i64, pcx: &mut Ctx<Comp>) -> *mut u8 {
     0 as *mut u8
 }
 
-fn path_base(path: *mut u8) -> *mut u8 {
-    unsafe {
-        let n = strlen(path) as i64;
-        let mut i = n - 1;
-        while i >= 0 && (*path.add(i as usize)) != b'/' {
-            i -= 1;
-        }
-        path.add((i + 1) as usize)
-    }
+// (0.29) The path of file f as bytes: read as a slice, not by offsets
+// from the C string (which read past a short path's NUL).
+pub fn file_path(f: i64, pcx: &Ctx<Comp>) -> &[u8] {
+    // UNSAFE: a file's path is kept as a C string (FileInfo.path)
+    // SAFETY: the path is made when the file is added (load_sources,
+    // add_source, the tools' cache's read buffer, which is frozen) and
+    // is never written or freed after; the slice borrows pcx, whose
+    // files it is read from, so it cannot outlive them
+    unsafe { c_bytes(pcx.files[f as usize].path) }
+}
+
+// Whether file f is a source the compiler made (`<std>`, `<derive>`,
+// `<test>`, a virtual module): its path starts with `<`.
+pub fn file_made(f: i64, pcx: &Ctx<Comp>) -> bool {
+    file_path(f, pcx).starts_with(b"<")
 }
 
 pub fn file_of_pos(pos: i64, pcx: &Ctx<Comp>) -> i64 {

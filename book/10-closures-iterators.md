@@ -525,7 +525,7 @@ fn main(gpa: Gpa) {
     let failed = reqs.iter().filter(|r| r.status >= 400).count();
     println("{} requests, {failed} failed, {ok_bytes} bytes served", reqs.len());
 
-    let mut by_status: HashMap<i64, i64, Gpa> = HashMap::new_in(gpa);
+    let mut by_status: HashMap<i64, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     reqs.iter().for_each(|r| {
         *by_status.entry(r.status).or_insert(0) += 1;
     });

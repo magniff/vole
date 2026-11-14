@@ -16,18 +16,19 @@
 use std::alloc::Arena;
 
 use crate::base::{
-    IntVec, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, get_src, streq,
+    buf_append, buf_byte, buf_bytes, buf_copy, buf_done, buf_int, buf_new, buf_str, get_src, streq,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, EV_WORD, Leaf, flag, is_flag, is_opt, option, table};
 use crate::front::embed::wgsl::WgslCx;
-use crate::tools::ctx::Tcx;
+use crate::front::modules::file_made;
+use crate::tools::ctx::{Tcx, falses};
 use crate::tools::edit::gone_path;
 use crate::tools::edit::apply::{cannot_write, copy_path, error_lines, not_generated};
 use crate::tools::edit::diff::diff_texts;
 use crate::tools::proc::{
-    buf_cstr, read_file_if, remove_file, run_capture, same_bytes, write_file_if,
+    buf_cstr, exec_words, read_file_if, remove_file, run_capture, same_bytes, write_file_if,
 };
 use crate::tools::query::c_slice;
 use crate::tools::query::command_line::load_program;
@@ -41,7 +42,7 @@ use crate::tools::textual::{
 };
 use crate::tools::textual::places::{match_in, read_lines, read_places};
 
-fn usage(message: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+fn usage(message: *const u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     let d = diag(c"error", c"rewrite.usage", tcx);
     buf_str(d, message);
     buf_byte(d, b'\n');
@@ -58,211 +59,197 @@ fn usage(message: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
 // the matches not taken (kept lines, other places); `kept` the lines kept.
 pub fn rewrite_text(p: &[u8], t: &[u8], old: &[u8], new: &[u8], after: &mut i64, left: &mut i64,
     kept: &mut i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut starts = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut ends = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        find_matches(t, 0, t.len() as i64, old, &mut starts, &mut ends, tcx);
-        if starts.count == 0 {
-            return 0;
-        }
-        let mut keep = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        *kept = kept_ranges(p, t, &mut keep, tcx);
-        let source = crate::base::source_ext_len(p) > 0;
-        let mut placed = tcx.t_places != 0 && source && read_places(t, tcx, pcx);
-        if tcx.t_places != 0 && source && !placed {
-            // (it does not lex: its `//` lines are its comments)
-            read_lines(t, tcx);
-            placed = true;
-        }
-        let out = buf_new();
-        let mut at: i64 = 0;
-        let mut n: i64 = 0;
-        let mut r: i64 = 0;
-        for k in 0..starts.count {
-            let s = (*starts.data.add(k as usize));
-            let e = (*ends.data.add(k as usize));
-            while r < keep.count && (*keep.data.add((r + 1) as usize)) <= s {
-                r += 2;
-            }
-            let in_kept = r < keep.count && (*keep.data.add(r as usize)) < e;
-            let in_place = tcx.t_places == 0 || (placed && match_in(t, s, e, tcx.t_places, tcx));
-            if in_kept || !in_place {
-                *left += 1;
-                continue;
-            }
-            buf_bytes(out, &t[at as usize..s as usize]);
-            put_replacement(out, new, &t[s as usize..e as usize], tcx);
-            at = e;
-            n += 1;
-        }
-        buf_bytes(out, &t[at as usize..]);
-        *after = out;
-        n
+    let mut starts: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut ends: Vec<i64, Comp> = Vec::new_in(Comp {});
+    find_matches(t, 0, t.len() as i64, old, &mut starts, &mut ends, tcx);
+    if starts.len() as i64 == 0 {
+        return 0;
     }
+    let mut keep: Vec<i64, Comp> = Vec::new_in(Comp {});
+    *kept = kept_ranges(p, t, &mut keep, tcx);
+    let source = crate::base::source_ext_len(p) > 0;
+    let mut placed = tcx.t_places != 0 && source && read_places(t, tcx, pcx);
+    if tcx.t_places != 0 && source && !placed {
+        // (it does not lex: its `//` lines are its comments)
+        read_lines(t, tcx);
+        placed = true;
+    }
+    let out = buf_new();
+    let mut at: i64 = 0;
+    let mut n: i64 = 0;
+    let mut r: i64 = 0;
+    for k in 0..starts.len() as i64 {
+        let s = (starts[k as usize]);
+        let e = (ends[k as usize]);
+        while r < keep.len() as i64 && (keep[(r + 1) as usize]) <= s {
+            r += 2;
+        }
+        let in_kept = r < keep.len() as i64 && (keep[r as usize]) < e;
+        let in_place = tcx.t_places == 0 || (placed && match_in(t, s, e, tcx.t_places, tcx));
+        if in_kept || !in_place {
+            *left += 1;
+            continue;
+        }
+        buf_bytes(out, &t[at as usize..s as usize]);
+        put_replacement(out, new, &t[s as usize..e as usize], tcx);
+        at = e;
+        n += 1;
+    }
+    buf_bytes(out, &t[at as usize..]);
+    *after = out;
+    n
 }
 
 // The path p with OLD replaced (--move-paths), or an empty slice when it
 // has none.
 fn moved_path<'a>(p: &'a [u8], old: &'a [u8], new: &'a [u8], tcx: &mut Tcx<Comp>) -> &'a [u8] {
-    unsafe {
-        let mut starts = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut ends = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        find_matches(p, 0, p.len() as i64, old, &mut starts, &mut ends, tcx);
-        if starts.count == 0 {
-            return &p[0..0];
-        }
-        let out = buf_new();
-        let mut at: i64 = 0;
-        for k in 0..starts.count {
-            buf_bytes(out, &p[at as usize..(*starts.data.add(k as usize)) as usize]);
-            put_replacement(out, new,
-                &p[(*starts.data.add(k as usize)) as usize..(*ends.data.add(k as usize)) as usize],
-                tcx);
-            at = (*ends.data.add(k as usize));
-        }
-        buf_bytes(out, &p[at as usize..]);
-        buf_slice(out)
+    let mut starts: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut ends: Vec<i64, Comp> = Vec::new_in(Comp {});
+    find_matches(p, 0, p.len() as i64, old, &mut starts, &mut ends, tcx);
+    if starts.len() as i64 == 0 {
+        return &p[0..0];
     }
+    let out = buf_new();
+    let mut at: i64 = 0;
+    for k in 0..starts.len() as i64 {
+        buf_bytes(out, &p[at as usize..(starts[k as usize]) as usize]);
+        put_replacement(out, new,
+            &p[(starts[k as usize]) as usize..(ends[k as usize]) as usize],
+            tcx);
+        at = (ends[k as usize]);
+    }
+    buf_bytes(out, &p[at as usize..]);
+    buf_done(out)
 }
 
 // `PROG check --diagnostics=short [--overlay FILE COPY]... ROOT`, the
 // edit's texts read in place of the files when `edited`: its output into
 // out; its status.
 pub fn check_root(root: *mut u8, edited: bool, out: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut args = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        args.push(pcx.prog as i64);
-        args.push(c"check" as i64);
-        args.push(c"--diagnostics=short" as i64);
-        if edited {
-            for k in 0..tcx.w_path.count {
-                let p = (*tcx.w_path.data.add(k as usize)) as *mut u8;
-                let copy_path_v = copy_path(original_path(p, tcx), pcx);
-                overlay(&mut args, p, copy_path_v);
-            }
-            for k in 0..tcx.m_from.count {
-                let a = (*tcx.m_from.data.add(k as usize)) as *mut u8;
-                overlay(&mut args, a, gone_path(a));
-                if !changed((*tcx.m_to.data.add(k as usize)) as *mut u8, tcx) {
-                    overlay(&mut args, (*tcx.m_to.data.add(k as usize)) as *mut u8, a);
-                }
+    let mut args: Vec<i64, Comp> = Vec::new_in(Comp {});
+    args.push(pcx.prog as i64);
+    args.push(c"check" as i64);
+    args.push(c"--diagnostics=short" as i64);
+    if edited {
+        for k in 0..tcx.w_path.len() as i64 {
+            let p = (tcx.w_path[k as usize]) as *mut u8;
+            let copy_path_v = copy_path(original_path(p, tcx), pcx);
+            overlay(&mut args, p, copy_path_v);
+        }
+        for k in 0..tcx.m_from.len() as i64 {
+            let a = (tcx.m_from[k as usize]) as *mut u8;
+            overlay(&mut args, a, gone_path(a));
+            if !changed((tcx.m_to[k as usize]) as *mut u8, tcx) {
+                overlay(&mut args, (tcx.m_to[k as usize]) as *mut u8, a);
             }
         }
-        args.push(root as i64);
-        args.push(0);
-        run_capture(args.data as *mut *mut u8, out)
     }
+    args.push(root as i64);
+    args.push(0);
+    run_capture(exec_words(args.as_slice()).as_slice(), out)
 }
 
 // `--overlay P COPY`, and `--overlay ./P COPY` (a module next to the root
 // is `./P` to the compiler).
-fn overlay(args: &mut IntVec, p: *mut u8, copy: *mut u8) {
-    unsafe {
+fn overlay(args: &mut Vec<i64, Comp>, p: *mut u8, copy: *mut u8) {
+    args.push(c"--overlay" as i64);
+    args.push(p as i64);
+    args.push(copy as i64);
+    if !crate::base::c_starts(p, b"/") && !crate::base::c_starts(p, b".") {
+        let b = buf_new();
+        buf_str(b, c"./");
+        buf_str(b, p);
         args.push(c"--overlay" as i64);
-        args.push(p as i64);
+        args.push(buf_cstr(b) as i64);
         args.push(copy as i64);
-        if (*p.add(0)) != b'/' && (*p.add(0)) != b'.' {
-            let b = buf_new();
-            buf_str(b, c"./");
-            buf_str(b, p);
-            args.push(c"--overlay" as i64);
-            args.push(buf_cstr(b) as i64);
-            args.push(copy as i64);
-        }
     }
 }
 
 // The path file p (as it is after the moves) has now.
 fn original_path(p: *mut u8, tcx: &Tcx<Comp>) -> *mut u8 {
-    unsafe {
-        for k in 0..tcx.m_to.count {
-            if streq((*tcx.m_to.data.add(k as usize)) as *mut u8, p) {
-                return (*tcx.m_from.data.add(k as usize)) as *mut u8;
-            }
+    for k in 0..tcx.m_to.len() as i64 {
+        if streq((tcx.m_to[k as usize]) as *mut u8, p) {
+            return (tcx.m_from[k as usize]) as *mut u8;
         }
-        p
     }
+    p
 }
 
 fn changed(p: *mut u8, tcx: &Tcx<Comp>) -> bool {
-    unsafe {
-        for k in 0..tcx.w_path.count {
-            if streq((*tcx.w_path.data.add(k as usize)) as *mut u8, p) {
-                return true;
-            }
+    for k in 0..tcx.w_path.len() as i64 {
+        if streq((tcx.w_path[k as usize]) as *mut u8, p) {
+            return true;
         }
-        false
     }
+    false
 }
 
 // The --check of each root: the new errors' lines into `added`; false when
 // a check could not run.
-pub fn check_roots(roots: IntVec, added: &mut IntVec, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        for k in 0..tcx.w_path.count {
-            let orig = original_path((*tcx.w_path.data.add(k as usize)) as *mut u8, tcx);
-            write_file_if(copy_path(orig, pcx), buf_slice((*tcx.w_after.data.add(k as usize))));
-        }
-        let mut ran = true;
-        for r in 0..roots.count {
-            let root = (*roots.data.add(r as usize)) as *mut u8;
-            let before = buf_new();
-            let after = buf_new();
-            let s1 = check_root(root, false, before, tcx, pcx);
-            let s2 = check_root(root, true, after, tcx, pcx);
-            if (s1 != 0 && s1 != 1) || (s2 != 0 && s2 != 1) {
-                ran = false;
-                continue;
-            }
-            let mut old = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            let mut now = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            error_lines(buf_slice(before), &mut old);
-            error_lines(buf_slice(after), &mut now);
-            let used = crate::base::alloc_array::<bool>(old.count / 2 + 1);
-            for j in 0..old.count / 2 + 1 {
-                (*used.add(j as usize)) = false;
-            }
-            let mut i: i64 = 0;
-            while i < now.count {
-                let mut found = false;
-                let mut j: i64 = 0;
-                while j < old.count {
-                    if !(*used.add((j / 2) as usize))
-                        && same_bytes(buf_slice((*old.data.add(j as usize))),
-                            buf_slice((*now.data.add(i as usize)))) {
-                        (*used.add((j / 2) as usize)) = true;
-                        found = true;
-                        break;
-                    }
-                    j += 2;
-                }
-                if !found {
-                    added.push((*now.data.add((i + 1) as usize)));
-                }
-                i += 2;
-            }
-        }
-        for k in 0..tcx.w_path.count {
-            remove_file(copy_path(original_path((*tcx.w_path.data.add(k as usize)) as *mut u8, tcx),
-                pcx));
-        }
-        ran
+pub fn check_roots(roots: &[i64], added: &mut Vec<i64, Comp>, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
+    for k in 0..tcx.w_path.len() as i64 {
+        let orig = original_path((tcx.w_path[k as usize]) as *mut u8, tcx);
+        write_file_if(copy_path(orig, pcx), &buf_copy((tcx.w_after[k as usize])));
     }
+    let mut ran = true;
+    for r in 0..roots.len() as i64 {
+        let root = (roots[r as usize]) as *mut u8;
+        let before = buf_new();
+        let after = buf_new();
+        let s1 = check_root(root, false, before, tcx, pcx);
+        let s2 = check_root(root, true, after, tcx, pcx);
+        if (s1 != 0 && s1 != 1) || (s2 != 0 && s2 != 1) {
+            ran = false;
+            continue;
+        }
+        let mut old: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut now: Vec<i64, Comp> = Vec::new_in(Comp {});
+        error_lines(&buf_copy(before), &mut old);
+        error_lines(&buf_copy(after), &mut now);
+        let mut used = falses(old.len() as i64 / 2 + 1);
+        for j in 0..old.len() as i64 / 2 + 1 {
+            (used[j as usize]) = false;
+        }
+        let mut i: i64 = 0;
+        while i < now.len() as i64 {
+            let mut found = false;
+            let mut j: i64 = 0;
+            while j < old.len() as i64 {
+                if !(used[(j / 2) as usize])
+                    && same_bytes(&buf_copy((old[j as usize])),
+                        &buf_copy((now[i as usize]))) {
+                    (used[(j / 2) as usize]) = true;
+                    found = true;
+                    break;
+                }
+                j += 2;
+            }
+            if !found {
+                added.push((now[(i + 1) as usize]));
+            }
+            i += 2;
+        }
+    }
+    for k in 0..tcx.w_path.len() as i64 {
+        remove_file(copy_path(original_path((tcx.w_path[k as usize]) as *mut u8, tcx),
+            pcx));
+    }
+    ran
 }
 
 // (0.25.5) A step of `refactor --script` (script.vl): the rewritten texts
 // written as the files' copies, unchecked, and listed in the step's report
 // (`file PATH`); then the lines and the totals. The exit status.
 fn step_write(out: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    for k in 0..tcx.w_path.count {
-        if !not_generated(c_slice(w_path(k, tcx)), buf_slice(tcx.w_before.get(k)), tcx, pcx) {
+    for k in 0..tcx.w_path.len() as i64 {
+        if !not_generated(&c_slice(w_path(k, tcx)), &buf_copy(tcx.w_before[k as usize]), tcx, pcx) {
             return 1;
         }
     }
     let report = buf_new();
-    for k in 0..tcx.w_path.count {
+    for k in 0..tcx.w_path.len() as i64 {
         let p = w_path(k, tcx);
-        if !write_file_if(copy_path(p, pcx), buf_slice(tcx.w_after.get(k))) {
+        if !write_file_if(copy_path(p, pcx), &buf_copy(tcx.w_after[k as usize])) {
             cannot_write(p, tcx);
             return 1;
         }
@@ -270,7 +257,7 @@ fn step_write(out: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
         buf_str(report, p);
         buf_byte(report, b'\n');
     }
-    if !write_file_if(tcx.step_report, buf_slice(report)) {
+    if !write_file_if(tcx.step_report, &buf_copy(report)) {
         cannot_write(tcx.step_report, tcx);
         return 1;
     }
@@ -280,9 +267,7 @@ fn step_write(out: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
 
 // The path of rewritten file k (W_PATH keeps C strings as integers).
 fn w_path(k: i64, tcx: &Tcx<Comp>) -> *mut u8 {
-    // UNSAFE: W_PATH keeps C strings as integers; one made a pointer again is a cast.
-    // SAFETY: each entry is a path the rewrite made (FILES' or buf_cstr's), never freed; k < W_PATH.count.
-    unsafe { tcx.w_path.get(k) as *mut u8 }
+    tcx.w_path[k as usize] as *mut u8
 }
 
 pub fn run_text_rewrite(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
@@ -320,13 +305,13 @@ pub fn text_rewrite_leaf(gpa: Gpa) -> Leaf<'static, Gpa> {
 fn run_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
     pcx.prog = c.prog();
-    let mut words = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-    let mut globs = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-    let mut roots = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut globs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut roots: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut move_paths = false;
     let mut no_sources = false;
     let mut show_diff = false;
-    let mut step_root = 0 as *mut u8;
+    let mut step_root = 0 as *const u8;
     for ev in c.evs.iter().copied() {
         let a = ev.value;
         if is_flag(ev, "text") {
@@ -355,7 +340,7 @@ fn run_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         } else if is_opt(ev, "check") {
             roots.push(a as i64);
         } else if is_opt(ev, "exclude") {
-            if !add_exclusion(c_slice(a), tcx) {
+            if !add_exclusion(&c_slice(a), tcx) {
                 return 2;
             }
         } else if is_opt(ev, "exclude-from") {
@@ -378,253 +363,252 @@ fn run_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
             words.push(a as i64);
         }
     }
-    unsafe {
-        if words.count != 2 {
-            return usage(c"--text takes OLD and NEW", tcx, pcx);
-        }
-        let old = c_slice((*words.data.add(0)) as *mut u8);
-        let new = c_slice((*words.data.add(1)) as *mut u8);
-        if old.len() == 0 {
-            return usage(c"OLD is empty", tcx, pcx);
-        }
-        if tcx.t_regex && tcx.t_case {
-            return usage(c"--case is for a literal OLD, not with --regex", tcx, pcx);
-        }
-        if tcx.t_regex && !crate::tools::rewrite::regex::re_valid(old) {
-            return usage(c"OLD is no regular expression (^ $ . * + ? [a-z] \\d \\w)", tcx, pcx);
-        }
-        let mut files = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        // (0.25.5, feedbacks/mod254.md #3) A step of `refactor --script`:
-        // the program's files, as the steps before left them (their copies,
-        // read in place of the files), rewritten as copies too, checked
-        // with the others at the script's end
-        let step = tcx.step_report != 0 as *mut u8;
-        let mut file_index = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        if step_root != 0 as *mut u8 && !step {
-            return usage(
-                c"--root is for a step of refactor --script; --text rewrites the files git tracks", tcx, pcx);
-        }
-        if step && (move_paths || roots.count > 0) {
-            return usage(c"in a refactor --script, --text rewrites the program's files: no --move-paths, no --check (the script checks)", tcx, pcx);
-        }
-        if step {
-            if step_root == 0 as *mut u8 || !load_program(step_root, tcx.target, tcx, pcx, wgx) {
-                program_errors(c"error", step_root, true, tcx, pcx);
-                return 1;
-            }
-            for g in 0..pcx.files.len() as i64 {
-                if (*pcx.files[g as usize].path.add(0)) != b'<' {
-                    files.push(pcx.files[g as usize].path as i64);
-                    file_index.push(g);
-                }
-            }
-        } else if !tracked_files(&mut files) {
-            let d = diag(c"error", c"rewrite.no-git", tcx);
-            buf_str(d, c"--text edits the files git tracks: this is no git checkout\n");
-            return 2;
-        }
-        let out = buf_new();
-        let diff = buf_new();
-        let mut total: i64 = 0;
-        let mut changed_files: i64 = 0;
-        let mut left_excluded: i64 = 0;
-        let mut excluded_files: i64 = 0;
-        let mut left_kept: i64 = 0;
-        let mut kept_files: i64 = 0;
-        let mut not_lexed: i64 = 0;
-        let unlexed = buf_new();
-        for f in 0..files.count {
-            let path = (*files.data.add(f as usize)) as *mut u8;
-            let p = c_slice(path);
-            if globs.count > 0 {
-                let mut picked = false;
-                for g in 0..globs.count {
-                    if glob_match(c_slice((*globs.data.add(g as usize)) as *mut u8), p) {
-                        picked = true;
-                    }
-                }
-                if !picked {
-                    continue;
-                }
-            }
-            let source = crate::base::source_ext_len(p) > 0;
-            if (tcx.t_places != 0 && !source) || (no_sources && source) {
-                continue;
-            }
-            let text = buf_new();
-            if step {
-                let g = (*file_index.data.add(f as usize));
-                buf_bytes(text,
-                    &get_src()[
-                        pcx.files[g as usize].start as usize..pcx.files[g as usize].end as usize]);
-            }
-            // (0.24: a link is its target's text: never written through)
-            else if crate::tools::proc::link_target(path) >= 0 || !read_file_if(path, text)
-                || !is_text(buf_slice(text)) {
-                continue;
-            }
-            let t = buf_slice(text);
-            if excluded(p, tcx) {
-                let mut s = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-                let mut e = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-                find_matches(t, 0, t.len() as i64, old, &mut s, &mut e, tcx);
-                if s.count > 0 {
-                    left_excluded += s.count;
-                    excluded_files += 1;
-                }
-                continue;
-            }
-            // (a file without a match: nothing to read further, unless it moves)
-            let mut ms = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            let mut me = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            find_matches(t, 0, t.len() as i64, old, &mut ms, &mut me, tcx);
-            if ms.count == 0 && !move_paths {
-                continue;
-            }
-            if ms.count > 0 && tcx.t_places != 0 && !read_places(t, tcx, pcx) {
-                if not_lexed < 3 {
-                    buf_str(unlexed, if not_lexed == 0 { c" (" } else { c", " });
-                    buf_bytes(unlexed, p);
-                }
-                not_lexed += 1;
-            }
-            let mut after: i64 = -1;
-            let mut left: i64 = 0;
-            let mut kept: i64 = 0;
-            let n = rewrite_text(p, t, old, new, &mut after, &mut left, &mut kept, tcx, pcx);
-            if left > 0 {
-                left_kept += left;
-                kept_files += 1;
-            }
-            let to = if move_paths { moved_path(p, old, new, tcx) } else { &p[0..0] };
-            if n == 0 && to.len() == 0 {
-                continue;
-            }
-            let mut final_path = path;
-            if to.len() > 0 {
-                let b = buf_new();
-                buf_bytes(b, to);
-                final_path = buf_cstr(b);
-                tcx.m_from.push(path as i64);
-                tcx.m_to.push(final_path as i64);
-            }
-            if n > 0 {
-                tcx.w_path.push(final_path as i64);
-                tcx.w_before.push(text);
-                tcx.w_after.push(after);
-                if show_diff {
-                    diff_texts(diff, c_slice(final_path), t, buf_slice(after), tcx);
-                }
-            }
-            put_file_line(out, c_slice(final_path), if to.len() > 0 { p } else { &p[0..0] }, n,
-                kept);
-            total += n;
-            changed_files += 1;
-        }
-        // The totals.
-        buf_str(out, if tcx.dry_run { c"would rewrite " } else { c"rewrote " });
-        buf_int(out, total);
-        buf_str(out, if total == 1 { c" match in " } else { c" matches in " });
-        buf_int(out, changed_files);
-        buf_str(out, if changed_files == 1 { c" file" } else { c" files" });
-        if tcx.m_from.count > 0 {
-            buf_str(out, c", ");
-            buf_int(out, tcx.m_from.count);
-            buf_str(out, c" moved");
-        }
-        buf_byte(out, b'\n');
-        if show_diff {
-            buf_bytes(out, buf_slice(diff));
-        }
-        // What is left, and why.
-        if left_excluded > 0 {
-            let d = diag(c"note", c"rewrite.excluded", tcx);
-            buf_int(d, left_excluded);
-            buf_str(d, if left_excluded == 1 { c" match left in " } else { c" matches left in " });
-            buf_int(d, excluded_files);
-            buf_str(d,
-                if excluded_files == 1 { c" excluded file\n" } else { c" excluded files\n" });
-        }
-        if left_kept > 0 {
-            let d = diag(c"note", c"rewrite.kept", tcx);
-            buf_int(d, left_kept);
-            buf_str(d, if left_kept == 1 { c" match left in " } else { c" matches left in " });
-            buf_int(d, kept_files);
-            buf_str(d, if kept_files == 1 { c" file" } else { c" files" });
-            buf_str(d, c": in kept lines (the exclusions), or in other places than --comments, --strings, --code ask\n");
-        }
-        if not_lexed > 0 {
-            let d = diag(c"warning", c"rewrite.not-lexed", tcx);
-            buf_int(d, not_lexed);
-            buf_str(d,
-                if not_lexed == 1 { c" vole source with a match does" }
-                else { c" vole sources with a match do" });
-            buf_str(d,
-                c" not lex: read by lines, only the lines that start with `//` are comments");
-            buf_bytes(d, buf_slice(unlexed));
-            buf_str(d, if not_lexed > 3 { c", ...)\n" } else { c")\n" });
-        }
-        if tcx.mixed_case > 0 {
-            let d = diag(c"note", c"rewrite.mixed-case", tcx);
-            buf_int(d, tcx.mixed_case);
-            buf_str(d, c" matches in a mixed case took NEW as it is\n");
-        }
-        if total == 0 && tcx.m_from.count == 0 {
-            flush(out);
-            return 0;
-        }
-        if step {
-            return step_write(out, tcx, pcx);
-        }
-        // The check, then the edit.
-        if roots.count > 0 {
-            let mut added = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            if !check_roots(roots, &mut added, tcx, pcx) {
-                let d = diag(c"error", c"rewrite.check", tcx);
-                buf_str(d, c"--check could not run the check; nothing written\n");
-                return 1;
-            }
-            if added.count > 0 {
-                let e = diags(tcx);
-                for k in 0..added.count {
-                    if k < 10 {
-                        buf_bytes(e, buf_slice((*added.data.add(k as usize))));
-                        buf_byte(e, b'\n');
-                    }
-                }
-                let d = diag(c"error", c"rewrite.breaks", tcx);
-                buf_int(d, added.count);
-                buf_str(d, if added.count == 1 { c" new error" } else { c" new errors" });
-                buf_str(d, c" in the --check programs; nothing written\n");
-                let t = diags(tcx);
-                buf_str(t, c"try:");
-                put_cword(t, pcx.prog);
-                for k in 1..c.line.len() {
-                    put_word(t, c.word(k).as_bytes());
-                }
-                if !tcx.dry_run {
-                    buf_str(t, c" --dry-run");
-                }
-                if !show_diff {
-                    buf_str(t, c" --diff");
-                }
-                try_end(t);
-                return 1;
-            }
-        }
-        flush(out);
-        if tcx.dry_run {
-            return 0;
-        }
-        let summary = buf_new();
-        buf_str(summary, c"rewrote --text");
-        put_word(summary, old);
-        put_word(summary, new);
-        buf_byte(summary, b'\t');
-        buf_int(summary, changed_files);
-        buf_str(summary, c" files\t");
-        buf_int(summary, total);
-        buf_str(summary, c" matches");
-        if write_edit(buf_slice(summary), c".", tcx, pcx) { 0 } else { 1 }
+    if words.len() as i64 != 2 {
+        return usage(c"--text takes OLD and NEW", tcx, pcx);
     }
+    let old = c_slice((words[0]) as *mut u8);
+    let new = c_slice((words[1]) as *mut u8);
+    if old.len() == 0 {
+        return usage(c"OLD is empty", tcx, pcx);
+    }
+    if tcx.t_regex && tcx.t_case {
+        return usage(c"--case is for a literal OLD, not with --regex", tcx, pcx);
+    }
+    if tcx.t_regex && !crate::tools::rewrite::regex::re_valid(&old) {
+        return usage(c"OLD is no regular expression (^ $ . * + ? [a-z] \\d \\w)", tcx, pcx);
+    }
+    let mut files: Vec<i64, Comp> = Vec::new_in(Comp {});
+    // (0.25.5, feedbacks/mod254.md #3) A step of `refactor --script`:
+    // the program's files, as the steps before left them (their copies,
+    // read in place of the files), rewritten as copies too, checked
+    // with the others at the script's end
+    let step = tcx.step_report != 0 as *mut u8;
+    let mut file_index: Vec<i64, Comp> = Vec::new_in(Comp {});
+    if step_root != 0 as *mut u8 && !step {
+        return usage(
+            c"--root is for a step of refactor --script; --text rewrites the files git tracks", tcx,
+            pcx);
+    }
+    if step && (move_paths || roots.len() as i64 > 0) {
+        return usage(c"in a refactor --script, --text rewrites the program's files: no --move-paths, no --check (the script checks)", tcx, pcx);
+    }
+    if step {
+        if step_root == 0 as *mut u8 || !load_program(step_root, tcx.target, tcx, pcx, wgx) {
+            program_errors(c"error", step_root, true, tcx, pcx);
+            return 1;
+        }
+        for g in 0..pcx.files.len() as i64 {
+            if !file_made(g, pcx) {
+                files.push(pcx.files[g as usize].path as i64);
+                file_index.push(g);
+            }
+        }
+    } else if !tracked_files(&mut files) {
+        let d = diag(c"error", c"rewrite.no-git", tcx);
+        buf_str(d, c"--text edits the files git tracks: this is no git checkout\n");
+        return 2;
+    }
+    let out = buf_new();
+    let diff = buf_new();
+    let mut total: i64 = 0;
+    let mut changed_files: i64 = 0;
+    let mut left_excluded: i64 = 0;
+    let mut excluded_files: i64 = 0;
+    let mut left_kept: i64 = 0;
+    let mut kept_files: i64 = 0;
+    let mut not_lexed: i64 = 0;
+    let unlexed = buf_new();
+    for f in 0..files.len() as i64 {
+        let path = (files[f as usize]) as *mut u8;
+        let p = c_slice(path);
+        if globs.len() as i64 > 0 {
+            let mut picked = false;
+            for g in 0..globs.len() as i64 {
+                if glob_match(&c_slice((globs[g as usize]) as *mut u8), &p) {
+                    picked = true;
+                }
+            }
+            if !picked {
+                continue;
+            }
+        }
+        let source = crate::base::source_ext_len(&p) > 0;
+        if (tcx.t_places != 0 && !source) || (no_sources && source) {
+            continue;
+        }
+        let text = buf_new();
+        if step {
+            let g = (file_index[f as usize]);
+            buf_bytes(text,
+                &get_src()[
+                    pcx.files[g as usize].start as usize..pcx.files[g as usize].end as usize]);
+        }
+        // (0.24: a link is its target's text: never written through)
+        else if crate::tools::proc::link_target(path) >= 0 || !read_file_if(path, text)
+            || !is_text(&buf_copy(text)) {
+            continue;
+        }
+        let t = buf_copy(text);
+        if excluded(&p, tcx) {
+            let mut s: Vec<i64, Comp> = Vec::new_in(Comp {});
+            let mut e: Vec<i64, Comp> = Vec::new_in(Comp {});
+            find_matches(&t, 0, t.len() as i64, &old, &mut s, &mut e, tcx);
+            if s.len() as i64 > 0 {
+                left_excluded += s.len() as i64;
+                excluded_files += 1;
+            }
+            continue;
+        }
+        // (a file without a match: nothing to read further, unless it moves)
+        let mut ms: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut me: Vec<i64, Comp> = Vec::new_in(Comp {});
+        find_matches(&t, 0, t.len() as i64, &old, &mut ms, &mut me, tcx);
+        if ms.len() as i64 == 0 && !move_paths {
+            continue;
+        }
+        if ms.len() as i64 > 0 && tcx.t_places != 0 && !read_places(&t, tcx, pcx) {
+            if not_lexed < 3 {
+                buf_str(unlexed, if not_lexed == 0 { c" (" } else { c", " });
+                buf_bytes(unlexed, &p);
+            }
+            not_lexed += 1;
+        }
+        let mut after: i64 = -1;
+        let mut left: i64 = 0;
+        let mut kept: i64 = 0;
+        let n = rewrite_text(&p, &t, &old, &new, &mut after, &mut left, &mut kept, tcx, pcx);
+        if left > 0 {
+            left_kept += left;
+            kept_files += 1;
+        }
+        let to = if move_paths { moved_path(&p, &old, &new, tcx) } else { &p[0..0] };
+        if n == 0 && to.len() == 0 {
+            continue;
+        }
+        let mut final_path = path;
+        if to.len() > 0 {
+            let b = buf_new();
+            buf_bytes(b, to);
+            final_path = buf_cstr(b);
+            tcx.m_from.push(path as i64);
+            tcx.m_to.push(final_path as i64);
+        }
+        if n > 0 {
+            tcx.w_path.push(final_path as i64);
+            tcx.w_before.push(text);
+            tcx.w_after.push(after);
+            if show_diff {
+                diff_texts(diff, &c_slice(final_path), &t, &buf_copy(after), tcx);
+            }
+        }
+        put_file_line(out, &c_slice(final_path), if to.len() > 0 { p } else { &p[0..0] }, n,
+            kept);
+        total += n;
+        changed_files += 1;
+    }
+    // The totals.
+    buf_str(out, if tcx.dry_run { c"would rewrite " } else { c"rewrote " });
+    buf_int(out, total);
+    buf_str(out, if total == 1 { c" match in " } else { c" matches in " });
+    buf_int(out, changed_files);
+    buf_str(out, if changed_files == 1 { c" file" } else { c" files" });
+    if tcx.m_from.len() as i64 > 0 {
+        buf_str(out, c", ");
+        buf_int(out, tcx.m_from.len() as i64);
+        buf_str(out, c" moved");
+    }
+    buf_byte(out, b'\n');
+    if show_diff {
+        buf_append(out, diff);
+    }
+    // What is left, and why.
+    if left_excluded > 0 {
+        let d = diag(c"note", c"rewrite.excluded", tcx);
+        buf_int(d, left_excluded);
+        buf_str(d, if left_excluded == 1 { c" match left in " } else { c" matches left in " });
+        buf_int(d, excluded_files);
+        buf_str(d,
+            if excluded_files == 1 { c" excluded file\n" } else { c" excluded files\n" });
+    }
+    if left_kept > 0 {
+        let d = diag(c"note", c"rewrite.kept", tcx);
+        buf_int(d, left_kept);
+        buf_str(d, if left_kept == 1 { c" match left in " } else { c" matches left in " });
+        buf_int(d, kept_files);
+        buf_str(d, if kept_files == 1 { c" file" } else { c" files" });
+        buf_str(d, c": in kept lines (the exclusions), or in other places than --comments, --strings, --code ask\n");
+    }
+    if not_lexed > 0 {
+        let d = diag(c"warning", c"rewrite.not-lexed", tcx);
+        buf_int(d, not_lexed);
+        buf_str(d,
+            if not_lexed == 1 { c" vole source with a match does" }
+            else { c" vole sources with a match do" });
+        buf_str(d,
+            c" not lex: read by lines, only the lines that start with `//` are comments");
+        buf_append(d, unlexed);
+        buf_str(d, if not_lexed > 3 { c", ...)\n" } else { c")\n" });
+    }
+    if tcx.mixed_case > 0 {
+        let d = diag(c"note", c"rewrite.mixed-case", tcx);
+        buf_int(d, tcx.mixed_case);
+        buf_str(d, c" matches in a mixed case took NEW as it is\n");
+    }
+    if total == 0 && tcx.m_from.len() as i64 == 0 {
+        flush(out);
+        return 0;
+    }
+    if step {
+        return step_write(out, tcx, pcx);
+    }
+    // The check, then the edit.
+    if roots.len() as i64 > 0 {
+        let mut added: Vec<i64, Comp> = Vec::new_in(Comp {});
+        if !check_roots(roots.as_slice(), &mut added, tcx, pcx) {
+            let d = diag(c"error", c"rewrite.check", tcx);
+            buf_str(d, c"--check could not run the check; nothing written\n");
+            return 1;
+        }
+        if added.len() as i64 > 0 {
+            let e = diags(tcx);
+            for k in 0..added.len() as i64 {
+                if k < 10 {
+                    buf_append(e, (added[k as usize]));
+                    buf_byte(e, b'\n');
+                }
+            }
+            let d = diag(c"error", c"rewrite.breaks", tcx);
+            buf_int(d, added.len() as i64);
+            buf_str(d, if added.len() as i64 == 1 { c" new error" } else { c" new errors" });
+            buf_str(d, c" in the --check programs; nothing written\n");
+            let t = diags(tcx);
+            buf_str(t, c"try:");
+            put_cword(t, pcx.prog);
+            for k in 1..c.line.len() {
+                put_word(t, c.word(k).as_bytes());
+            }
+            if !tcx.dry_run {
+                buf_str(t, c" --dry-run");
+            }
+            if !show_diff {
+                buf_str(t, c" --diff");
+            }
+            try_end(t);
+            return 1;
+        }
+    }
+    flush(out);
+    if tcx.dry_run {
+        return 0;
+    }
+    let summary = buf_new();
+    buf_str(summary, c"rewrote --text");
+    put_word(summary, &old);
+    put_word(summary, &new);
+    buf_byte(summary, b'\t');
+    buf_int(summary, changed_files);
+    buf_str(summary, c" files\t");
+    buf_int(summary, total);
+    buf_str(summary, c" matches");
+    if write_edit(&buf_copy(summary), c".", tcx, pcx) { 0 } else { 1 }
 }

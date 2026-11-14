@@ -1,0 +1,575 @@
+// (0.29) What a call leaves of a Vec's header: a summary per function of
+// the Vec headers (ptr, len, cap) it may write, itself and through what it
+// calls, with which value numbering and LICM keep a Vec's pointer and
+// length across a call (the bounds check after the call is the one before
+// it). docs/optimizer.md, "0.29: Vec headers across calls".
+//
+// The summary is bits of ipo's FN_ATTRS (so it is inferred bottom-up with
+// the attributes, iterated in a recursive component, read under
+// fn_facts_ready, and part of the code cache's R_ATTRS fact): HW_KNOWN,
+// every write of the function is one of those below; HW_STATIC, it may
+// write a Vec header in a static; HW_RESULT, through its result pointer;
+// a bit for each of the first HW_ARGS call operands, through that operand;
+// and for the first operand that has its bit, where: the words (8 bytes)
+// [lo, hi) from the operand's address that hold what it writes (a context
+// with several Vecs: a callee that pushes to one leaves the others). The
+// other operands' writes are at any offset.
+//
+// A write is, by its address (write_bits):
+// - in a frame slot of the function, or constant data: no bit (a slot of
+//   the callee is no memory the caller named before the call);
+// - in a static: HW_STATIC, unless the static's type has no Vec header
+//   where the write is;
+// - at a pointer parameter plus offsets: the operand's bit, unless the
+//   parameter is a reference whose referent's type has no Vec header
+//   where the write is;
+// - in the buffer of a Vec whose header is where a type says it is
+//   (owned_buffer: the address is made by additions from the `ptr` loaded
+//   from the header in a reference parameter's referent, a static or a
+//   slot): no bit. The buffer is a heap block the Vec owns; it holds no
+//   static and no frame slot, and not the object that holds the Vec;
+// - anything else (a pointer loaded from memory, a raw pointer of unknown
+//   origin, a number made a pointer): the summary is unknown. So is it
+//   after an atomic, an indirect call, a call of C other than the
+//   allocator's, and a callee whose summary is unknown.
+// A call adds its callee's bits, each operand's where that operand's
+// address is by the same rules.
+//
+// What the caller concludes (call_keeps_header), for a Vec header at a
+// reference parameter's referent, a static or a slot of its own:
+// - in a static: kept unless HW_STATIC, or a marked operand is not known
+//   to be elsewhere (another static, a slot, a buffer, a parameter kept
+//   apart from statics);
+// - in a slot: kept unless a marked operand may be that slot;
+// - in the referent of a reference parameter p (under noalias_active): the
+//   referent is written only through pointers made from p while the
+//   function runs (0.17's rule for an exclusive parameter, gvn::
+//   param_frozen; a shared one is frozen), so kept unless a marked operand
+//   may be made from p. A buffer of a Vec in the referent is not the
+//   referent.
+//
+// What unsafe code must keep for this (guide unsafe): a Vec's buffer is
+// the Vec's own heap block (not a static, a local, or the object the Vec
+// is in), and the referent of a `&mut T` parameter is written, while the
+// function runs, only through pointers made from the parameter.
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::types::{TY_U64, TyKind, fn_param, type_size};
+use crate::middle::ctx::FnCtx;
+use crate::middle::fold::is_const;
+use crate::middle::gvn::{
+    PC_EXCLUSIVE, address_base, copy_dst, copy_size, is_copy, noalias_active, optimized_fn,
+    param_class, param_root, params_disjoint, root_of,
+};
+use crate::middle::inline::param_operand;
+use crate::middle::ipo::{ATTR_NORETURN, ATTR_READONLY, c_allocates};
+use crate::middle::ir::{Op, Term, ir_arg, ir_operand, ir_operand_count, ir_val};
+use crate::middle::ir::Op::{Add, GAddr, Param, SAddr, Slot, Store};
+use crate::middle::ir::cfg::{succ, succ_count};
+use crate::middle::vecfacts::{buffer_load, memory_type, same_object, touches_header, vec_header_at};
+
+// The summary's bits in FN_ATTRS (above the attributes and the cost).
+pub const HW_KNOWN: i64 = 1 << 16;
+pub const HW_STATIC: i64 = 1 << 17;
+pub const HW_RESULT: i64 = 1 << 18;
+pub const HW_ARG_SHIFT: i64 = 20;
+pub const HW_ARGS: i64 = 8;
+// The first marked operand's range, in words: lo, and hi (HW_FAR: no end).
+const HW_LO_SHIFT: i64 = 28;
+const HW_HI_SHIFT: i64 = 44;
+pub const HW_FAR: i64 = 65535;
+// Every bit of the summary.
+pub const HW_MASK: i64 = -65536;
+
+// A function's summary while it is gathered (ipo::compute_attrs): `known`
+// until a write may be anywhere; `bits`: HW_STATIC, HW_RESULT and the
+// operands'; per operand with its bit, the words [lo, hi) of its writes.
+pub struct Writes {
+    pub known: bool,
+    pub bits: i64,
+    pub lo: [i64; 8],
+    pub hi: [i64; 8],
+}
+
+pub fn no_writes() -> Writes {
+    Writes { known: true, bits: 0, lo: [0; 8], hi: [0; 8] }
+}
+
+// The summary as FN_ATTRS' bits (0: nothing known).
+pub fn writes_bits(w: &Writes) -> i64 {
+    if !w.known {
+        return 0;
+    }
+    let mut hw = HW_KNOWN | w.bits;
+    let k = first_operand(w.bits);
+    if k >= 0 {
+        hw = hw | (w.lo[k as usize] << HW_LO_SHIFT) | (w.hi[k as usize] << HW_HI_SHIFT);
+    }
+    hw
+}
+
+// The first operand marked in summary `hw`, or -1.
+fn first_operand(hw: i64) -> i64 {
+    for k in 0..HW_ARGS {
+        if hw & (1 << (HW_ARG_SHIFT + k)) != 0 {
+            return k;
+        }
+    }
+    -1
+}
+
+// The words [lo, hi) from operand k's address that summary `hw` says the
+// callee's writes through it are in (hi HW_FAR: anywhere from lo).
+pub fn writes_lo(hw: i64, k: i64) -> i64 {
+    if first_operand(hw) == k { (hw >> HW_LO_SHIFT) & HW_FAR } else { 0 }
+}
+
+pub fn writes_hi(hw: i64, k: i64) -> i64 {
+    if first_operand(hw) == k { (hw >> HW_HI_SHIFT) & HW_FAR } else { HW_FAR }
+}
+
+// Adds bytes [from, to) (to < 0: no end) to operand k's range.
+fn add_range(w: &mut Writes, k: i64, from: i64, to: i64) {
+    let lo = if from < 0 { 0 } else if from / 8 > HW_FAR { HW_FAR } else { from / 8 };
+    let hi = if from < 0 || to < 0 || (to + 7) / 8 >= HW_FAR { HW_FAR } else { (to + 7) / 8 };
+    let bit = 1 << (HW_ARG_SHIFT + k);
+    if w.bits & bit == 0 {
+        w.bits = w.bits | bit;
+        w.lo[k as usize] = lo;
+        w.hi[k as usize] = hi;
+        return;
+    }
+    if lo < w.lo[k as usize] {
+        w.lo[k as usize] = lo;
+    }
+    if hi > w.hi[k as usize] {
+        w.hi[k as usize] = hi;
+    }
+}
+
+// The pointer parameter (its PARAM instruction) address v is made from
+// through additions, or 0: a reference or raw pointer parameter, the
+// pointer of a slice parameter, the result pointer. A parameter that is
+// a number is none (an address made from one is anywhere).
+fn pointer_param(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut x = v;
+    for _ in 0..64 {
+        let op = cx.insts[x as usize].op;
+        if op == Param {
+            return if is_pointer_param(cx, x, pcx) { x } else { 0 };
+        }
+        if op != Add || cx.insts[x as usize].ty != TY_U64 {
+            return 0;
+        }
+        let a = cx.insts[x as usize].a;
+        let b = cx.insts[x as usize].b;
+        if is_const(cx, b) {
+            x = a;
+            continue;
+        }
+        let pa = pointer_param(cx, a, pcx);
+        let pb = pointer_param(cx, b, pcx);
+        if (pa == 0) == (pb == 0) {
+            return 0;
+        }
+        return if pa != 0 { pa } else { pb };
+    }
+    0
+}
+
+fn is_pointer_param(cx: &mut FnCtx<Comp>, p: i64, pcx: &Ctx<Comp>) -> bool {
+    if cx.insts[p as usize].ty != TY_U64 {
+        return false;
+    }
+    let k = cx.insts[p as usize].imm;
+    let piece = cx.insts[p as usize].imm2;
+    if k == -1 {
+        // (the result pointer: lower_body)
+        return piece == 0;
+    }
+    let f = optimized_fn(cx);
+    if k < 0 || f < 0 || k >= pcx.fns[f as usize].param_count {
+        return false;
+    }
+    let t = fn_param(f, k, pcx);
+    if t <= 0 {
+        return false;
+    }
+    let kind = pcx.types[t as usize].kind;
+    kind == TyKind::Ptr && piece == 0 || kind == TyKind::Slice && piece == 1
+}
+
+// Whether address a is in the buffer of a Vec whose header is where a type
+// says it is: made by additions from the `ptr` loaded from the header of a
+// std Vec in a reference parameter's referent, a static or a frame slot.
+pub fn owned_buffer(cx: &mut FnCtx<Comp>, a: i64, pcx: &Ctx<Comp>) -> bool {
+    if pcx.vec_tmpl == 0 {
+        return false;
+    }
+    let l = buffer_load(cx, a);
+    if l == 0 {
+        return false;
+    }
+    let mut o = cx.insts[l as usize].imm;
+    let la = cx.insts[l as usize].a;
+    let hb = address_base(cx, la, &mut o);
+    let op = cx.insts[hb as usize].op;
+    if op != Param && op != GAddr && op != Slot {
+        return false;
+    }
+    let t = memory_type(cx, hb, pcx);
+    t > 0 && vec_header_at(cx, t, o, 8, false, pcx) == o + 1
+}
+
+// Adds to summary w a write of `size` bytes (-1: not known) at address
+// a0 + off0 in function fi (the rules above); false when it may be
+// anywhere.
+fn write_at(cx: &mut FnCtx<Comp>, fi: i64, w: &mut Writes, a0: i64, off0: i64, size: i64,
+    depth: i64, pcx: &Ctx<Comp>) -> bool {
+    let a = ir_val(cx, a0);
+    if a == 0 {
+        return false;
+    }
+    let mut off = off0;
+    let base = address_base(cx, a, &mut off);
+    let root = root_of(cx, a);
+    if root != 0 {
+        if cx.insts[root as usize].op != GAddr || w.bits & HW_STATIC != 0 {
+            return true;
+        }
+        let t = memory_type(cx, root, pcx);
+        if t <= 0 || touches(t, base == root, off, size, pcx) {
+            w.bits = w.bits | HW_STATIC;
+        }
+        return true;
+    }
+    let p = pointer_param(cx, a, pcx);
+    if p != 0 {
+        if cx.insts[p as usize].imm == -1 {
+            w.bits = w.bits | HW_RESULT;
+            return true;
+        }
+        // (the type first: most writes through a reference are to fields
+        // that are no Vec, and the operand's number is a walk of the
+        // parameters)
+        let exact = base == p && size >= 0 && off >= 0;
+        let t = memory_type(cx, p, pcx);
+        if t > 0 && !touches(t, exact, off, size, pcx) {
+            return true;
+        }
+        let k = param_operand(cx, fi, p, pcx);
+        if k < 0 || k >= HW_ARGS {
+            return false;
+        }
+        if exact {
+            add_range(w, k, off, off + size);
+        } else {
+            add_range(w, k, 0, -1);
+        }
+        return true;
+    }
+    if owned_buffer(cx, a, pcx) {
+        return true;
+    }
+    if cx.insts[base as usize].op == Op::Phi && depth < 4 {
+        // One of several addresses (`if c { &mut a } else { &mut b }`):
+        // each one's.
+        for k in 0..ir_operand_count(cx, base) {
+            let o = ir_operand(cx, base, k);
+            if o == 0 {
+                continue;
+            }
+            // (0.29) A null or dangling pointer among them (an empty Vec's,
+            // beside the block its growth allocated: what std's block copy
+            // is given) is no address anything is at.
+            let ov = ir_val(cx, o);
+            if ov != 0 && cx.insts[ov as usize].op == Op::Const
+                && cx.insts[ov as usize].imm >= 0 && cx.insts[ov as usize].imm < 4096 {
+                continue;
+            }
+            if !write_at(cx, fi, w, o, off, size, depth + 1, pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    cx.capture_stamp += 1;
+    fresh_block(cx, a, 0, pcx) == 1
+}
+
+// Whether address v is in a block C's allocator returned in this function
+// (malloc, calloc, realloc...): 1 when it is made by additions from the
+// result of such a call, or from a phi of such results and of null or
+// dangling pointers (a constant below a page: nothing is there); 2 when
+// it is only such constants, or a phi seen again (a loop's: what goes
+// round is what came in; cx.capture_stamp marks what was seen), which
+// says nothing by itself; 0 otherwise. The block is no static and no frame
+// slot, and none the caller named before the call but the one given to
+// realloc, which the callee holds alone.
+fn fresh_block(cx: &mut FnCtx<Comp>, v: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
+    if depth > 16 {
+        return 0;
+    }
+    let mut x = v;
+    for _ in 0..64 {
+        let op = cx.insts[x as usize].op;
+        if op == Op::Call {
+            let f = cx.insts[x as usize].imm;
+            return if cx.insts[x as usize].ty == TY_U64 && c_allocates(f, pcx) { 1 } else { 0 };
+        }
+        if op == Op::Const {
+            let c = cx.insts[x as usize].imm;
+            return if c >= 0 && c < 4096 { 2 } else { 0 };
+        }
+        if op == Op::Phi {
+            if cx.insts[x as usize].mark == cx.capture_stamp {
+                return 2;
+            }
+            cx.insts[x as usize].mark = cx.capture_stamp;
+            let mut all = 2;
+            for k in 0..ir_operand_count(cx, x) {
+                let o0 = ir_operand(cx, x, k);
+                if o0 == 0 {
+                    continue;
+                }
+                let o = ir_val(cx, o0);
+                let r = fresh_block(cx, o, depth + 1, pcx);
+                if r == 0 {
+                    return 0;
+                }
+                if r == 1 {
+                    all = 1;
+                }
+            }
+            return all;
+        }
+        if op != Add || cx.insts[x as usize].ty != TY_U64 {
+            return 0;
+        }
+        let a = cx.insts[x as usize].a;
+        let b = cx.insts[x as usize].b;
+        if is_const(cx, b) {
+            x = a;
+            continue;
+        }
+        // (one side the block; the other an offset, no block itself)
+        let fa = fresh_block(cx, a, depth + 1, pcx);
+        let fb = fresh_block(cx, b, depth + 1, pcx);
+        return if (fa == 1) != (fb == 1) { 1 } else { 0 };
+    }
+    0
+}
+
+// Whether a write of `size` bytes at offset `off` of a value of type t
+// (`exact`: the offset is known, else anywhere in it) may touch a Vec's
+// header.
+fn touches(t: i64, exact: bool, off: i64, size: i64, pcx: &Ctx<Comp>) -> bool {
+    if !exact || size < 0 {
+        return touches_header(t, 0, -1, 0, pcx);
+    }
+    if off < 0 || off + size > type_size(t, pcx) {
+        return true;
+    }
+    touches_header(t, off, size, 0, pcx)
+}
+
+// Marks (mark 2) the blocks of the current function from which a RET is
+// reached, after layout_order (cx.order, and mark 1 on what the entry
+// reaches). What a block that reaches none writes is not seen after the
+// call: the function does not return from it (a failed check's report).
+pub fn mark_returning(cx: &mut FnCtx<Comp>) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = cx.order.len() as i64;
+        while i > 0 {
+            i -= 1;
+            let b = cx.order[i as usize];
+            if cx.blocks[b as usize].mark == 2 {
+                continue;
+            }
+            let mut reaches = cx.blocks[b as usize].term == Term::Ret;
+            for k in 0..succ_count(cx, b) {
+                let s = succ(cx, b, k);
+                if cx.blocks[s as usize].mark == 2 {
+                    reaches = true;
+                }
+            }
+            if reaches {
+                cx.blocks[b as usize].mark = 2;
+                changed = true;
+            }
+        }
+    }
+}
+
+// Adds instruction v's writes to the summary w of function fi (not known
+// any more when v may write anywhere): `known` is, for a call, the
+// callee's attributes (ipo::compute_attrs: call_attrs, or what is assumed
+// of a function of the same component).
+pub fn note_writes(cx: &mut FnCtx<Comp>, fi: i64, v: i64, known: i64, w: &mut Writes,
+    pcx: &Ctx<Comp>) {
+    if !w.known {
+        return;
+    }
+    let op = cx.insts[v as usize].op;
+    if op == Store {
+        let a = cx.insts[v as usize].a;
+        let off = cx.insts[v as usize].imm;
+        let size = type_size(cx.insts[v as usize].imm2, pcx);
+        w.known = write_at(cx, fi, w, a, off, size, 0, pcx);
+    } else if is_copy(cx, v, pcx) {
+        let dst = copy_dst(cx, v);
+        let size = copy_size(cx, v);
+        w.known = write_at(cx, fi, w, dst, 0, size, 0, pcx);
+    } else if op.is_call() {
+        // (a callee that does not return leaves nothing to see)
+        if known & (ATTR_READONLY | ATTR_NORETURN) != 0 {
+            return;
+        }
+        if known & HW_KNOWN == 0 {
+            w.known = false;
+            return;
+        }
+        w.bits = w.bits | (known & HW_STATIC);
+        if known & HW_RESULT != 0 {
+            let c = cx.insts[v as usize].c;
+            if !write_at(cx, fi, w, c, 0, -1, 0, pcx) {
+                w.known = false;
+                return;
+            }
+        }
+        let nargs = cx.insts[v as usize].nargs;
+        for k in 0..HW_ARGS {
+            if known & (1 << (HW_ARG_SHIFT + k)) == 0 {
+                continue;
+            }
+            if k >= nargs {
+                w.known = false;
+                return;
+            }
+            // The callee's range from the operand's address is the
+            // write here.
+            let arg = ir_arg(cx, v, k);
+            let lo = writes_lo(known, k);
+            let hi = writes_hi(known, k);
+            let size = if hi == HW_FAR { -1 } else { (hi - lo) * 8 };
+            if !write_at(cx, fi, w, arg, lo * 8, size, 0, pcx) {
+                w.known = false;
+                return;
+            }
+        }
+    } else if op == Op::Atomic || op == Op::Fence || op == Op::IntrMem || op == Op::StoreX {
+        w.known = false;
+    }
+}
+
+// Whether a write through address a0, in the words [wlo, whi) from it (whi
+// HW_FAR: anywhere in its object), is not in the bytes [loff, + lsize) of
+// the object at `base` (a reference parameter's referent, a static, a
+// slot of the function being optimized).
+fn target_apart(cx: &mut FnCtx<Comp>, a0: i64, base: i64, loff: i64, lsize: i64, wlo: i64, whi: i64,
+    pcx: &Ctx<Comp>) -> bool {
+    let a = ir_val(cx, a0);
+    if a == 0 {
+        return false;
+    }
+    // The same object at a known offset: by the ranges.
+    let mut c: i64 = 0;
+    let ab = address_base(cx, a, &mut c);
+    if same_object(cx, ab, base) {
+        return whi != HW_FAR && (loff + lsize <= c + wlo * 8 || c + whi * 8 <= loff);
+    }
+    let bop = cx.insts[base as usize].op;
+    let r = root_of(cx, a);
+    if r != 0 {
+        let rop = cx.insts[r as usize].op;
+        if rop == SAddr {
+            return true;
+        }
+        if bop == Param {
+            // (a slot of this function is not the referent; a static is
+            // not an exclusive parameter's: gvn::params_disjoint)
+            return rop == Slot || params_disjoint(cx, a, base, pcx);
+        }
+        return rop != bop || cx.insts[r as usize].imm != cx.insts[base as usize].imm;
+    }
+    if param_root(cx, a, pcx) != 0 {
+        // (a reference parameter never points to a slot of this function)
+        return bop == Slot || params_disjoint(cx, a, base, pcx);
+    }
+    owned_buffer(cx, a, pcx)
+}
+
+// The summary in attributes `attrs` of a call (ipo::call_attrs): HW_KNOWN
+// and the bits, or 0 when nothing is known of its writes.
+pub fn header_writes(attrs: i64) -> i64 {
+    if attrs & HW_KNOWN == 0 { 0 } else { attrs & HW_MASK }
+}
+
+// Whether [base + off, + size) is in the header of a std Vec at a place
+// whose type says so, of which a call's summary can speak: a reference
+// parameter's referent (under noalias_active), a static of this program,
+// a frame slot. (It does not change while a pass runs: value numbering
+// asks once for each location it knows.)
+pub fn header_place(cx: &mut FnCtx<Comp>, base: i64, off: i64, size: i64, pcx: &Ctx<Comp>) -> bool {
+    if pcx.vec_tmpl == 0 {
+        return false;
+    }
+    let op = cx.insts[base as usize].op;
+    if op != Param && op != GAddr && op != Slot {
+        return false;
+    }
+    let t = memory_type(cx, base, pcx);
+    if t <= 0 || vec_header_at(cx, t, off, size, false, pcx) == 0 {
+        return false;
+    }
+    op != Param || noalias_active(optimized_fn(cx), pcx)
+}
+
+// Whether call v, whose callee's summary is `hw` (header_writes, not 0),
+// leaves the bytes [off, + size) of the Vec header at `base` (a
+// header_place) as they are: no write of the callee reaches them (the
+// rules above).
+pub fn call_keeps_header(cx: &mut FnCtx<Comp>, v: i64, base: i64, off: i64, size: i64, hw: i64,
+    pcx: &Ctx<Comp>) -> bool {
+    if hw == HW_KNOWN {
+        return true;
+    }
+    if hw & HW_KNOWN == 0 {
+        return false;
+    }
+    let op = cx.insts[base as usize].op;
+    if hw & HW_STATIC != 0 {
+        if op == GAddr {
+            return false;
+        }
+        // (a shared parameter may be a view of a static)
+        if op == Param && {
+            let k = cx.insts[base as usize].imm;
+            param_class(cx, k, pcx) != PC_EXCLUSIVE
+        } {
+            return false;
+        }
+    }
+    if hw & HW_RESULT != 0 {
+        let c = cx.insts[v as usize].c;
+        if !target_apart(cx, c, base, off, size, 0, HW_FAR, pcx) {
+            return false;
+        }
+    }
+    let nargs = cx.insts[v as usize].nargs;
+    for k in 0..HW_ARGS {
+        if hw & (1 << (HW_ARG_SHIFT + k)) == 0 {
+            continue;
+        }
+        if k >= nargs {
+            return false;
+        }
+        let arg = ir_arg(cx, v, k);
+        if !target_apart(cx, arg, base, off, size, writes_lo(hw, k), writes_hi(hw, k), pcx) {
+            return false;
+        }
+    }
+    true
+}

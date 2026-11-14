@@ -3,11 +3,16 @@
 # the given C headers, C (compiled by cc) and vole must agree on its
 # size, its alignment and the offset of every field.
 #
-# usage: tests/cimport/layout.sh [-c COMPILER] [-t TARGET] [-I DIR] HEADER...
+# usage: tests/cimport/layout.sh [-c COMPILER] [-t TARGET] [-I DIR] [-m RECORDS] HEADER...
 #
 #   -c COMPILER   the volec to test (default: target/volec)
 #   -t TARGET     the target (default: the host)
 #   -I DIR        an include directory (for both compilers)
+#   -m RECORDS    (0.29) the fewest records the headers must give (default
+#                 1): with fewer the check fails, saying how many it found.
+#                 The records are read from the text `--emit-imports`
+#                 prints; when 0.28.0 changed that text the script found 4
+#                 of 111 and passed. The gate gives the floor of its headers.
 #
 # Prints "layout: N records, M fields agree" or the differences.
 set -eu
@@ -15,15 +20,18 @@ set -eu
 compiler=target/volec
 target=
 incs=
+floor=1
 while [ $# -gt 0 ]; do
     case $1 in
         -c) compiler=$2; shift 2 ;;
         -t) target=$2; shift 2 ;;
         -I) incs="$incs -I $2"; shift 2 ;;
+        -m) floor=$2; shift 2 ;;
         *) break ;;
     esac
 done
-[ $# -gt 0 ] || { echo "usage: $0 [-c COMPILER] [-t TARGET] [-I DIR] HEADER..." >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: $0 [-c COMPILER] [-t TARGET] [-I DIR] [-m RECORDS] HEADER..." >&2; exit 2; }
+case $floor in ''|*[!0-9]*) echo "$0: -m needs a number, not '$floor'" >&2; exit 2 ;; esac
 
 tflag=
 arch=
@@ -74,7 +82,7 @@ active && /^\}$/ {
     for (i = 1; i <= nf; i++) {
         cf = fields[i]; sub(/^r#/, "", cf)
         printf "    printf(\" %%zu\", offsetof(%s, %s));\n", rec_c, cf > cfile
-        printf "    c::printf(c\" %%zu\", (&(*p%d).%s) as u64 - 4096);\n", k, fields[i] > tfile
+        printf "    c::printf(c\" %%zu\", &raw const (*p%d).%s as usize as u64 - 4096);\n", k, fields[i] > tfile
         nfields++
     }
     print "    printf(\"\\n\");" > cfile
@@ -99,6 +107,12 @@ cc $arch -o "$dir/t" "$dir/t.o" -lm
 "$dir/c" > "$dir/c.out"
 "$dir/t" > "$dir/t.out"
 read -r records fields < "$dir/counts"
+# (0.29) too few records: the script no longer reads the import text (or
+# the headers give less), and agreeing on what is left means nothing
+if [ "$records" -lt "$floor" ]; then
+    echo "layout: only $records records ($fields fields) read from the imports of $*, fewer than the $floor asked for (-m): does this script still read what --emit-imports prints?"
+    exit 1
+fi
 if cmp -s "$dir/c.out" "$dir/t.out"; then
     echo "layout: $records records, $fields fields agree"
 else

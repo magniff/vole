@@ -123,7 +123,6 @@ checked, comes from its fence. The words after `vole` are annotations.
 | ` ```vole ` | a snippet | compiles with `--deny-warnings` (see below for how it's wrapped) |
 | ` ```vole NAME.vl ` | a file the reader saves | compiles as it is, never wrapped |
 | ` ```vole ... warn ` | code that has a warning on purpose | compiles; warnings allowed |
-| ` ```vole ... mvs `, ` ```console mvs ` | (0.28 only) a block or session still in the old edition, waiting for something the new one lacks; listed with what it waits on | as its fence says, in the old edition |
 | ` ```vole ... skip ` | an excerpt of a listing already shown, or code that can't compile on purpose without an error to show | nothing |
 | ` ```in ` | after a vole block: the program's stdin | used by the next `out` |
 | ` ```out ` | after a vole block (and its `in`) | the program runs; stdout and stderr together match exactly, trailing blanks aside; exit status 0 |

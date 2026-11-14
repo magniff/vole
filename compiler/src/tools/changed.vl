@@ -1,0 +1,420 @@
+// `check --changed` (0.29): the check an agent harness's hooks run after
+// every edit, as one command for the harnesses that have no hooks. Every
+// program a file changed since the branch's base belongs to is checked
+// (`volec check ROOT`, its embedded shaders with it), and the changed
+// .vl files of those programs are compared with their layout (`volec fmt
+// --check`).
+//
+//   - the base: `--since REV` (its merge base with HEAD), else the merge
+//     base of HEAD and the nearest of the other release-*, main and master
+//     branches, else HEAD (what is not committed);
+//   - the changed files: what git says differs from the base in the work
+//     tree, and the new files it does not track, under the current
+//     directory;
+//   - a file's program: for a .vl the main.vl that declares it (`mod` by
+//     `mod`), compiler/src's for std's files, itself when it has `fn
+//     main` and no program declares it; for another file the nearest
+//     main.vl above it (a shader, a README and a header beside a main.vl
+//     are that program's). Files under tests/ are their suites': a case
+//     names the errors it expects and a tool's fixture is broken on
+//     purpose, so a plain check of them says nothing. A program whose
+//     root has the line `// premerge: broken on purpose` is not checked.
+//
+// Each program is checked by this compiler run again (its own `ok:` line
+// or its errors, as `check ROOT` prints them); the last line counts what
+// was checked, and says so when it was nothing. tools/premerge.sh's
+// check row is this command.
+
+use std::alloc::Allocator;
+
+use crate::base::{buf_append, buf_byte, buf_bytes, buf_copy, buf_int, buf_new, buf_ptr, buf_str};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::print_ok;
+use crate::front::cpp::directives::file_exists;
+use crate::tools::ctx::Tcx;
+use crate::tools::fmt::git_paths;
+use crate::tools::proc::{buf_cstr, exec_words, read_file_if, run_capture, run_inherit};
+use crate::tools::query::c_slice;
+use crate::tools::query::diagnostics::{diag, write_diags};
+use crate::tools::query::roots::program_of;
+
+// What the changed files come to.
+struct Changed<A: Allocator> {
+    // (the programs' roots, C strings, each once)
+    roots: Vec<i64, A>,
+    // (the changed .vl files of a program, and the index of its root)
+    vl: Vec<i64, A>,
+    vl_root: Vec<i64, A>,
+    files: i64,
+    tests: i64,
+    none: i64,
+}
+
+// Runs git with `words` (C strings), its output into `out`: its status.
+fn git(words: &[i64], out: i64) -> i64 {
+    let argv = exec_words(words);
+    run_capture(argv.as_slice(), out)
+}
+
+// The first line of buffer b, a C string.
+fn first_line(b: i64) -> *mut u8 {
+    let t = buf_copy(b);
+    let mut e: i64 = 0;
+    while e < t.len() as i64 && t[e as usize] != b'\n' {
+        e += 1;
+    }
+    let o = buf_new();
+    buf_bytes(o, &t[0..e as usize]);
+    buf_cstr(o)
+}
+
+// Whether p starts with head.
+fn starts(p: &[u8], head: &[u8]) -> bool {
+    p.len() >= head.len() && &p[0..head.len()] == head
+}
+
+// Whether p ends with tail.
+fn ends(p: &[u8], tail: &[u8]) -> bool {
+    p.len() >= tail.len() && &p[p.len() - tail.len()..] == tail
+}
+
+// Whether a line of text t starts with head.
+fn has_line(t: &[u8], head: &[u8]) -> bool {
+    let mut i: i64 = 0;
+    while i < t.len() as i64 {
+        if starts(&t[i as usize..], head) {
+            return true;
+        }
+        while i < t.len() as i64 && t[i as usize] != b'\n' {
+            i += 1;
+        }
+        i += 1;
+    }
+    false
+}
+
+// Whether a line of file `path` starts with head (false: no such file).
+fn file_has_line(path: *mut u8, head: &[u8]) -> bool {
+    let b = buf_new();
+    read_file_if(path, b) && has_line(&buf_copy(b), head)
+}
+
+// Whether path p is under a directory tests/.
+fn under_tests(p: &[u8]) -> bool {
+    if starts(p, b"tests/") {
+        return true;
+    }
+    let mut i: i64 = 0;
+    while i + 7 <= p.len() as i64 {
+        if &p[i as usize..(i + 7) as usize] == b"/tests/" {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// The root of the program changed file p belongs to (a C string); 0 when
+// it is no program's.
+fn root_of(p: &[u8], pcx: &Ctx<Comp>) -> *const u8 {
+    if (starts(p, b"compiler/src/") || starts(p, b"compiler/std/"))
+        && file_exists(c"compiler/src/main.vl", pcx) {
+        return c"compiler/src/main.vl";
+    }
+    if ends(p, b".vl") {
+        // (a source: the program that declares it, `mod` by `mod`; else
+        // one of its own, with `fn main`; else no program's, whatever
+        // main.vl is above it)
+        let own = program_of(p, pcx);
+        if own != 0 as *mut u8 {
+            return own;
+        }
+        let f = buf_new();
+        buf_bytes(f, p);
+        let path = buf_cstr(f);
+        if file_has_line(path, b"fn main(") || file_has_line(path, b"pub fn main(") {
+            return path;
+        }
+        return 0 as *mut u8;
+    }
+    // (another file: the nearest main.vl above; `end` is the length of
+    // the directory's path with its slash, 0 for the current directory)
+    let mut end = p.len() as i64;
+    loop {
+        while end > 0 && p[(end - 1) as usize] != b'/' {
+            end -= 1;
+        }
+        let m = buf_new();
+        buf_bytes(m, &p[0..end as usize]);
+        buf_str(m, c"main.vl");
+        if file_exists(buf_cstr(m), pcx) {
+            return buf_cstr(m);
+        }
+        if end == 0 {
+            break;
+        }
+        end -= 1;
+    }
+    0 as *mut u8
+}
+
+// Counts the paths of NUL-separated listing t into ch.
+fn count_paths(t: &[u8], ch: &mut Changed<Comp>, pcx: &Ctx<Comp>) {
+    let mut i: i64 = 0;
+    while i < t.len() as i64 {
+        let mut e = i;
+        while e < t.len() as i64 && t[e as usize] != 0 {
+            e += 1;
+        }
+        let p = &t[i as usize..e as usize];
+        i = e + 1;
+        if p.len() == 0 {
+            continue;
+        }
+        ch.files += 1;
+        if under_tests(p) {
+            ch.tests += 1;
+            continue;
+        }
+        let root = root_of(p, pcx);
+        if root == 0 as *mut u8 {
+            ch.none += 1;
+            continue;
+        }
+        let mut at: i64 = -1;
+        for k in 0..ch.roots.len() as i64 {
+            if crate::base::c_eq(ch.roots[k as usize] as *mut u8, &c_slice(root)) {
+                at = k;
+            }
+        }
+        if at < 0 {
+            at = ch.roots.len() as i64;
+            ch.roots.push(root as i64);
+        }
+        if ends(p, b".vl") {
+            let f = buf_new();
+            buf_bytes(f, p);
+            ch.vl.push(buf_cstr(f) as i64);
+            ch.vl_root.push(at);
+        }
+    }
+}
+
+// The commit the changes are counted from (a C string): `since`'s merge
+// base with HEAD, or with no `since` the nearest merge base of HEAD and
+// another release-*, main or master branch (HEAD when there is none); 0
+// after the diagnostic when git cannot tell.
+fn base_commit(since: *const u8, tcx: &mut Tcx<Comp>) -> *mut u8 {
+    let out = buf_new();
+    if since != 0 as *mut u8 {
+        if git(&[c"git" as i64, c"merge-base" as i64, since as i64, c"HEAD" as i64], out) == 0 {
+            return first_line(out);
+        }
+        let d = diag(c"error", c"check.no-git", tcx);
+        buf_str(d, c"git cannot tell which files changed since ");
+        buf_str(d, since);
+        buf_str(d, c": no checkout here, or no such revision\n");
+        return 0 as *mut u8;
+    }
+    let current = buf_new();
+    let refs = buf_new();
+    if git(&[c"git" as i64, c"rev-parse" as i64, c"--abbrev-ref" as i64, c"HEAD" as i64], current)
+        != 0
+        || git(
+            &[c"git" as i64, c"for-each-ref" as i64, c"--format=%(refname:short)" as i64,
+                c"refs/heads/release-*" as i64, c"refs/heads/main" as i64,
+                c"refs/heads/master" as i64], refs) != 0 {
+        let d = diag(c"error", c"check.no-git", tcx);
+        buf_str(d, c"git cannot tell which files changed: no checkout here, or no commit yet\n");
+        return 0 as *mut u8;
+    }
+    let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
+    words.push(c"git" as i64);
+    words.push(c"merge-base" as i64);
+    words.push(c"HEAD" as i64);
+    let own = c_slice(first_line(current));
+    let t = buf_copy(refs);
+    let mut i: i64 = 0;
+    while i < t.len() as i64 {
+        let mut e = i;
+        while e < t.len() as i64 && t[e as usize] != b'\n' {
+            e += 1;
+        }
+        let name = &t[i as usize..e as usize];
+        if name.len() > 0 && name != own {
+            let b = buf_new();
+            buf_bytes(b, name);
+            words.push(buf_cstr(b) as i64);
+        }
+        i = e + 1;
+    }
+    if words.len() > 3 && git(words.as_slice(), out) == 0 {
+        return first_line(out);
+    }
+    let head = buf_new();
+    if git(&[c"git" as i64, c"rev-parse" as i64, c"HEAD" as i64], head) != 0 {
+        let d = diag(c"error", c"check.no-git", tcx);
+        buf_str(d, c"git cannot tell which files changed: no checkout here, or no commit yet\n");
+        return 0 as *mut u8;
+    }
+    first_line(head)
+}
+
+// `N WORD` or `N WORDs` into b.
+fn put_count(b: i64, n: i64, word: *const u8) {
+    buf_int(b, n);
+    buf_byte(b, b' ');
+    buf_str(b, word);
+    if n != 1 {
+        buf_byte(b, b's');
+    }
+}
+
+// `volec check --changed [--since REV]`, run as `prog`: 0 when every
+// program touched checks and its changed files are formatted (or there
+// was none to check, which the last line says), 1 when not, 2 when git
+// cannot tell what changed.
+pub fn run_check_changed(prog: *mut u8, since: *const u8, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>)
+    -> i64 {
+    let base = base_commit(since, tcx);
+    if base == 0 as *mut u8 {
+        write_diags(tcx);
+        return 2;
+    }
+    let listing = buf_new();
+    let others = buf_new();
+    if git_paths(base, listing) != 0 || git_paths(0 as *mut u8, others) != 0 {
+        let d = diag(c"error", c"check.no-git", tcx);
+        buf_str(d, c"git cannot tell which files changed since ");
+        buf_str(d, base);
+        buf_str(d, c": no checkout here, or no such revision\n");
+        write_diags(tcx);
+        return 2;
+    }
+    let mut ch: Changed<Comp> = Changed {
+        roots: Vec::new_in(Comp {}),
+        vl: Vec::new_in(Comp {}),
+        vl_root: Vec::new_in(Comp {}),
+        files: 0,
+        tests: 0,
+        none: 0,
+    };
+    count_paths(&buf_copy(listing), &mut ch, pcx);
+    count_paths(&buf_copy(others), &mut ch, pcx);
+
+    // each program, by this compiler run again
+    let mut checked: i64 = 0;
+    let mut failed: i64 = 0;
+    let mut on_purpose: i64 = 0;
+    let mut skipped: Vec<bool, Comp> = Vec::new_in(Comp {});
+    for k in 0..ch.roots.len() as i64 {
+        let root = ch.roots[k as usize] as *mut u8;
+        if file_has_line(root, b"// premerge: broken on purpose") {
+            on_purpose += 1;
+            skipped.push(true);
+            continue;
+        }
+        skipped.push(false);
+        checked += 1;
+        // (not marked as a volec this one runs, VOLEC_NESTED: the program's
+        // own `ok:` line, with its files and shaders, is wanted)
+        let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
+        for w in [c"env", c"-u", c"VOLEC_NESTED", prog, c"check"] {
+            words.push(w as i64);
+        }
+        // (0.29) `--deny=CODE`: each program checked with it
+        if pcx.denied.len() as i64 > 0 {
+            let deny = buf_new();
+            buf_str(deny, c"--deny=");
+            for k in 0..pcx.denied.len() as i64 {
+                if k > 0 {
+                    buf_byte(deny, b',');
+                }
+                buf_append(deny, pcx.denied[k as usize]);
+            }
+            buf_byte(deny, 0);
+            words.push(buf_ptr(deny) as i64);
+        }
+        words.push(root as i64);
+        let argv = exec_words(words.as_slice());
+        if run_inherit(argv.as_slice()) != 0 {
+            failed += 1;
+        }
+    }
+    // the layout of their changed .vl files
+    let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
+    words.push(prog as i64);
+    words.push(c"fmt" as i64);
+    words.push(c"--check" as i64);
+    for k in 0..ch.vl.len() as i64 {
+        if !skipped[ch.vl_root[k as usize] as usize] {
+            words.push(ch.vl[k as usize]);
+        }
+    }
+    let formatted = words.len() as i64 - 3;
+    let mut unformatted = false;
+    if formatted > 0 {
+        let argv = exec_words(words.as_slice());
+        unformatted = run_inherit(argv.as_slice()) != 0;
+    }
+
+    // the last line: what was checked, since where, and what was not
+    let rest = buf_new();
+    buf_str(rest, c"since ");
+    // (the revision as it was given; else the commit found, short)
+    let b = c_slice(base);
+    if since != 0 as *mut u8 {
+        buf_str(rest, since);
+    } else {
+        buf_bytes(rest, if b.len() > 9 { &b[0..9] } else { b });
+    }
+    buf_str(rest, c" (");
+    put_count(rest, ch.files, c"changed file");
+    if ch.tests > 0 {
+        buf_str(rest, c"; ");
+        buf_int(rest, ch.tests);
+        buf_str(rest, c" under tests/, which their tests run");
+    }
+    if ch.none > 0 {
+        buf_str(rest, c"; ");
+        buf_int(rest, ch.none);
+        buf_str(rest, c" of no program");
+    }
+    if on_purpose > 0 {
+        buf_str(rest, c"; ");
+        put_count(rest, on_purpose, c"program");
+        buf_str(rest, c" broken on purpose");
+    }
+    buf_byte(rest, b')');
+    if failed > 0 || unformatted {
+        let d = diag(c"error", c"check.changed", tcx);
+        if failed > 0 {
+            buf_int(d, failed);
+            buf_str(d, c" of ");
+            put_count(d, checked, c"program");
+            buf_str(d, if failed == 1 { c" has errors" } else { c" have errors" });
+        }
+        if unformatted {
+            buf_str(d, if failed > 0 { c", and changed .vl files" } else { c"changed .vl files" });
+            buf_str(d, c" are not formatted");
+        }
+        buf_str(d, c", ");
+        buf_append(d, rest);
+        buf_byte(d, b'\n');
+        write_diags(tcx);
+        return 1;
+    }
+    let what = buf_new();
+    if checked == 0 {
+        buf_str(what, c"no program to check ");
+    } else {
+        put_count(what, checked, c"program");
+        buf_str(what, c" checked, ");
+        put_count(what, formatted, c"changed .vl file");
+        buf_str(what, c" formatted, ");
+    }
+    buf_append(what, rest);
+    print_ok(&buf_copy(what), pcx);
+    0
+}

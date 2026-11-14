@@ -24,7 +24,7 @@ use crate::arch::features::{
     build_features, feature_ambiguous, feature_bit_in, feature_name, feature_value, implied,
     parse_feature,
 };
-use crate::base::{alloc_array, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::base::{buf_bytes, buf_copy, buf_new, buf_str, sized_table};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{edit_distance, err_begin, err_end_soft, err_fix, err_fmt, err_help_fmt};
@@ -57,12 +57,10 @@ pub fn note_feature_attr(kind: i64, str_id: i64, pos: i64, pcx: &mut Ctx<Comp>) 
 
 // The pending attributes belong to Fn node `node` (parse_function).
 pub fn take_feature_attrs(node: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let mut i = pcx.feature_attrs.count - FA_WIDTH;
-        while i >= 0 && (*pcx.feature_attrs.data.add(i as usize)) == 0 {
-            (*pcx.feature_attrs.data.add(i as usize)) = node;
-            i -= FA_WIDTH;
-        }
+    let mut i = pcx.feature_attrs.len() as i64 - FA_WIDTH;
+    while i >= 0 && (pcx.feature_attrs[i as usize]) == 0 {
+        (pcx.feature_attrs[i as usize]) = node;
+        i -= FA_WIDTH;
     }
 }
 
@@ -71,6 +69,7 @@ pub fn take_feature_attrs(node: i64, pcx: &mut Ctx<Comp>) {
 // has()/detect() call n names feature `bit` (front/check/arch.vl).
 pub fn note_feature_call(n: i64, bit: i64, detect: bool, pcx: &mut Ctx<Comp>) {
     pcx.feature_calls.put(n + 1, bit + 1 + if detect { FC_DETECT } else { 0 });
+    pcx.feature_call_nodes.push(n);
 }
 
 // The feature of has()/detect() call n (-1: not checked).
@@ -91,15 +90,13 @@ pub fn feature_call_value(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // (0.19 T3) Whether some detect() is tested at run time: then gen0's main
 // fills the word first (-O1 and -O2 look for CPUFEATs instead).
 pub fn any_runtime_detect(pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        for k in 0..pcx.feature_calls.size {
-            let key = (*pcx.feature_calls.keys.add(k as usize));
-            if key > 0 && feature_call_value(key - 1, pcx) < 0 {
-                return true;
-            }
+    for k in 0..pcx.feature_call_nodes.len() {
+        let n = pcx.feature_call_nodes[k];
+        if feature_call_value(n, pcx) < 0 {
+            return true;
         }
-        false
     }
+    false
 }
 
 // The features known at has()/detect() call n: the build's, the enclosing
@@ -150,29 +147,25 @@ pub fn static_condition(c: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // The features function f needs beyond the build's (inferred over the
 // calls, infer.vl; a declaration's set for a #[target_feature] function).
 pub fn fn_needs(f: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if f < 0 || f >= pcx.needs_count {
-            return 0;
-        }
-        (*pcx.needs.add(f as usize))
+    if f < 0 || f >= pcx.needs_count {
+        return 0;
     }
+    (pcx.needs[f as usize])
 }
 
 // The features Fn node `node` declares with #[target_feature] (implied
 // ones included; 0 for none).
 pub fn fn_declared_features(node: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut s: i64 = 0;
-        let mut i: i64 = 0;
-        while i < pcx.feature_attrs.count {
-            if (*pcx.feature_attrs.data.add(i as usize)) == node
-                && (*pcx.feature_attrs.data.add((i + 1) as usize)) == FA_TARGET_FEATURE {
-                s |= features_of_string(str_at((*pcx.feature_attrs.data.add((i + 2) as usize))));
-            }
-            i += FA_WIDTH;
+    let mut s: i64 = 0;
+    let mut i: i64 = 0;
+    while i < pcx.feature_attrs.len() as i64 {
+        if (pcx.feature_attrs[i as usize]) == node
+            && (pcx.feature_attrs[(i + 1) as usize]) == FA_TARGET_FEATURE {
+            s |= features_of_string(str_at((pcx.feature_attrs[(i + 2) as usize]), pcx));
         }
-        implied(s)
+        i += FA_WIDTH;
     }
+    implied(s)
 }
 
 // The set a comma-separated list of names gives (unknown names left out).
@@ -210,54 +203,52 @@ fn trim(s: &[u8]) -> &[u8] {
 // After the effects (check_program): the attributes' names, then the walk
 // of every checked body (regions.vl), the requirements (infer.vl) and
 // their errors (check.vl).
-pub fn check_features(fcx: &mut FeaturesCx, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if !pcx.arch_used {
-            return;
-        }
-        let mut i: i64 = 0;
-        while i < pcx.feature_attrs.count {
-            check_feature_string(str_at((*pcx.feature_attrs.data.add((i + 2) as usize))),
-                (*pcx.feature_attrs.data.add((i + 3) as usize)), pcx);
-            i += FA_WIDTH;
-        }
-        let n = pcx.fns.len() as i64;
-        let build = build_features(pcx);
-        pcx.needs = alloc_array::<i64>(n + 1);
-        pcx.declared = alloc_array::<i64>(n + 1);
-        pcx.call_first = alloc_array::<i64>(n + 2);
-        regions_reset(fcx, pcx);
-        for f in 0..n {
-            (*pcx.call_first.add(f as usize)) = pcx.regions_calls.count / CALL_WIDTH;
-            let own = intrinsic_needs(f, build, pcx);
-            if own >= 0 {
-                (*pcx.needs.add(f as usize)) = own;
-                continue;
-            }
-            let attr = declaration_of(f, pcx);
-            let mut known = build;
-            let mut alt: i64 = 0;
-            if attr >= 0 {
-                let text = str_at((*pcx.feature_attrs.data.add((attr + 2) as usize)));
-                let declared = implied(features_of_string(text));
-                (*pcx.declared.add(f as usize)) = declared | DECLARED_MARK;
-                (*pcx.needs.add(f as usize)) = declared & ~build;
-                known = implied(build | declared);
-                alt = ambiguous_of_string(text);
-            } else if crate::front::features::multiversion::is_dispatcher(f, fcx, pcx) {
-                // (0.19 T3: #[multiversion]'s dispatcher needs the baseline
-                // only; its baseline version's calls are checked as one)
-                (*pcx.declared.add(f as usize)) = DECLARED_MARK;
-            }
-            if body_walked(f, pcx) {
-                walk_function(f, known, alt, if alt != 0 { -1 - attr } else { 0 }, fcx, pcx);
-            }
-        }
-        (*pcx.call_first.add(n as usize)) = pcx.regions_calls.count / CALL_WIDTH;
-        pcx.needs_count = n;
-        infer_needs(n, pcx);
-        check_requirements(n, fcx, pcx);
+pub fn check_features(fcx: &mut FeaturesCx<Comp>, pcx: &mut Ctx<Comp>) {
+    if !pcx.arch_used {
+        return;
     }
+    let mut i: i64 = 0;
+    while i < pcx.feature_attrs.len() as i64 {
+        check_feature_string(str_at((pcx.feature_attrs[(i + 2) as usize]), pcx),
+            (pcx.feature_attrs[(i + 3) as usize]), pcx);
+        i += FA_WIDTH;
+    }
+    let n = pcx.fns.len() as i64;
+    let build = build_features(pcx);
+    sized_table(&mut pcx.needs, n + 1, 0);
+    sized_table(&mut pcx.declared, n + 1, 0);
+    sized_table(&mut pcx.call_first, n + 2, 0);
+    regions_reset(fcx, pcx);
+    for f in 0..n {
+        (pcx.call_first[f as usize]) = pcx.regions_calls.len() as i64 / CALL_WIDTH;
+        let own = intrinsic_needs(f, build, pcx);
+        if own >= 0 {
+            (pcx.needs[f as usize]) = own;
+            continue;
+        }
+        let attr = declaration_of(f, pcx);
+        let mut known = build;
+        let mut alt: i64 = 0;
+        if attr >= 0 {
+            let text = str_at((pcx.feature_attrs[(attr + 2) as usize]), pcx);
+            let declared = implied(features_of_string(text));
+            (pcx.declared[f as usize]) = declared | DECLARED_MARK;
+            (pcx.needs[f as usize]) = declared & !build;
+            known = implied(build | declared);
+            alt = ambiguous_of_string(text);
+        } else if crate::front::features::multiversion::is_dispatcher(f, fcx, pcx) {
+            // (0.19 T3: #[multiversion]'s dispatcher needs the baseline
+            // only; its baseline version's calls are checked as one)
+            (pcx.declared[f as usize]) = DECLARED_MARK;
+        }
+        if body_walked(f, pcx) {
+            walk_function(f, known, alt, if alt != 0 { -1 - attr } else { 0 }, fcx, pcx);
+        }
+    }
+    (pcx.call_first[n as usize]) = pcx.regions_calls.len() as i64 / CALL_WIDTH;
+    pcx.needs_count = n;
+    infer_needs(n, pcx);
+    check_requirements(n, fcx, pcx);
 }
 
 // The other architecture's reading of the unqualified names of both
@@ -387,7 +378,7 @@ pub fn unknown_feature(name: &[u8], pos: i64, lit: i64, pcx: &mut Ctx<Comp>) {
             buf_str(fixed, c"\"");
             buf_bytes(fixed, near);
             buf_str(fixed, c"\"");
-            err_fix(pcx.nodes[lit as usize].start, pcx.nodes[lit as usize].end, buf_slice(fixed),
+            err_fix(pcx.nodes[lit as usize].start, pcx.nodes[lit as usize].end, &buf_copy(fixed),
                 pcx);
         }
     } else {

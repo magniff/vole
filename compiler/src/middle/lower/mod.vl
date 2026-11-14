@@ -23,7 +23,7 @@ mod arch;
 pub mod atomic;
 
 use crate::back::abi::{conv_classify, conv_returns_through_pointer, fn_uses_c};
-use crate::base::{alloc_array, intern_c};
+use crate::base::{intern_c, sized_table};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::get_x86;
@@ -36,8 +36,8 @@ use crate::front::lexer::Tok;
 use crate::front::types::{TY_I64, TY_U64, align_to, is_compound, is_void, type_align, type_size};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
-    INLINE_COPY_MAX, Op, Term, emit_ir, get_irfuncs, init_ir, ir_const, ir_load, ir_new_block,
-    ir_new_slot, ir_slot_addr, ir_store, ir_type,
+    INLINE_COPY_MAX, Op, Term, emit_ir, fn_entry, fn_result_ptr, init_ir, ir_const, ir_load,
+    ir_new_block, ir_new_slot, ir_slot_addr, ir_store, ir_type,
 };
 use crate::middle::ir::cfg::ir_terminate;
 use crate::middle::lower::calls::{push_arg, take_args};
@@ -49,21 +49,20 @@ use ssa::ssa_write;
 // ---- Blocks during lowering ----
 
 // A block that no edge reaches (code after `return`, `break`, ...).
-fn is_dead_block(cx: &mut FnCtx, b: i64) -> bool {
-    unsafe {
-        (*cx.blocks.add(b as usize)).sealed != 0 && (*cx.blocks.add(b as usize)).preds.count == 0
-            && b != (*get_irfuncs().add(cx.irf as usize)).entry
-    }
+fn is_dead_block(cx: &mut FnCtx<Comp>, b: i64) -> bool {
+    (cx.blocks[b as usize]).sealed != 0
+        && (cx.blocks[b as usize]).preds.len() as i64 == 0
+        && b != fn_entry(cx, cx.irf)
 }
 
-fn start_dead_block(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
+fn start_dead_block(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
     let b = ir_new_block(cx);
-    unsafe { (*cx.blocks.add(b as usize)).sealed = 1; }
+    (cx.blocks[b as usize]).sealed = 1;
     pcx.ir_cur = b;
 }
 
 // Ends the current block with a jump (no edge from a dead block).
-fn lower_jump(cx: &mut FnCtx, target: i64, pcx: &Ctx<Comp>) {
+fn lower_jump(cx: &mut FnCtx<Comp>, target: i64, pcx: &Ctx<Comp>) {
     if is_dead_block(cx, pcx.ir_cur) {
         ir_terminate(cx, pcx.ir_cur, Term::Unreach, 0, 0, 0);
     } else {
@@ -71,7 +70,7 @@ fn lower_jump(cx: &mut FnCtx, target: i64, pcx: &Ctx<Comp>) {
     }
 }
 
-fn lower_branch(cx: &mut FnCtx, cond: i64, if_true: i64, if_false: i64, pcx: &Ctx<Comp>) {
+fn lower_branch(cx: &mut FnCtx<Comp>, cond: i64, if_true: i64, if_false: i64, pcx: &Ctx<Comp>) {
     if is_dead_block(cx, pcx.ir_cur) {
         ir_terminate(cx, pcx.ir_cur, Term::Unreach, 0, 0, 0);
     } else {
@@ -82,11 +81,11 @@ fn lower_branch(cx: &mut FnCtx, cond: i64, if_true: i64, if_false: i64, pcx: &Ct
 // ---- The program ----
 
 // Lowers every function to IR.
-pub fn lower_program(cx: &mut FnCtx, program: i64, pcx: &mut Ctx<Comp>) {
+pub fn lower_program(cx: &mut FnCtx<Comp>, program: i64, pcx: &mut Ctx<Comp>) {
     let mut pbody = body_new();
     init_ir(cx, pcx);
-    pcx.promote = 0 as *mut i64;
-    pcx.local_addr = alloc_array::<i64>(pcx.locals.len() as i64 + 1);
+    pcx.promote.clear();
+    sized_table(&mut pcx.local_addr, pcx.locals.len() as i64 + 1, 0);
     // (0.26.1: PROMOTE is made when a lowering of the AST's expressions
     // first needs it, places.vl)
     for i in 0..pcx.nodes[program as usize].count {
@@ -120,85 +119,77 @@ pub fn lower_program(cx: &mut FnCtx, program: i64, pcx: &mut Ctx<Comp>) {
 // PROMOTE, made once a program: a scalar local whose address is never
 // taken is an SSA variable; the others live in memory.
 pub fn need_promote(pcx: &mut Ctx<Comp>) {
-    // UNSAFE: PROMOTE is a raw array the SSA builder reads (ssa.vl), LOCALS the
-    // checker's static mut table.
-    // SAFETY: PROMOTE is allocated here with LOCAL_COUNT + 1 entries, and every
-    // index is a local below LOCAL_COUNT (the loop, and an Ident's local).
-    unsafe {
-        if pcx.promote != 0 as *mut i64 {
-            return;
-        }
-        pcx.promote = alloc_array::<i64>(pcx.locals.len() as i64 + 1);
-        for local in 0..pcx.locals.len() as i64 {
-            let ty = pcx.locals[local as usize].ty;
-            (*pcx.promote.add(local as usize)) = if is_void(ty) || is_compound(ty, pcx) { 0 }
-                else { 1 };
-        }
-        for n in 1..pcx.nodes.len() {
-            if pcx.nodes[n].kind == Unary && pcx.nodes[n].op == Tok::Amp {
-                let operand = pcx.nodes[n].b;
-                if pcx.nodes[operand as usize].kind == Ident
-                    && pcx.nodes[operand as usize].res == Res::Local {
-                    (*pcx.promote.add(pcx.nodes[operand as usize].y as usize)) = 0;
-                }
+    if !pcx.promote.is_empty() {
+        return;
+    }
+    sized_table(&mut pcx.promote, pcx.locals.len() as i64 + 1, 0);
+    for local in 0..pcx.locals.len() as i64 {
+        let ty = pcx.locals[local as usize].ty;
+        (pcx.promote[local as usize]) = if is_void(ty) || is_compound(ty, pcx) { 0 }
+            else { 1 };
+    }
+    for n in 1..pcx.nodes.len() {
+        if pcx.nodes[n].kind == Unary && pcx.nodes[n].op == Tok::Amp {
+            let operand = pcx.nodes[n].b;
+            if pcx.nodes[operand as usize].kind == Ident
+                && pcx.nodes[operand as usize].res == Res::Local {
+                (pcx.promote[pcx.nodes[operand as usize].y as usize]) = 0;
             }
         }
     }
 }
 
-fn lower_return(cx: &mut FnCtx, value: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let f = (*get_irfuncs().add(cx.irf as usize)).f;
-        let ret = pcx.fns[f as usize].ret;
-        let mut result: i64 = 0;
-        let c = fn_uses_c(f, pcx);
-        if conv_returns_through_pointer(cx, c, ret, pcx) {
-            lower_copy(cx, (*get_irfuncs().add(cx.irf as usize)).result_ptr, value,
-                type_size(ret, pcx), pcx);
-            if get_x86() && c {
-                // Returned in rax, as C does.
-                result = (*get_irfuncs().add(cx.irf as usize)).result_ptr;
-            }
-        } else if is_compound(ret, pcx) {
-            // Returned in registers: its pieces, read from a multiple of 8
-            // bytes, packed for the RET.
-            let mut addr = need_value(cx, value, ret, pcx);
-            if type_size(ret, pcx) % 8 != 0 && (*cx.insts.add(addr as usize)).op != Op::Slot {
-                let new_slot_for_v = new_slot_for(cx, ret, pcx);
-                let copy = ir_slot_addr(cx, new_slot_for_v, pcx);
-                lower_copy(cx, copy, addr, type_size(ret, pcx), pcx);
-                addr = copy;
-            }
-            conv_classify(cx, c, ret, pcx);
-            let count = cx.abi_piece_count;
-            let mut tys: [i64; 4] = [0i64; 4];
-            let mut offsets: [i64; 4] = [0i64; 4];
-            for k in 0..count {
-                tys[k as usize] = cx.abi_piece_ty[k as usize];
-                offsets[k as usize] = cx.abi_piece_offset[k as usize];
-            }
-            let mark = cx.ssa_stack.count;
-            for k in 0..count {
-                let ir_load_v = ir_load(cx, tys[k as usize], addr, offsets[k as usize], pcx);
-                push_arg(cx, ir_load_v, tys[k as usize]);
-            }
-            result = emit_ir(cx, Op::Pack, 0, 0, 0, 0, pcx);
-            take_args(cx, result, mark);
-        } else if is_void(ret) {
-            // `main` without a result exits with 0.
-            if pcx.fns[f as usize].name == pcx.main_sym {
-                result = ir_const(cx, 0, TY_I64, pcx);
-            }
-        } else {
-            result = need_value(cx, value, ret, pcx);
+fn lower_return(cx: &mut FnCtx<Comp>, value: i64, pcx: &mut Ctx<Comp>) {
+    let f = pcx.ir_fn[cx.irf as usize];
+    let ret = pcx.fns[f as usize].ret;
+    let mut result: i64 = 0;
+    let c = fn_uses_c(f, pcx);
+    if conv_returns_through_pointer(cx, c, ret, pcx) {
+        lower_copy(cx, fn_result_ptr(cx, cx.irf), value,
+            type_size(ret, pcx), pcx);
+        if get_x86() && c {
+            // Returned in rax, as C does.
+            result = fn_result_ptr(cx, cx.irf);
         }
-        if !is_dead_block(cx, pcx.ir_cur) {
-            ir_terminate(cx, pcx.ir_cur, Term::Ret, result, 0, 0);
-        } else {
-            ir_terminate(cx, pcx.ir_cur, Term::Unreach, 0, 0, 0);
+    } else if is_compound(ret, pcx) {
+        // Returned in registers: its pieces, read from a multiple of 8
+        // bytes, packed for the RET.
+        let mut addr = need_value(cx, value, ret, pcx);
+        if type_size(ret, pcx) % 8 != 0 && (cx.insts[addr as usize]).op != Op::Slot {
+            let new_slot_for_v = new_slot_for(cx, ret, pcx);
+            let copy = ir_slot_addr(cx, new_slot_for_v, pcx);
+            lower_copy(cx, copy, addr, type_size(ret, pcx), pcx);
+            addr = copy;
         }
-        start_dead_block(cx, pcx);
+        conv_classify(cx, c, ret, pcx);
+        let count = cx.abi_piece_count;
+        let mut tys: [i64; 4] = [0i64; 4];
+        let mut offsets: [i64; 4] = [0i64; 4];
+        for k in 0..count {
+            tys[k as usize] = cx.abi_piece_ty[k as usize];
+            offsets[k as usize] = cx.abi_piece_offset[k as usize];
+        }
+        let mark = cx.ssa_stack.len() as i64;
+        for k in 0..count {
+            let ir_load_v = ir_load(cx, tys[k as usize], addr, offsets[k as usize], pcx);
+            push_arg(cx, ir_load_v, tys[k as usize]);
+        }
+        result = emit_ir(cx, Op::Pack, 0, 0, 0, 0, pcx);
+        take_args(cx, result, mark);
+    } else if is_void(ret) {
+        // `main` without a result exits with 0.
+        if pcx.fns[f as usize].name == pcx.main_sym {
+            result = ir_const(cx, 0, TY_I64, pcx);
+        }
+    } else {
+        result = need_value(cx, value, ret, pcx);
     }
+    if !is_dead_block(cx, pcx.ir_cur) {
+        ir_terminate(cx, pcx.ir_cur, Term::Ret, result, 0, 0);
+    } else {
+        ir_terminate(cx, pcx.ir_cur, Term::Unreach, 0, 0, 0);
+    }
+    start_dead_block(cx, pcx);
 }
 
 // ---- Statements and bindings ----
@@ -216,64 +207,59 @@ pub fn is_fresh(n: i64, pcx: &Ctx<Comp>) -> bool {
 
 // Binds local `local` (of type `ty`) to `value` (the address of a compound
 // value, taken over when `fresh`).
-fn bind_local(cx: &mut FnCtx, local: i64, value: i64, ty: i64, fresh: bool, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if is_void(ty) {
-            return;
-        }
-        if (*pcx.promote.add(local as usize)) != 0 {
-            let need_value_v = need_value(cx, value, ty, pcx);
-            ssa_write(cx, local, pcx.ir_cur, need_value_v);
-            return;
-        }
-        if is_compound(ty, pcx) && fresh {
-            (*pcx.local_addr.add(local as usize)) = value;
-            return;
-        }
-        let new_slot_for_v = new_slot_for(cx, ty, pcx);
-        let addr = ir_slot_addr(cx, new_slot_for_v, pcx);
-        if is_compound(ty, pcx) {
-            lower_copy(cx, addr, value, type_size(ty, pcx), pcx);
-        } else {
-            let ir_type_v = ir_type(ty, pcx);
-            let need_value_v1 = need_value(cx, value, ty, pcx);
-            ir_store(cx, ir_type_v, addr, need_value_v1, 0, pcx);
-        }
-        (*pcx.local_addr.add(local as usize)) = addr;
+fn bind_local(cx: &mut FnCtx<Comp>, local: i64, value: i64, ty: i64, fresh: bool,
+    pcx: &mut Ctx<Comp>) {
+    if is_void(ty) {
+        return;
     }
+    if (pcx.promote[local as usize]) != 0 {
+        let need_value_v = need_value(cx, value, ty, pcx);
+        ssa_write(cx, local, pcx.ir_cur, need_value_v);
+        return;
+    }
+    if is_compound(ty, pcx) && fresh {
+        (pcx.local_addr[local as usize]) = value;
+        return;
+    }
+    let new_slot_for_v = new_slot_for(cx, ty, pcx);
+    let addr = ir_slot_addr(cx, new_slot_for_v, pcx);
+    if is_compound(ty, pcx) {
+        lower_copy(cx, addr, value, type_size(ty, pcx), pcx);
+    } else {
+        let ir_type_v = ir_type(ty, pcx);
+        let need_value_v1 = need_value(cx, value, ty, pcx);
+        ir_store(cx, ir_type_v, addr, need_value_v1, 0, pcx);
+    }
+    (pcx.local_addr[local as usize]) = addr;
 }
 
 // A frame slot for a value of type `ty`; compound values get a multiple of
 // 8 bytes, so that they can be read and written in 8-byte pieces.
-fn new_slot_for(mut cx: *mut FnCtx, ty: i64, pcx: &Ctx<Comp>) -> i64 {
+fn new_slot_for(cx: &mut FnCtx<Comp>, ty: i64, pcx: &Ctx<Comp>) -> i64 {
     let size = if is_compound(ty, pcx) { align_to(type_size(ty, pcx), 8) }
         else { type_size(ty, pcx) };
-    // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
-    // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
-    let slot = ir_new_slot(unsafe { &mut *cx }, size, type_align(ty, pcx));
-    unsafe { (*cx.slots.add(slot as usize)).ty = ty; }
+    let slot = ir_new_slot(&mut *cx, size, type_align(ty, pcx));
+    (cx.slots[slot as usize]).ty = ty;
     slot
 }
 
 // Copies `size` bytes from `src` to `dst`.
-fn lower_copy(cx: &mut FnCtx, dst: i64, src: i64, size: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if size == 0 {
-            return;
-        }
-        if size <= INLINE_COPY_MAX {
-            let v = emit_ir(cx, Op::Copy, 0, dst, src, size, pcx);
-            (*cx.insts.add(v as usize)).imm2 = 0;
-            return;
-        }
-        let mark = cx.ssa_stack.count;
-        push_arg(cx, dst, TY_U64);
-        push_arg(cx, src, TY_U64);
-        let ir_const_v = ir_const(cx, size, TY_U64, pcx);
-        push_arg(cx, ir_const_v, TY_U64);
-        let call = emit_ir(cx, Op::CallC, 0, 0, 0, intern_c(c"memcpy", pcx), pcx);
-        take_args(cx, call, mark);
+fn lower_copy(cx: &mut FnCtx<Comp>, dst: i64, src: i64, size: i64, pcx: &mut Ctx<Comp>) {
+    if size == 0 {
+        return;
     }
+    if size <= INLINE_COPY_MAX {
+        let v = emit_ir(cx, Op::Copy, 0, dst, src, size, pcx);
+        (cx.insts[v as usize]).imm2 = 0;
+        return;
+    }
+    let mark = cx.ssa_stack.len() as i64;
+    push_arg(cx, dst, TY_U64);
+    push_arg(cx, src, TY_U64);
+    let ir_const_v = ir_const(cx, size, TY_U64, pcx);
+    push_arg(cx, ir_const_v, TY_U64);
+    let call = emit_ir(cx, Op::CallC, 0, 0, 0, intern_c(c"memcpy", pcx), pcx);
+    take_args(cx, call, mark);
 }
 
 // ---- Assignment ----

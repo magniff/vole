@@ -3,15 +3,15 @@
 // statement), statements (`let`, `defer`), `if` in both modes, loops and
 // the jumps out of them (`break`, `continue`, `return`).
 
-use crate::base::{_setjmp, buf_fmt, buf_new, buf_slice, get_src};
+use crate::base::{_setjmp, buf_copy, buf_fmt, buf_new, get_src};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{
     err_begin, err_end, err_end_soft, err_fix, err_help, err_str, err_sym, err_try_fmt,
     recover_enter, recover_leave,
 };
-use crate::front::ast::{BLOCK_UNSAFE, CONV_INOUT, FN_LAZY, FN_UNSAFE, NODE_REF, NodeKind, child};
-use crate::front::ast::NodeKind::{Block, Defer, Ident, If, Let, Loop, PatTuple, Path, Range, While};
+use crate::front::ast::{BLOCK_UNSAFE, FN_LAZY, FN_UNSAFE, NODE_REF, NodeKind, child};
+use crate::front::ast::NodeKind::{Block, Ident, If, Let, Loop, PatTuple, Path, Range, While};
 use crate::front::check::{
     check_recovering, define_local, lookup_local, mismatch_error, name_error, poison_statement,
     pop_scope, push_scope, restore_check_state, save_check_state, type_error, type_error_got,
@@ -35,8 +35,8 @@ use crate::front::modules::lookup::{B_ITEM, B_TVARIANT, binding_kind, binding_va
 use crate::front::patterns::{check_irrefutable, check_pattern};
 use crate::front::traits::bounded_param_of_type;
 use crate::front::types::{
-    REF_MUT, TY_BOOL, TY_I64, TY_NEVER, TY_UNIT, TY_USIZE, TyKind, buf_type, err_type, fn_param,
-    is_integer, is_numeric,
+    TY_BOOL, TY_I64, TY_NEVER, TY_UNIT, TY_USIZE, TyKind, buf_type, err_type, fn_param, is_integer,
+    is_numeric,
 };
 
 // ---- Functions ----
@@ -68,10 +68,9 @@ pub fn check_function(item: i64, pcx: &mut Ctx<Comp>) {
     let saved_base = pcx.loop_base;
     pcx.cur_fn = f;
     pcx.loop_base = 0;
-    pcx.loop_stack.count = 0;
-    pcx.env.count = 0;
-    pcx.check_scopes.count = 0;
-    pcx.const_ptrs.count = 0;
+    pcx.loop_stack.clear();
+    pcx.env.clear();
+    pcx.check_scopes.clear();
     for i in 0..pcx.nodes[item as usize].count {
         let param = child(item, i, pcx);
         if pcx.nodes[param as usize].a != pcx.underscore {
@@ -79,8 +78,6 @@ pub fn check_function(item: i64, pcx: &mut Ctx<Comp>) {
                 fn_param(f, i, pcx), pcx.nodes[param as usize].c != 0, true, pcx);
             { let at_ix = pcx.nodes[param as usize].x as usize;
                 pcx.locals[at_ix].borrow = is_borrow_param(param, pcx) };
-            crate::front::check::rust::note_const_ptr(pcx.nodes[param as usize].x,
-                pcx.nodes[param as usize].b, pcx);
             { let at_ix = pcx.nodes[param as usize].x as usize;
                 pcx.locals[at_ix].tparam = bounded_param_of_type(pcx.nodes[param as usize].b,
                     pcx) };
@@ -89,12 +86,6 @@ pub fn check_function(item: i64, pcx: &mut Ctx<Comp>) {
                     pcx) };
             { let at_ix = pcx.nodes[param as usize].x as usize;
                 pcx.locals[at_ix].tnode = pcx.nodes[param as usize].b };
-            // (0.20) a let or inout parameter that is a reference: used as
-            // the value it designates (front/conv, names: synth_name)
-            { let at_ix = pcx.nodes[param as usize].x as usize; pcx.locals[at_ix].access =
-                crate::front::conv::param_is_access(param, fn_param(f, i, pcx), pcx) };
-            { let at_ix = pcx.nodes[param as usize].x as usize; pcx.locals[at_ix].is_sink =
-                crate::front::conv::param_conv(param, pcx) == crate::front::conv::CONV_SINK_K };
         } else {
             pcx.nodes[param as usize].x = -1;
         }
@@ -108,8 +99,8 @@ pub fn check_function(item: i64, pcx: &mut Ctx<Comp>) {
     // (0.17, T1: the by-value parameters' drops, front/own/drops)
     param_drops(item, f, pcx);
     crate::front::check::assign::clear_inout_places(pcx);
-    let deferred_at = pcx.deferred.count;
-    let open_at = pcx.open_lets.count;
+    let deferred_at = pcx.deferred.len() as i64;
+    let open_at = pcx.open_lets.len() as i64;
     // RULE: F18.6 (the type variables the body makes are its own)
     let infer_at = crate::front::check::infer::begin(pcx);
     // RULE: D21.2 (an `impl Tr` result: the body's type is the hidden type,
@@ -126,9 +117,9 @@ pub fn check_function(item: i64, pcx: &mut Ctx<Comp>) {
     // (0.27.1) a deferred `let x;` never assigned: its type is not known
     // (rustc E0282)
     let mut i = deferred_at;
-    while i + 1 < pcx.deferred.count {
-        let l = pcx.deferred.get(i);
-        let pos = pcx.deferred.get(i + 1);
+    while i + 1 < pcx.deferred.len() as i64 {
+        let l = pcx.deferred[i as usize];
+        let pos = pcx.deferred[(i + 1) as usize];
         i += 2;
         if pcx.locals[l as usize].ty == 0 {
             pcx.locals[l as usize].ty = pcx.ty_error;
@@ -173,67 +164,75 @@ pub fn check_function(item: i64, pcx: &mut Ctx<Comp>) {
 
 // The type of a block; `expected` (0 for none) goes to its tail.
 pub fn check_block(block: i64, expected: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        push_scope(pcx);
-        let locals = pcx.locals.len() as i64;
-        let is_unsafe = (pcx.nodes[block as usize].p & BLOCK_UNSAFE) != 0;
-        if is_unsafe {
-            pcx.unsafe_depth += 1;
-            audit_checked(pcx.nodes[block as usize].start, pcx);
-        }
-        let saved_wrap = pcx.wrap_node;
-        let mut diverges = false;
-        // (0.17, T1: its statements' temporaries and borrowing bindings,
-        // front/own/drops; the places IR drops its owned locals)
-        let drops = block_begin(block, pcx);
-        // (0.18.1: `&f(x)`, a temporary)
-        crate::front::check::temps::hoist_temporaries(block, pcx);
-        for i in 0..pcx.nodes[block as usize].count {
-            // A recovery point: after an error, on at the next statement. A
-            // block with a statement that failed counts as diverging, which
-            // reports nothing more about its type.
-            let stmt = child(block, i, pcx);
-            let depth = pcx.recover_depth;
-            let state = save_check_state(pcx);
-            let mut result = false;
-            pcx.wrap_node = stmt;
-            if _setjmp(recover_enter(pcx)) == 0 {
-                result = check_stmt(stmt, pcx);
-                after_stmt(drops, stmt, pcx);
-            } else {
-                restore_check_state(state, pcx);
-                poison_statement(stmt, pcx);
-                result = true;
-            }
-            recover_leave(depth, pcx);
-            if result {
-                diverges = true;
-            }
-        }
-        let tail = pcx.nodes[block as usize].a;
-        let mut ty = TY_UNIT;
-        if tail != 0 {
-            pcx.wrap_node = tail;
-            // RULE: D21.4, D20.3 (the tail closure of a function with an
-            // `impl Fn*` result: its bound's parameter types)
-            if expected == 0 && pcx.cur_fn >= 0
-                && block == pcx.nodes[pcx.fns[pcx.cur_fn as usize].node as usize].c
-                && crate::front::opaque::has_opaque_result(pcx.cur_fn, pcx) {
-                crate::front::opaque::closure_value(tail, pcx.fns[pcx.cur_fn as usize].ret, pcx);
-            }
-            ty = if expected != 0 { check_expr(tail, expected, pcx) }
-                else { synth_expr(tail, pcx) };
-            check_scope_exit(ty, locals, pcx.nodes[tail as usize].start, pcx);
-            after_tail(drops, block, pcx);
-        }
-        pcx.wrap_node = saved_wrap;
-        if is_unsafe {
-            pcx.unsafe_depth -= 1;
-        }
-        pop_scope(pcx);
-        pcx.nodes[block as usize].ty = if diverges { TY_NEVER } else { ty };
-        pcx.nodes[block as usize].ty
+    push_scope(pcx);
+    let locals = pcx.locals.len() as i64;
+    let is_unsafe = (pcx.nodes[block as usize].p & BLOCK_UNSAFE) != 0;
+    if is_unsafe {
+        pcx.unsafe_depth += 1;
+        audit_checked(pcx.nodes[block as usize].start, pcx);
     }
+    let saved_wrap = pcx.wrap_node;
+    let mut diverges = false;
+    // (0.17, T1: its statements' temporaries and borrowing bindings,
+    // front/own/drops; the places IR drops its owned locals)
+    let drops = block_begin(block, pcx);
+    // (0.18.1: `&f(x)`, a temporary)
+    crate::front::check::temps::hoist_temporaries(block, pcx);
+    for i in 0..pcx.nodes[block as usize].count {
+        // A recovery point: after an error, on at the next statement. A
+        // block with a statement that failed counts as diverging, which
+        // reports nothing more about its type.
+        let stmt = child(block, i, pcx);
+        let depth = pcx.recover_depth;
+        let state = save_check_state(pcx);
+        let mut result = false;
+        pcx.wrap_node = stmt;
+        // UNSAFE: the front end's error recovery is C's setjmp/longjmp
+        // (base::diag::err_jump): an error raised in what this guards returns here, and
+        // setjmp must be called in the frame that stays live, so no safe wrapper can make
+        // the call.
+        // SAFETY: recover_enter gives the jmp_buf of this frame's depth (512 zeroed bytes
+        // kept in pcx.recover_bufs, never freed); err_jump jumps only to the buffer of
+        // recover_depth - 1, and this function sets recover_depth back to the depth it
+        // entered with (recover_leave(depth) below) before it returns, on both paths, so no
+        // jump lands in a frame that has returned. A jump skips the destructors of the
+        // frames between: their allocations leak, nothing is freed twice.
+        if unsafe { _setjmp(recover_enter(pcx)) == 0 } {
+            result = check_stmt(stmt, pcx);
+            after_stmt(drops, stmt, pcx);
+        } else {
+            restore_check_state(state, pcx);
+            poison_statement(stmt, pcx);
+            result = true;
+        }
+        recover_leave(depth, pcx);
+        if result {
+            diverges = true;
+        }
+    }
+    let tail = pcx.nodes[block as usize].a;
+    let mut ty = TY_UNIT;
+    if tail != 0 {
+        pcx.wrap_node = tail;
+        // RULE: D21.4, D20.3 (the tail closure of a function with an
+        // `impl Fn*` result: its bound's parameter types)
+        if expected == 0 && pcx.cur_fn >= 0
+            && block == pcx.nodes[pcx.fns[pcx.cur_fn as usize].node as usize].c
+            && crate::front::opaque::has_opaque_result(pcx.cur_fn, pcx) {
+            crate::front::opaque::closure_value(tail, pcx.fns[pcx.cur_fn as usize].ret, pcx);
+        }
+        ty = if expected != 0 { check_expr(tail, expected, pcx) }
+            else { synth_expr(tail, pcx) };
+        check_scope_exit(ty, locals, pcx.nodes[tail as usize].start, pcx);
+        after_tail(drops, block, pcx);
+    }
+    pcx.wrap_node = saved_wrap;
+    if is_unsafe {
+        pcx.unsafe_depth -= 1;
+    }
+    pop_scope(pcx);
+    pcx.nodes[block as usize].ty = if diverges { TY_NEVER } else { ty };
+    pcx.nodes[block as usize].ty
 }
 
 pub fn check_branch(block: i64, expected: i64, pcx: &mut Ctx<Comp>) -> i64 {
@@ -254,20 +253,10 @@ fn check_stmt(stmt: i64, pcx: &mut Ctx<Comp>) -> bool {
     if pcx.nodes[stmt as usize].kind == Let {
         return check_let(stmt, pcx);
     }
-    if pcx.nodes[stmt as usize].kind == Defer {
-        return check_defer(stmt, pcx);
-    }
     let expr = pcx.nodes[stmt as usize].a;
     let ty = if pcx.nodes[stmt as usize].b != 0 { synth_expr(expr, pcx) }
         else { check_expr(expr, TY_UNIT, pcx) };
     ty == TY_NEVER
-}
-
-// A `defer` (error syntax.defer since 0.26.2; nothing else makes one):
-// its body, checked.
-fn check_defer(stmt: i64, pcx: &mut Ctx<Comp>) -> bool {
-    synth_expr(pcx.nodes[stmt as usize].a, pcx);
-    false
 }
 
 fn check_let(stmt: i64, pcx: &mut Ctx<Comp>) -> bool {
@@ -305,15 +294,15 @@ fn check_let(stmt: i64, pcx: &mut Ctx<Comp>) -> bool {
         pcx.rust_arg = init;
         // RULE: D3.6a (0.27.7: a `let` written `*mut T` takes no `&T`)
         let saved_raw = pcx.raw_mut_at;
-        pcx.raw_mut_at = if pcx.rust_arg != 0
-            && crate::front::check::rust::mut_raw_node(pcx.nodes[stmt as usize].b, pcx) { init }
-            else { 0 };
+        pcx.raw_mut_at = if pcx.rust_arg != 0 {
+            crate::front::check::rust::raw_mut_value(init, pcx.nodes[stmt as usize].b, pcx)
+        } else { 0 };
         actual = check_expr(init, binding_ty, pcx);
         pcx.raw_mut_at = saved_raw;
         pcx.rust_arg = saved;
     } else {
         // (0.27.3: a literal of its tree may not fit the fallback, F18.5)
-        if pcx.open_hints.count > 0 && pcx.open_lets.count > 0 {
+        if pcx.open_hints.len() as i64 > 0 && pcx.open_lets.len() as i64 > 0 {
             crate::front::check::literals::open_hint(stmt, init, pcx);
         }
         let saved_init = pcx.open_init;
@@ -328,53 +317,18 @@ fn check_let(stmt: i64, pcx: &mut Ctx<Comp>) -> bool {
         pcx.open_init = saved_init;
         actual = binding_ty;
     }
-    let borrowed = pcx.nodes[stmt as usize].b == 0 && let_part(stmt, init, binding_ty, pcx);
-    if borrowed {
-        binding_ty = synth_expr(init, pcx);
-        actual = binding_ty;
-    }
     check_pattern(pcx.nodes[stmt as usize].a, binding_ty, pcx);
-    if pcx.nodes[pcx.nodes[stmt as usize].a as usize].kind == NodeKind::PatBind {
-        crate::front::check::rust::note_const_ptr(pcx.nodes[pcx.nodes[stmt as usize].a as usize].x,
-            pcx.nodes[stmt as usize].b, pcx);
-    }
     // RULE: F18.5 (an unannotated `let` of a literal tree: an open local)
     if pcx.nodes[stmt as usize].b == 0 {
-        let bound: i64 = if !borrowed
-            && pcx.nodes[pcx.nodes[stmt as usize].a as usize].kind == NodeKind::PatBind {
+        let bound: i64 = if pcx.nodes[pcx.nodes[stmt as usize].a as usize].kind
+            == NodeKind::PatBind {
             pcx.nodes[pcx.nodes[stmt as usize].a as usize].x } else { -1 };
         crate::front::check::literals::open_let(bound, init, pcx);
     }
-    if borrowed && pcx.nodes[pcx.nodes[stmt as usize].a as usize].x >= 0 {
-        { let at_ix = pcx.nodes[pcx.nodes[stmt as usize].a as usize].x as usize;
-            pcx.locals[at_ix].access = true };
-    }
     check_irrefutable(pcx.nodes[stmt as usize].a, c"let", pcx);
     let pat = pcx.nodes[stmt as usize].a;
-    // (0.20) `inout x = &place;`: x is an exclusive access, used as the
-    // value it designates (front/conv)
-    if (pcx.nodes[stmt as usize].p & CONV_INOUT) != 0
-        && pcx.nodes[pat as usize].kind == NodeKind::PatBind
-        && pcx.nodes[pat as usize].x >= 0 {
-        if binding_ty > 0 && pcx.types[binding_ty as usize].kind == TyKind::Ptr
-            && pcx.types[binding_ty as usize].b == REF_MUT {
-            { let at_ix = pcx.nodes[pat as usize].x as usize; pcx.locals[at_ix].access = true };
-        } else if binding_ty > 0 && binding_ty != pcx.ty_error
-            && !(pcx.types[binding_ty as usize].kind == TyKind::Slice
-                && pcx.types[binding_ty as usize].b == REF_MUT) {
-            crate::front::conv::conv_error(crate::front::conv::CODE_PLACE,
-                pcx.nodes[init as usize].start, pcx.nodes[init as usize].end,
-                b"an inout binding is an exclusive access of a place: 'inout x = &place;'",
-                b"lend the place with '&', or bind a copy with 'var x = ..'", b"", pcx);
-        }
-    }
-    // (0.25) `inout r = &make()` binds a temporary (no conv.place);
-    // `let r = &x` is a let access of x, not an inout one
     if pcx.nodes[init as usize].kind == NodeKind::Unary && pcx.nodes[init as usize].op == Tok::Amp {
-        pcx.let_amps.push(init);
-        if (pcx.nodes[stmt as usize].p & CONV_INOUT) == 0 {
-            pcx.raw_addrs.push(init);
-        }
+        pcx.raw_addrs.push(init);
     }
     // (0.17) `let p = &v;`: v, for an error indexing through p
     if pcx.nodes[pat as usize].kind == NodeKind::PatBind && pcx.nodes[pat as usize].b == 0
@@ -405,23 +359,6 @@ fn check_let(stmt: i64, pcx: &mut Ctx<Comp>) -> bool {
         }
     }
     actual == TY_NEVER
-}
-
-// (0.20, conventions.md D13) `let x = part;` in a 0.20 file, where part is
-// a place of an owned (or move-only) value that the function cannot take:
-// an element (`rows[0]`), a field reached through an access or a pointer,
-// a let parameter. 0.19 rejected it (own.move_out); here x borrows it: init
-// becomes `&part`, and x an access (the caller sets Local.access). Whatever
-// the function owns (a local, a sink parameter, their fields) still moves.
-// (0.25.2) In std too: until 0.25.2 std was exempt, and there the same
-// line was a copy of the element's bits that the scope then dropped while
-// the collection still owned it (std::gpu::wgsl freed parts of its module
-// on every translation). A move of the bits that std means, its
-// containers' and iterators', is written as one: a read through a raw
-// pointer (`let at: *T = &v[i]; let x = unsafe { *at };`, borrowed_place).
-fn let_part(stmt: i64, init: i64, ty: i64, pcx: &mut Ctx<Comp>) -> bool {
-    let pat = pcx.nodes[stmt as usize].a;
-    return false;
 }
 
 pub fn check_if(n: i64, expected: i64, pcx: &mut Ctx<Comp>) -> i64 {
@@ -563,9 +500,9 @@ pub fn synth_if(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if else_block != 0 && then_ty != TY_NEVER && (branch_takes_type(else_block, pcx)
         && (tail_needs_context(else_block, pcx) || is_numeric(then_ty)
             || literal_array_takes(else_block, then_ty, pcx))
-        // RULE: F18.1 (0.27.2, std2: the else branch is checked against
+        // RULE: F18.1 (0.27.2: the else branch is checked against
         // the then branch's type, `if c { p } else { null_mut() }`)
-        || crate::front::known::on_std2(pcx) && then_ty != pcx.ty_error
+        || then_ty != pcx.ty_error
         && pcx.nodes[else_block as usize].kind == Block) {
         // RULE: F18.5 (0.27.6: a tuple element the then branch gives by
         // literals alone takes the else branch's type there)
@@ -640,8 +577,8 @@ fn branch_types_error(n: i64, then_ty: i64, else_ty: i64, pcx: &mut Ctx<Comp>) -
             buf_fmt(t,
                 { let text = str::from_utf8(text).unwrap(); format_args("({text}) as i64") });
         }
-        err_try_fmt(str::from_utf8(buf_slice(t)).unwrap(), pcx);
-        err_fix(pcx.nodes[u as usize].start, pcx.nodes[u as usize].end, buf_slice(t), pcx);
+        err_try_fmt(str::from_utf8(&buf_copy(t)).unwrap(), pcx);
+        err_fix(pcx.nodes[u as usize].start, pcx.nodes[u as usize].end, &buf_copy(t), pcx);
     }
     if literal == 1 {
         crate::front::check::literals::literal_help(pcx.nodes[n as usize].start, pcx);
@@ -657,7 +594,7 @@ fn branch_tail(b: i64, pcx: &Ctx<Comp>) -> i64 {
 // ---- Loops and jumps ----
 
 // (0.14) A closure's body is a function of its own.
-fn leave_closure_error(n: i64, keyword: *mut u8, pcx: &mut Ctx<Comp>) {
+fn leave_closure_error(n: i64, keyword: *const u8, pcx: &mut Ctx<Comp>) {
     err_begin(pcx.nodes[n as usize].start, pcx);
     err_str(c"'", pcx);
     err_str(keyword, pcx);
@@ -666,40 +603,38 @@ fn leave_closure_error(n: i64, keyword: *mut u8, pcx: &mut Ctx<Comp>) {
 }
 
 // The loop a `break`/`continue` refers to.
-pub fn find_loop(n: i64, keyword: *mut u8, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let label = pcx.nodes[n as usize].a;
-        if label == 0 {
-            if pcx.loop_stack.count == 0 {
-                err_begin(pcx.nodes[n as usize].start, pcx);
-                err_str(keyword, pcx);
-                err_str(c" outside of loop", pcx);
-                err_end(pcx);
-            }
-            if pcx.loop_base >= pcx.loop_stack.count {
+pub fn find_loop(n: i64, keyword: *const u8, pcx: &mut Ctx<Comp>) -> i64 {
+    let label = pcx.nodes[n as usize].a;
+    if label == 0 {
+        if pcx.loop_stack.len() as i64 == 0 {
+            err_begin(pcx.nodes[n as usize].start, pcx);
+            err_str(keyword, pcx);
+            err_str(c" outside of loop", pcx);
+            err_end(pcx);
+        }
+        if pcx.loop_base >= pcx.loop_stack.len() as i64 {
+            leave_closure_error(n, keyword, pcx);
+        }
+        return (pcx.loop_stack[(pcx.loop_stack.len() as i64 - 1) as usize]);
+    }
+    let mut i = pcx.loop_stack.len() as i64 - 1;
+    while i >= 0 {
+        let lp = (pcx.loop_stack[i as usize]);
+        if pcx.nodes[lp as usize].a == label {
+            if pcx.loop_base > i {
                 leave_closure_error(n, keyword, pcx);
             }
-            return (*pcx.loop_stack.data.add((pcx.loop_stack.count - 1) as usize));
+            return lp;
         }
-        let mut i = pcx.loop_stack.count - 1;
-        while i >= 0 {
-            let lp = (*pcx.loop_stack.data.add(i as usize));
-            if pcx.nodes[lp as usize].a == label {
-                if pcx.loop_base > i {
-                    leave_closure_error(n, keyword, pcx);
-                }
-                return lp;
-            }
-            i -= 1;
-        }
-        name_error(pcx.nodes[n as usize].start, c"unknown loop label ':", label, c"'", pcx)
+        i -= 1;
     }
+    name_error(pcx.nodes[n as usize].start, c"unknown loop label ':", label, c"'", pcx)
 }
 
 fn check_loop_body(lp: i64, body: i64, pcx: &mut Ctx<Comp>) {
     pcx.loop_stack.push(lp);
     check_branch(body, TY_UNIT, pcx);
-    pcx.loop_stack.pop();
+    pcx.loop_stack.pop().unwrap();
 }
 
 // `loop`; `expected` (0 for none) is the type of its break values.
@@ -724,7 +659,7 @@ pub fn check_while(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
 
 pub fn check_for(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let range = pcx.nodes[n as usize].c;
-    // (0.27.2: `for i in 0..`, a RangeFrom on std2, through its Iterator)
+    // (0.27.2: `for i in 0..`, a RangeFrom on std, through its Iterator)
     if pcx.nodes[range as usize].kind != Range || pcx.nodes[range as usize].a == 0
         || pcx.nodes[range as usize].b == 0 {
         return check_for_each(n, pcx);
@@ -745,7 +680,7 @@ pub fn check_for(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         synth_expr(end, pcx);
         pcx.open_keep = false;
         pcx.open_init = saved_init;
-    } else if literal_takes_rhs_type(start, end, pcx) || pcx.open_lets.count > 0
+    } else if literal_takes_rhs_type(start, end, pcx) || pcx.open_lets.len() as i64 > 0
         && crate::front::check::literals::open_local(start, pcx) >= 0
         && !crate::front::check::widen::takes_context(end, pcx) {
         elem_ty = synth_expr(end, pcx);
@@ -843,7 +778,7 @@ pub fn check_return(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             // RULE: D3.6a (0.27.7: a function's result written `*mut T`
             // takes no `&T`; a closure's is not read)
             let saved_raw = pcx.raw_mut_at;
-            let fnode: i64 = if pcx.closure_stack.count == 0 && pcx.cur_fn >= 0 {
+            let fnode: i64 = if pcx.closure_stack.len() as i64 == 0 && pcx.cur_fn >= 0 {
                 pcx.fns[pcx.cur_fn as usize].node } else { 0 };
             pcx.raw_mut_at = if fnode > 0 {
                 crate::front::check::rust::raw_mut_value(value, pcx.nodes[fnode as usize].b, pcx)

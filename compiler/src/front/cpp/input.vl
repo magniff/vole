@@ -2,7 +2,7 @@
 // stack of files being read (include frames, with their open `#if`s),
 // with the tokens pushed back to be read again.
 
-use crate::base::{IntVec, buf_byte, buf_new, cstr, get_bufs, intern, read_file};
+use crate::base::{buf_at, buf_byte, buf_copy, buf_done, buf_len, buf_new, intern, read_file};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::cimport::ctx::CImportCx;
@@ -15,182 +15,168 @@ use crate::front::lexer::{is_alpha, is_digit, is_ident_byte};
 
 // `dir`: the index in CDIRS of the directory the file was found in (-1:
 // found otherwise), for #include_next.
-#[derive(Clone, Copy)] pub struct CFile { pub path: *mut u8, pub dir: i64, first: i64, end: i64 }
+#[derive(Clone, Copy)] pub struct CFile { pub path: *const u8, pub dir: i64, first: i64, end: i64 }
 
 fn c_ident_byte(c: u8) -> bool {
     is_ident_byte(c) || c == b'$'
 }
 
-fn c_punct_len(p: *mut u8, n: i64) -> i64 {
-    unsafe {
-        let a = (*p.add(0));
-        let b = if n > 1 { (*p.add(1)) } else { 0 as u8 };
-        let c = if n > 2 { (*p.add(2)) } else { 0 as u8 };
-        if (a == b'.' && b == b'.' && c == b'.') || (a == b'<' && b == b'<' && c == b'=')
-            || (a == b'>' && b == b'>' && c == b'=') {
-            return 3;
-        }
-        if (a == b'-' && (b == b'>' || b == b'-' || b == b'='))
-            || (a == b'+' && (b == b'+' || b == b'=')) || (a == b'<' && (b == b'<' || b == b'='))
-            || (a == b'>' && (b == b'>' || b == b'=')) || (a == b'=' && b == b'=')
-            || (a == b'!' && b == b'=') || (a == b'&' && (b == b'&' || b == b'='))
-            || (a == b'|' && (b == b'|' || b == b'='))
-            || ((a == b'*' || a == b'/' || a == b'%' || a == b'^') && b == b'=')
-            || (a == b'#' && b == b'#') {
-            return 2;
-        }
-        1
+// The length of the punctuator that starts p (not empty).
+fn c_punct_len(p: &[u8]) -> i64 {
+    let a = p[0];
+    let b = if p.len() > 1 { p[1] } else { 0 as u8 };
+    let c = if p.len() > 2 { p[2] } else { 0 as u8 };
+    if (a == b'.' && b == b'.' && c == b'.') || (a == b'<' && b == b'<' && c == b'=')
+        || (a == b'>' && b == b'>' && c == b'=') {
+        return 3;
     }
+    if (a == b'-' && (b == b'>' || b == b'-' || b == b'='))
+        || (a == b'+' && (b == b'+' || b == b'=')) || (a == b'<' && (b == b'<' || b == b'='))
+        || (a == b'>' && (b == b'>' || b == b'=')) || (a == b'=' && b == b'=')
+        || (a == b'!' && b == b'=') || (a == b'&' && (b == b'&' || b == b'='))
+        || (a == b'|' && (b == b'|' || b == b'='))
+        || ((a == b'*' || a == b'/' || a == b'%' || a == b'^') && b == b'=')
+        || (a == b'#' && b == b'#') {
+        return 2;
+    }
+    1
 }
 
-// Lexes `n` bytes at `p` (lines already spliced) into tokens of file `f`;
+// Lexes the bytes p (lines already spliced) into tokens of file `f`;
 // returns the first token's index (the tokens end at CTOK_COUNT).
-pub fn c_lex(p: *mut u8, n: i64, f: i64, first_line: i64, ccx: &mut CImportCx<Comp>,
-    pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let first = pcx.ctok_count;
-        let mut i: i64 = 0;
-        let mut line = first_line;
-        let mut bol = true;
-        let mut space = false;
-        while i < n {
-            let c = (*p.add(i as usize));
-            if c == b'\n' {
-                line += 1;
-                bol = true;
-                space = false;
-                i += 1;
-                continue;
-            }
-            if c == b' ' || c == b'\t' || c == b'\r' || c == 12 || c == 11 {
-                space = true;
-                i += 1;
-                continue;
-            }
-            if c == b'/' && i + 1 < n && (*p.add((i + 1) as usize)) == b'/' {
-                while i < n && (*p.add(i as usize)) != b'\n' {
-                    i += 1;
-                }
-                space = true;
-                continue;
-            }
-            if c == b'/' && i + 1 < n && (*p.add((i + 1) as usize)) == b'*' {
-                i += 2;
-                while i < n
-                    && !((*p.add(i as usize)) == b'*' && i + 1 < n
-                        && (*p.add((i + 1) as usize)) == b'/') {
-                    if (*p.add(i as usize)) == b'\n' {
-                        line += 1;
-                    }
-                    i += 1;
-                }
-                i += 2;
-                space = true;
-                continue;
-            }
-            let start = i;
-            let mut kind = Punct;
-            // Prefixed literals: L"", u8"", u"", U"".
-            let mut prefix: i64 = 0;
-            if (c == b'L' || c == b'U' || c == b'u') && i + 1 < n
-                && ((*p.add((i + 1) as usize)) == b'"' || (*p.add((i + 1) as usize)) == b'\'') {
-                prefix = 1;
-            }
-            else if c == b'u' && i + 2 < n && (*p.add((i + 1) as usize)) == b'8'
-                && ((*p.add((i + 2) as usize)) == b'"' || (*p.add((i + 2) as usize)) == b'\'') {
-                prefix = 2;
-            }
-            let q = (*p.add((i + prefix) as usize));
-            if (prefix > 0 || c == b'"' || c == b'\'') && (q == b'"' || q == b'\'') {
-                kind = if q == b'"' { Str } else { Char };
-                i += prefix + 1;
-                while i < n && (*p.add(i as usize)) != q && (*p.add(i as usize)) != b'\n' {
-                    if (*p.add(i as usize)) == b'\\' && i + 1 < n {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                if i < n && (*p.add(i as usize)) == q {
-                    i += 1;
-                }
-            }
-            else if is_digit(c)
-                || (c == b'.' && i + 1 < n && is_digit((*p.add((i + 1) as usize)))) {
-                kind = Num;
-                i += 1;
-                while i < n {
-                    let d = (*p.add(i as usize));
-                    if (d == b'+' || d == b'-')
-                        && ((*p.add((i - 1) as usize)) == b'e' || (*p.add((i - 1) as usize)) == b'E'
-                            || (*p.add((i - 1) as usize)) == b'p'
-                            || (*p.add((i - 1) as usize)) == b'P') {
-                        i += 1;
-                    } else if c_ident_byte(d) || d == b'.' {
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-            } else if c == b'_' || is_alpha(c) || c == b'$' {
-                kind = Ident;
-                while i < n && c_ident_byte((*p.add(i as usize))) {
-                    i += 1;
-                }
-            } else {
-                i += c_punct_len(p.add(i as usize), n - i);
-            }
-            ctok_new(kind,
-                intern(std::slice::from_raw_parts(p.add((start) as usize), (i - (start)) as usize),
-                    pcx), f, line, space, bol, ccx, pcx);
-            bol = false;
+pub fn c_lex(p: &[u8], f: i64, first_line: i64, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let n = p.len();
+    let first = pcx.ctoks.len() as i64;
+    let mut i: usize = 0;
+    let mut line = first_line;
+    let mut bol = true;
+    let mut space = false;
+    while i < n {
+        let c = p[i];
+        if c == b'\n' {
+            line += 1;
+            bol = true;
             space = false;
+            i += 1;
+            continue;
         }
-        first
+        if c == b' ' || c == b'\t' || c == b'\r' || c == 12 || c == 11 {
+            space = true;
+            i += 1;
+            continue;
+        }
+        if c == b'/' && i + 1 < n && p[i + 1] == b'/' {
+            while i < n && p[i] != b'\n' {
+                i += 1;
+            }
+            space = true;
+            continue;
+        }
+        if c == b'/' && i + 1 < n && p[i + 1] == b'*' {
+            i += 2;
+            while i < n && !(p[i] == b'*' && i + 1 < n && p[i + 1] == b'/') {
+                if p[i] == b'\n' {
+                    line += 1;
+                }
+                i += 1;
+            }
+            i += 2;
+            space = true;
+            continue;
+        }
+        let start = i;
+        let mut kind = Punct;
+        // Prefixed literals: L"", u8"", u"", U"".
+        let mut prefix: usize = 0;
+        if (c == b'L' || c == b'U' || c == b'u') && i + 1 < n
+            && (p[i + 1] == b'"' || p[i + 1] == b'\'') {
+            prefix = 1;
+        }
+        else if c == b'u' && i + 2 < n && p[i + 1] == b'8'
+            && (p[i + 2] == b'"' || p[i + 2] == b'\'') {
+            prefix = 2;
+        }
+        let q = p[i + prefix];
+        if (prefix > 0 || c == b'"' || c == b'\'') && (q == b'"' || q == b'\'') {
+            kind = if q == b'"' { Str } else { Char };
+            i += prefix + 1;
+            while i < n && p[i] != q && p[i] != b'\n' {
+                if p[i] == b'\\' && i + 1 < n {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i < n && p[i] == q {
+                i += 1;
+            }
+        }
+        else if is_digit(c) || (c == b'.' && i + 1 < n && is_digit(p[i + 1])) {
+            kind = Num;
+            i += 1;
+            while i < n {
+                let d = p[i];
+                let before = p[i - 1];
+                if (d == b'+' || d == b'-')
+                    && (before == b'e' || before == b'E' || before == b'p' || before == b'P') {
+                    i += 1;
+                } else if c_ident_byte(d) || d == b'.' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+        } else if c == b'_' || is_alpha(c) || c == b'$' {
+            kind = Ident;
+            while i < n && c_ident_byte(p[i]) {
+                i += 1;
+            }
+        } else {
+            i += c_punct_len(&p[i..]) as usize;
+        }
+        let text = intern(&p[start..i], pcx);
+        ctok_new(kind, text, f, line, space, bol, ccx, pcx);
+        bol = false;
+        space = false;
     }
+    first
 }
 
 // Reads a file and lexes it; returns its CFILES index.
 pub fn c_load_file(path: *mut u8, dir: i64, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let raw = buf_new();
-        read_file(path, raw, pcx);
-        // Splice lines (a backslash before a newline); a spliced line's
-        // newline is kept, after the logical line, so lines keep their numbers.
-        let text = buf_new();
-        let data = (*get_bufs().add(raw as usize)).data;
-        let n = (*get_bufs().add(raw as usize)).len;
-        let mut pending: i64 = 0;
-        let mut i: i64 = 0;
-        while i < n {
-            if (*data.add(i as usize)) == b'\\' && i + 1 < n
-                && (*data.add((i + 1) as usize)) == b'\n' {
-                pending += 1;
-                i += 2;
-                continue;
-            }
-            if (*data.add(i as usize)) == b'\\' && i + 2 < n
-                && (*data.add((i + 1) as usize)) == b'\r'
-                && (*data.add((i + 2) as usize)) == b'\n' {
-                pending += 1;
-                i += 3;
-                continue;
-            }
-            buf_byte(text, (*data.add(i as usize)));
-            if (*data.add(i as usize)) == b'\n' {
-                while pending > 0 {
-                    buf_byte(text, b'\n');
-                    pending -= 1;
-                }
-            }
-            i += 1;
+    let raw = buf_new();
+    read_file(path, raw, pcx);
+    // Splice lines (a backslash before a newline); a spliced line's
+    // newline is kept, after the logical line, so lines keep their numbers.
+    let text = buf_new();
+    let n = buf_len(raw);
+    let mut pending: i64 = 0;
+    let mut i: i64 = 0;
+    while i < n {
+        let c = buf_at(raw, i);
+        if c == b'\\' && i + 1 < n && buf_at(raw, i + 1) == b'\n' {
+            pending += 1;
+            i += 2;
+            continue;
         }
-        buf_byte(text, b'\n');
-        let f = pcx.cfiles.len() as i64;
-        let first = c_lex((*get_bufs().add(text as usize)).data,
-            (*get_bufs().add(text as usize)).len, f, 1, ccx, pcx);
-        pcx.cfiles.push(CFile { path, dir, first, end: pcx.ctok_count });
-        f
+        if c == b'\\' && i + 2 < n && buf_at(raw, i + 1) == b'\r' && buf_at(raw, i + 2) == b'\n' {
+            pending += 1;
+            i += 3;
+            continue;
+        }
+        buf_byte(text, c);
+        if c == b'\n' {
+            while pending > 0 {
+                buf_byte(text, b'\n');
+                pending -= 1;
+            }
+        }
+        i += 1;
     }
+    buf_byte(text, b'\n');
+    let f = pcx.cfiles.len() as i64;
+    let first = c_lex(buf_done(text), f, 1, ccx, pcx);
+    pcx.cfiles.push(CFile { path, dir, first, end: pcx.ctoks.len() as i64 });
+    f
 }
 
 // (0.25.2) The path of C file f (empty: no such file), for the language
@@ -199,64 +185,64 @@ pub fn cfile_path(f: i64, pcx: &Ctx<Comp>) -> &[u8] {
     if f < 0 || f >= pcx.cfiles.len() as i64 {
         return b"";
     }
-    cstr(pcx.cfiles[f as usize].path)
+    // UNSAFE: a C file's path is a raw C string, seen as a slice
+    // SAFETY: c_load_file and c_load_text keep a NUL-terminated path in a
+    // block of its own that is never freed or written, and the entry
+    // stays in pcx.cfiles, which the result borrows
+    unsafe { crate::base::c_bytes(pcx.cfiles[f as usize].path) }
 }
 
 // ---- The input: include frames, and tokens pushed back ----
 
 pub fn cur_frame(ccx: &CImportCx<Comp>) -> i64 {
-    ccx.frame_file.count - 1
+    ccx.frame_file.len() as i64 - 1
 }
 
 pub fn push_frame(f: i64, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) {
-    if ccx.frame_file.count > 200 {
+    if ccx.frame_file.len() as i64 > 200 {
         c_error2(0, c"#include nested too deeply: ", pcx.cfiles[f as usize].path, pcx);
     }
     ccx.frame_file.push(f);
     ccx.frame_pos.push(pcx.cfiles[f as usize].first);
-    ccx.frame_cond.push(ccx.cpp_conds.count);
+    ccx.frame_cond.push(ccx.cpp_conds.len() as i64);
 }
 
 // The next token of the current file, or -1 at its end (no frames: EOF).
 pub fn file_tok(ccx: &mut CImportCx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let fr = cur_frame(ccx);
-        let pos = (*ccx.frame_pos.data.add(fr as usize));
-        if pos >= pcx.cfiles[(*ccx.frame_file.data.add(fr as usize)) as usize].end {
-            return -1;
-        }
-        (*ccx.frame_pos.data.add(fr as usize)) = pos + 1;
-        pos
+    let fr = cur_frame(ccx);
+    let pos = (ccx.frame_pos[fr as usize]);
+    if pos >= pcx.cfiles[(ccx.frame_file[fr as usize]) as usize].end {
+        return -1;
     }
+    (ccx.frame_pos[fr as usize]) = pos + 1;
+    pos
 }
 
 pub fn file_peek(ccx: &CImportCx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let fr = cur_frame(ccx);
-        let pos = (*ccx.frame_pos.data.add(fr as usize));
-        if pos >= pcx.cfiles[(*ccx.frame_file.data.add(fr as usize)) as usize].end { -1 }
-        else { pos }
-    }
+    let fr = cur_frame(ccx);
+    let pos = (ccx.frame_pos[fr as usize]);
+    if pos >= pcx.cfiles[(ccx.frame_file[fr as usize]) as usize].end { -1 }
+    else { pos }
 }
 
 // The rest of the directive's line, as a list in CINTS (start, count).
 pub fn line_tokens(ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> (i64, i64) {
-    let start = pcx.cints.count;
+    let start = pcx.cints.len() as i64;
     loop {
         let t = file_peek(ccx, pcx);
-        if unsafe { t < 0 || (*pcx.ctoks.add(t as usize)).bol } {
+        if t < 0 || (pcx.ctoks[t as usize]).bol {
             break;
         }
         file_tok(ccx, pcx);
         pcx.cints.push(t);
     }
-    (start, pcx.cints.count - start)
+    (start, pcx.cints.len() as i64 - start)
 }
 
 pub fn skip_line(ccx: &mut CImportCx<Comp>, pcx: &Ctx<Comp>) {
     loop {
         let t = file_peek(ccx, pcx);
-        if unsafe { t < 0 || (*pcx.ctoks.add(t as usize)).bol } {
+        if t < 0 || (pcx.ctoks[t as usize]).bol {
             return;
         }
         file_tok(ccx, pcx);
@@ -265,32 +251,30 @@ pub fn skip_line(ccx: &mut CImportCx<Comp>, pcx: &Ctx<Comp>) {
 
 // The next token before macro expansion; directives are carried out.
 pub fn raw_next(ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        loop {
-            if ccx.cpp_pending.count > 0 {
-                return ccx.cpp_pending.pop();
-            }
-            if ccx.cpp_list_mode || ccx.frame_file.count == 0 {
-                return pcx.c_eof;
-            }
-            let t = file_tok(ccx, pcx);
-            if t < 0 {
-                if ccx.cpp_conds.count != (*ccx.frame_cond.data.add(cur_frame(ccx) as usize)) {
-                    c_error2(0, c"unterminated #if in ",
-                        pcx.cfiles[(*ccx.frame_file.data.add(cur_frame(ccx) as usize)) as usize].path, pcx);
-                }
-                ccx.frame_file.pop();
-                ccx.frame_pos.pop();
-                ccx.frame_cond.pop();
-                continue;
-            }
-            if (*pcx.ctoks.add(t as usize)).bol && ctok_is(t, ccx.s_hash, pcx)
-                && (*pcx.ctoks.add(t as usize)).kind == Punct {
-                directive(t, ccx, pcx);
-                continue;
-            }
-            return t;
+    loop {
+        if ccx.cpp_pending.len() as i64 > 0 {
+            return ccx.cpp_pending.pop().unwrap();
         }
+        if ccx.cpp_list_mode || ccx.frame_file.len() as i64 == 0 {
+            return pcx.c_eof;
+        }
+        let t = file_tok(ccx, pcx);
+        if t < 0 {
+            if ccx.cpp_conds.len() as i64 != (ccx.frame_cond[cur_frame(ccx) as usize]) {
+                c_error2(0, c"unterminated #if in ",
+                    pcx.cfiles[(ccx.frame_file[cur_frame(ccx) as usize]) as usize].path, pcx);
+            }
+            ccx.frame_file.pop().unwrap();
+            ccx.frame_pos.pop().unwrap();
+            ccx.frame_cond.pop().unwrap();
+            continue;
+        }
+        if (pcx.ctoks[t as usize]).bol && ctok_is(t, ccx.s_hash, pcx)
+            && (pcx.ctoks[t as usize]).kind == Punct {
+            directive(t, ccx, pcx);
+            continue;
+        }
+        return t;
     }
 }
 
@@ -299,20 +283,17 @@ pub fn push_back(t: i64, ccx: &mut CImportCx<Comp>) {
 }
 
 // Pushes the tokens of a list (in CINTS or scratch) to be read next.
-pub fn push_list(v: IntVec, ccx: &mut CImportCx<Comp>) {
-    let mut i = v.count - 1;
+pub fn push_list(v: &[i64], ccx: &mut CImportCx<Comp>) {
+    let mut i = v.len() as i64 - 1;
     while i >= 0 {
-        unsafe { ccx.cpp_pending.push((*v.data.add(i as usize))); }
+        ccx.cpp_pending.push((v[i as usize]));
         i -= 1;
     }
 }
 
-pub fn c_load_text(path: *mut u8, text: i64, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let f = pcx.cfiles.len() as i64;
-        let first = c_lex((*get_bufs().add(text as usize)).data,
-            (*get_bufs().add(text as usize)).len, f, 1, ccx, pcx);
-        pcx.cfiles.push(CFile { path, dir: -1, first, end: pcx.ctok_count });
-        f
-    }
+pub fn c_load_text(path: *const u8, text: i64, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let f = pcx.cfiles.len() as i64;
+    let first = c_lex(&buf_copy(text), f, 1, ccx, pcx);
+    pcx.cfiles.push(CFile { path, dir: -1, first, end: pcx.ctoks.len() as i64 });
+    f
 }

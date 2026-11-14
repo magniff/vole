@@ -16,7 +16,7 @@ global allocator and no default `A`.
 | Rust | vole |
 |---|---|
 | `fn main()` | `fn main(gpa: Gpa)`: the program's allocator, passed down (`fn main()` when nothing allocates) |
-| `Vec<T>`, `String`, `HashMap<K, V>`, `Box<T>` | `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa>`, `Box<T, Gpa>`; generic code writes `A: Allocator` (`use std::alloc::Allocator`). `Vec<T>` is `alloc.default` |
+| `Vec<T>`, `String`, `HashMap<K, V>`, `Box<T>` | `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa, FixedState>` (the hasher is written too, `hash.default`; `FixedState` is in the prelude), `Box<T, Gpa>`; generic code writes `A: Allocator` (`use std::alloc::Allocator`). `Vec<T>` is `alloc.default` |
 | `Vec::new()`, `String::new()`, `Box::new(x)`, `Arc::new(x)` | `Vec::new_in(gpa)`, `String::new_in(gpa)`, `Box::new_in(x, gpa)`, `Arc::new_in(x, gpa)`: the allocator last. `Vec::new()` is `alloc.no_in` |
 | `x.to_string()`, `format!("{a}-{b}")`, `iter.collect()` | `x.to_string_in(gpa)`, `format_in("{a}-{b}", gpa)`, `iter.collect_in(gpa)`: what returns owned memory ends in `_in` |
 
@@ -120,7 +120,8 @@ fn main() {
 - **Overflow** panics at `-O0` (`attempt to add with overflow`) and
   wraps at `-O2`, as Rust's debug and release builds do; `wrapping_add`
   and its family always wrap.
-- `~x` is accepted for `!x` until 0.29.
+- `~x` is an error (`syntax.tilde`): an integer's complement is `!x`;
+  `volec fix --suggested` writes it.
 
 ```vole
 fn main() {
@@ -137,12 +138,12 @@ fn main() {
 
 ## Pointers and slices
 
-- `*const T` and `*mut T` are one type until 0.29: either goes where
-  the other is wanted, with no cast (`let q: *mut i64 = p;` of a
-  `*const i64`), and diagnostics print it `*T`. A write through a
-  pointer declared `*const T` is still refused.
-- A slice has the fields `ptr` and `len` beside Rust's `as_ptr()` and
-  `len()` (until 0.29).
+- `*const T` and `*mut T` are two types, as in Rust (0.29): a `*mut T`
+  goes where a `*const T` is wanted, the other way needs a cast (`p as
+  *mut T`, `p.cast_mut()`); a `&T` gives a `*const T` only; nothing is
+  written through a `*const T`. A `c"..."` literal is a `*const u8`.
+- A slice has no fields (0.29): its length is `s.len()`, its pointer
+  `s.as_ptr()` or `s.as_mut_ptr()`.
 - Raw pointers are for `unsafe` code, as in Rust (`guide unsafe`).
 
 ## C
@@ -188,7 +189,7 @@ window`), the arenas of `std::alloc`, and `embed wgsl` blocks with
 | `macro_rules!`, procedural macros | none |
 | `async`, `await` | none: threads (`guide threads`) |
 | const generics (`struct B<const N: usize>`) | none: the constant is an ordinary argument or field |
-| `-> Option<impl Tr>`, a trait method's `-> impl Tr`, `let x: impl Tr` | 0.29 (`edition.later`); `-> impl Tr` at the top of a result works |
+| `-> Option<impl Tr>`, a trait method's `-> impl Tr`, `let x: impl Tr` | 0.29 (`syntax.later`); `-> impl Tr` at the top of a result works |
 | `matches!(x, P)` | `match x { P => true, _ => false }` |
 | `let mut v = Vec::new_in(gpa);` typed by a later `v.push(x)` | the type is written: `let mut v: Vec<T, Gpa> = Vec::new_in(gpa);` |
 | a closure parameter `\|&&x\|`; `std::cmp::Reverse(k)` by its path | `\|x\| **x > 0`; `use std::cmp::Reverse;` then `Reverse(k)` |

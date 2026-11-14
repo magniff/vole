@@ -23,15 +23,18 @@
 }
 # (0.28) The programs are in the rust edition; its forms the seed
 # subset uses (tests/fuzz/gen.awk's plain mode, what fuzz-seed runs) and the
-# seed spells otherwise: the edition line (dropped), `*const T` and
+# seed spells otherwise: `*const T` and
 # `*mut T` (`*T`), an index `[(E) as usize]` (`[(E)]`: the seed indexes
-# with any integer), `&mut x` (`&x`: the seed has one `&`). `let mut`,
-# `mut p: T`, a typed range `0i64..n` and `~x` are the seed's own.
-/^\/\/ EDITION: rust *$/ { next }
+# with any integer), `&mut x` (`&x`: the seed has one `&`), an integer's
+# complement, which gen.awk writes `(! E)` (`(~E)`: the seed's spelling;
+# 0.29, the language has only `!x`; a condition's not is `(!C)`, without
+# the space, and the seed's own). `let mut`, `mut p: T` and a typed
+# range `0i64..n` are the seed's own.
 {
     gsub(/\*const /, "*"); gsub(/\*mut /, "*")
     gsub(/\) as usize\]/, ")]")
     gsub(/&mut /, "\\&")
+    gsub(/\(! /, "(~")
 }
 /^extern "C" \{ *fn .*; *\}$/ {
     sub(/^extern "C" \{ */, "extern ")

@@ -3,7 +3,7 @@ $ check
 main.vl:14:1: warning[unsafe.unjustified] extern block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
 main.vl:22:5: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
 calc.vl:4:17: warning[use.unused] unused import 'area': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
-ok: 0 errors, 3 warnings in main.vl
+ok: 0 errors, 3 warnings in main.vl (5 files, 0 shaders)
 ## edit delete MODULE: its `mod` line and its file; undo brings both back.
 $ edit delete report
 deleted crate::report	2 files	+0 -5 lines
@@ -31,14 +31,14 @@ $ edit patch crate::extern --old 'i32' --new 'i64' --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -15 +15 @@
--    fn puts(s: *mut u8) -> i32;
-+    fn puts(s: *mut u8) -> i64;
+-    fn puts(s: *const u8) -> i32;
++    fn puts(s: *const u8) -> i64;
 $ edit patch main::extern --old 'puts' --new 'fputs' --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -15 +15 @@
--    fn puts(s: *mut u8) -> i32;
-+    fn fputs(s: *mut u8) -> i32;
+-    fn puts(s: *const u8) -> i32;
++    fn fputs(s: *const u8) -> i32;
 main.vl:23:9: error[type error] undefined variable 'puts' | help: did you mean 'fputs'? | try: volec fix --suggested main.vl  [in crate::main]
 warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run); the error: main.vl:23:9: undefined variable 'puts'
 [exit 1]
@@ -194,7 +194,7 @@ $ refactor rename crate::calc::header top --dry-run
 ## query refs: the uses of string and C-string constants.
 $ query refs GREETING TITLE
 # main.vl
-9:7	def	->GREETING	const GREETING: *mut u8 = c"hello";
+9:7	def	->GREETING	const GREETING: *const u8 = c"hello";
 10:7	def	->TITLE	const TITLE: &str = "totals";
 21:15	read	main	->TITLE	println("{TITLE}: share {}%, twice {}", percent(a, b), twice(a));
 23:14	read	main	->GREETING	puts(GREETING);

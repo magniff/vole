@@ -22,14 +22,14 @@
 pub mod resolve;
 
 use crate::base::{
-    IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
-    get_bufs, streq,
+    STDOUT, buf_append, buf_byte, buf_bytes, buf_copy, buf_done, buf_int, buf_len, buf_new, buf_str,
+    buf_write_fd, streq,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, EV_WORD, Leaf, flag, is_flag, is_opt, option, table};
 use crate::tools::ctx::Tcx;
-use crate::tools::proc::{buf_cstr, read_file_if, run_capture, same_bytes};
+use crate::tools::proc::{buf_cstr, exec_words, read_file_if, run_capture, same_bytes};
 use crate::tools::query::{c_slice, file_line, find_root};
 use crate::tools::query::diagnostics::{diag, diags, put_cword, put_word, try_end};
 
@@ -37,83 +37,72 @@ use crate::tools::query::diagnostics::{diag, diags, put_cword, put_word, try_end
 
 // File `path` read, its regions found: its index, or -1 after the
 // diagnostic.
-fn read_source(path0: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut path = path0;
-        while (*path.add(0)) == b'.' && (*path.add(1)) == b'/' {
-            path = path.add(2);
+fn read_source(path0: *const u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let path = crate::base::c_plain_path(path0);
+    for f in 0..tcx.f_path.len() as i64 {
+        if streq((tcx.f_path[f as usize]) as *mut u8, path) {
+            return f;
         }
-        for f in 0..tcx.f_path.count {
-            if streq((*tcx.f_path.data.add(f as usize)) as *mut u8, path) {
-                return f;
-            }
-        }
-        let text = buf_new();
-        if !read_file_if(path, text) {
-            let d = diag(c"error", c"query.no-file", tcx);
-            buf_str(d, c"cannot read '");
-            buf_str(d, path);
-            buf_str(d, c"'\n");
-            return -1;
-        }
-        tcx.f_path.push(path as i64);
-        tcx.f_text.push(text);
-        tcx.f_l0.push(tcx.conflicts_ls.count);
-        let t = buf_slice(text);
-        let mut n: i64 = 0;
-        let mut i: i64 = 0;
-        while i < t.len() as i64 {
-            tcx.conflicts_ls.push(i);
-            n += 1;
-            while i < t.len() as i64 && t[i as usize] != b'\n' {
-                i += 1;
-            }
+    }
+    let text = buf_new();
+    if !read_file_if(path, text) {
+        let d = diag(c"error", c"query.no-file", tcx);
+        buf_str(d, c"cannot read '");
+        buf_str(d, path);
+        buf_str(d, c"'\n");
+        return -1;
+    }
+    tcx.f_path.push(path as i64);
+    tcx.f_text.push(text);
+    tcx.f_l0.push(tcx.conflicts_ls.len() as i64);
+    let t = buf_copy(text);
+    let mut n: i64 = 0;
+    let mut i: i64 = 0;
+    while i < t.len() as i64 {
+        tcx.conflicts_ls.push(i);
+        n += 1;
+        while i < t.len() as i64 && t[i as usize] != b'\n' {
             i += 1;
         }
-        tcx.f_nl.push(n);
-        tcx.f_scanned.push(0);
-        let f = tcx.f_path.count - 1;
-        if !scan(f, tcx, pcx) {
-            return -1;
-        }
-        f
+        i += 1;
     }
+    tcx.f_nl.push(n);
+    tcx.f_scanned.push(0);
+    let f = tcx.f_path.len() as i64 - 1;
+    if !scan(f, tcx, pcx) {
+        return -1;
+    }
+    f
 }
 
 // The path of a file: its C string's text (`tcx.f_path.get(f)`). A view of
 // the string itself, never freed or written, not of tcx (src-buffer.md,
 // views of other storage).
 fn path_of(p: i64) -> &'static [u8] {
-    // UNSAFE: tcx keeps each path as a word, the address of its C string
-    // SAFETY: p is a word of tcx.f_path: a NUL-ended path, never freed or
-    // written while the tool runs
-    unsafe { c_slice(p as *mut u8) }
+    crate::base::c_kept(p as *mut u8)
 }
 
 // Line n (from 1) of file f, without its newline.
-fn line(f: i64, n: i64, tcx: &Tcx<Comp>) -> &[u8] {
-    unsafe {
-        let t = buf_slice((*tcx.f_text.data.add(f as usize)));
-        let s = (*tcx.conflicts_ls.data.add(((*tcx.f_l0.data.add(f as usize)) + n - 1) as usize));
-        let mut e = s;
-        while e < t.len() as i64 && t[e as usize] != b'\n' {
-            e += 1;
-        }
-        if e > s && t[(e - 1) as usize] == b'\r' {
-            e -= 1;
-        }
-        &t[s as usize..e as usize]
+fn line(f: i64, n: i64, tcx: &Tcx<Comp>) -> &'static [u8] {
+    // (a file's text is read once, read_source, and never written again)
+    let t = buf_done((tcx.f_text[f as usize]));
+    let s = (tcx.conflicts_ls[((tcx.f_l0[f as usize]) + n - 1) as usize]);
+    let mut e = s;
+    while e < t.len() as i64 && t[e as usize] != b'\n' {
+        e += 1;
     }
+    if e > s && t[(e - 1) as usize] == b'\r' {
+        e -= 1;
+    }
+    &t[s as usize..e as usize]
 }
 
 // Where line n of file f starts (one past its last line: its end).
 fn line_pos(f: i64, n: i64, tcx: &Tcx<Comp>) -> i64 {
-    unsafe {
-        if n > (*tcx.f_nl.data.add(f as usize)) {
-            return (*get_bufs().add((*tcx.f_text.data.add(f as usize)) as usize)).len;
-        }
-        (*tcx.conflicts_ls.data.add(((*tcx.f_l0.data.add(f as usize)) + n - 1) as usize))
+    if n > (tcx.f_nl[f as usize]) {
+        return buf_len((tcx.f_text[f as usize]));
     }
+    (tcx.conflicts_ls[((tcx.f_l0[f as usize]) + n - 1) as usize])
 }
 
 // Whether l is a marker line of byte m (seven of it; `=======` alone).
@@ -148,55 +137,54 @@ fn label(l: &[u8]) -> &[u8] {
 
 // The regions of file f. False after the diagnostic.
 fn scan(f: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        if (*tcx.f_scanned.data.add(f as usize)) != 0 {
-            return true;
-        }
-        (*tcx.f_scanned.data.add(f as usize)) = 1;
-        let mut state: i64 = 0;
-        let mut start: i64 = 0;
-        let mut base: i64 = -1;
-        let mut sep: i64 = 0;
-        for n in 1..(*tcx.f_nl.data.add(f as usize)) + 1 {
-            let l = line(f, n, tcx);
-            if marker(l, b'<') {
-                if state != 0 {
-                    return format_error(f, n, c"a <<<<<<< line inside the region of line ", start,
-                        tcx, pcx);
-                }
-                state = 1;
-                start = n;
-                base = -1;
-            } else if marker(l, b'|') && state == 1 {
-                state = 2;
-                base = n;
-            } else if marker(l, b'=') && (state == 1 || state == 2) {
-                state = 3;
-                sep = n;
-            } else if marker(l, b'>') {
-                if state != 3 {
-                    return format_error(f, n,
-                        c"a >>>>>>> line without its <<<<<<< and ======= lines", -1, tcx, pcx);
-                }
-                tcx.r_file.push(f);
-                tcx.conflicts_r_start.push(start);
-                tcx.r_base.push(base);
-                tcx.r_sep.push(sep);
-                tcx.conflicts_r_end.push(n);
-                tcx.r_items.push(region_items(tcx.r_file.count - 1, tcx));
-                state = 0;
-            }
-        }
-        if state != 0 {
-            return format_error(f, start, c"a region without its >>>>>>> line", -1, tcx, pcx);
-        }
-        true
+    if (tcx.f_scanned[f as usize]) != 0 {
+        return true;
     }
+    (tcx.f_scanned[f as usize]) = 1;
+    let mut state: i64 = 0;
+    let mut start: i64 = 0;
+    let mut base: i64 = -1;
+    let mut sep: i64 = 0;
+    for n in 1..(tcx.f_nl[f as usize]) + 1 {
+        let l = line(f, n, tcx);
+        if marker(l, b'<') {
+            if state != 0 {
+                return format_error(f, n, c"a <<<<<<< line inside the region of line ", start,
+                    tcx, pcx);
+            }
+            state = 1;
+            start = n;
+            base = -1;
+        } else if marker(l, b'|') && state == 1 {
+            state = 2;
+            base = n;
+        } else if marker(l, b'=') && (state == 1 || state == 2) {
+            state = 3;
+            sep = n;
+        } else if marker(l, b'>') {
+            if state != 3 {
+                return format_error(f, n,
+                    c"a >>>>>>> line without its <<<<<<< and ======= lines", -1, tcx, pcx);
+            }
+            tcx.r_file.push(f);
+            tcx.conflicts_r_start.push(start);
+            tcx.r_base.push(base);
+            tcx.r_sep.push(sep);
+            tcx.conflicts_r_end.push(n);
+            tcx.r_items.push(region_items(tcx.r_file.len() as i64 - 1, tcx));
+            state = 0;
+        }
+    }
+    if state != 0 {
+        return format_error(f, start, c"a region without its >>>>>>> line", -1, tcx, pcx);
+    }
+    true
 }
 
-fn format_error(f: i64, n: i64, message: *mut u8, other: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
+fn format_error(f: i64, n: i64, message: *const u8, other: i64, tcx: &mut Tcx<Comp>,
+    pcx: &Ctx<Comp>) -> bool {
     let d = diag(c"error", c"conflict.format", tcx);
-    buf_bytes(d, path_of(tcx.f_path.get(f)));
+    buf_bytes(d, path_of(tcx.f_path[f as usize]));
     buf_byte(d, b':');
     buf_int(d, n);
     buf_str(d, c": ");
@@ -208,12 +196,12 @@ fn format_error(f: i64, n: i64, message: *mut u8, other: i64, tcx: &mut Tcx<Comp
     let out = try_start(tcx, pcx);
     buf_str(out, c" query text");
     let w = buf_new();
-    buf_bytes(w, path_of(tcx.f_path.get(f)));
+    buf_bytes(w, path_of(tcx.f_path[f as usize]));
     buf_byte(w, b':');
     buf_int(w, if n > 5 { n - 5 } else { 1 });
     buf_byte(w, b'-');
     buf_int(w, n + 5);
-    put_word(out, buf_slice(w));
+    put_word(out, &buf_copy(w));
     try_end(out);
     false
 }
@@ -252,22 +240,16 @@ fn is_ident(c: u8) -> bool {
 }
 
 // Where word w ends when l has it at i (then a blank, `<`, `{` or `(`), or -1.
-fn word_at(l: &[u8], i: i64, w: *mut u8) -> i64 {
-    unsafe {
-        let mut k: i64 = 0;
-        while (*w.add(k as usize)) != 0 {
-            if i + k >= l.len() as i64 || l[(i + k) as usize] != (*w.add(k as usize)) {
-                return -1;
-            }
-            k += 1;
-        }
-        let e = i + k;
-        if e < l.len() as i64 && l[e as usize] != b' ' && l[e as usize] != b'<'
-            && l[e as usize] != b'{' && l[e as usize] != b'(' {
-            return -1;
-        }
-        e
+fn word_at(l: &[u8], i: i64, w: *const u8) -> i64 {
+    let e = i + crate::base::c_len(w);
+    if i < 0 || e > l.len() as i64 || !crate::base::c_eq(w, &l[i as usize..e as usize]) {
+        return -1;
     }
+    if e < l.len() as i64 && l[e as usize] != b' ' && l[e as usize] != b'<'
+        && l[e as usize] != b'{' && l[e as usize] != b'(' {
+        return -1;
+    }
+    e
 }
 
 // The identifier at or after the blanks at i, into out: whether there is one.
@@ -396,7 +378,7 @@ fn qualified(f: i64, n: i64, name: i64, out: i64, tcx: &Tcx<Comp>) {
             if !blank(l) && !comment(l) && !any_marker(l) && indent(l) < ind {
                 let b = buf_new();
                 if header(l, b) == 2 {
-                    buf_bytes(out, buf_slice(b));
+                    buf_append(out, b);
                     buf_str(out, c"::");
                 }
                 break;
@@ -404,12 +386,12 @@ fn qualified(f: i64, n: i64, name: i64, out: i64, tcx: &Tcx<Comp>) {
             m -= 1;
         }
     }
-    buf_bytes(out, buf_slice(name));
+    buf_append(out, name);
 }
 
 // Name q added to the list in out (`a, b`) unless it is there.
 fn add_name(out: i64, q: &[u8]) {
-    let t = buf_slice(out);
+    let t = buf_copy(out);
     let mut i: i64 = 0;
     while i < t.len() as i64 {
         let mut e = i;
@@ -429,93 +411,89 @@ fn add_name(out: i64, q: &[u8]) {
 
 // The items of region r (a buffer, `a, b`; `-` when none is found).
 fn region_items(r: i64, tcx: &Tcx<Comp>) -> i64 {
-    unsafe {
-        let f = (*tcx.r_file.data.add(r as usize));
-        let start = (*tcx.conflicts_r_start.data.add(r as usize));
-        let end = (*tcx.conflicts_r_end.data.add(r as usize));
-        let out = buf_new();
-        let mut first: i64 = -1;
-        let mut notes = true;
-        for n in start + 1..end {
-            let l = line(f, n, tcx);
-            if any_marker(l) || blank(l) {
-                continue;
-            }
-            if first < 0 {
-                first = indent(l);
-            }
-            if !comment(l) {
-                notes = false;
-            }
-            let b = buf_new();
-            if header(l, b) != 0 {
-                let q = buf_new();
-                qualified(f, n, b, q, tcx);
-                add_name(out, buf_slice(q));
-            }
+    let f = (tcx.r_file[r as usize]);
+    let start = (tcx.conflicts_r_start[r as usize]);
+    let end = (tcx.conflicts_r_end[r as usize]);
+    let out = buf_new();
+    let mut first: i64 = -1;
+    let mut notes = true;
+    for n in start + 1..end {
+        let l = line(f, n, tcx);
+        if any_marker(l) || blank(l) {
+            continue;
         }
-        if (*get_bufs().add(out as usize)).len > 0 {
-            return out;
+        if first < 0 {
+            first = indent(l);
         }
-        if first > 0 {
-            // (the item around it: a less indented header above)
-            let mut ind = first;
-            let mut m = start - 1;
-            while m >= 1 {
-                let l = line(f, m, tcx);
-                if !blank(l) && !comment(l) && !any_marker(l) && indent(l) < ind {
-                    let b = buf_new();
-                    if header(l, b) != 0 {
-                        qualified(f, m, b, out, tcx);
-                        return out;
-                    }
-                    ind = indent(l);
-                    if ind == 0 {
-                        break;
-                    }
+        if !comment(l) {
+            notes = false;
+        }
+        let b = buf_new();
+        if header(l, b) != 0 {
+            let q = buf_new();
+            qualified(f, n, b, q, tcx);
+            add_name(out, &buf_copy(q));
+        }
+    }
+    if buf_len(out) > 0 {
+        return out;
+    }
+    if first > 0 {
+        // (the item around it: a less indented header above)
+        let mut ind = first;
+        let mut m = start - 1;
+        while m >= 1 {
+            let l = line(f, m, tcx);
+            if !blank(l) && !comment(l) && !any_marker(l) && indent(l) < ind {
+                let b = buf_new();
+                if header(l, b) != 0 {
+                    qualified(f, m, b, out, tcx);
+                    return out;
                 }
-                m -= 1;
-            }
-        } else if notes {
-            // (comments at the top level: the item after them)
-            let mut m = end + 1;
-            while m <= (*tcx.f_nl.data.add(f as usize)) {
-                let l = line(f, m, tcx);
-                if !blank(l) && !comment(l) {
-                    let b = buf_new();
-                    if indent(l) == 0 && header(l, b) != 0 {
-                        qualified(f, m, b, out, tcx);
-                        return out;
-                    }
+                ind = indent(l);
+                if ind == 0 {
                     break;
                 }
-                m += 1;
             }
+            m -= 1;
         }
-        buf_byte(out, b'-');
-        out
+    } else if notes {
+        // (comments at the top level: the item after them)
+        let mut m = end + 1;
+        while m <= (tcx.f_nl[f as usize]) {
+            let l = line(f, m, tcx);
+            if !blank(l) && !comment(l) {
+                let b = buf_new();
+                if indent(l) == 0 && header(l, b) != 0 {
+                    qualified(f, m, b, out, tcx);
+                    return out;
+                }
+                break;
+            }
+            m += 1;
+        }
     }
+    buf_byte(out, b'-');
+    out
 }
 
 // Whether NAME names one of region r's items: the same, or one ends the
 // other after `::`.
 fn names_item(r: i64, name: &[u8], tcx: &Tcx<Comp>) -> bool {
-    unsafe {
-        let t = buf_slice((*tcx.r_items.data.add(r as usize)));
-        let mut i: i64 = 0;
-        while i < t.len() as i64 {
-            let mut e = i;
-            while e < t.len() as i64 && t[e as usize] != b',' {
-                e += 1;
-            }
-            let item = &t[i as usize..e as usize];
-            if same_bytes(item, name) || ends_path(item, name) || ends_path(name, item) {
-                return true;
-            }
-            i = e + 2;
+    let t = buf_copy((tcx.r_items[r as usize]));
+    let mut i: i64 = 0;
+    while i < t.len() as i64 {
+        let mut e = i;
+        while e < t.len() as i64 && t[e as usize] != b',' {
+            e += 1;
         }
-        false
+        let item = &t[i as usize..e as usize];
+        if same_bytes(item, name) || ends_path(item, name) || ends_path(name, item) {
+            return true;
+        }
+        i = e + 2;
     }
+    false
 }
 
 // Whether a is `...::b`.
@@ -529,49 +507,46 @@ fn ends_path(a: &[u8], b: &[u8]) -> bool {
 // ---- Finding the files ----
 
 // The .vl files with a `<<<<<<<` line under dir (C strings), sorted.
-fn conflicted_files(dir: *mut u8, out: &mut IntVec) {
-    unsafe {
-        let mut args = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        args.push(c"grep" as i64);
-        args.push(c"-rl" as i64);
-        args.push(c"--include=*.vl" as i64);
-        args.push(c"--include=*.vl" as i64);
-        args.push(c"-e" as i64);
-        args.push(c"^<<<<<<<" as i64);
-        args.push(dir as i64);
-        args.push(0);
-        let b = buf_new();
-        run_capture(args.data as *mut *mut u8, b);
-        let t = buf_slice(b);
-        let mut i: i64 = 0;
-        while i < t.len() as i64 {
-            let mut e = i;
-            while e < t.len() as i64 && t[e as usize] != b'\n' {
-                e += 1;
-            }
-            let mut s = i;
-            while s + 1 < e && t[s as usize] == b'.' && t[(s + 1) as usize] == b'/' {
-                s += 2;
-            }
-            if crate::base::source_ext_len(&t[s as usize..e as usize]) > 0 {
-                let p = buf_new();
-                buf_bytes(p, &t[s as usize..e as usize]);
-                out.push(buf_cstr(p) as i64);
-            }
-            i = e + 1;
+fn conflicted_files(dir: *const u8, out: &mut Vec<i64, Comp>) {
+    let mut args: Vec<i64, Comp> = Vec::new_in(Comp {});
+    args.push(c"grep" as i64);
+    args.push(c"-rl" as i64);
+    args.push(c"--include=*.vl" as i64);
+    args.push(c"--include=*.vl" as i64);
+    args.push(c"-e" as i64);
+    args.push(c"^<<<<<<<" as i64);
+    args.push(dir as i64);
+    args.push(0);
+    let b = buf_new();
+    run_capture(exec_words(args.as_slice()).as_slice(), b);
+    let t = buf_copy(b);
+    let mut i: i64 = 0;
+    while i < t.len() as i64 {
+        let mut e = i;
+        while e < t.len() as i64 && t[e as usize] != b'\n' {
+            e += 1;
         }
-        // (sorted: grep lists them in the directory's order)
-        let v = out.data;
-        for k in 1..out.count {
-            let mut j = k;
-            while j > 0
-                && less(c_slice((*v.add(j as usize)) as *mut u8),
-                    c_slice((*v.add((j - 1) as usize)) as *mut u8)) {
-                let x = (*v.add(j as usize));
-                (*v.add(j as usize)) = (*v.add((j - 1) as usize));
-                (*v.add((j - 1) as usize)) = x;
-                j -= 1;
-            }
+        let mut s = i;
+        while s + 1 < e && t[s as usize] == b'.' && t[(s + 1) as usize] == b'/' {
+            s += 2;
+        }
+        if crate::base::source_ext_len(&t[s as usize..e as usize]) > 0 {
+            let p = buf_new();
+            buf_bytes(p, &t[s as usize..e as usize]);
+            out.push(buf_cstr(p) as i64);
+        }
+        i = e + 1;
+    }
+    // (sorted: grep lists them in the directory's order)
+    for k in 1..out.len() as i64 {
+        let mut j = k;
+        while j > 0
+            && less(&c_slice((out[j as usize]) as *mut u8),
+                &c_slice((out[(j - 1) as usize]) as *mut u8)) {
+            let x = (out[j as usize]);
+            (out[j as usize]) = (out[(j - 1) as usize]);
+            (out[(j - 1) as usize]) = x;
+            j -= 1;
         }
     }
 }
@@ -588,7 +563,7 @@ fn less(a: &[u8], b: &[u8]) -> bool {
 }
 
 // The directory searched without a FILE: the root's (`.` without one).
-fn default_dir(tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> *mut u8 {
+fn default_dir(tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> *const u8 {
     let root = find_root(tcx.root_given, pcx);
     if root == 0 as *mut u8 {
         return c".";
@@ -607,11 +582,11 @@ fn default_dir(tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> *mut u8 {
 }
 
 // The files under dir, read. False after a diagnostic.
-fn read_dir(dir: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
-    let mut files = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+fn read_dir(dir: *const u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
+    let mut files: Vec<i64, Comp> = Vec::new_in(Comp {});
     conflicted_files(dir, &mut files);
-    for k in 0..files.count {
-        if unsafe { read_source((*files.data.add(k as usize)) as *mut u8, tcx, pcx) < 0 } {
+    for k in 0..files.len() as i64 {
+        if read_source((files[k as usize]) as *mut u8, tcx, pcx) < 0 {
             return false;
         }
     }
@@ -621,54 +596,52 @@ fn read_dir(dir: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
 // TARGET `FILE` or `FILE:LINE` (a .vl file): its regions (with a line,
 // the one holding it) into sel. 1 when it is no file, 2 after a
 // diagnostic, 0 done.
-fn file_target(arg: *mut u8, sel: &mut IntVec, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let a = c_slice(arg);
-        let mut ln: i64 = -1;
-        let mut n = file_line(a, &mut ln);
-        if n < 0 {
-            n = a.len() as i64;
-            ln = -1;
-        }
-        if crate::base::source_ext_len(&a[0..n as usize]) == 0 {
-            return 1;
-        }
-        let p = buf_new();
-        buf_bytes(p, &a[0..n as usize]);
-        let f = read_source(buf_cstr(p), tcx, pcx);
-        if f < 0 {
-            return 2;
-        }
-        let mut found = false;
-        for r in 0..tcx.r_file.count {
-            if (*tcx.r_file.data.add(r as usize)) == f
-                && (ln < 0
-                    || ((*tcx.conflicts_r_start.data.add(r as usize)) <= ln
-                        && ln <= (*tcx.conflicts_r_end.data.add(r as usize)))) {
-                add_region(sel, r);
-                found = true;
-            }
-        }
-        if !found && ln >= 0 {
-            let d = diag(c"error", c"conflict.none", tcx);
-            buf_str(d, c"no conflict region holds ");
-            buf_bytes(d, path_of(tcx.f_path.get(f)));
-            buf_byte(d, b':');
-            buf_int(d, ln);
-            buf_byte(d, b'\n');
-            let out = try_start(tcx, pcx);
-            buf_str(out, c" query conflicts");
-            put_word(out, path_of(tcx.f_path.get(f)));
-            try_end(out);
-            return 2;
-        }
-        0
+fn file_target(arg: *const u8, sel: &mut Vec<i64, Comp>, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let a = c_slice(arg);
+    let mut ln: i64 = -1;
+    let mut n = file_line(&a, &mut ln);
+    if n < 0 {
+        n = a.len() as i64;
+        ln = -1;
     }
+    if crate::base::source_ext_len(&a[0..n as usize]) == 0 {
+        return 1;
+    }
+    let p = buf_new();
+    buf_bytes(p, &a[0..n as usize]);
+    let f = read_source(buf_cstr(p), tcx, pcx);
+    if f < 0 {
+        return 2;
+    }
+    let mut found = false;
+    for r in 0..tcx.r_file.len() as i64 {
+        if (tcx.r_file[r as usize]) == f
+            && (ln < 0
+                || ((tcx.conflicts_r_start[r as usize]) <= ln
+                    && ln <= (tcx.conflicts_r_end[r as usize]))) {
+            add_region(sel, r);
+            found = true;
+        }
+    }
+    if !found && ln >= 0 {
+        let d = diag(c"error", c"conflict.none", tcx);
+        buf_str(d, c"no conflict region holds ");
+        buf_bytes(d, path_of(tcx.f_path[f as usize]));
+        buf_byte(d, b':');
+        buf_int(d, ln);
+        buf_byte(d, b'\n');
+        let out = try_start(tcx, pcx);
+        buf_str(out, c" query conflicts");
+        put_word(out, path_of(tcx.f_path[f as usize]));
+        try_end(out);
+        return 2;
+    }
+    0
 }
 
-fn add_region(sel: &mut IntVec, r: i64) {
-    for k in 0..sel.count {
-        if unsafe { (*sel.data.add(k as usize)) == r } {
+fn add_region(sel: &mut Vec<i64, Comp>, r: i64) {
+    for k in 0..sel.len() as i64 {
+        if (sel[k as usize]) == r {
             return;
         }
     }
@@ -682,7 +655,7 @@ fn put_lines(out: i64, n: i64) {
     buf_str(out, if n == 1 { c" line" } else { c" lines" });
 }
 
-fn put_side(out: i64, f: i64, side: *mut u8, marker_line: i64, n: i64, tcx: &Tcx<Comp>) {
+fn put_side(out: i64, f: i64, side: *const u8, marker_line: i64, n: i64, tcx: &Tcx<Comp>) {
     buf_str(out, side);
     buf_byte(out, b' ');
     put_lines(out, n);
@@ -696,41 +669,37 @@ fn put_side(out: i64, f: i64, side: *mut u8, marker_line: i64, n: i64, tcx: &Tcx
 
 // The lines of the sides of region r: ours [a, b], base, theirs.
 fn ours_end(r: i64, tcx: &Tcx<Comp>) -> i64 {
-    unsafe {
-        if (*tcx.r_base.data.add(r as usize)) >= 0 { (*tcx.r_base.data.add(r as usize)) }
-        else { (*tcx.r_sep.data.add(r as usize)) }
-    }
+    if (tcx.r_base[r as usize]) >= 0 { (tcx.r_base[r as usize]) }
+    else { (tcx.r_sep[r as usize]) }
 }
 
 // `FILE:A-B<TAB>ITEMS<TAB>ours N lines (LABEL)[<TAB>base ...]<TAB>theirs ...`
 fn put_region(out: i64, r: i64, tcx: &Tcx<Comp>) {
-    unsafe {
-        let f = (*tcx.r_file.data.add(r as usize));
-        let s = (*tcx.conflicts_r_start.data.add(r as usize));
-        buf_bytes(out, path_of(tcx.f_path.get(f)));
-        buf_byte(out, b':');
-        buf_int(out, s);
-        buf_byte(out, b'-');
-        buf_int(out, (*tcx.conflicts_r_end.data.add(r as usize)));
+    let f = (tcx.r_file[r as usize]);
+    let s = (tcx.conflicts_r_start[r as usize]);
+    buf_bytes(out, path_of(tcx.f_path[f as usize]));
+    buf_byte(out, b':');
+    buf_int(out, s);
+    buf_byte(out, b'-');
+    buf_int(out, (tcx.conflicts_r_end[r as usize]));
+    buf_byte(out, b'\t');
+    buf_append(out, (tcx.r_items[r as usize]));
+    buf_byte(out, b'\t');
+    put_side(out, f, c"ours", s, ours_end(r, tcx) - s - 1, tcx);
+    if (tcx.r_base[r as usize]) >= 0 {
         buf_byte(out, b'\t');
-        buf_bytes(out, buf_slice((*tcx.r_items.data.add(r as usize))));
-        buf_byte(out, b'\t');
-        put_side(out, f, c"ours", s, ours_end(r, tcx) - s - 1, tcx);
-        if (*tcx.r_base.data.add(r as usize)) >= 0 {
-            buf_byte(out, b'\t');
-            put_side(out, f, c"base", (*tcx.r_base.data.add(r as usize)),
-                (*tcx.r_sep.data.add(r as usize)) - (*tcx.r_base.data.add(r as usize)) - 1, tcx);
-        }
-        buf_byte(out, b'\t');
-        put_side(out, f, c"theirs", (*tcx.conflicts_r_end.data.add(r as usize)),
-            (*tcx.conflicts_r_end.data.add(r as usize)) - (*tcx.r_sep.data.add(r as usize)) - 1,
-            tcx);
-        buf_byte(out, b'\n');
+        put_side(out, f, c"base", (tcx.r_base[r as usize]),
+            (tcx.r_sep[r as usize]) - (tcx.r_base[r as usize]) - 1, tcx);
     }
+    buf_byte(out, b'\t');
+    put_side(out, f, c"theirs", (tcx.conflicts_r_end[r as usize]),
+        (tcx.conflicts_r_end[r as usize]) - (tcx.r_sep[r as usize]) - 1,
+        tcx);
+    buf_byte(out, b'\n');
 }
 
 // One side's lines a..b (excluded) of file f, under `// SIDE (LABEL), lines A-B:`.
-fn show_side(out: i64, f: i64, side: *mut u8, marker_line: i64, a: i64, b: i64, tcx: &Tcx<Comp>) {
+fn show_side(out: i64, f: i64, side: *const u8, marker_line: i64, a: i64, b: i64, tcx: &Tcx<Comp>) {
     buf_str(out, c"// ");
     buf_str(out, side);
     let lab = label(line(f, marker_line, tcx));
@@ -757,27 +726,25 @@ fn show_side(out: i64, f: i64, side: *mut u8, marker_line: i64, a: i64, b: i64, 
 }
 
 fn show_region(out: i64, r: i64, tcx: &Tcx<Comp>) {
-    unsafe {
-        let f = (*tcx.r_file.data.add(r as usize));
-        let s = (*tcx.conflicts_r_start.data.add(r as usize));
-        buf_str(out, c"// ");
-        buf_bytes(out, path_of(tcx.f_path.get(f)));
-        buf_byte(out, b':');
-        buf_int(out, s);
-        buf_byte(out, b'-');
-        buf_int(out, (*tcx.conflicts_r_end.data.add(r as usize)));
-        buf_byte(out, b'\t');
-        buf_bytes(out, buf_slice((*tcx.r_items.data.add(r as usize))));
-        buf_byte(out, b'\n');
-        show_side(out, f, c"ours", s, s + 1, ours_end(r, tcx), tcx);
-        if (*tcx.r_base.data.add(r as usize)) >= 0 {
-            show_side(out, f, c"base", (*tcx.r_base.data.add(r as usize)),
-                (*tcx.r_base.data.add(r as usize)) + 1, (*tcx.r_sep.data.add(r as usize)), tcx);
-        }
-        show_side(out, f, c"theirs", (*tcx.conflicts_r_end.data.add(r as usize)),
-            (*tcx.r_sep.data.add(r as usize)) + 1, (*tcx.conflicts_r_end.data.add(r as usize)),
-            tcx);
+    let f = (tcx.r_file[r as usize]);
+    let s = (tcx.conflicts_r_start[r as usize]);
+    buf_str(out, c"// ");
+    buf_bytes(out, path_of(tcx.f_path[f as usize]));
+    buf_byte(out, b':');
+    buf_int(out, s);
+    buf_byte(out, b'-');
+    buf_int(out, (tcx.conflicts_r_end[r as usize]));
+    buf_byte(out, b'\t');
+    buf_append(out, (tcx.r_items[r as usize]));
+    buf_byte(out, b'\n');
+    show_side(out, f, c"ours", s, s + 1, ours_end(r, tcx), tcx);
+    if (tcx.r_base[r as usize]) >= 0 {
+        show_side(out, f, c"base", (tcx.r_base[r as usize]),
+            (tcx.r_base[r as usize]) + 1, (tcx.r_sep[r as usize]), tcx);
     }
+    show_side(out, f, c"theirs", (tcx.conflicts_r_end[r as usize]),
+        (tcx.r_sep[r as usize]) + 1, (tcx.conflicts_r_end[r as usize]),
+        tcx);
 }
 
 // `query conflicts`'s arguments (0.25.2: a leaf of volec's Command tree, cli/tree.vl).
@@ -793,7 +760,7 @@ pub fn conflicts_leaf(gpa: Gpa) -> Leaf<'static, Gpa> {
 pub fn run_conflicts(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     tcx.tool = 0 as *mut u8;
     let mut show = false;
-    let mut args = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut args: Vec<i64, Comp> = Vec::new_in(Comp {});
     for ev in c.evs.iter().copied() {
         let a = ev.value;
         if is_flag(ev, "show") {
@@ -813,58 +780,56 @@ pub fn run_conflicts(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) ->
             args.push(a as i64);
         }
     }
-    unsafe {
-        let mut sel = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        if args.count == 0 {
-            if !read_dir(default_dir(tcx, pcx), tcx, pcx) {
-                return 1;
-            }
-            for r in 0..tcx.r_file.count {
-                sel.push(r);
-            }
+    let mut sel: Vec<i64, Comp> = Vec::new_in(Comp {});
+    if args.len() as i64 == 0 {
+        if !read_dir(default_dir(tcx, pcx), tcx, pcx) {
+            return 1;
         }
-        for k in 0..args.count {
-            let a = (*args.data.add(k as usize)) as *mut u8;
-            let t = file_target(a, &mut sel, tcx, pcx);
-            if t == 2 {
-                return 1;
-            }
-            if t == 1 {
-                let before = tcx.r_file.count;
-                if !read_dir(a, tcx, pcx) {
-                    return 1;
-                }
-                for r in before..tcx.r_file.count {
-                    add_region(&mut sel, r);
-                }
-            }
+        for r in 0..tcx.r_file.len() as i64 {
+            sel.push(r);
         }
-        if sel.count == 0 {
-            let d = diag(c"note", c"conflict.none", tcx);
-            buf_str(d, c"no conflict markers in ");
-            if args.count == 0 {
-                buf_str(d, c"the .vl files under ");
-                buf_str(d, default_dir(tcx, pcx));
-            } else {
-                for k in 0..args.count {
-                    if k > 0 {
-                        buf_str(d, c", ");
-                    }
-                    buf_str(d, (*args.data.add(k as usize)) as *mut u8);
-                }
-            }
-            buf_byte(d, b'\n');
-            return 0;
-        }
-        let out = buf_new();
-        for k in 0..sel.count {
-            if show {
-                show_region(out, (*sel.data.add(k as usize)), tcx);
-            } else {
-                put_region(out, (*sel.data.add(k as usize)), tcx);
-            }
-        }
-        buf_write_fd(out, STDOUT);
-        0
     }
+    for k in 0..args.len() as i64 {
+        let a = (args[k as usize]) as *mut u8;
+        let t = file_target(a, &mut sel, tcx, pcx);
+        if t == 2 {
+            return 1;
+        }
+        if t == 1 {
+            let before = tcx.r_file.len() as i64;
+            if !read_dir(a, tcx, pcx) {
+                return 1;
+            }
+            for r in before..tcx.r_file.len() as i64 {
+                add_region(&mut sel, r);
+            }
+        }
+    }
+    if sel.len() as i64 == 0 {
+        let d = diag(c"note", c"conflict.none", tcx);
+        buf_str(d, c"no conflict markers in ");
+        if args.len() as i64 == 0 {
+            buf_str(d, c"the .vl files under ");
+            buf_str(d, default_dir(tcx, pcx));
+        } else {
+            for k in 0..args.len() as i64 {
+                if k > 0 {
+                    buf_str(d, c", ");
+                }
+                buf_str(d, (args[k as usize]) as *mut u8);
+            }
+        }
+        buf_byte(d, b'\n');
+        return 0;
+    }
+    let out = buf_new();
+    for k in 0..sel.len() as i64 {
+        if show {
+            show_region(out, (sel[k as usize]), tcx);
+        } else {
+            put_region(out, (sel[k as usize]), tcx);
+        }
+    }
+    buf_write_fd(out, STDOUT);
+    0
 }

@@ -10,14 +10,14 @@ use crate::option::Option;
 // A *mut T that is never null: what a container keeps (Option<NonNull<T>>
 // is one word). Covariant in T, as Rust's.
 // mvs: NonNull
-// std2: changed: a struct over *const T (MVS: a distinct *T with an invariant)
+// std: changed: a struct over *const T (MVS: a distinct *T with an invariant)
 pub struct NonNull<T: ?Sized> {
     pointer: *const T,
 }
 
 impl<T> NonNull<T> {
     // p as a NonNull; None when it is null.
-    // std2: changed: takes *mut T
+    // std: changed: takes *mut T
     #[effects()]
     pub fn new(p: *mut T) -> Option<NonNull<T>> {
         if p.is_null() { Option::None } else { Option::Some(NonNull { pointer: p as *const T }) }
@@ -31,7 +31,7 @@ impl<T> NonNull<T> {
     }
 
     // The pointer.
-    // std2: changed: returns *mut T
+    // std: changed: returns *mut T
     #[effects()]
     pub fn as_ptr(self) -> *mut T {
         self.pointer as *mut T
@@ -120,37 +120,139 @@ pub unsafe fn write<T>(dst: *mut T, value: T) {
     dst[0] = value;
 }
 
+// UNSAFE: C's block routines, over raw memory.
+// SAFETY: the prototypes are string.h's; each call below says why its
+// ranges are valid.
+extern "C" {
+    #[link_name = "memcpy"]
+    fn ptr_c_memcpy(d: *mut u8, s: *const u8, n: usize) -> *mut u8;
+    #[link_name = "memmove"]
+    fn ptr_c_memmove(d: *mut u8, s: *const u8, n: usize) -> *mut u8;
+    #[link_name = "memset"]
+    fn ptr_c_memset(d: *mut u8, c: i32, n: usize) -> *mut u8;
+    #[link_name = "memcmp"]
+    fn ptr_c_memcmp(a: *const u8, b: *const u8, n: usize) -> i32;
+    #[link_name = "memchr"]
+    fn ptr_c_memchr(s: *const u8, c: i32, n: usize) -> *const u8;
+}
+
+// (0.29) From this many elements on a copy is C's (one call, the bytes
+// moved as words and vectors); below it, the loop: a call costs more
+// than moving one to three elements (mem::swap's one, a sort's).
+const BLOCK_MIN: usize = 4;
+
 // count T's from src to dst; the two may overlap (memmove).
-#[effects(diverge, unsafe)]
+#[effects(unsafe)]
 // UNSAFE: reads and writes through raw pointers.
 // SAFETY: a contract on the caller: both ranges valid and aligned.
 pub unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize) {
+    let size = crate::mem::size_of::<T>();
+    if size == 0 {
+        // (a zero-sized T has no bytes to move, and its pointers are
+        // dangling: C is given none of them)
+        return;
+    }
+    if count >= BLOCK_MIN {
+        // The caller's two ranges are count T's each, count * size bytes;
+        // memmove allows their overlap.
+        ptr_c_memmove(dst as *mut u8, src as *const u8, count * size);
+        return;
+    }
     // Forward when dst is below src, backward otherwise: overlap is safe.
+    // (0.29: counted loops, which end: a copy is no reason for `diverge`
+    // in what calls it, a String's push_str and every format among them)
     if (dst as *const T as usize) <= (src as usize) {
-        let mut i: usize = 0;
-        while i < count {
+        for i in 0..count {
             dst[i] = src[i];
-            i += 1;
         }
     } else {
-        let mut i = count;
-        while i > 0 {
-            i -= 1;
+        for k in 0..count {
+            let i = count - 1 - k;
             dst[i] = src[i];
         }
     }
 }
 
 // count T's from src to dst, which do not overlap (memcpy).
-#[effects(diverge, unsafe)]
+#[effects(unsafe)]
 // UNSAFE: reads and writes through raw pointers.
 // SAFETY: a contract on the caller: both ranges valid, aligned, disjoint.
 pub unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {
-    let mut i: usize = 0;
-    while i < count {
-        dst[i] = src[i];
-        i += 1;
+    let size = crate::mem::size_of::<T>();
+    if size == 0 {
+        // (as copy: nothing to move, and no dangling pointer given to C)
+        return;
     }
+    if count >= BLOCK_MIN {
+        // The caller's two ranges are count T's each, count * size bytes,
+        // and disjoint, as memcpy asks.
+        ptr_c_memcpy(dst as *mut u8, src as *const u8, count * size);
+        return;
+    }
+    for i in 0..count {
+        dst[i] = src[i];
+    }
+}
+
+// (0.29) count copies of *x written from dst on, as a block: a byte-sized
+// T by memset; a larger one written a few times, then what is filled
+// copied onto what is not, twice as much each time (a handful of memcpy
+// calls for any count). The bits of *x are duplicated, nothing is cloned
+// or dropped: for a Copy T (mem::is_copy), as Vec::resize and [T]::fill
+// use it.
+#[effects(unsafe)]
+// UNSAFE: writes through a raw pointer.
+// SAFETY: a contract on the caller: dst valid and aligned for count T's,
+// which x is no part of; a T that may be duplicated bit for bit.
+pub(crate) unsafe fn fill_copies<T>(dst: *mut T, count: usize, x: &T) {
+    let size = crate::mem::size_of::<T>();
+    if size == 0 {
+        // (nothing to write)
+        return;
+    }
+    let src = x as *const T;
+    if size == 1 {
+        // x is one readable byte (a reference to a T of size 1); dst has
+        // count writable bytes (the caller's).
+        ptr_c_memset(dst as *mut u8, (src as *const u8)[0] as i32, count);
+        return;
+    }
+    let head = if count < 8 { count } else { 8 };
+    for i in 0..head {
+        dst[i] = src[0];
+    }
+    let mut i = head;
+    // What is filled doubles each time, from 8 elements: 64 rounds reach
+    // any count a usize holds (a counted loop: it ends, and says so).
+    for _ in 0..64 {
+        if i >= count {
+            break;
+        }
+        // [0, i) is filled; the next k <= i elements, [i, i + k), are
+        // inside the caller's range (k <= count - i) and past [0, k).
+        let k = if count - i < i { count - i } else { i };
+        ptr_c_memcpy(dst.add(i) as *mut u8, dst as *const u8, k * size);
+        i += k;
+    }
+}
+
+// (0.29) Whether the n bytes at a and at b are the same (memcmp).
+#[effects(unsafe)]
+// UNSAFE: reads through raw pointers.
+// SAFETY: a contract on the caller: n readable bytes at each.
+pub(crate) unsafe fn bytes_equal(a: *const u8, b: *const u8, n: usize) -> bool {
+    ptr_c_memcmp(a, b, n) == 0
+}
+
+// (0.29) The index of the first byte x among the n at p (memchr).
+#[effects(unsafe)]
+// UNSAFE: reads through a raw pointer.
+// SAFETY: a contract on the caller: n readable bytes at p.
+pub(crate) unsafe fn byte_index(p: *const u8, n: usize, x: u8) -> Option<usize> {
+    // memchr returns null or the address of one of the n bytes: at or
+    // above p, below p + n.
+    let q = ptr_c_memchr(p, x as i32, n);
+    if q.is_null() { Option::None } else { Option::Some((q as usize) - (p as usize)) }
 }
 
 // Runs the drop of the value at p, in place.
@@ -169,9 +271,65 @@ pub fn eq<T: ?Sized>(a: *const T, b: *const T) -> bool {
     a == b
 }
 
-// std2: new: Rust's raw-pointer methods. vole's `*const T` and `*mut T`
-// are one type (front-rust.md FR4), so one impl has them all.
+// std: new: Rust's raw-pointer methods. `*const T` and `*mut T` are two
+// types (0.29, front-rust.md F30.5), each with its impl, as in Rust: the
+// arithmetic of each gives its own kind, `write` is `*mut T`'s only, and
+// `cast_mut` and `cast_const` go from one to the other. A `*mut T`
+// receiver also takes a method that only `*const T` has.
 impl<T> *const T {
+    // Whether the pointer is null.
+    #[effects()]
+    pub fn is_null(self) -> bool {
+        (self as usize) == 0
+    }
+
+    // The pointer count T's on (pointer arithmetic, Rust's `add`).
+    #[effects(unsafe)]
+    // UNSAFE: the result must stay in (or one past) the same allocation.
+    // SAFETY: a contract on the caller, as Rust's.
+    pub unsafe fn add(self, count: usize) -> *const T {
+        ((self as usize) + count * crate::mem::size_of::<T>()) as *const T
+    }
+
+    // The pointer count T's back.
+    // UNSAFE: as add.
+    // SAFETY: a contract on the caller, as Rust's.
+    #[effects(unsafe)]
+    pub unsafe fn sub(self, count: usize) -> *const T {
+        ((self as usize) - count * crate::mem::size_of::<T>()) as *const T
+    }
+
+    // The pointer count T's on, or back for a negative count.
+    // UNSAFE: as add.
+    // SAFETY: a contract on the caller, as Rust's.
+    #[effects(unsafe, T)]
+    pub unsafe fn offset(self, count: isize) -> *const T {
+        if count >= 0 { self.add(count as usize) } else { self.sub((0 - count) as usize) }
+    }
+
+    // The T it points to, moved out bit for bit (ptr::read).
+    #[effects(unsafe, T)]
+    // UNSAFE: reads through a raw pointer.
+    // SAFETY: a contract on the caller: valid, aligned, initialized.
+    pub unsafe fn read(self) -> T {
+        read(self)
+    }
+
+    // The same address as a pointer to U.
+    #[effects()]
+    pub fn cast<U>(self) -> *const U {
+        self as *const U
+    }
+
+    // The same pointer as a `*mut T` (Rust's `cast_mut`): writing through
+    // it is the caller's to justify.
+    #[effects()]
+    pub fn cast_mut(self) -> *mut T {
+        self as *mut T
+    }
+}
+
+impl<T> *mut T {
     // Whether the pointer is null.
     #[effects()]
     pub fn is_null(self) -> bool {
@@ -207,7 +365,7 @@ impl<T> *const T {
     // UNSAFE: reads through a raw pointer.
     // SAFETY: a contract on the caller: valid, aligned, initialized.
     pub unsafe fn read(self) -> T {
-        read(self)
+        read(self as *const T)
     }
 
     // value stored where it points, the old value not dropped (ptr::write).
@@ -215,13 +373,19 @@ impl<T> *const T {
     // SAFETY: a contract on the caller: valid and aligned.
     #[effects(unsafe, T)]
     pub unsafe fn write(self, value: T) {
-        write(self as *mut T, value)
+        write(self, value)
     }
 
     // The same address as a pointer to U.
     #[effects()]
     pub fn cast<U>(self) -> *mut U {
         self as *mut U
+    }
+
+    // The same pointer as a `*const T` (Rust's `cast_const`).
+    #[effects()]
+    pub fn cast_const(self) -> *const T {
+        self as *const T
     }
 }
 

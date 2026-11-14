@@ -14,7 +14,6 @@
 // (ranges over all j and k); the original loop runs otherwise, and the
 // remainder.
 
-use crate::base::{IntVec, free};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::types::{TY_I64, TY_U64, int_bits, is_float, is_integer, type_size, vector_type};
@@ -30,7 +29,7 @@ use crate::middle::ir::Op::{
 };
 use crate::middle::ir::cfg::{ir_terminate, pred_index};
 use crate::middle::loops::{
-    add_pred_values, clone_region, invariant_in, loop_contains, loop_header, loop_latch,
+    add_pred_values, clone_lp_list2, invariant_in, loop_contains, loop_header, loop_latch,
     loop_preheader, loop_size, mark_loop_blocks, new_phi_in,
 };
 use crate::middle::profile::is_cold_block;
@@ -43,448 +42,434 @@ use crate::middle::vectorize::legality::{
     class_of, coef, lane_type, loads_in, set_class, use_elem, vector_operand_ok,
 };
 
-fn saved_class(cx: &mut FnCtx, v: i64) -> i64 {
-    unsafe {
-        let x = ir_val(cx, v);
-        let mut k: i64 = 0;
-        while k < cx.v_class.count {
-            if (*cx.v_class.data.add(k as usize)) == x {
-                return (*cx.v_class.data.add((k + 1) as usize));
-            }
-            k += 2;
+fn saved_class(cx: &mut FnCtx<Comp>, v: i64) -> i64 {
+    let x = ir_val(cx, v);
+    let mut k: i64 = 0;
+    while k < cx.v_class.len() as i64 {
+        if (cx.v_class[k as usize]) == x {
+            return (cx.v_class[(k + 1) as usize]);
         }
-        0
+        k += 2;
     }
+    0
 }
 
 // The chain of blocks from b to `to` (both in L, not in L2), each jumping
 // to the next, appended to V_CHAIN; false when there is another shape.
-fn chain_to(cx: &mut FnCtx, l: i64, l2: i64, from: i64, to: i64) -> bool {
-    unsafe {
-        let mut b = from;
-        for _ in 0..16 {
-            cx.v_chain.push(b);
-            if b == to {
-                return true;
-            }
-            let s = (*cx.blocks.add(b as usize)).s0;
-            if (*cx.blocks.add(b as usize)).term != Term::Jump || !loop_contains(cx, l, s)
-                || loop_contains(cx, l2, s)
-                || (*cx.blocks.add(s as usize)).preds.count != 1 {
-                return false;
-            }
-            b = s;
+fn chain_to(cx: &mut FnCtx<Comp>, l: i64, l2: i64, from: i64, to: i64) -> bool {
+    let mut b = from;
+    for _ in 0..16 {
+        cx.v_chain.push(b);
+        if b == to {
+            return true;
         }
-        false
+        let s = (cx.blocks[b as usize]).s0;
+        if (cx.blocks[b as usize]).term != Term::Jump || !loop_contains(cx, l, s)
+            || loop_contains(cx, l2, s)
+            || (cx.blocks[s as usize]).preds.len() as i64 != 1 {
+            return false;
+        }
+        b = s;
     }
+    false
 }
 
 // The inner loop l2: a header phi (*iv) from a constant start, by a
 // constant step s > 0 (unrolling makes it more than 1), while its next
 // value is below a constant (or not equal to it, reached exactly); its
 // last value in *last.
-fn inner_counted(cx: &mut FnCtx, l2: i64, iv: &mut i64, last: &mut i64) -> bool {
-    unsafe {
-        let h = loop_header(cx, l2);
-        let latch = loop_latch(cx, l2);
-        let c = ir_val(cx, (*cx.blocks.add(latch as usize)).cond);
-        if (*cx.insts.add(c as usize)).op != Cmp || !is_integer((*cx.insts.add(c as usize)).imm2)
-            || int_bits((*cx.insts.add(c as usize)).imm2) != 64 {
-            return false;
-        }
-        let mut cond = (*cx.insts.add(c as usize)).cond;
-        let mut x = bits_of_value(cx, (*cx.insts.add(c as usize)).a);
-        let mut n = bits_of_value(cx, (*cx.insts.add(c as usize)).b);
-        if is_const(cx, x) && !is_const(cx, n) {
-            let t = x;
-            x = n;
-            n = t;
-            cond = cond.mirror();
-        }
-        if !is_const(cx, n) || (*cx.blocks.add(latch as usize)).term != Term::Branch {
-            return false;
-        }
-        if (*cx.blocks.add(latch as usize)).s0 != h {
-            cond = cond.negate();
-        }
-        let mut phi = (*cx.blocks.add(h as usize)).first;
-        while phi != 0 && (*cx.insts.add(phi as usize)).op == Phi {
-            let mut s: i64 = 0;
-            let pred_index_v1 = pred_index(cx, h, latch);
-            let ir_arg_v1 = ir_arg(cx, phi, pred_index_v1);
-            let ir_val_v = ir_val(cx, ir_arg_v1);
-            let arg_v1 = ir_val_v == x
-                && iv_step(cx, l2, phi, &mut s);
-            let arg_v = arg_v1 && s > 0;
-            if arg_v
-                && int_bits((*cx.insts.add(phi as usize)).ty) == 64 {
-                let loop_preheader_v = loop_preheader(cx, l2);
-                let pred_index_v = pred_index(cx, h, loop_preheader_v);
-                let ir_arg_v = ir_arg(cx, phi, pred_index_v);
-                let k0v = ir_val(cx,
-                    ir_arg_v);
-                if !is_const(cx, k0v) {
-                    return false;
-                }
-                let k0 = (*cx.insts.add(k0v as usize)).imm;
-                let nn = (*cx.insts.add(n as usize)).imm;
-                if k0 >= nn || nn - k0 > 1073741824 {
-                    return false;
-                }
-                if cond == Cond::Ne && (nn - k0) % s != 0 {
-                    return false;
-                }
-                if cond != Cond::Ne && cond != Cond::Lt {
-                    return false;
-                }
-                let trips = (nn - k0 + s - 1) / s;
-                *iv = phi;
-                *last = k0 + (trips - 1) * s;
-                return true;
-            }
-            phi = (*cx.insts.add(phi as usize)).next;
-        }
-        false
+fn inner_counted(cx: &mut FnCtx<Comp>, l2: i64, iv: &mut i64, last: &mut i64) -> bool {
+    let h = loop_header(cx, l2);
+    let latch = loop_latch(cx, l2);
+    let c = ir_val(cx, (cx.blocks[latch as usize]).cond);
+    if (cx.insts[c as usize]).op != Cmp || !is_integer((cx.insts[c as usize]).imm2)
+        || int_bits((cx.insts[c as usize]).imm2) != 64 {
+        return false;
     }
+    let mut cond = (cx.insts[c as usize]).cond;
+    let mut x = bits_of_value(cx, (cx.insts[c as usize]).a);
+    let mut n = bits_of_value(cx, (cx.insts[c as usize]).b);
+    if is_const(cx, x) && !is_const(cx, n) {
+        let t = x;
+        x = n;
+        n = t;
+        cond = cond.mirror();
+    }
+    if !is_const(cx, n) || (cx.blocks[latch as usize]).term != Term::Branch {
+        return false;
+    }
+    if (cx.blocks[latch as usize]).s0 != h {
+        cond = cond.negate();
+    }
+    let mut phi = (cx.blocks[h as usize]).first;
+    while phi != 0 && (cx.insts[phi as usize]).op == Phi {
+        let mut s: i64 = 0;
+        let pred_index_v1 = pred_index(cx, h, latch);
+        let ir_arg_v1 = ir_arg(cx, phi, pred_index_v1);
+        let ir_val_v = ir_val(cx, ir_arg_v1);
+        let arg_v1 = ir_val_v == x
+            && iv_step(cx, l2, phi, &mut s);
+        let arg_v = arg_v1 && s > 0;
+        if arg_v
+            && int_bits((cx.insts[phi as usize]).ty) == 64 {
+            let loop_preheader_v = loop_preheader(cx, l2);
+            let pred_index_v = pred_index(cx, h, loop_preheader_v);
+            let ir_arg_v = ir_arg(cx, phi, pred_index_v);
+            let k0v = ir_val(cx,
+                ir_arg_v);
+            if !is_const(cx, k0v) {
+                return false;
+            }
+            let k0 = (cx.insts[k0v as usize]).imm;
+            let nn = (cx.insts[n as usize]).imm;
+            if k0 >= nn || nn - k0 > 1073741824 {
+                return false;
+            }
+            if cond == Cond::Ne && (nn - k0) % s != 0 {
+                return false;
+            }
+            if cond != Cond::Ne && cond != Cond::Lt {
+                return false;
+            }
+            let trips = (nn - k0 + s - 1) / s;
+            *iv = phi;
+            *last = k0 + (trips - 1) * s;
+            return true;
+        }
+        phi = (cx.insts[phi as usize]).next;
+    }
+    false
 }
 
-fn analyze_outer(cx: &mut FnCtx, l: i64, l2: i64, exit: &mut i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        cx.vstamp += 1;
-        cx.v_elem = 0;
-        cx.v_has_store = false;
-        cx.v_has_uload = false;
-        cx.v_chain.count = 0;
-        cx.v_checks.count = 0;
-        cx.v_access.count = 0;
-        cx.v_reds.count = 0;
-        cx.v_iv2 = 0;
-        let h = loop_header(cx, l);
-        let latch = loop_latch(cx, l);
-        let h2 = loop_header(cx, l2);
-        let latch2 = loop_latch(cx, l2);
-        let p2 = loop_preheader(cx, l2);
-        if (*cx.blocks.add(h as usize)).novec != 0 || is_cold_block(cx, h, pcx) || latch == 0
-            || loop_preheader(cx, l) == 0 || latch2 == 0 || p2 == 0
-            || (*cx.blocks.add(latch as usize)).term != Term::Branch
-            || (*cx.blocks.add(latch2 as usize)).term != Term::Branch {
+fn analyze_outer(cx: &mut FnCtx<Comp>, l: i64, l2: i64, exit: &mut i64, pcx: &Ctx<Comp>) -> bool {
+    cx.vstamp += 1;
+    cx.v_elem = 0;
+    cx.v_has_store = false;
+    cx.v_has_uload = false;
+    cx.v_chain.clear();
+    cx.v_checks.clear();
+    cx.v_access.clear();
+    cx.v_reds.clear();
+    cx.v_iv2 = 0;
+    let h = loop_header(cx, l);
+    let latch = loop_latch(cx, l);
+    let h2 = loop_header(cx, l2);
+    let latch2 = loop_latch(cx, l2);
+    let p2 = loop_preheader(cx, l2);
+    if (cx.blocks[h as usize]).novec != 0 || is_cold_block(cx, h, pcx) || latch == 0
+        || loop_preheader(cx, l) == 0 || latch2 == 0 || p2 == 0
+        || (cx.blocks[latch as usize]).term != Term::Branch
+        || (cx.blocks[latch2 as usize]).term != Term::Branch {
+        return false;
+    }
+    let mut iv: i64 = 0;
+    let mut step: i64 = 0;
+    let mut n: i64 = 0;
+    let mut ne = false;
+    if !counted_loop(cx, l, &mut iv, &mut step, &mut n, &mut ne) || step != 1
+        || int_bits((cx.insts[iv as usize]).ty) != 64 {
+        return false;
+    }
+    let mut iv2: i64 = 0;
+    let mut last2: i64 = 0;
+    if !inner_counted(cx, l2, &mut iv2, &mut last2) {
+        return false;
+    }
+    cx.v_iv = iv;
+    cx.v_n = n;
+    cx.v_ne = ne;
+    cx.v_iv2 = iv2;
+    cx.v_last2 = last2;
+    // L2's only exit is at its latch.
+    let s0 = (cx.blocks[latch2 as usize]).s0;
+    let s1 = (cx.blocks[latch2 as usize]).s1;
+    let e2 = if s0 == h2 { s1 } else { s0 };
+    if loop_contains(cx, l2, e2) || !loop_contains(cx, l, e2)
+        || (cx.blocks[e2 as usize]).preds.len() as i64 != 1 {
+        return false;
+    }
+    // The blocks: h ... p2, L2 (a chain of jumps), e2 ... latch.
+    if !chain_to(cx, l, l2, h, p2) || (cx.blocks[p2 as usize]).s0 != h2 {
+        return false;
+    }
+    cx.v_pre = cx.v_chain.len() as i64;
+    let mut b = h2;
+    for _ in 0..16 {
+        cx.v_chain.push(b);
+        if b == latch2 {
+            break;
+        }
+        let s = (cx.blocks[b as usize]).s0;
+        if (cx.blocks[b as usize]).term != Term::Jump || !loop_contains(cx, l2, s)
+            || (cx.blocks[s as usize]).preds.len() as i64 != 1 {
             return false;
         }
-        let mut iv: i64 = 0;
-        let mut step: i64 = 0;
-        let mut n: i64 = 0;
-        let mut ne = false;
-        if !counted_loop(cx, l, &mut iv, &mut step, &mut n, &mut ne) || step != 1
-            || int_bits((*cx.insts.add(iv as usize)).ty) != 64 {
+        b = s;
+    }
+    if (cx.v_chain[(cx.v_chain.len() as i64 - 1) as usize]) != latch2
+        || cx.v_chain.len() as i64 - cx.v_pre != loop_size(cx, l2) {
+        return false;
+    }
+    if !chain_to(cx, l, l2, e2, latch) || cx.v_chain.len() as i64 != loop_size(cx, l) {
+        return false;
+    }
+    let ss0 = (cx.blocks[latch as usize]).s0;
+    let e = if ss0 == h { (cx.blocks[latch as usize]).s1 } else { ss0 };
+    if loop_contains(cx, l, e) || (cx.blocks[e as usize]).preds.len() as i64 != 1 {
+        return false;
+    }
+    *exit = e;
+    // Phis: j alone in h; k and accumulators in h2; e2's (one operand)
+    // take their operand's class below.
+    let mut phi = (cx.blocks[h as usize]).first;
+    while phi != 0 && (cx.insts[phi as usize]).op == Phi {
+        if phi != iv {
             return false;
         }
-        let mut iv2: i64 = 0;
-        let mut last2: i64 = 0;
-        if !inner_counted(cx, l2, &mut iv2, &mut last2) {
-            return false;
-        }
-        cx.v_iv = iv;
-        cx.v_n = n;
-        cx.v_ne = ne;
-        cx.v_iv2 = iv2;
-        cx.v_last2 = last2;
-        // L2's only exit is at its latch.
-        let s0 = (*cx.blocks.add(latch2 as usize)).s0;
-        let s1 = (*cx.blocks.add(latch2 as usize)).s1;
-        let e2 = if s0 == h2 { s1 } else { s0 };
-        if loop_contains(cx, l2, e2) || !loop_contains(cx, l, e2)
-            || (*cx.blocks.add(e2 as usize)).preds.count != 1 {
-            return false;
-        }
-        // The blocks: h ... p2, L2 (a chain of jumps), e2 ... latch.
-        if !chain_to(cx, l, l2, h, p2) || (*cx.blocks.add(p2 as usize)).s0 != h2 {
-            return false;
-        }
-        cx.v_pre = cx.v_chain.count;
-        let mut b = h2;
-        for _ in 0..16 {
-            cx.v_chain.push(b);
-            if b == latch2 {
-                break;
-            }
-            let s = (*cx.blocks.add(b as usize)).s0;
-            if (*cx.blocks.add(b as usize)).term != Term::Jump || !loop_contains(cx, l2, s)
-                || (*cx.blocks.add(s as usize)).preds.count != 1 {
-                return false;
-            }
-            b = s;
-        }
-        if (*cx.v_chain.data.add((cx.v_chain.count - 1) as usize)) != latch2
-            || cx.v_chain.count - cx.v_pre != loop_size(cx, l2) {
-            return false;
-        }
-        if !chain_to(cx, l, l2, e2, latch) || cx.v_chain.count != loop_size(cx, l) {
-            return false;
-        }
-        let ss0 = (*cx.blocks.add(latch as usize)).s0;
-        let e = if ss0 == h { (*cx.blocks.add(latch as usize)).s1 } else { ss0 };
-        if loop_contains(cx, l, e) || (*cx.blocks.add(e as usize)).preds.count != 1 {
-            return false;
-        }
-        *exit = e;
-        // Phis: j alone in h; k and accumulators in h2; e2's (one operand)
-        // take their operand's class below.
-        let mut phi = (*cx.blocks.add(h as usize)).first;
-        while phi != 0 && (*cx.insts.add(phi as usize)).op == Phi {
-            if phi != iv {
-                return false;
-            }
+        set_class(cx, phi, VC_UNIFORM);
+        phi = (cx.insts[phi as usize]).next;
+    }
+    phi = (cx.blocks[h2 as usize]).first;
+    while phi != 0 && (cx.insts[phi as usize]).op == Phi {
+        if phi == iv2 {
             set_class(cx, phi, VC_UNIFORM);
-            phi = (*cx.insts.add(phi as usize)).next;
-        }
-        phi = (*cx.blocks.add(h2 as usize)).first;
-        while phi != 0 && (*cx.insts.add(phi as usize)).op == Phi {
-            if phi == iv2 {
-                set_class(cx, phi, VC_UNIFORM);
-            } else {
-                if !use_elem(cx, (*cx.insts.add(phi as usize)).ty) {
-                    return false;
-                }
-                set_class(cx, phi, VC_VECTOR);
-            }
-            phi = (*cx.insts.add(phi as usize)).next;
-        }
-        let latch_cond = ir_val(cx, (*cx.blocks.add(latch as usize)).cond);
-        let mut total: i64 = 0;
-        for k in 0..cx.v_chain.count {
-            let blk = (*cx.v_chain.data.add(k as usize));
-            let mut v = (*cx.blocks.add(blk as usize)).first;
-            while v != 0 {
-                total += 1;
-                if total > VEC_MAX_INSTS {
-                    return false;
-                }
-                if (*cx.insts.add(v as usize)).op == Phi {
-                    if blk == e2 {
-                        let ir_arg_v = ir_arg(cx, v, 0);
-                        let w = ir_val(cx, ir_arg_v);
-                        let c = if class_of(cx, w) != 0 { class_of(cx, w) } else { VC_UNIFORM };
-                        if c == VC_SKIP {
-                            return false;
-                        }
-                        set_class(cx, v, c);
-                    } else if class_of(cx, v) == 0 {
-                        return false;
-                    }
-                } else if !classify_outer(cx, l, v, latch_cond, pcx) {
-                    return false;
-                }
-                v = (*cx.insts.add(v as usize)).next;
-            }
-        }
-        cx.v_size = total;
-        if cx.v_elem == 0 {
-            return false;
-        }
-        cx.v_vf = 16 / type_size(cx.v_elem, pcx);
-        cx.v_vt = vector_type(lane_type(cx.v_elem), cx.v_vf, pcx);
-        if cx.v_vt == 0 {
-            return false;
-        }
-        // The accumulators' operands have values for every lane.
-        phi = (*cx.blocks.add(h2 as usize)).first;
-        while phi != 0 && (*cx.insts.add(phi as usize)).op == Phi {
-            if phi != iv2 {
-                for i in 0..(*cx.insts.add(phi as usize)).nargs {
-                    let ir_arg_v1 = ir_arg(cx, phi, i);
-                    let vector_operand_ok_v = vector_operand_ok(cx, l, ir_arg_v1);
-                    if !vector_operand_ok_v {
-                        return false;
-                    }
-                }
-            }
-            phi = (*cx.insts.add(phi as usize)).next;
-        }
-        // What L leaves for after it: invariants only.
-        let mut x = (*cx.blocks.add(e as usize)).first;
-        while x != 0 && (*cx.insts.add(x as usize)).op == Phi {
-            let ir_arg_v2 = ir_arg(cx, x, 0);
-            let ir_val_v = ir_val(cx, ir_arg_v2);
-            let invariant_in_v = invariant_in(cx, l, ir_val_v);
-            if !invariant_in_v {
+        } else {
+            if !use_elem(cx, (cx.insts[phi as usize]).ty) {
                 return false;
             }
-            x = (*cx.insts.add(x as usize)).next;
+            set_class(cx, phi, VC_VECTOR);
         }
-        // Addresses: affine in j and k, from no load.
-        for k in 0..cx.v_access.count / 3 {
-            let a = (*cx.v_access.data.add((3 * k + 1) as usize));
-            if !multi_affine(cx, l, a) || loads_in(cx, l, a) {
-                return false;
-            }
-        }
-        if overlap_pairs(cx, pcx) > VEC_MAX_OVERLAPS {
-            return false;
-        }
-        true
+        phi = (cx.insts[phi as usize]).next;
     }
+    let latch_cond = ir_val(cx, (cx.blocks[latch as usize]).cond);
+    let mut total: i64 = 0;
+    for k in 0..cx.v_chain.len() as i64 {
+        let blk = (cx.v_chain[k as usize]);
+        let mut v = (cx.blocks[blk as usize]).first;
+        while v != 0 {
+            total += 1;
+            if total > VEC_MAX_INSTS {
+                return false;
+            }
+            if (cx.insts[v as usize]).op == Phi {
+                if blk == e2 {
+                    let ir_arg_v = ir_arg(cx, v, 0);
+                    let w = ir_val(cx, ir_arg_v);
+                    let c = if class_of(cx, w) != 0 { class_of(cx, w) } else { VC_UNIFORM };
+                    if c == VC_SKIP {
+                        return false;
+                    }
+                    set_class(cx, v, c);
+                } else if class_of(cx, v) == 0 {
+                    return false;
+                }
+            } else if !classify_outer(cx, l, v, latch_cond, pcx) {
+                return false;
+            }
+            v = (cx.insts[v as usize]).next;
+        }
+    }
+    cx.v_size = total;
+    if cx.v_elem == 0 {
+        return false;
+    }
+    cx.v_vf = 16 / type_size(cx.v_elem, pcx);
+    cx.v_vt = vector_type(lane_type(cx.v_elem), cx.v_vf, pcx);
+    if cx.v_vt == 0 {
+        return false;
+    }
+    // The accumulators' operands have values for every lane.
+    phi = (cx.blocks[h2 as usize]).first;
+    while phi != 0 && (cx.insts[phi as usize]).op == Phi {
+        if phi != iv2 {
+            for i in 0..(cx.insts[phi as usize]).nargs {
+                let ir_arg_v1 = ir_arg(cx, phi, i);
+                let vector_operand_ok_v = vector_operand_ok(cx, l, ir_arg_v1);
+                if !vector_operand_ok_v {
+                    return false;
+                }
+            }
+        }
+        phi = (cx.insts[phi as usize]).next;
+    }
+    // What L leaves for after it: invariants only.
+    let mut x = (cx.blocks[e as usize]).first;
+    while x != 0 && (cx.insts[x as usize]).op == Phi {
+        let ir_arg_v2 = ir_arg(cx, x, 0);
+        let ir_val_v = ir_val(cx, ir_arg_v2);
+        let invariant_in_v = invariant_in(cx, l, ir_val_v);
+        if !invariant_in_v {
+            return false;
+        }
+        x = (cx.insts[x as usize]).next;
+    }
+    // Addresses: affine in j and k, from no load.
+    for k in 0..cx.v_access.len() as i64 / 3 {
+        let a = (cx.v_access[(3 * k + 1) as usize]);
+        if !multi_affine(cx, l, a) || loads_in(cx, l, a) {
+            return false;
+        }
+    }
+    if overlap_pairs(cx, pcx) > VEC_MAX_OVERLAPS {
+        return false;
+    }
+    true
 }
 
-fn classify_outer(cx: &mut FnCtx, l: i64, v: i64, latch_cond: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let op = (*cx.insts.add(v as usize)).op;
-        if v == latch_cond {
-            set_class(cx, v, VC_SKIP);
-            return true;
-        }
-        if op == Load || op == Store {
-            let ty = if op == Load { (*cx.insts.add(v as usize)).ty }
-                else { (*cx.insts.add(v as usize)).imm2 };
-            let addr = ir_val(cx, (*cx.insts.add(v as usize)).a);
-            let c = coef(cx, l, addr);
-            cx.v_access.push(v);
-            cx.v_access.push(addr);
-            cx.v_access.push(type_size(ty, pcx));
-            if op == Load && c == 0
-                && (class_of(cx, addr) == VC_UNIFORM || invariant_in(cx, l, addr)) {
-                // The same for all lanes (stores are kept apart by the
-                // overlap test).
-                set_class(cx, v, VC_UNIFORM);
-                return true;
-            }
-            if c != type_size(ty, pcx) || !use_elem(cx, ty) {
-                return false;
-            }
-            if op == Store {
-                if !vector_operand_ok(cx, l, (*cx.insts.add(v as usize)).b) {
-                    return false;
-                }
-                cx.v_has_store = true;
-            }
-            set_class(cx, v, VC_VECTOR);
-            return true;
-        }
-        let a: i64 = if (*cx.insts.add(v as usize)).a
-            != 0 {
-            let ir_val_v = ir_val(cx, (*cx.insts.add(v as usize)).a); class_of(cx, ir_val_v)
-        } else { 0 };
-        let b: i64 = if (*cx.insts.add(v as usize)).b
-            != 0 {
-            let ir_val_v1 = ir_val(cx, (*cx.insts.add(v as usize)).b); class_of(cx, ir_val_v1)
-        }
-            else { 0 };
-        if a == VC_VECTOR || b == VC_VECTOR {
-            let ty = (*cx.insts.add(v as usize)).ty;
-            let ok_op = op == Add || op == Sub || op == Mul || op == And || op == Or || op == Xor
-                || op == Neg || (op == Div && is_float(ty));
-            if !ok_op || (is_float(ty) && (op == And || op == Or || op == Xor))
-                || !use_elem(cx, ty) {
-                return false;
-            }
-            if !vector_operand_ok(cx, l, (*cx.insts.add(v as usize)).a)
-                || ((*cx.insts.add(v as usize)).b != 0
-                    && !vector_operand_ok(cx, l, (*cx.insts.add(v as usize)).b)) {
-                return false;
-            }
-            set_class(cx, v, VC_VECTOR);
-            return true;
-        }
-        if a == VC_SKIP || b == VC_SKIP {
-            return false;
-        }
-        if op.is_pure() || op == Const {
-            // (A comparison: the inner loop's test; its operands are the same
-            // for all lanes.)
+fn classify_outer(cx: &mut FnCtx<Comp>, l: i64, v: i64, latch_cond: i64, pcx: &Ctx<Comp>) -> bool {
+    let op = (cx.insts[v as usize]).op;
+    if v == latch_cond {
+        set_class(cx, v, VC_SKIP);
+        return true;
+    }
+    if op == Load || op == Store {
+        let ty = if op == Load { (cx.insts[v as usize]).ty }
+            else { (cx.insts[v as usize]).imm2 };
+        let addr = ir_val(cx, (cx.insts[v as usize]).a);
+        let c = coef(cx, l, addr);
+        cx.v_access.push(v);
+        cx.v_access.push(addr);
+        cx.v_access.push(type_size(ty, pcx));
+        if op == Load && c == 0
+            && (class_of(cx, addr) == VC_UNIFORM || invariant_in(cx, l, addr)) {
+            // The same for all lanes (stores are kept apart by the
+            // overlap test).
             set_class(cx, v, VC_UNIFORM);
             return true;
         }
-        false
+        if c != type_size(ty, pcx) || !use_elem(cx, ty) {
+            return false;
+        }
+        if op == Store {
+            if !vector_operand_ok(cx, l, (cx.insts[v as usize]).b) {
+                return false;
+            }
+            cx.v_has_store = true;
+        }
+        set_class(cx, v, VC_VECTOR);
+        return true;
     }
+    let a: i64 = if (cx.insts[v as usize]).a
+        != 0 {
+        let ir_val_v = ir_val(cx, (cx.insts[v as usize]).a); class_of(cx, ir_val_v)
+    } else { 0 };
+    let b: i64 = if (cx.insts[v as usize]).b
+        != 0 {
+        let ir_val_v1 = ir_val(cx, (cx.insts[v as usize]).b); class_of(cx, ir_val_v1)
+    }
+        else { 0 };
+    if a == VC_VECTOR || b == VC_VECTOR {
+        let ty = (cx.insts[v as usize]).ty;
+        let ok_op = op == Add || op == Sub || op == Mul || op == And || op == Or || op == Xor
+            || op == Neg || (op == Div && is_float(ty));
+        if !ok_op || (is_float(ty) && (op == And || op == Or || op == Xor))
+            || !use_elem(cx, ty) {
+            return false;
+        }
+        if !vector_operand_ok(cx, l, (cx.insts[v as usize]).a)
+            || ((cx.insts[v as usize]).b != 0
+                && !vector_operand_ok(cx, l, (cx.insts[v as usize]).b)) {
+            return false;
+        }
+        set_class(cx, v, VC_VECTOR);
+        return true;
+    }
+    if a == VC_SKIP || b == VC_SKIP {
+        return false;
+    }
+    if op.is_pure() || op == Const {
+        // (A comparison: the inner loop's test; its operands are the same
+        // for all lanes.)
+        set_class(cx, v, VC_UNIFORM);
+        return true;
+    }
+    false
 }
 
 // Whether v is affine in j and in k separately, with invariant (maybe
 // not constant) coefficients and no product of the two: its extremes over
 // the iterations are then at the corners.
-fn multi_affine(cx: &mut FnCtx, l: i64, v: i64) -> bool {
+fn multi_affine(cx: &mut FnCtx<Comp>, l: i64, v: i64) -> bool {
     lin_mask(cx, l, v) >= 0
 }
 
 // What v depends on: 1 for j, 2 for k (3 for both), -1 when not linear.
-fn lin_mask(cx: &mut FnCtx, l: i64, v: i64) -> i64 {
-    unsafe {
-        let x = ir_val(cx, v);
-        if x == cx.v_iv {
-            return 1;
-        }
-        if x == cx.v_iv2 {
-            return 2;
-        }
-        if x == 0 || invariant_in(cx, l, x) {
-            return 0;
-        }
-        if class_of(cx, x) != VC_UNIFORM || (*cx.insts.add(x as usize)).op == Load
-            || (*cx.insts.add(x as usize)).op == Phi {
-            return -1;
-        }
-        let op = (*cx.insts.add(x as usize)).op;
-        let a = lin_mask(cx, l, (*cx.insts.add(x as usize)).a);
-        let b = lin_mask(cx, l, (*cx.insts.add(x as usize)).b);
-        if a < 0 || b < 0 {
-            return -1;
-        }
-        if a == 0 && b == 0 {
-            return 0;
-        }
-        if !is_integer((*cx.insts.add(x as usize)).ty)
-            || int_bits((*cx.insts.add(x as usize)).ty) != 64 {
-            return -1;
-        }
-        if op == Add || op == Sub {
-            return a | b;
-        }
-        if op == Mul && (a == 0 || b == 0) {
-            return a | b;
-        }
-        if op == Shl && b == 0
-            && { let at_arg1 = ir_val(cx, (*cx.insts.add(x as usize)).b); is_const(cx, at_arg1) } {
-            return a;
-        }
-        if op == Conv && is_integer((*cx.insts.add(x as usize)).imm2)
-            && int_bits((*cx.insts.add(x as usize)).imm2) == 64 {
-            return a;
-        }
-        -1
+fn lin_mask(cx: &mut FnCtx<Comp>, l: i64, v: i64) -> i64 {
+    let x = ir_val(cx, v);
+    if x == cx.v_iv {
+        return 1;
     }
+    if x == cx.v_iv2 {
+        return 2;
+    }
+    if x == 0 || invariant_in(cx, l, x) {
+        return 0;
+    }
+    if class_of(cx, x) != VC_UNIFORM || (cx.insts[x as usize]).op == Load
+        || (cx.insts[x as usize]).op == Phi {
+        return -1;
+    }
+    let op = (cx.insts[x as usize]).op;
+    let a = lin_mask(cx, l, (cx.insts[x as usize]).a);
+    let b = lin_mask(cx, l, (cx.insts[x as usize]).b);
+    if a < 0 || b < 0 {
+        return -1;
+    }
+    if a == 0 && b == 0 {
+        return 0;
+    }
+    if !is_integer((cx.insts[x as usize]).ty)
+        || int_bits((cx.insts[x as usize]).ty) != 64 {
+        return -1;
+    }
+    if op == Add || op == Sub {
+        return a | b;
+    }
+    if op == Mul && (a == 0 || b == 0) {
+        return a | b;
+    }
+    if op == Shl && b == 0
+        && { let at_arg1 = ir_val(cx, (cx.insts[x as usize]).b); is_const(cx, at_arg1) } {
+        return a;
+    }
+    if op == Conv && is_integer((cx.insts[x as usize]).imm2)
+        && int_bits((cx.insts[x as usize]).imm2) == 64 {
+        return a;
+    }
+    -1
 }
 
 // The value of v (uniform, without loads) with j = `at` and k = `at2`, in
 // block b.
-pub fn eval_at2(cx: &mut FnCtx, l: i64, v: i64, at: i64, at2: i64, b: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let x = ir_val(cx, v);
-        if x == cx.v_iv {
-            return at;
-        }
-        if x == cx.v_iv2 {
-            return at2;
-        }
-        if invariant_in(cx, l, x) {
-            return x;
-        }
-        let a: i64 = if (*cx.insts.add(x as usize)).a
-            != 0 { eval_at2(cx, l, (*cx.insts.add(x as usize)).a, at, at2, b, pcx) }
-            else { 0 };
-        let y: i64 = if (*cx.insts.add(x as usize)).b
-            != 0 { eval_at2(cx, l, (*cx.insts.add(x as usize)).b, at, at2, b, pcx) }
-            else { 0 };
-        let nv = ir_make(cx, (*cx.insts.add(x as usize)).op, (*cx.insts.add(x as usize)).ty, a, y,
-            (*cx.insts.add(x as usize)).imm, pcx);
-        (*cx.insts.add(nv as usize)).imm2 = (*cx.insts.add(x as usize)).imm2;
-        (*cx.insts.add(nv as usize)).cond = (*cx.insts.add(x as usize)).cond;
-        ir_append(cx, b, nv);
-        nv
+pub fn eval_at2(cx: &mut FnCtx<Comp>, l: i64, v: i64, at: i64, at2: i64, b: i64, pcx: &Ctx<Comp>) -> i64 {
+    let x = ir_val(cx, v);
+    if x == cx.v_iv {
+        return at;
     }
+    if x == cx.v_iv2 {
+        return at2;
+    }
+    if invariant_in(cx, l, x) {
+        return x;
+    }
+    let a: i64 = if (cx.insts[x as usize]).a
+        != 0 { eval_at2(cx, l, (cx.insts[x as usize]).a, at, at2, b, pcx) }
+        else { 0 };
+    let y: i64 = if (cx.insts[x as usize]).b
+        != 0 { eval_at2(cx, l, (cx.insts[x as usize]).b, at, at2, b, pcx) }
+        else { 0 };
+    let nv = ir_make(cx, (cx.insts[x as usize]).op, (cx.insts[x as usize]).ty, a, y,
+        (cx.insts[x as usize]).imm, pcx);
+    (cx.insts[nv as usize]).imm2 = (cx.insts[x as usize]).imm2;
+    (cx.insts[nv as usize]).cond = (cx.insts[x as usize]).cond;
+    ir_append(cx, b, nv);
+    nv
 }
 
 // The vector value of operand w of copy nv (whose original's operand had
 // class `cls`): w itself, or a splat (in vp for invariants, else just
 // before nv).
-fn outer_vector(cx: &mut FnCtx, l: i64, w: i64, cls: i64, nv: i64, vp: i64, pcx: &Ctx<Comp>) -> i64 {
+fn outer_vector(cx: &mut FnCtx<Comp>, l: i64, w: i64, cls: i64, nv: i64, vp: i64, pcx: &Ctx<Comp>) -> i64 {
     if cls == VC_VECTOR {
         return w;
     }
@@ -499,182 +484,178 @@ fn outer_vector(cx: &mut FnCtx, l: i64, w: i64, cls: i64, nv: i64, vp: i64, pcx:
 }
 
 // Whether value w is in the copy of L.
-fn in_clone(cx: &mut FnCtx, w: i64) -> bool {
-    unsafe {
-        let b = (*cx.insts.add(w as usize)).block;
-        b != 0 && (*cx.blocks.add(b as usize)).mark == cx.v_clone_stamp
-    }
+fn in_clone(cx: &mut FnCtx<Comp>, w: i64) -> bool {
+    let b = (cx.insts[w as usize]).block;
+    b != 0 && (cx.blocks[b as usize]).mark == cx.v_clone_stamp
 }
 
-pub fn vectorize_outer(cx: &mut FnCtx, fi: i64, l: i64, l2: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let mut e: i64 = 0;
-        if !analyze_outer(cx, l, l2, &mut e, pcx) {
-            cx.v_iv2 = 0;
-            return false;
-        }
-        ir_enter(cx, fi, pcx);
-        let h = loop_header(cx, l);
-        let p = loop_preheader(cx, l);
-        let latch = loop_latch(cx, l);
-        let h2 = loop_header(cx, l2);
-        let p2 = loop_preheader(cx, l2);
-        let arg_v5 = cx.v_iv;
-        let pred_index_v = pred_index(cx, h, p);
-        let ir_arg_v = ir_arg(cx, arg_v5, pred_index_v);
-        let start = ir_val(cx, ir_arg_v);
-        let arg_v6 = cx.v_iv2;
-        let pred_index_v1 = pred_index(cx, h2, p2);
-        let ir_arg_v1 = ir_arg(cx, arg_v6, pred_index_v1);
-        let start2 = ir_val(cx, ir_arg_v1);
-        let vf = cx.v_vf;
-        let vt = cx.v_vt;
-        let n = cx.v_n;
-        // Classes, saved before cloning.
-        cx.v_class.count = 0;
-        for k in 0..cx.v_chain.count {
-            let mut v = (*cx.blocks.add((*cx.v_chain.data.add(k as usize)) as usize)).first;
-            while v != 0 {
-                cx.v_class.push(v);
-                let class_of_v = class_of(cx, v);
-                cx.v_class.push(class_of_v);
-                v = (*cx.insts.add(v as usize)).next;
-            }
-        }
-        let c = ir_new_block(cx);
-        let vp = ir_new_block(cx);
-        let vx = ir_new_block(cx);
-        let sp = ir_new_block(cx);
-        (*cx.blocks.add(c as usize)).sealed = 1;
-        (*cx.blocks.add(vp as usize)).sealed = 1;
-        (*cx.blocks.add(vx as usize)).sealed = 1;
-        (*cx.blocks.add(sp as usize)).sealed = 1;
-        (*cx.blocks.add(p as usize)).s0 = c;
-        (*cx.blocks.add(c as usize)).preds.push(p);
-        let trips = append(cx, c, Sub, TY_I64, n, start, 0, pcx);
-        let konst_v = konst(cx, c, vf, TY_I64, pcx);
-        let mut ok = cmp(cx, c, Cond::Ge, TY_U64, trips, konst_v, pcx);
-        let konst_v1 = konst(cx, c, 1, TY_I64, pcx);
-        let last = append(cx, c, Sub, TY_I64, n, konst_v1, 0, pcx);
-        let last2 = konst(cx, c, cx.v_last2, TY_I64, pcx);
-        build_groups(cx);
-        ok = overlap_tests(cx, l, c, ok, start, last, start2, last2, pcx);
-        ir_terminate(cx, c, Term::Branch, ok, vp, sp);
-        let konst_v2 = konst(cx, vp, 0 - vf, TY_I64, pcx);
-        let vtrips = append(cx, vp, And, TY_I64, trips, konst_v2, 0,
-            pcx);
-        let vend = append(cx, vp, Add, TY_I64, start, vtrips, 0, pcx);
-        // The copy of L.
-        let stamp = mark_loop_blocks(cx, l);
-        clone_region(cx, fi, &mut cx.lp_list2, stamp, pcx);
-        cx.vstamp += 1;
-        cx.v_clone_stamp = cx.vstamp;
-        for i in 0..cx.lp_list2.count {
-            { let at_ix = (*cx.blocks.add((*cx.lp_list2.data.add(i as usize)) as usize)).aux as usize; (*cx.blocks.add(at_ix)).mark = cx.v_clone_stamp };
-        }
-        let h_c = (*cx.blocks.add(h as usize)).aux;
-        let latch_c = (*cx.blocks.add(latch as usize)).aux;
-        // Turn the copy's vector values into vectors.
-        for k in 0..cx.v_chain.count {
-            let mut v = (*cx.blocks.add((*cx.v_chain.data.add(k as usize)) as usize)).first;
-            while v != 0 {
-                let nv = (*cx.insts.add(v as usize)).aux;
-                let op = (*cx.insts.add(v as usize)).op;
-                if saved_class(cx, v) == VC_VECTOR {
-                    if op == Phi {
-                        (*cx.insts.add(nv as usize)).ty = vt;
-                        let pb = (*cx.insts.add(nv as usize)).block;
-                        for i in 0..(*cx.insts.add(nv as usize)).nargs {
-                            let ir_arg_v2 = ir_arg(cx, v, i);
-                            let cls = saved_class(cx, ir_arg_v2);
-                            if cls != VC_VECTOR {
-                                // A splat at the end of the predecessor.
-                                let w = ir_arg(cx, nv, i);
-                                let s = ir_make(cx, VSplat, vt, w, 0, 0, pcx);
-                                ir_append(cx,
-                                    (*(*cx.blocks.add(pb as usize)).preds.data.add(i as usize)), s);
-                                ir_set_arg(cx, nv, i, s);
-                            }
-                        }
-                    } else if op == Load {
-                        (*cx.insts.add(nv as usize)).ty = vt;
-                    } else if op == Store {
-                        (*cx.insts.add(nv as usize)).imm2 = vt;
-                        let arg_v = (*cx.insts.add(nv as usize)).b;
-                        let saved_class_v = saved_class(cx, (*cx.insts.add(v as usize)).b);
-                        (*cx.insts.add(nv as usize)).b = outer_vector(cx, l, arg_v,
-                            saved_class_v, nv, vp, pcx);
-                    } else if op == Neg {
-                        (*cx.insts.add(nv as usize)).op = VNeg;
-                        (*cx.insts.add(nv as usize)).ty = vt;
-                        let arg_v1 = (*cx.insts.add(nv as usize)).a;
-                        let saved_class_v1 = saved_class(cx, (*cx.insts.add(v as usize)).a);
-                        (*cx.insts.add(nv as usize)).a = outer_vector(cx, l, arg_v1,
-                            saved_class_v1, nv, vp, pcx);
-                    } else {
-                        (*cx.insts.add(nv as usize)).imm = op as i64;
-                        (*cx.insts.add(nv as usize)).op = VBin;
-                        (*cx.insts.add(nv as usize)).ty = vt;
-                        let arg_v2 = (*cx.insts.add(nv as usize)).a;
-                        let saved_class_v2 = saved_class(cx, (*cx.insts.add(v as usize)).a);
-                        (*cx.insts.add(nv as usize)).a = outer_vector(cx, l, arg_v2,
-                            saved_class_v2, nv, vp, pcx);
-                        let arg_v3 = (*cx.insts.add(nv as usize)).b;
-                        let saved_class_v3 = saved_class(cx, (*cx.insts.add(v as usize)).b);
-                        (*cx.insts.add(nv as usize)).b = outer_vector(cx, l, arg_v3,
-                            saved_class_v3, nv, vp, pcx);
-                    }
-                }
-                v = (*cx.insts.add(v as usize)).next;
-            }
-        }
-        // The copy's entry: from vp; its j steps by VF, to vend, out to vx.
-        let hp = pred_index(cx, h_c, p);
-        (*(*cx.blocks.add(h_c as usize)).preds.data.add(hp as usize)) = vp;
-        (*cx.blocks.add(vp as usize)).term = Term::Jump;
-        (*cx.blocks.add(vp as usize)).s0 = h_c;
-        let jv = (*cx.insts.add(cx.v_iv as usize)).aux;
-        let jl = pred_index(cx, h_c, latch_c);
-        let arg_v4 = (*cx.insts.add(cx.v_iv as usize)).ty;
-        let konst_v3 = konst(cx, latch_c, vf, (*cx.insts.add(cx.v_iv as usize)).ty, pcx);
-        let vnext = append(cx, latch_c, Add, arg_v4, jv,
-            konst_v3, 0, pcx);
-        ir_set_arg(cx, jv, jl, vnext);
-        let more = cmp(cx, latch_c, Cond::Ne, TY_I64, vnext, vend, pcx);
-        (*cx.blocks.add(latch_c as usize)).term = Term::Branch;
-        (*cx.blocks.add(latch_c as usize)).cond = more;
-        (*cx.blocks.add(latch_c as usize)).s0 = h_c;
-        (*cx.blocks.add(latch_c as usize)).s1 = vx;
-        (*cx.blocks.add(vx as usize)).preds.push(latch_c);
-        let done = cmp(cx, vx, Cond::Eq, TY_I64, vend, n, pcx);
-        ir_terminate(cx, vx, Term::Branch, done, e, sp);
-        // SP: the scalar loop's preheader, from C or VX.
-        let mut vals = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        vals.push(start);
-        vals.push(vend);
-        let iv0 = new_phi_in(cx, sp, (*cx.insts.add(cx.v_iv as usize)).ty, &mut vals, 0, 2, pcx);
-        let ohp = pred_index(cx, h, p);
-        ir_set_arg(cx, cx.v_iv, ohp, iv0);
-        ir_terminate(cx, sp, Term::Jump, 0, h, 0);
-        (*cx.blocks.add(h as usize)).preds.count -= 1;
-        (*(*cx.blocks.add(h as usize)).preds.data.add(ohp as usize)) = sp;
-        // E: from VX too (its phis' operands are invariants).
-        vals.count = 0;
-        let mut x = (*cx.blocks.add(e as usize)).first;
-        while x != 0 && (*cx.insts.add(x as usize)).op == Phi {
-            let ir_arg_v3 = ir_arg(cx, x, 0);
-            let ir_val_v = ir_val(cx, ir_arg_v3);
-            vals.push(ir_val_v);
-            x = (*cx.insts.add(x as usize)).next;
-        }
-        (*cx.blocks.add(e as usize)).preds.count -= 1;
-        add_pred_values(cx, e, vx, &mut vals, 0);
-        (*cx.blocks.add(h as usize)).novec = 1;
-        (*cx.blocks.add(h2 as usize)).novec = 1;
-        { let at_ix = (*cx.blocks.add(h2 as usize)).aux as usize;
-            (*cx.blocks.add(at_ix)).novec = 1 };
-        free(vals.data as *mut u8);
+pub fn vectorize_outer(cx: &mut FnCtx<Comp>, fi: i64, l: i64, l2: i64, pcx: &Ctx<Comp>) -> bool {
+    let mut e: i64 = 0;
+    if !analyze_outer(cx, l, l2, &mut e, pcx) {
         cx.v_iv2 = 0;
-        true
+        return false;
     }
+    ir_enter(cx, fi, pcx);
+    let h = loop_header(cx, l);
+    let p = loop_preheader(cx, l);
+    let latch = loop_latch(cx, l);
+    let h2 = loop_header(cx, l2);
+    let p2 = loop_preheader(cx, l2);
+    let arg_v5 = cx.v_iv;
+    let pred_index_v = pred_index(cx, h, p);
+    let ir_arg_v = ir_arg(cx, arg_v5, pred_index_v);
+    let start = ir_val(cx, ir_arg_v);
+    let arg_v6 = cx.v_iv2;
+    let pred_index_v1 = pred_index(cx, h2, p2);
+    let ir_arg_v1 = ir_arg(cx, arg_v6, pred_index_v1);
+    let start2 = ir_val(cx, ir_arg_v1);
+    let vf = cx.v_vf;
+    let vt = cx.v_vt;
+    let n = cx.v_n;
+    // Classes, saved before cloning.
+    cx.v_class.clear();
+    for k in 0..cx.v_chain.len() as i64 {
+        let mut v = (cx.blocks[(cx.v_chain[k as usize]) as usize]).first;
+        while v != 0 {
+            cx.v_class.push(v);
+            let class_of_v = class_of(cx, v);
+            cx.v_class.push(class_of_v);
+            v = (cx.insts[v as usize]).next;
+        }
+    }
+    let c = ir_new_block(cx);
+    let vp = ir_new_block(cx);
+    let vx = ir_new_block(cx);
+    let sp = ir_new_block(cx);
+    (cx.blocks[c as usize]).sealed = 1;
+    (cx.blocks[vp as usize]).sealed = 1;
+    (cx.blocks[vx as usize]).sealed = 1;
+    (cx.blocks[sp as usize]).sealed = 1;
+    (cx.blocks[p as usize]).s0 = c;
+    (cx.blocks[c as usize]).preds.push(p);
+    let trips = append(cx, c, Sub, TY_I64, n, start, 0, pcx);
+    let konst_v = konst(cx, c, vf, TY_I64, pcx);
+    let mut ok = cmp(cx, c, Cond::Ge, TY_U64, trips, konst_v, pcx);
+    let konst_v1 = konst(cx, c, 1, TY_I64, pcx);
+    let last = append(cx, c, Sub, TY_I64, n, konst_v1, 0, pcx);
+    let last2 = konst(cx, c, cx.v_last2, TY_I64, pcx);
+    build_groups(cx);
+    ok = overlap_tests(cx, l, c, ok, start, last, start2, last2, pcx);
+    ir_terminate(cx, c, Term::Branch, ok, vp, sp);
+    let konst_v2 = konst(cx, vp, 0 - vf, TY_I64, pcx);
+    let vtrips = append(cx, vp, And, TY_I64, trips, konst_v2, 0,
+        pcx);
+    let vend = append(cx, vp, Add, TY_I64, start, vtrips, 0, pcx);
+    // The copy of L.
+    let stamp = mark_loop_blocks(cx, l);
+    clone_lp_list2(cx, fi, stamp, pcx);
+    cx.vstamp += 1;
+    cx.v_clone_stamp = cx.vstamp;
+    for i in 0..cx.lp_list2.len() as i64 {
+        { let at_ix = (cx.blocks[(cx.lp_list2[i as usize]) as usize]).aux as usize;
+            (cx.blocks[at_ix]).mark = cx.v_clone_stamp };
+    }
+    let h_c = (cx.blocks[h as usize]).aux;
+    let latch_c = (cx.blocks[latch as usize]).aux;
+    // Turn the copy's vector values into vectors.
+    for k in 0..cx.v_chain.len() as i64 {
+        let mut v = (cx.blocks[(cx.v_chain[k as usize]) as usize]).first;
+        while v != 0 {
+            let nv = (cx.insts[v as usize]).aux;
+            let op = (cx.insts[v as usize]).op;
+            if saved_class(cx, v) == VC_VECTOR {
+                if op == Phi {
+                    (cx.insts[nv as usize]).ty = vt;
+                    let pb = (cx.insts[nv as usize]).block;
+                    for i in 0..(cx.insts[nv as usize]).nargs {
+                        let ir_arg_v2 = ir_arg(cx, v, i);
+                        let cls = saved_class(cx, ir_arg_v2);
+                        if cls != VC_VECTOR {
+                            // A splat at the end of the predecessor.
+                            let w = ir_arg(cx, nv, i);
+                            let s = ir_make(cx, VSplat, vt, w, 0, 0, pcx);
+                            ir_append(cx,
+                                ((cx.blocks[pb as usize]).preds[i as usize]), s);
+                            ir_set_arg(cx, nv, i, s);
+                        }
+                    }
+                } else if op == Load {
+                    (cx.insts[nv as usize]).ty = vt;
+                } else if op == Store {
+                    (cx.insts[nv as usize]).imm2 = vt;
+                    let arg_v = (cx.insts[nv as usize]).b;
+                    let saved_class_v = saved_class(cx, (cx.insts[v as usize]).b);
+                    (cx.insts[nv as usize]).b = outer_vector(cx, l, arg_v,
+                        saved_class_v, nv, vp, pcx);
+                } else if op == Neg {
+                    (cx.insts[nv as usize]).op = VNeg;
+                    (cx.insts[nv as usize]).ty = vt;
+                    let arg_v1 = (cx.insts[nv as usize]).a;
+                    let saved_class_v1 = saved_class(cx, (cx.insts[v as usize]).a);
+                    (cx.insts[nv as usize]).a = outer_vector(cx, l, arg_v1,
+                        saved_class_v1, nv, vp, pcx);
+                } else {
+                    (cx.insts[nv as usize]).imm = op as i64;
+                    (cx.insts[nv as usize]).op = VBin;
+                    (cx.insts[nv as usize]).ty = vt;
+                    let arg_v2 = (cx.insts[nv as usize]).a;
+                    let saved_class_v2 = saved_class(cx, (cx.insts[v as usize]).a);
+                    (cx.insts[nv as usize]).a = outer_vector(cx, l, arg_v2,
+                        saved_class_v2, nv, vp, pcx);
+                    let arg_v3 = (cx.insts[nv as usize]).b;
+                    let saved_class_v3 = saved_class(cx, (cx.insts[v as usize]).b);
+                    (cx.insts[nv as usize]).b = outer_vector(cx, l, arg_v3,
+                        saved_class_v3, nv, vp, pcx);
+                }
+            }
+            v = (cx.insts[v as usize]).next;
+        }
+    }
+    // The copy's entry: from vp; its j steps by VF, to vend, out to vx.
+    let hp = pred_index(cx, h_c, p);
+    ((cx.blocks[h_c as usize]).preds[hp as usize]) = vp;
+    (cx.blocks[vp as usize]).term = Term::Jump;
+    (cx.blocks[vp as usize]).s0 = h_c;
+    let jv = (cx.insts[cx.v_iv as usize]).aux;
+    let jl = pred_index(cx, h_c, latch_c);
+    let arg_v4 = (cx.insts[cx.v_iv as usize]).ty;
+    let konst_v3 = konst(cx, latch_c, vf, (cx.insts[cx.v_iv as usize]).ty, pcx);
+    let vnext = append(cx, latch_c, Add, arg_v4, jv,
+        konst_v3, 0, pcx);
+    ir_set_arg(cx, jv, jl, vnext);
+    let more = cmp(cx, latch_c, Cond::Ne, TY_I64, vnext, vend, pcx);
+    (cx.blocks[latch_c as usize]).term = Term::Branch;
+    (cx.blocks[latch_c as usize]).cond = more;
+    (cx.blocks[latch_c as usize]).s0 = h_c;
+    (cx.blocks[latch_c as usize]).s1 = vx;
+    (cx.blocks[vx as usize]).preds.push(latch_c);
+    let done = cmp(cx, vx, Cond::Eq, TY_I64, vend, n, pcx);
+    ir_terminate(cx, vx, Term::Branch, done, e, sp);
+    // SP: the scalar loop's preheader, from C or VX.
+    let mut vals: Vec<i64, Comp> = Vec::new_in(Comp {});
+    vals.push(start);
+    vals.push(vend);
+    let iv0 = new_phi_in(cx, sp, (cx.insts[cx.v_iv as usize]).ty, vals.as_slice(), 0, 2, pcx);
+    let ohp = pred_index(cx, h, p);
+    ir_set_arg(cx, cx.v_iv, ohp, iv0);
+    ir_terminate(cx, sp, Term::Jump, 0, h, 0);
+    (cx.blocks[h as usize]).preds.pop();
+    ((cx.blocks[h as usize]).preds[ohp as usize]) = sp;
+    // E: from VX too (its phis' operands are invariants).
+    vals.clear();
+    let mut x = (cx.blocks[e as usize]).first;
+    while x != 0 && (cx.insts[x as usize]).op == Phi {
+        let ir_arg_v3 = ir_arg(cx, x, 0);
+        let ir_val_v = ir_val(cx, ir_arg_v3);
+        vals.push(ir_val_v);
+        x = (cx.insts[x as usize]).next;
+    }
+    (cx.blocks[e as usize]).preds.pop();
+    add_pred_values(cx, e, vx, vals.as_slice(), 0);
+    (cx.blocks[h as usize]).novec = 1;
+    (cx.blocks[h2 as usize]).novec = 1;
+    { let at_ix = (cx.blocks[h2 as usize]).aux as usize;
+        (cx.blocks[at_ix]).novec = 1 };
+    cx.v_iv2 = 0;
+    true
 }

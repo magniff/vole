@@ -134,7 +134,7 @@ let order = sort(&g, gpa).map_err(|c| self.named(&c, gpa))?;
 Ok(order.iter().map(|v| self.names[*v]).collect_in(gpa))
 ```
 
-Task names are mapped to numbers with a `HashMap<&str, i64, Gpa>`; the
+Task names are mapped to numbers with a `HashMap<&str, i64, Gpa, FixedState>`; the
 names themselves are slices of the input lines (`split_whitespace`
 yields slices of its text), so nothing is copied.
 
@@ -186,7 +186,7 @@ program, generation and checks included, runs in about 0.3 s.
 | `Result`, `?`, `map_err` with a closure | `plan_order`, `Plan::order` | `volec guide conversions` |
 | `Option` and `?` | `find_cycle` | `volec guide conversions` |
 | enums with payloads, matched by variant | `PlanError`, `print_plan` | `volec guide syntax` |
-| `HashMap<&str, i64, Gpa>`, `split_whitespace` (slices, no copies) | `Plan` | `volec guide std` |
+| `HashMap<&str, i64, Gpa, FixedState>`, `split_whitespace` (slices, no copies) | `Plan` | `volec guide std` |
 | tuples in `Vec`s, patterns in `for`, `while let`, closures | `Graph::new`, `find_cycle` | `volec guide syntax`, `guide closures` |
 | iterators: `position`, `map`, `collect`, `all`, `any`, `enumerate` | `find_cycle`, `main` | `volec guide iterators` |
 | drops: graphs, plans and orders freed at the end of their scope, on every path out (an early `return` or `?` too) | everywhere | `volec guide memory` |

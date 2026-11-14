@@ -286,7 +286,7 @@ if [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ]; then
     # libsystem
     awk '/^const LIBSYSTEM:/ { p = 1; next } p && /^\];/ { p = 0 } p' \
         "$ROOT/compiler/src/back/objfile/link_macho.vl" | tr ',' '\n' \
-        | sed -n 's/.*c"\([A-Za-z0-9_]*\)".*/\1/p' >names.txt
+        | sed -n 's/.*[bc]"\([A-Za-z0-9_]*\)".*/\1/p' >names.txt
     cat >has.c <<'EOF'
 #include <dlfcn.h>
 #include <stdio.h>

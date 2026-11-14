@@ -24,7 +24,9 @@
 
 use std::alloc::Arena;
 
-use crate::base::{IntVec, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq};
+use crate::base::{
+    buf_append, buf_byte, buf_bytes, buf_copy, buf_done, buf_int, buf_new, buf_str, streq,
+};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::cli::line::{
@@ -32,7 +34,7 @@ use crate::cli::line::{
 };
 use crate::front::cpp::directives::file_exists;
 use crate::front::embed::wgsl::WgslCx;
-use crate::tools::ctx::Tcx;
+use crate::tools::ctx::{Tcx, falses};
 use crate::tools::edit::diff::diff_texts;
 use crate::tools::edit::undo::run_undo;
 use crate::tools::proc::{absolute_path, buf_cstr, read_file_if, same_bytes};
@@ -47,7 +49,7 @@ use crate::tools::textual::{
 use crate::tools::textual::places::{match_in, read_lines, read_places};
 use crate::tools::textual::samebuild::{clean, compare_one, compile_all, has_mod_lines, processors};
 
-fn usage(message: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+fn usage(message: *const u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     let d = diag(c"error", c"extension.usage", tcx);
     buf_str(d, message);
     buf_byte(d, b'\n');
@@ -70,14 +72,14 @@ fn is_alnum(c: u8) -> bool {
 
 // `.ext` from `ext` or `.ext`, as a slice.
 fn dotted(s: *mut u8) -> &'static [u8] {
-    let t = c_slice(s);
+    let t = crate::base::c_kept(s);
     if t.len() > 0 && t[0] == b'.' {
         return t;
     }
     let b = buf_new();
     buf_byte(b, b'.');
-    buf_bytes(b, t);
-    buf_slice(b)
+    buf_bytes(b, &t);
+    buf_done(b)
 }
 
 fn ends_with(p: &[u8], e: &[u8]) -> bool {
@@ -86,44 +88,43 @@ fn ends_with(p: &[u8], e: &[u8]) -> bool {
 
 // Path p normalized: `./` and `x/..` dropped, no leading `./`.
 fn normalized(p: &[u8]) -> &[u8] {
-    unsafe {
-        let mut parts = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut lens = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let absolute = p.len() > 0 && p[0] == b'/';
-        let mut i: i64 = 0;
-        while i <= p.len() as i64 {
-            let mut e = i;
-            while e < p.len() as i64 && p[e as usize] != b'/' {
-                e += 1;
-            }
-            let part = &p[i as usize..e as usize];
-            if part.len() == 0 || (part.len() == 1 && part[0] == b'.') {
-            } else if part.len() == 2 && part[0] == b'.' && part[1] == b'.' && parts.count > 0
-                && (*lens.data.add((lens.count - 1) as usize)) != -2 {
-                parts.count -= 1;
-                lens.count -= 1;
-            } else {
-                parts.push(i);
-                lens.push(if part.len() == 2 && part[0] == b'.' && part[1] == b'.' { -2 }
-                    else { e - i });
-            }
-            i = e + 1;
+    let mut parts: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut lens: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let absolute = p.len() > 0 && p[0] == b'/';
+    let mut i: i64 = 0;
+    while i <= p.len() as i64 {
+        let mut e = i;
+        while e < p.len() as i64 && p[e as usize] != b'/' {
+            e += 1;
         }
-        let b = buf_new();
-        if absolute {
+        let part = &p[i as usize..e as usize];
+        if part.len() == 0 || (part.len() == 1 && part[0] == b'.') {
+        }
+        else if part.len() == 2 && part[0] == b'.' && part[1] == b'.' && parts.len() as i64 > 0
+            && (lens[(lens.len() as i64 - 1) as usize]) != -2 {
+            parts.pop().unwrap();
+            lens.pop().unwrap();
+        } else {
+            parts.push(i);
+            lens.push(if part.len() == 2 && part[0] == b'.' && part[1] == b'.' { -2 }
+                else { e - i });
+        }
+        i = e + 1;
+    }
+    let b = buf_new();
+    if absolute {
+        buf_byte(b, b'/');
+    }
+    for k in 0..parts.len() as i64 {
+        if k > 0 {
             buf_byte(b, b'/');
         }
-        for k in 0..parts.count {
-            if k > 0 {
-                buf_byte(b, b'/');
-            }
-            let s = (*parts.data.add(k as usize));
-            let n: i64 = if (*lens.data.add(k as usize)) == -2 { 2 }
-                else { (*lens.data.add(k as usize)) };
-            buf_bytes(b, &p[s as usize..(s + n) as usize]);
-        }
-        buf_slice(b)
+        let s = (parts[k as usize]);
+        let n: i64 = if (lens[k as usize]) == -2 { 2 }
+            else { (lens[k as usize]) };
+        buf_bytes(b, &p[s as usize..(s + n) as usize]);
     }
+    buf_done(b)
 }
 
 // The directory of path p (`` for a file here).
@@ -136,64 +137,60 @@ fn dir_of(p: &[u8]) -> &[u8] {
 }
 
 fn index_of(p: &[u8], tcx: &Tcx<Comp>) -> i64 {
-    unsafe {
-        for k in 0..tcx.old_files.count {
-            if same_bytes(c_slice((*tcx.old_files.data.add(k as usize)) as *mut u8), p) {
-                return k;
-            }
+    for k in 0..tcx.old_files.len() as i64 {
+        if same_bytes(&c_slice((tcx.old_files[k as usize]) as *mut u8), p) {
+            return k;
         }
-        -1
     }
+    -1
 }
 
 // The file a mention `tok` in file `from` names: an index into OLD_FILES;
 // -1 none, -2 several (the end of a path that is several files').
 fn resolve(tok: &[u8], from: &[u8], tcx: &Tcx<Comp>) -> i64 {
-    unsafe {
-        let d = dir_of(from);
-        if d.len() > 0 {
-            let b = buf_new();
-            buf_bytes(b, d);
-            buf_byte(b, b'/');
-            buf_bytes(b, tok);
-            let k = index_of(normalized(buf_slice(b)), tcx);
-            if k >= 0 {
-                return k;
-            }
-        }
-        let k = index_of(normalized(tok), tcx);
+    let d = dir_of(from);
+    if d.len() > 0 {
+        let b = buf_new();
+        buf_bytes(b, d);
+        buf_byte(b, b'/');
+        buf_bytes(b, tok);
+        let k = index_of(normalized(&buf_copy(b)), tcx);
         if k >= 0 {
             return k;
         }
-        // (by its end: the longest end of tok that ends one file's path)
-        let mut s: i64 = 0;
-        while s < tok.len() as i64 {
-            let end = &tok[s as usize..];
-            let mut found: i64 = -1;
-            let mut count: i64 = 0;
-            for j in 0..tcx.old_files.count {
-                let q = c_slice((*tcx.old_files.data.add(j as usize)) as *mut u8);
-                if same_bytes(q, end)
-                    || (q.len() > end.len()
-                        && q[(q.len() as i64 - end.len() as i64 - 1) as usize] == b'/'
-                        && same_bytes(&q[(q.len() as i64 - end.len() as i64) as usize..], end)) {
-                    found = j;
-                    count += 1;
-                }
+    }
+    let k = index_of(normalized(tok), tcx);
+    if k >= 0 {
+        return k;
+    }
+    // (by its end: the longest end of tok that ends one file's path)
+    let mut s: i64 = 0;
+    while s < tok.len() as i64 {
+        let end = &tok[s as usize..];
+        let mut found: i64 = -1;
+        let mut count: i64 = 0;
+        for j in 0..tcx.old_files.len() as i64 {
+            let q = c_slice((tcx.old_files[j as usize]) as *mut u8);
+            if same_bytes(&q, end)
+                || (q.len() > end.len()
+                    && q[(q.len() as i64 - end.len() as i64 - 1) as usize] == b'/'
+                    && same_bytes(&q[(q.len() as i64 - end.len() as i64) as usize..], end)) {
+                found = j;
+                count += 1;
             }
-            if count == 1 {
-                return found;
-            }
-            if count > 1 {
-                return -2;
-            }
-            while s < tok.len() as i64 && tok[s as usize] != b'/' {
-                s += 1;
-            }
+        }
+        if count == 1 {
+            return found;
+        }
+        if count > 1 {
+            return -2;
+        }
+        while s < tok.len() as i64 && tok[s as usize] != b'/' {
             s += 1;
         }
-        -1
+        s += 1;
     }
+    -1
 }
 
 // The renamed path of p (OLD replaced by NEW at its end).
@@ -222,11 +219,11 @@ fn is_root(p: &[u8], old: &[u8], pcx: &Ctx<Comp>) -> bool {
         }
         buf_str(m, c"main");
         buf_bytes(m, old);
-        let mp = buf_slice(m);
-        if !same_bytes(mp, p) && file_exists(buf_cstr(m), pcx) {
+        let mp = buf_copy(m);
+        if !same_bytes(&mp, p) && file_exists(buf_cstr(m), pcx) {
             let t = buf_new();
             read_file_if(buf_cstr(m), t);
-            if has_mod_lines(buf_slice(t)) {
+            if has_mod_lines(&buf_copy(t)) {
                 return false;
             }
         }
@@ -238,11 +235,11 @@ fn is_root(p: &[u8], old: &[u8], pcx: &Ctx<Comp>) -> bool {
 }
 
 // Path p of the program as git names it: relative to here.
-fn here_relative(p: *mut u8) -> &'static [u8] {
-    let s = c_slice(p);
+fn here_relative(p: *const u8) -> &'static [u8] {
+    let s = crate::base::c_kept(p);
     if s.len() > 0 && s[0] == b'/' {
-        let here = c_slice(absolute_path(c"."));
-        let full = c_slice(absolute_path(p));
+        let here = crate::base::c_kept(absolute_path(c"."));
+        let full = crate::base::c_kept(absolute_path(p));
         if full.len() as i64 > here.len() as i64 + 1 && full[here.len()] == b'/'
             && same_bytes(&full[0..here.len()], here) {
             return &full[(here.len() as i64 + 1) as usize..];
@@ -277,7 +274,7 @@ pub fn extension_leaf(gpa: Gpa) -> Leaf<'static, Gpa> {
 fn run_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
     pcx.prog = c.prog();
-    let mut words = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut all = false;
     let mut no_check = false;
     let mut show_diff = false;
@@ -295,7 +292,7 @@ fn run_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         } else if is_opt(ev, "j") {
             jobs = crate::tools::query::parse_count(a);
         } else if is_opt(ev, "exclude") {
-            if !add_exclusion(c_slice(a), tcx) {
+            if !add_exclusion(&c_slice(a), tcx) {
                 return 2;
             }
         } else if is_opt(ev, "exclude-from") {
@@ -313,473 +310,471 @@ fn run_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
             words.push(a as i64);
         }
     }
-    unsafe {
-        if words.count < 2 {
-            return usage(c"extension takes OLD and NEW (.vl .vl), then ROOT, DIR or --all", tcx,
-                pcx);
+    if words.len() as i64 < 2 {
+        return usage(c"extension takes OLD and NEW (.vl .vl), then ROOT, DIR or --all", tcx,
+            pcx);
+    }
+    let old = dotted((words[0]) as *mut u8);
+    let new = dotted((words[1]) as *mut u8);
+    if old.len() < 2 || new.len() < 2 || same_bytes(old, new) {
+        return usage(c"OLD and NEW are two extensions", tcx, pcx);
+    }
+    if jobs <= 0 {
+        jobs = processors();
+    }
+    let mut tracked: Vec<i64, Comp> = Vec::new_in(Comp {});
+    if !tracked_files(&mut tracked) {
+        let d = diag(c"error", c"extension.no-git", tcx);
+        buf_str(d,
+            c"refactor extension renames the files git tracks: this is no git checkout\n");
+        return 2;
+    }
+    for k in 0..tracked.len() as i64 {
+        if ends_with(&c_slice((tracked[k as usize]) as *mut u8), old) {
+            tcx.old_files.push((tracked[k as usize]));
         }
-        let old = dotted((*words.data.add(0)) as *mut u8);
-        let new = dotted((*words.data.add(1)) as *mut u8);
-        if old.len() < 2 || new.len() < 2 || same_bytes(old, new) {
-            return usage(c"OLD and NEW are two extensions", tcx, pcx);
+    }
+    // The renamed files (indexes into OLD_FILES; -1 untracked, in
+    // `untracked`), the roots to compile.
+    let mut picked = falses(tcx.old_files.len() as i64 + 1);
+    for k in 0..tcx.old_files.len() as i64 + 1 {
+        (picked[k as usize]) = false;
+    }
+    let mut untracked: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut roots: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut excluded_count: i64 = 0;
+    let targets = words.len() as i64 - 2;
+    if all {
+        for k in 0..tcx.old_files.len() as i64 {
+            (picked[k as usize]) = true;
         }
-        if jobs <= 0 {
-            jobs = processors();
+    }
+    let mut t: i64 = 2;
+    while t < words.len() as i64 || (targets == 0 && !all && t == 2) {
+        let arg = if t < words.len() as i64 { (words[t as usize]) as *const u8 }
+            else { find_root(0 as *mut u8, pcx) };
+        t += 1;
+        if arg == 0 as *mut u8 {
+            return usage(c"no program here: name a ROOT, a DIR, or --all", tcx, pcx);
         }
-        let mut tracked = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        if !tracked_files(&mut tracked) {
-            let d = diag(c"error", c"extension.no-git", tcx);
-            buf_str(d,
-                c"refactor extension renames the files git tracks: this is no git checkout\n");
-            return 2;
-        }
-        for k in 0..tracked.count {
-            if ends_with(c_slice((*tracked.data.add(k as usize)) as *mut u8), old) {
-                tcx.old_files.push((*tracked.data.add(k as usize)));
+        let a = here_relative(arg);
+        if ends_with(a, old) {
+            // A program: its files.
+            if !load_program(arg, 0, tcx, pcx, wgx) {
+                let d = diag(c"error", c"extension.no-program", tcx);
+                buf_str(d, c"cannot read the program of '");
+                buf_str(d, arg);
+                buf_str(d, c"'\n");
+                return 1;
             }
-        }
-        // The renamed files (indexes into OLD_FILES; -1 untracked, in
-        // `untracked`), the roots to compile.
-        let picked = crate::base::alloc_array::<bool>(tcx.old_files.count + 1);
-        for k in 0..tcx.old_files.count + 1 {
-            (*picked.add(k as usize)) = false;
-        }
-        let mut untracked = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut roots = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut excluded_count: i64 = 0;
-        let targets = words.count - 2;
-        if all {
-            for k in 0..tcx.old_files.count {
-                (*picked.add(k as usize)) = true;
-            }
-        }
-        let mut t: i64 = 2;
-        while t < words.count || (targets == 0 && !all && t == 2) {
-            let arg = if t < words.count { (*words.data.add(t as usize)) as *mut u8 }
-                else { find_root(0 as *mut u8, pcx) };
-            t += 1;
-            if arg == 0 as *mut u8 {
-                return usage(c"no program here: name a ROOT, a DIR, or --all", tcx, pcx);
-            }
-            let a = here_relative(arg);
-            if ends_with(a, old) {
-                // A program: its files.
-                if !load_program(arg, 0, tcx, pcx, wgx) {
-                    let d = diag(c"error", c"extension.no-program", tcx);
-                    buf_str(d, c"cannot read the program of '");
-                    buf_str(d, arg);
-                    buf_str(d, c"'\n");
-                    return 1;
+            let rb = buf_new();
+            buf_bytes(rb, a);
+            roots.push(buf_cstr(rb) as i64);
+            for f in 0..pcx.files.len() {
+                let path = pcx.files[f].path;
+                if crate::base::c_starts(path, b"<")
+                    || crate::tools::edit::stdedit::is_std_file(&c_slice(path)) {
+                    continue;
                 }
-                let rb = buf_new();
-                buf_bytes(rb, a);
-                roots.push(buf_cstr(rb) as i64);
-                for f in 0..pcx.files.len() {
-                    let path = pcx.files[f].path;
-                    if (*path.add(0)) == b'<'
-                        || crate::tools::edit::stdedit::is_std_file(c_slice(path)) {
-                        continue;
-                    }
-                    let p = here_relative(path);
-                    if !ends_with(p, old) {
-                        continue;
-                    }
-                    let k = index_of(p, tcx);
-                    if k >= 0 {
-                        (*picked.add(k as usize)) = true;
-                    } else {
-                        let b = buf_new();
-                        buf_bytes(b, p);
-                        untracked.push(buf_cstr(b) as i64);
-                    }
+                let p = here_relative(path);
+                if !ends_with(p, old) {
+                    continue;
                 }
-            } else {
-                // A directory: the files under it.
-                let mut any = false;
-                for k in 0..tcx.old_files.count {
-                    let q = c_slice((*tcx.old_files.data.add(k as usize)) as *mut u8);
-                    if a.len() == 0
-                        || (q.len() > a.len() && q[a.len()] == b'/'
-                            && same_bytes(&q[0..a.len()], a)) {
-                        (*picked.add(k as usize)) = true;
-                        any = true;
-                    }
-                }
-                if !any {
-                    let d = diag(c"error", c"extension.no-files", tcx);
-                    buf_str(d, c"no file of git's ends with ");
-                    buf_bytes(d, old);
-                    buf_str(d, c" under '");
-                    buf_str(d, arg);
-                    buf_str(d, c"'\n");
-                    return 1;
+                let k = index_of(p, tcx);
+                if k >= 0 {
+                    (picked[k as usize]) = true;
+                } else {
+                    let b = buf_new();
+                    buf_bytes(b, p);
+                    untracked.push(buf_cstr(b) as i64);
                 }
             }
-        }
-        let by_program = roots.count > 0;
-        for k in 0..tcx.old_files.count {
-            if !(*picked.add(k as usize)) {
-                continue;
+        } else {
+            // A directory: the files under it.
+            let mut any = false;
+            for k in 0..tcx.old_files.len() as i64 {
+                let q = c_slice((tcx.old_files[k as usize]) as *mut u8);
+                if a.len() == 0
+                    || (q.len() > a.len() && q[a.len()] == b'/'
+                        && same_bytes(&q[0..a.len()], a)) {
+                    (picked[k as usize]) = true;
+                    any = true;
+                }
             }
-            let p = c_slice((*tcx.old_files.data.add(k as usize)) as *mut u8);
-            if excluded(p, tcx) {
-                (*picked.add(k as usize)) = false;
-                excluded_count += 1;
-                continue;
-            }
-            tcx.renamed.push(k);
-        }
-        if tcx.renamed.count == 0 && untracked.count == 0 {
-            let d = diag(c"note", c"extension.no-files", tcx);
-            buf_str(d, c"no file to rename\n");
-            return 0;
-        }
-        // The moves.
-        for r in 0..tcx.renamed.count {
-            let p = c_slice(
-                (*tcx.old_files.data.add((*tcx.renamed.data.add(r as usize)) as usize)) as *mut u8);
-            tcx.m_from.push(
-                (*tcx.old_files.data.add((*tcx.renamed.data.add(r as usize)) as usize)));
-            tcx.m_to.push(renamed(p, old, new) as i64);
-            if !by_program && is_root(p, old, pcx) {
-                roots.push((*tcx.old_files.data.add((*tcx.renamed.data.add(r as usize)) as usize)));
-            }
-        }
-        for u in 0..untracked.count {
-            let p = c_slice((*untracked.data.add(u as usize)) as *mut u8);
-            tcx.m_from.push((*untracked.data.add(u as usize)));
-            tcx.m_to.push(renamed(p, old, new) as i64);
-        }
-        for m in 0..tcx.m_to.count {
-            if file_exists((*tcx.m_to.data.add(m as usize)) as *mut u8, pcx) {
-                let d = diag(c"error", c"extension.exists", tcx);
-                buf_str(d, c"'");
-                buf_str(d, (*tcx.m_to.data.add(m as usize)) as *mut u8);
-                buf_str(d, c"' exists already: '");
-                buf_str(d, (*tcx.m_from.data.add(m as usize)) as *mut u8);
-                buf_str(d, c"' cannot take its name; nothing renamed\n");
+            if !any {
+                let d = diag(c"error", c"extension.no-files", tcx);
+                buf_str(d, c"no file of git's ends with ");
+                buf_bytes(d, old);
+                buf_str(d, c" under '");
+                buf_str(d, arg);
+                buf_str(d, c"'\n");
                 return 1;
             }
         }
-        // The mentions, in every file git tracks.
-        let out = buf_new();
-        let diff = buf_new();
-        let mut mentions: i64 = 0;
-        let mut mention_files: i64 = 0;
-        let mut in_strings: i64 = 0;
-        let mut string_files: i64 = 0;
-        let mut unresolved: i64 = 0;
-        let mut ambiguous: i64 = 0;
-        let mut left_excluded: i64 = 0;
-        let mut left_kept: i64 = 0;
-        let example = buf_new();
-        for f in 0..tracked.count {
-            let path = (*tracked.data.add(f as usize)) as *mut u8;
-            let p = c_slice(path);
-            let text = buf_new();
-            // (0.24: a link is its target's text: never written through)
-            if crate::tools::proc::link_target(path) >= 0 || !read_file_if(path, text)
-                || !is_text(buf_slice(text)) {
+    }
+    let by_program = roots.len() as i64 > 0;
+    for k in 0..tcx.old_files.len() as i64 {
+        if !(picked[k as usize]) {
+            continue;
+        }
+        let p = c_slice((tcx.old_files[k as usize]) as *mut u8);
+        if excluded(&p, tcx) {
+            (picked[k as usize]) = false;
+            excluded_count += 1;
+            continue;
+        }
+        tcx.renamed.push(k);
+    }
+    if tcx.renamed.len() as i64 == 0 && untracked.len() as i64 == 0 {
+        let d = diag(c"note", c"extension.no-files", tcx);
+        buf_str(d, c"no file to rename\n");
+        return 0;
+    }
+    // The moves.
+    for r in 0..tcx.renamed.len() as i64 {
+        let p = c_slice((tcx.old_files[(tcx.renamed[r as usize]) as usize]) as *mut u8)
+            ;
+        tcx.m_from.push(
+            (tcx.old_files[(tcx.renamed[r as usize]) as usize]));
+        tcx.m_to.push(renamed(&p, old, new) as i64);
+        if !by_program && is_root(&p, old, pcx) {
+            roots.push((tcx.old_files[(tcx.renamed[r as usize]) as usize]));
+        }
+    }
+    for u in 0..untracked.len() as i64 {
+        let p = c_slice((untracked[u as usize]) as *mut u8);
+        tcx.m_from.push((untracked[u as usize]));
+        tcx.m_to.push(renamed(&p, old, new) as i64);
+    }
+    for m in 0..tcx.m_to.len() as i64 {
+        if file_exists((tcx.m_to[m as usize]) as *mut u8, pcx) {
+            let d = diag(c"error", c"extension.exists", tcx);
+            buf_str(d, c"'");
+            buf_str(d, (tcx.m_to[m as usize]) as *mut u8);
+            buf_str(d, c"' exists already: '");
+            buf_str(d, (tcx.m_from[m as usize]) as *mut u8);
+            buf_str(d, c"' cannot take its name; nothing renamed\n");
+            return 1;
+        }
+    }
+    // The mentions, in every file git tracks.
+    let out = buf_new();
+    let diff = buf_new();
+    let mut mentions: i64 = 0;
+    let mut mention_files: i64 = 0;
+    let mut in_strings: i64 = 0;
+    let mut string_files: i64 = 0;
+    let mut unresolved: i64 = 0;
+    let mut ambiguous: i64 = 0;
+    let mut left_excluded: i64 = 0;
+    let mut left_kept: i64 = 0;
+    let example = buf_new();
+    for f in 0..tracked.len() as i64 {
+        let path = (tracked[f as usize]) as *mut u8;
+        let p = c_slice(path);
+        let text = buf_new();
+        // (0.24: a link is its target's text: never written through)
+        if crate::tools::proc::link_target(path) >= 0 || !read_file_if(path, text)
+            || !is_text(&buf_copy(text)) {
+            continue;
+        }
+        let tx = buf_copy(text);
+        // (the matches: OLD that ends a word)
+        let mut starts: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut j: i64 = 0;
+        while j + old.len() as i64 <= tx.len() as i64 {
+            if tx[j as usize] == old[0]
+                && same_bytes(&tx[j as usize..(j + old.len() as i64) as usize], old)
+                && (j + old.len() as i64 == tx.len() as i64
+                    || !is_alnum(tx[(j + old.len() as i64) as usize])) {
+                starts.push(j);
+                j += old.len() as i64;
+            } else {
+                j += 1;
+            }
+        }
+        if starts.len() as i64 == 0 {
+            continue;
+        }
+        if excluded(&p, tcx) {
+            left_excluded += starts.len() as i64;
+            continue;
+        }
+        let mut keep: Vec<i64, Comp> = Vec::new_in(Comp {});
+        kept_ranges(&p, &tx, &mut keep, tcx);
+        let source = crate::base::source_ext_len(&p) > 0 || ends_with(&p, old);
+        let mut placed = source && read_places(&tx, tcx, pcx);
+        if source && !placed {
+            // (it does not lex: its `//` lines are its comments)
+            read_lines(&tx, tcx);
+            placed = true;
+        }
+        let after = buf_new();
+        let mut at: i64 = 0;
+        let mut n: i64 = 0;
+        let mut strings_here: i64 = 0;
+        let mut r: i64 = 0;
+        for k in 0..starts.len() as i64 {
+            let s = (starts[k as usize]);
+            let e = s + old.len() as i64;
+            while r < keep.len() as i64 && (keep[(r + 1) as usize]) <= s {
+                r += 2;
+            }
+            if r < keep.len() as i64 && (keep[r as usize]) < e {
+                left_kept += 1;
                 continue;
             }
-            let tx = buf_slice(text);
-            // (the matches: OLD that ends a word)
-            let mut starts = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            let mut j: i64 = 0;
-            while j + old.len() as i64 <= tx.len() as i64 {
-                if tx[j as usize] == old[0]
-                    && same_bytes(&tx[j as usize..(j + old.len() as i64) as usize], old)
-                    && (j + old.len() as i64 == tx.len() as i64
-                        || !is_alnum(tx[(j + old.len() as i64) as usize])) {
-                    starts.push(j);
-                    j += old.len() as i64;
-                } else {
-                    j += 1;
-                }
-            }
-            if starts.count == 0 {
-                continue;
-            }
-            if excluded(p, tcx) {
-                left_excluded += starts.count;
-                continue;
-            }
-            let mut keep = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            kept_ranges(p, tx, &mut keep, tcx);
-            let source = crate::base::source_ext_len(p) > 0 || ends_with(p, old);
-            let mut placed = source && read_places(tx, tcx, pcx);
-            if source && !placed {
-                // (it does not lex: its `//` lines are its comments)
-                read_lines(tx, tcx);
-                placed = true;
-            }
-            let after = buf_new();
-            let mut at: i64 = 0;
-            let mut n: i64 = 0;
-            let mut strings_here: i64 = 0;
-            let mut r: i64 = 0;
-            for k in 0..starts.count {
-                let s = (*starts.data.add(k as usize));
-                let e = s + old.len() as i64;
-                while r < keep.count && (*keep.data.add((r + 1) as usize)) <= s {
-                    r += 2;
-                }
-                if r < keep.count && (*keep.data.add(r as usize)) < e {
-                    left_kept += 1;
+            if source {
+                if placed && match_in(&tx, s, e, G_STRING, tcx) {
+                    strings_here += 1;
                     continue;
                 }
-                if source {
-                    if placed && match_in(tx, s, e, G_STRING, tcx) {
-                        strings_here += 1;
-                        continue;
-                    }
-                    if !placed || !match_in(tx, s, e, G_COMMENT, tcx) {
-                        continue;
-                    }
-                }
-                if !all {
-                    let mut b = s;
-                    while b > 0 && is_path_byte(tx[(b - 1) as usize]) {
-                        b -= 1;
-                    }
-                    let tok = &tx[b as usize..e as usize];
-                    let res = resolve(tok, p, tcx);
-                    if res == -1 {
-                        unresolved += 1;
-                        if buf_len(example) == 0 {
-                            buf_bytes(example, p);
-                            buf_str(example, c": ");
-                            buf_bytes(example, tok);
-                        }
-                        continue;
-                    }
-                    if res == -2 {
-                        ambiguous += 1;
-                        continue;
-                    }
-                    if !(*picked.add(res as usize)) {
-                        continue;
-                    }
-                }
-                buf_bytes(after, &tx[at as usize..s as usize]);
-                buf_bytes(after, new);
-                at = e;
-                n += 1;
-            }
-            if strings_here > 0 {
-                in_strings += strings_here;
-                string_files += 1;
-            }
-            if n == 0 {
-                continue;
-            }
-            buf_bytes(after, &tx[at as usize..]);
-            // (a renamed file's path after the move)
-            let mut final_path = path;
-            for m in 0..tcx.m_from.count {
-                if streq((*tcx.m_from.data.add(m as usize)) as *mut u8, path) {
-                    final_path = (*tcx.m_to.data.add(m as usize)) as *mut u8;
+                if !placed || !match_in(&tx, s, e, G_COMMENT, tcx) {
+                    continue;
                 }
             }
-            tcx.w_path.push(final_path as i64);
-            tcx.w_before.push(text);
-            tcx.w_after.push(after);
-            buf_bytes(out, c_slice(final_path));
-            buf_byte(out, b'\t');
-            buf_int(out, n);
-            buf_str(out, if n == 1 { c" mention\n" } else { c" mentions\n" });
-            if show_diff {
-                diff_texts(diff, c_slice(final_path), tx, buf_slice(after), tcx);
+            if !all {
+                let mut b = s;
+                while b > 0 && is_path_byte(tx[(b - 1) as usize]) {
+                    b -= 1;
+                }
+                let tok = &tx[b as usize..e as usize];
+                let res = resolve(tok, &p, tcx);
+                if res == -1 {
+                    unresolved += 1;
+                    if buf_len(example) == 0 {
+                        buf_bytes(example, &p);
+                        buf_str(example, c": ");
+                        buf_bytes(example, tok);
+                    }
+                    continue;
+                }
+                if res == -2 {
+                    ambiguous += 1;
+                    continue;
+                }
+                if !(picked[res as usize]) {
+                    continue;
+                }
             }
-            mentions += n;
-            mention_files += 1;
+            buf_bytes(after, &tx[at as usize..s as usize]);
+            buf_bytes(after, new);
+            at = e;
+            n += 1;
         }
-        // The renames, a line per directory (in the order first seen).
-        let mut dirs = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut counts = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for m in 0..tcx.m_from.count {
-            let dir = dir_of(c_slice((*tcx.m_from.data.add(m as usize)) as *mut u8));
-            let mut found: i64 = -1;
-            for k in 0..dirs.count {
-                if same_bytes(
-                    dir_of(
-                        c_slice(
-                            (*tcx.m_from.data.add((*dirs.data.add(k as usize)) as usize)) as *mut u8)), dir) {
-                    found = k;
-                    break;
-                }
-            }
-            if found < 0 {
-                dirs.push(m);
-                counts.push(1);
-            } else {
-                (*counts.data.add(found as usize)) += 1;
+        if strings_here > 0 {
+            in_strings += strings_here;
+            string_files += 1;
+        }
+        if n == 0 {
+            continue;
+        }
+        buf_bytes(after, &tx[at as usize..]);
+        // (a renamed file's path after the move)
+        let mut final_path = path;
+        for m in 0..tcx.m_from.len() as i64 {
+            if streq((tcx.m_from[m as usize]) as *mut u8, path) {
+                final_path = (tcx.m_to[m as usize]) as *mut u8;
             }
         }
-        for k in 0..dirs.count {
-            let dir = dir_of(
-                c_slice((*tcx.m_from.data.add((*dirs.data.add(k as usize)) as usize)) as *mut u8));
-            if dir.len() > 0 {
-                buf_bytes(out, dir);
-                buf_byte(out, b'/');
-            }
-            buf_byte(out, b'*');
-            buf_bytes(out, old);
-            buf_str(out, c" -> *");
-            buf_bytes(out, new);
-            buf_byte(out, b'\t');
-            buf_int(out, (*counts.data.add(k as usize)));
-            buf_str(out,
-                if (*counts.data.add(k as usize)) == 1 { c" file\n" } else { c" files\n" });
-        }
-        buf_str(out, if tcx.dry_run { c"would rename " } else { c"renamed " });
-        buf_int(out, tcx.m_from.count);
-        buf_str(out, if tcx.m_from.count == 1 { c" file (" } else { c" files (" });
-        buf_bytes(out, old);
-        buf_str(out, c" -> ");
-        buf_bytes(out, new);
-        buf_str(out, c"), ");
-        buf_int(out, mentions);
-        buf_str(out, if mentions == 1 { c" mention in " } else { c" mentions in " });
-        buf_int(out, mention_files);
-        buf_str(out, if mention_files == 1 { c" file\n" } else { c" files\n" });
+        tcx.w_path.push(final_path as i64);
+        tcx.w_before.push(text);
+        tcx.w_after.push(after);
+        buf_bytes(out, &c_slice(final_path));
+        buf_byte(out, b'\t');
+        buf_int(out, n);
+        buf_str(out, if n == 1 { c" mention\n" } else { c" mentions\n" });
         if show_diff {
-            buf_bytes(out, buf_slice(diff));
+            diff_texts(diff, &c_slice(final_path), &tx, &buf_copy(after), tcx);
         }
-        // What is left.
-        if in_strings > 0 {
-            let d = diag(c"note", c"extension.strings", tcx);
-            buf_int(d, in_strings);
-            buf_str(d,
-                if in_strings == 1 { c" mention in string literals of " }
-                else { c" mentions in string literals of " });
-            buf_int(d, string_files);
-            buf_str(d, if string_files == 1 { c" source" } else { c" sources" });
-            buf_str(d, c" left: changing them changes what the program does\n");
-            let tr = diags(tcx);
-            buf_str(tr, c"try:");
-            put_cword(tr, pcx.prog);
-            buf_str(tr, c" rewrite --text");
-            put_word(tr, old);
-            put_word(tr, new);
-            buf_str(tr, c" --word --strings --dry-run");
-            try_end(tr);
-        }
-        if excluded_count > 0 || left_excluded > 0 || left_kept > 0 {
-            let d = diag(c"note", c"extension.excluded", tcx);
-            let left = left_excluded + left_kept;
-            buf_int(d, excluded_count);
-            buf_str(d,
-                if excluded_count == 1 { c" file kept its name" }
-                else { c" files kept their name" });
-            buf_str(d, c" (excluded); ");
-            buf_int(d, left);
-            buf_str(d, if left == 1 { c" mention" } else { c" mentions" });
-            buf_str(d, c" left in excluded files and lines\n");
-        }
-        if untracked.count > 0 {
-            let d = diag(c"note", c"extension.untracked", tcx);
-            buf_int(d, untracked.count);
-            buf_str(d, if untracked.count == 1 { c" file" } else { c" files" });
-            buf_str(d, c" of the program git does not track: renamed without it\n");
-        }
-        if unresolved > 0 || ambiguous > 0 {
-            let d = diag(c"note", c"extension.unresolved", tcx);
-            buf_int(d, unresolved);
-            buf_str(d, c" mentions name no file, ");
-            buf_int(d, ambiguous);
-            buf_str(d, c" the end of several files' paths: left");
-            if buf_len(example) > 0 {
-                buf_str(d, c" (");
-                buf_bytes(d, buf_slice(example));
-                buf_byte(d, b')');
-            }
-            buf_byte(d, b'\n');
-        }
-        if tcx.dry_run {
-            flush(out);
-            if !no_check && roots.count > 0 {
-                let d = diag(c"note", c"extension.check", tcx);
-                buf_int(d, roots.count);
-                buf_str(d, if roots.count == 1 { c" program" } else { c" programs" });
-                buf_str(d, c" would be compiled before and after the rename, and compared\n");
-            }
-            return 0;
-        }
-        // The build before.
-        let before = c"target/extension-check/before";
-        let after = c"target/extension-check/after";
-        if !no_check && roots.count > 0 && !compile_all(roots, before, jobs, pcx) {
-            let d = diag(c"error", c"extension.check", tcx);
-            buf_str(d, c"cannot make target/extension-check; nothing renamed\n");
-            return 1;
-        }
-        let summary = buf_new();
-        buf_str(summary, c"renamed ");
-        buf_int(summary, tcx.m_from.count);
-        buf_str(summary, c" files ");
-        buf_bytes(summary, old);
-        buf_str(summary, c" -> ");
-        buf_bytes(summary, new);
-        buf_byte(summary, b'\t');
-        buf_int(summary, mentions);
-        buf_str(summary, c" mentions in ");
-        buf_int(summary, mention_files);
-        buf_str(summary, c" files");
-        if !write_edit(buf_slice(summary), c".", tcx, pcx) {
-            return 1;
-        }
-        flush(out);
-        if no_check || roots.count == 0 {
-            return 0;
-        }
-        // The build after: the same, or the edit is undone.
-        let mut new_roots = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for k in 0..roots.count {
-            let p = c_slice((*roots.data.add(k as usize)) as *mut u8);
-            new_roots.push(renamed(p, old, new) as i64);
-        }
-        compile_all(new_roots, after, jobs, pcx);
-        let mut differ: i64 = 0;
-        let why = buf_new();
-        let mut first: i64 = -1;
-        for k in 0..roots.count {
-            let w = buf_new();
-            if compare_one(before, after, k, old, new, w) != 0 {
-                differ += 1;
-                if first < 0 {
-                    first = k;
-                    buf_bytes(why, buf_slice(w));
-                }
-            }
-        }
-        if differ > 0 {
-            let d = diag(c"error", c"extension.differs", tcx);
-            buf_int(d, differ);
-            buf_str(d, c" of ");
-            buf_int(d, roots.count);
-            buf_str(d, c" programs build differently after the rename (");
-            buf_str(d, (*new_roots.data.add(first as usize)) as *mut u8);
-            buf_str(d, c": ");
-            buf_bytes(d, buf_slice(why));
-            buf_str(d, c"); the rename is undone, the outputs are in target/extension-check\n");
-            run_undo(false, c".", tcx, pcx);
-            return 1;
-        }
-        clean(before, roots.count);
-        clean(after, roots.count);
-        crate::tools::proc::remove_dir(c"target/extension-check");
-        let o = buf_new();
-        buf_str(o, c"same build\t");
-        buf_int(o, roots.count);
-        buf_str(o, if roots.count == 1 { c" program builds" } else { c" programs build" });
-        buf_str(o, c" as before (the paths aside)\n");
-        flush(o);
-        0
+        mentions += n;
+        mention_files += 1;
     }
+    // The renames, a line per directory (in the order first seen).
+    let mut dirs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut counts: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for m in 0..tcx.m_from.len() as i64 {
+        let dir = dir_of(crate::base::c_kept((tcx.m_from[m as usize]) as *mut u8));
+        let mut found: i64 = -1;
+        for k in 0..dirs.len() as i64 {
+            if same_bytes(
+                dir_of(
+                    &c_slice((tcx.m_from[(dirs[k as usize]) as usize]) as *mut u8)), dir) {
+                found = k;
+                break;
+            }
+        }
+        if found < 0 {
+            dirs.push(m);
+            counts.push(1);
+        } else {
+            (counts[found as usize]) += 1;
+        }
+    }
+    for k in 0..dirs.len() as i64 {
+        let dir = dir_of(
+            crate::base::c_kept((tcx.m_from[(dirs[k as usize]) as usize]) as *mut u8));
+        if dir.len() > 0 {
+            buf_bytes(out, dir);
+            buf_byte(out, b'/');
+        }
+        buf_byte(out, b'*');
+        buf_bytes(out, old);
+        buf_str(out, c" -> *");
+        buf_bytes(out, new);
+        buf_byte(out, b'\t');
+        buf_int(out, (counts[k as usize]));
+        buf_str(out,
+            if (counts[k as usize]) == 1 { c" file\n" } else { c" files\n" });
+    }
+    buf_str(out, if tcx.dry_run { c"would rename " } else { c"renamed " });
+    buf_int(out, tcx.m_from.len() as i64);
+    buf_str(out, if tcx.m_from.len() as i64 == 1 { c" file (" } else { c" files (" });
+    buf_bytes(out, old);
+    buf_str(out, c" -> ");
+    buf_bytes(out, new);
+    buf_str(out, c"), ");
+    buf_int(out, mentions);
+    buf_str(out, if mentions == 1 { c" mention in " } else { c" mentions in " });
+    buf_int(out, mention_files);
+    buf_str(out, if mention_files == 1 { c" file\n" } else { c" files\n" });
+    if show_diff {
+        buf_append(out, diff);
+    }
+    // What is left.
+    if in_strings > 0 {
+        let d = diag(c"note", c"extension.strings", tcx);
+        buf_int(d, in_strings);
+        buf_str(d,
+            if in_strings == 1 { c" mention in string literals of " }
+            else { c" mentions in string literals of " });
+        buf_int(d, string_files);
+        buf_str(d, if string_files == 1 { c" source" } else { c" sources" });
+        buf_str(d, c" left: changing them changes what the program does\n");
+        let tr = diags(tcx);
+        buf_str(tr, c"try:");
+        put_cword(tr, pcx.prog);
+        buf_str(tr, c" rewrite --text");
+        put_word(tr, old);
+        put_word(tr, new);
+        buf_str(tr, c" --word --strings --dry-run");
+        try_end(tr);
+    }
+    if excluded_count > 0 || left_excluded > 0 || left_kept > 0 {
+        let d = diag(c"note", c"extension.excluded", tcx);
+        let left = left_excluded + left_kept;
+        buf_int(d, excluded_count);
+        buf_str(d,
+            if excluded_count == 1 { c" file kept its name" }
+            else { c" files kept their name" });
+        buf_str(d, c" (excluded); ");
+        buf_int(d, left);
+        buf_str(d, if left == 1 { c" mention" } else { c" mentions" });
+        buf_str(d, c" left in excluded files and lines\n");
+    }
+    if untracked.len() as i64 > 0 {
+        let d = diag(c"note", c"extension.untracked", tcx);
+        buf_int(d, untracked.len() as i64);
+        buf_str(d, if untracked.len() as i64 == 1 { c" file" } else { c" files" });
+        buf_str(d, c" of the program git does not track: renamed without it\n");
+    }
+    if unresolved > 0 || ambiguous > 0 {
+        let d = diag(c"note", c"extension.unresolved", tcx);
+        buf_int(d, unresolved);
+        buf_str(d, c" mentions name no file, ");
+        buf_int(d, ambiguous);
+        buf_str(d, c" the end of several files' paths: left");
+        if buf_len(example) > 0 {
+            buf_str(d, c" (");
+            buf_append(d, example);
+            buf_byte(d, b')');
+        }
+        buf_byte(d, b'\n');
+    }
+    if tcx.dry_run {
+        flush(out);
+        if !no_check && roots.len() as i64 > 0 {
+            let d = diag(c"note", c"extension.check", tcx);
+            buf_int(d, roots.len() as i64);
+            buf_str(d, if roots.len() as i64 == 1 { c" program" } else { c" programs" });
+            buf_str(d, c" would be compiled before and after the rename, and compared\n");
+        }
+        return 0;
+    }
+    // The build before.
+    let before = c"target/extension-check/before";
+    let after = c"target/extension-check/after";
+    if !no_check && roots.len() as i64 > 0
+        && !compile_all(roots.as_slice(), before, jobs, pcx) {
+        let d = diag(c"error", c"extension.check", tcx);
+        buf_str(d, c"cannot make target/extension-check; nothing renamed\n");
+        return 1;
+    }
+    let summary = buf_new();
+    buf_str(summary, c"renamed ");
+    buf_int(summary, tcx.m_from.len() as i64);
+    buf_str(summary, c" files ");
+    buf_bytes(summary, old);
+    buf_str(summary, c" -> ");
+    buf_bytes(summary, new);
+    buf_byte(summary, b'\t');
+    buf_int(summary, mentions);
+    buf_str(summary, c" mentions in ");
+    buf_int(summary, mention_files);
+    buf_str(summary, c" files");
+    if !write_edit(&buf_copy(summary), c".", tcx, pcx) {
+        return 1;
+    }
+    flush(out);
+    if no_check || roots.len() as i64 == 0 {
+        return 0;
+    }
+    // The build after: the same, or the edit is undone.
+    let mut new_roots: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for k in 0..roots.len() as i64 {
+        let p = c_slice((roots[k as usize]) as *mut u8);
+        new_roots.push(renamed(&p, old, new) as i64);
+    }
+    compile_all(new_roots.as_slice(), after, jobs, pcx);
+    let mut differ: i64 = 0;
+    let why = buf_new();
+    let mut first: i64 = -1;
+    for k in 0..roots.len() as i64 {
+        let w = buf_new();
+        if compare_one(before, after, k, old, new, w) != 0 {
+            differ += 1;
+            if first < 0 {
+                first = k;
+                buf_append(why, w);
+            }
+        }
+    }
+    if differ > 0 {
+        let d = diag(c"error", c"extension.differs", tcx);
+        buf_int(d, differ);
+        buf_str(d, c" of ");
+        buf_int(d, roots.len() as i64);
+        buf_str(d, c" programs build differently after the rename (");
+        buf_str(d, (new_roots[first as usize]) as *mut u8);
+        buf_str(d, c": ");
+        buf_append(d, why);
+        buf_str(d, c"); the rename is undone, the outputs are in target/extension-check\n");
+        run_undo(false, c".", tcx, pcx);
+        return 1;
+    }
+    clean(before, roots.len() as i64);
+    clean(after, roots.len() as i64);
+    crate::tools::proc::remove_dir(c"target/extension-check");
+    let o = buf_new();
+    buf_str(o, c"same build\t");
+    buf_int(o, roots.len() as i64);
+    buf_str(o, if roots.len() as i64 == 1 { c" program builds" } else { c" programs build" });
+    buf_str(o, c" as before (the paths aside)\n");
+    flush(o);
+    0
 }
 
 // The length of buffer b.
 fn buf_len(b: i64) -> i64 {
-    unsafe { (*crate::base::get_bufs().add(b as usize)).len }
+    crate::base::buf_len(b)
 }

@@ -64,7 +64,7 @@ use std::cli::{Arg, Command, Matches};
 use std::collections::HashMap;
 
 fn run(m: &Matches<Gpa>, n: usize, gpa: Gpa) -> io::Result<()> {
-    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    let mut counts: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     for path in m.values("file") {
         let text = fs::read_to_string_in(path, gpa)?;
         count::add_words(&mut counts, &text, gpa);
@@ -125,7 +125,7 @@ fn trim_punct(word: &str) -> &str {
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: Gpa) {
+pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: &str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -141,7 +141,7 @@ pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: G
 
 use std::collections::HashMap;
 
-pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
     Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts {
@@ -297,7 +297,7 @@ pub fn count(text: &str) -> Counts {
 // Adds one to freq for each word of text, without the punctuation around
 // it. The keys borrow from text: no word is copied.
 #[no_io]
-pub fn add_words<'a, A: Allocator>(freq: &mut HashMap<&'a str, i64, A>, text: &'a str) {
+pub fn add_words<'a, A: Allocator>(freq: &mut HashMap<&'a str, i64, A, FixedState>, text: &'a str) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if !w.is_empty() {
@@ -340,7 +340,7 @@ fn counts_lines_words_bytes() {
 
 #[test]
 fn trims_punctuation(gpa: Gpa) {
-    let mut freq: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut freq: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     add_words(&mut freq, "(the) end. The end!");
     assert_eq(freq["end"], 2);
     assert_eq(freq["the"], 1);
@@ -355,7 +355,7 @@ fn counts_add_up(bytes: Vec<u8, Gpa>, gpa: Gpa) {
     for b in &bytes {
         text.push_str(pieces[(*b % 4) as usize]);
     }
-    let mut freq: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut freq: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     add_words(&mut freq, &text);
     let mut total = 0;
     for (_, k) in &freq {
@@ -413,7 +413,7 @@ pub fn print_counts(c: &Counts, name: &str, words_only: bool) {
 }
 
 // The n most common words, most common first; as common, alphabetically.
-pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
     Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts {
@@ -527,7 +527,7 @@ impl Display for TallyError<Gpa> {
 
 // Counts one text, and adds its words to totals. The text's own word
 // counts live in an arena, freed all at once when the text is done.
-fn tally(text: &str, fold: bool, totals: &mut HashMap<String<Gpa>, i64, Gpa>, gpa: Gpa) -> Counts {
+fn tally(text: &str, fold: bool, totals: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, gpa: Gpa) -> Counts {
     arena_scope(&gpa, |a| {
         // the words, lowercased if asked: in the arena
         let words = if fold {
@@ -547,7 +547,7 @@ fn tally(text: &str, fold: bool, totals: &mut HashMap<String<Gpa>, i64, Gpa>, gp
 fn run(m: &Matches<Gpa>, top: usize, gpa: Gpa) -> Result<(), TallyError<Gpa>> {
     let fold = m.flag("ignore-case");
     let words_only = m.flag("words");
-    let mut totals: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    let mut totals: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     let files = m.values("file");
     if files.is_empty() {
         let mut bytes: Vec<u8, Gpa> = Vec::new_in(gpa);
@@ -789,8 +789,12 @@ A few last checks before calling it done. Is everything formatted?
 
 ```console
 $ volec fmt --check main.vl count.vl report.vl
+report.vl
+error fmt.unformatted: 1 of 3 files are not formatted
+try: volec fmt --dry-run report.vl
+try: volec fmt report.vl
 $ echo $?
-0
+1
 ```
 
 Silence and status 0: yes.

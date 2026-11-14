@@ -111,8 +111,8 @@ use crate::back::codecache::cc_args;
 use crate::back::objfile::{OUT_EXECUTABLE, output_mode_of};
 use crate::back::objfile::output::link_args_given;
 use crate::base::{
-    STDERR, STDOUT, alloc_zeroed, buf_fmt, buf_int, buf_new, buf_slice, buf_str, buf_write_fd, cstr,
-    die, die2, getenv, load_sources, streq,
+    STDERR, STDOUT, alloc_zeroed, buf_copy, buf_fmt, buf_int, buf_new, buf_str, buf_write_fd, cstr,
+    die, die2, load_sources, streq,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::{Ctx, ctx_new};
@@ -144,13 +144,16 @@ use crate::tools::commands::{run_alias, run_command};
 use crate::tools::ctx::{Tcx, tcx_new};
 use crate::tools::help::{is_help, run_help};
 
+// UNSAFE: C's uname, the system and machine this compiler runs on.
+// SAFETY: <sys/utsname.h>'s prototype; it fills a struct utsname, which
+// host_target gives it room for.
 extern "C" {
     fn uname(info: *mut u8) -> i32;
 }
 
 // The release this source is; see docs/releases.md.
-pub fn version() -> *mut u8 {
-    c"0.28.0"
+pub fn version() -> *const u8 {
+    c"0.29.0"
 }
 
 // struct utsname: sysname is the first field on every system; machine is
@@ -162,29 +165,35 @@ const LINUX_UTS_FIELD: i64 = 65;
 // The target of the machine this compiler runs on, or 0 when it has no
 // backend for it.
 pub fn host_target() -> i64 {
-    unsafe {
-        let info = alloc_zeroed(UTSNAME_SIZE);
-        if uname(info) != 0 {
-            return 0;
-        }
-        let mut field: i64 = 0;
-        if streq(info, c"Darwin") {
-            field = MACOS_UTS_FIELD;
-        } else if streq(info, c"Linux") {
-            field = LINUX_UTS_FIELD;
-        } else {
-            return 0;
-        }
-        let machine = info.add((4 * field) as usize);
-        let x86 = streq(machine, c"x86_64");
-        if field == MACOS_UTS_FIELD {
-            if streq(machine, c"arm64") {
-                return T_AARCH64_MACOS;
-            }
-            return if x86 { T_X86_64_MACOS } else { 0 };
-        }
-        if x86 { T_X86_64_LINUX } else if streq(machine, c"aarch64") { T_AARCH64_LINUX } else { 0 }
+    let info = alloc_zeroed(UTSNAME_SIZE);
+    // UNSAFE: uname is C's, given a raw block
+    // SAFETY: info is a block of UTSNAME_SIZE zero bytes, more than a
+    // struct utsname on macOS (5 fields of 256 bytes) and on Linux (6
+    // of 65): uname writes only inside it, each field NUL-terminated
+    if unsafe { uname(info) } != 0 {
+        return 0;
     }
+    let mut field: i64 = 0;
+    if streq(info, c"Darwin") {
+        field = MACOS_UTS_FIELD;
+    } else if streq(info, c"Linux") {
+        field = LINUX_UTS_FIELD;
+    } else {
+        return 0;
+    }
+    // UNSAFE: the address of the struct's fifth field
+    // SAFETY: 4 * field is at most 1024, inside the block of
+    // UTSNAME_SIZE (2048) bytes; the bytes from there are a
+    // NUL-terminated string that uname wrote, or zeros
+    let machine = unsafe { info.add((4 * field) as usize) };
+    let x86 = streq(machine, c"x86_64");
+    if field == MACOS_UTS_FIELD {
+        if streq(machine, c"arm64") {
+            return T_AARCH64_MACOS;
+        }
+        return if x86 { T_X86_64_MACOS } else { 0 };
+    }
+    if x86 { T_X86_64_LINUX } else if streq(machine, c"aarch64") { T_AARCH64_LINUX } else { 0 }
 }
 
 fn print_version() {
@@ -219,9 +228,6 @@ fn main(gpa: Gpa) -> i32 {
     crate::front::stdtree::std_tree_env(gpa, &mut pcx);
     // (0.26.0) the arena `embed wgsl` blocks are checked on (front/embed)
     crate::front::embed::wgsl::wgsl_init(gpa, &mut wgx);
-    // (0.20: a migration's children read the program as it does)
-    crate::front::conv::syntax_from_env(&mut pcx);
-    crate::front::rust::edition_from_env(&mut pcx);
     // (0.15) `--json`, anywhere: diagnostics and output as JSON lines
     // (base::diag::DIAG_JSON), for every command; taken out of the line.
     // (0.25.2: these are read before the Command tree, cli/tree.vl: they
@@ -233,18 +239,11 @@ fn main(gpa: Gpa) -> i32 {
     // after `--` (a program's own arguments): base::term.
     let mut color = COLOR_AUTO;
     let mut dashes = false;
-    let mut edition_next = false;
     for k in 1..given.len() {
         let w = given[k];
-        // (0.27.0) `--edition rust`, front/rust: the word after it
-        if edition_next && !dashes {
-            crate::front::rust::set_edition(w);
-            edition_next = false;
-            continue;
-        }
-        if w == "--edition" && !dashes {
-            edition_next = true;
-            continue;
+        // (0.29.0) `--edition`: the option went with the second edition
+        if !dashes && (w == "--edition" || w.starts_with("--edition=")) {
+            crate::base::die(c"unknown option '--edition': there is one language (0.28.0) and no edition to choose; leave the option out");
         }
         // (0.25.4: the words after `--` are a program's, as they are:
         // `volec run -- --json`)
@@ -268,8 +267,8 @@ fn main(gpa: Gpa) -> i32 {
         // --places-diff: places/mod.vl)
         let values = crate::front::conv::syntax_option(w, &mut pcx)
             || crate::places::places_option(w, &mut pcx)
-            || crate::front::rust::edition_option(w, &mut pcx)
             || crate::base::diag::allow_option(w, &mut pcx)
+            || crate::base::diag::deny_option(w, &mut pcx)
             || crate::base::diag::max_errors_option(w, &mut pcx);
         if w == "--json" || values {
             if !values {
@@ -306,10 +305,10 @@ fn main(gpa: Gpa) -> i32 {
     if first == "run" {
         return crate::cli::run::run(line, gpa, &mut pcx, &mut wgx) as i32;
     }
-    // (0.27.5) `volec --edition rust __std2-index FILE`: std2's units, for
-    // embed.sh (front/modules/std2lazy.vl). RULE: Z5.2
-    if first == "__std2-index" && line.len() == 3 {
-        return crate::front::modules::std2lazy::index_command(line.word(2), &mut pcx) as i32;
+    // (0.27.5) `volec __std-index FILE`: std's units, for
+    // embed.sh (front/modules/stdlazy.vl). RULE: Z5.2
+    if first == "__std-index" && line.len() == 3 {
+        return crate::front::modules::stdlazy::index_command(line.word(2), &mut pcx) as i32;
     }
     // (0.27.7) `volec __selftest freeze`: a write to a frozen buffer stops
     // the compiler (base: buf_done, src-buffer.md; tests/selftest.sh)
@@ -335,6 +334,10 @@ fn main(gpa: Gpa) -> i32 {
 // error ends the program (exit 1).
 pub fn build(line: Line<'_>, gpa: Gpa, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
+    // UNSAFE: the main function context, reached through its raw pointer (main_cx)
+    // SAFETY: main_cx returns the context made once for the process and never freed; each `&mut
+    // *main_cx(pcx)` is made on the main thread for one call (check_rules, compile_program) and
+    // no other reference to that context is in use during it: the tasks' contexts are their own
     unsafe {
         // (0.15) A build prints its errors as `check` does, one per line,
         // when stderr is not a terminal (an agent, a script, a pipe);
@@ -360,11 +363,11 @@ pub fn build(line: Line<'_>, gpa: Gpa, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         let include_dirs = build.include_dirs;
         let emit_imports = build.emit_imports;
         let vec_stats = build.vec_stats;
-        if inputs.count == 0 {
+        if inputs.len() as i64 == 0 {
             usage();
         }
         // (0.25.3) `volec build main.vl`: a command word that is no file
-        let hint = not_a_command(line, (*inputs.data.add(0)) as *mut u8, tcx, pcx);
+        let hint = not_a_command(line, (inputs[0]) as *mut u8, tcx, pcx);
         if hint >= 0 {
             return hint;
         }
@@ -384,7 +387,7 @@ pub fn build(line: Line<'_>, gpa: Gpa, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         // --trace or a test build raises it to)
         pcx.overflow_checks = if pcx.overflow_flag >= 0 { pcx.overflow_flag == 1 }
             else { pcx.opt_level == 0 };
-        pcx.ovf_census = pcx.overflow_checks && getenv(c"VOLE_OVF_CENSUS") != 0 as *mut u8;
+        pcx.ovf_census = pcx.overflow_checks && crate::base::env_is_set(c"VOLE_OVF_CENSUS");
         // (-O0's generator has no frames to trace: --trace builds at -O1)
         if pcx.trace && pcx.opt_level == 0 {
             pcx.opt_level = 1;
@@ -411,7 +414,7 @@ pub fn build(line: Line<'_>, gpa: Gpa, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         let t_load = timer_now(pcx);
         phase_time(0 as *mut u8, pcx);
         pcx.err_kind = c"tokenizer error";
-        load_sources(inputs.data as *mut *mut u8, inputs.count, pcx);
+        load_sources(inputs.as_slice(), pcx);
         pcx.errors_as_dump = tokens_only;
         init_lexer(pcx);
         let user_files = pcx.files.len() as i64;
@@ -425,7 +428,7 @@ pub fn build(line: Line<'_>, gpa: Gpa, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         set_target(if target == 0 { host_target() } else { target }, pcx);
         if !tokens_only {
             pcx.err_kind = c"module error";
-            crate::front::modules::std2lazy::set_build();
+            crate::front::modules::stdlazy::set_build();
             load_modules(pcx);
             pcx.err_kind = c"tokenizer error";
         }
@@ -444,8 +447,8 @@ pub fn build(line: Line<'_>, gpa: Gpa, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         set_target(target, pcx);
         buf_fmt(compiling,
             format_args("{} (-O{opt_level}, {})",
-                str::from_utf8(cstr((*inputs.data.add(0)) as *mut u8)).unwrap(),
-                str::from_utf8(cstr(target_name(target))).unwrap(), opt_level = pcx.opt_level));
+                str::from_utf8(&cstr((inputs[0]) as *mut u8)).unwrap(),
+                str::from_utf8(&cstr(target_name(target))).unwrap(), opt_level = pcx.opt_level));
         // (0.19: -C's errors, once the target is known)
         if pcx.arch_used {
             build_features(pcx);
@@ -456,7 +459,7 @@ pub fn build(line: Line<'_>, gpa: Gpa, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         if link_args_given(pcx) && pcx.output_mode != OUT_EXECUTABLE && !pcx.emit_header {
             die(c"-l, -L, objects, archives and C files are for the link: name an executable (-o prog), not an object (.o, -c) or assembly (.s, -S)");
         }
-        import_c_headers(target, include_dirs, emit_imports, output, pcx);
+        import_c_headers(target, include_dirs.as_slice(), emit_imports, output, pcx);
         lex_range(pcx.files[(pcx.files.len() as i64 - 1) as usize].end,
             pcx.files[(pcx.files.len() as i64 - 1) as usize].end, true, pcx);
         timer_add(T_LOAD, t_load, pcx);
@@ -472,7 +475,7 @@ pub fn build(line: Line<'_>, gpa: Gpa, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         if pcx.rich && !streq(output, c"-") {
             build_finished(pcx.warnings_shown, pcx);
         } else if !streq(output, c"-") {
-            print_ok(buf_slice(done), pcx);
+            print_ok(&buf_copy(done), pcx);
         }
         if vec_stats {
             let b = buf_new();
@@ -488,7 +491,3 @@ pub fn build(line: Line<'_>, gpa: Gpa, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
         0
     }
 }
-
-// 0.27.8, which builds this file, reads the program's edition from the line
-// below; to every later compiler it is a comment. It goes in 0.28.1.
-// EDITION: rust

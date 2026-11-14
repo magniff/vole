@@ -87,7 +87,6 @@
 // check.vl); the code generator uses `z`.
 
 use std::fmt::Binary; use std::ops::Index; use std::iter::Repeat; use std::ops::Range;
-use crate::base::{IntVecItems, grow};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::check::Res;
@@ -121,9 +120,6 @@ use crate::front::lexer::Tok;
     Generics,
     // `mod name;` (0.5): a=name.
     Mod,
-    // `defer stmt;` / `defer { ... }` (0.6), a statement: a=the deferred
-    // expression (a Block for `defer { ... }`).
-    Defer,
     // `trait Name { fn ...; }` (0.9), an item: a=name list=its functions
     // (Fn nodes; c=0 for a function without a default body).
     Trait,
@@ -229,6 +225,11 @@ pub const REPR_WGSL: i64 = 64;
 pub const ARM_SYNTHETIC: i64 = 2;
 // ... of an `if let` without `else`: the `if let` must have type `()`.
 pub const ARM_NO_ELSE: i64 = 4;
+// ... (0.29.0) of an `if let`, with an `else` or not (not a `while let`'s,
+// a `?`'s or another desugaring's): its scrutinee's temporaries are dropped
+// before the else block and at the end of the matching block
+// (places::build::lower_match).
+pub const ARM_IF_LET: i64 = 8;
 
 // ... (0.18.1) the `_` arm a `let PAT = e else { .. };` becomes: its body
 // must not end normally (patterns::check_match).
@@ -356,7 +357,7 @@ pub const FN_TERMINATES: i64 = 1 << 23;
 
 // (0.27.2) FnInfo.attrs: a function checked only by a query's unchecked
 // pass (check_unchecked: a lazy default or an instance no compilation
-// makes), on std2: the places IR does not build it, so a check shows the
+// makes), on std: the places IR does not build it, so a check shows the
 // errors a build shows.
 pub const FN_QUERY_ONLY: i64 = 1 << 62;
 
@@ -407,18 +408,6 @@ pub const NODE_ASSOC_CONST: i64 = 1 << 45;
 // edition (front-rust.md F8.1): a the name A, its one list element X's
 // type node, c the trait's (a TyName).
 pub const NODE_QPATH: i64 = 1 << 62;
-
-// (0.20, parameter conventions, docs/design/conventions.md, Phase 0) Written
-// in 0.20's spelling. CONV_NEW: on a TyPtr or TySlice, an access type `let
-// T` / `inout T` (with NODE_REF / NODE_REF_MUT as `&T` / `&mut T`); on a
-// Param, a parameter with a convention (`x: inout T`, `x: sink T`, `x: let
-// T`, `self`, `inout self`, `sink self`; without CONV_INOUT or CONV_SINK: let);
-// on a Unary `&`, the inout marker of a 0.20 file (front/conv.vl:
-// inout_marker); on a Let, `var` (CONV_NEW alone) or `inout x = e`
-// (CONV_INOUT); on a Static, `static var`; on a Closure, `sink |..|`.
-pub const CONV_NEW: i64 = 1 << 54;
-pub const CONV_INOUT: i64 = 1 << 55;
-pub const CONV_SINK: i64 = 1 << 49;
 
 // (0.17) On a function: it has `#[views(...)]` or `#[stores(...)]`
 // (front/own/summary.vl, parse_views_attr).
@@ -477,7 +466,7 @@ pub fn init_ast(pcx: &mut Ctx<Comp>) {
 // Lists are built on SCRATCH: remember `list_begin()`, push the children
 // with `list_push`, and move them to node `n` with `list_end(n, mark)`.
 pub fn list_begin(pcx: &Ctx<Comp>) -> i64 {
-    pcx.scratch.count
+    pcx.scratch.len() as i64
 }
 
 pub fn list_push(child: i64, pcx: &mut Ctx<Comp>) {
@@ -485,42 +474,27 @@ pub fn list_push(child: i64, pcx: &mut Ctx<Comp>) {
 }
 
 pub fn list_end(n: i64, mark: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        pcx.nodes[n as usize].list = pcx.lists.count;
-        pcx.nodes[n as usize].count = pcx.scratch.count - mark;
-        for i in mark..pcx.scratch.count {
-            pcx.lists.push((*pcx.scratch.data.add(i as usize)));
-        }
-        pcx.scratch.count = mark;
+    pcx.nodes[n as usize].list = pcx.lists.len() as i64;
+    pcx.nodes[n as usize].count = pcx.scratch.len() as i64 - mark;
+    for i in mark..pcx.scratch.len() as i64 {
+        pcx.lists.push((pcx.scratch[i as usize]));
     }
+    pcx.scratch.truncate(mark as usize);
 }
 
 // Child `i` of node `n`'s list.
 pub fn child(n: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (*pcx.lists.data.add((pcx.nodes[n as usize].list + i) as usize)) }
-}
-
-// The children of node `n`'s list, as an iterator (0.15): `for c in
-// kids(n) { .. }` is `for i in 0..NODES[n].count { let c = child(n, i);
-// .. }`, the list's place and length taken when the loop starts.
-#[inline]
-pub fn kids(n: i64, pcx: &mut Ctx<Comp>) -> IntVecItems {
-    pcx.lists.items_in(pcx.nodes[n as usize].list,
-        pcx.nodes[n as usize].list + pcx.nodes[n as usize].count)
+    (pcx.lists[(pcx.nodes[n as usize].list + i) as usize])
 }
 
 pub fn keep_parsed(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        while pcx.parsed_count < pcx.nodes.len() as i64 {
-            pcx.parsed_nodes = grow(pcx.parsed_nodes, pcx.parsed_count, &mut pcx.parsed_cap);
-            { let at_ix = pcx.parsed_count as usize;
-                (*pcx.parsed_nodes.add(at_ix)) = pcx.nodes[pcx.parsed_count as usize] };
-            pcx.parsed_count += 1;
-        }
+    while pcx.parsed_nodes.len() < pcx.nodes.len() {
+        let node = pcx.nodes[pcx.parsed_nodes.len()];
+        pcx.parsed_nodes.push(node);
     }
 }
 
 // Child `i` of the list of node `n` as parsed.
 pub fn parsed_child(n: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (*pcx.lists.data.add(((*pcx.parsed_nodes.add(n as usize)).list + i) as usize)) }
+    (pcx.lists[((pcx.parsed_nodes[n as usize]).list + i) as usize])
 }

@@ -1,9 +1,9 @@
 // std's built-in text as files on disk (0.25, docs/lsp.md): std is in the
-// compiler (front/stdsrc_rust.vl), so a definition in it has no file of the
+// compiler (front/stdsrc.vl), so a definition in it has no file of the
 // user's. The worker writes std's text once per compiler (its version and
 // a hash of the text) to a cache directory, each of std's files at its
 // path under compiler/std (std.vl, vec.vl, collections/mod.vl..., then
-// rt/tail.vl, the end std2_tail adds), the files read-only, and answers with their
+// rt/tail.vl, the end std_tail adds), the files read-only, and answers with their
 // file:// URIs: any client opens them. A position in std's text is one in
 // such a file (a segment), line for line; the text between them (a
 // module's banner and braces, embed.sh's) belongs to the next one.
@@ -14,16 +14,22 @@
 // directory with that name is whole.
 
 use crate::base::{
-    IntVec, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, cstr, get_bufs, get_src,
-    getenv, realpath, streq,
+    buf_append, buf_byte, buf_bytes, buf_clear, buf_copy, buf_done, buf_eq, buf_fmt, buf_new,
+    buf_str, cstr, get_src, getenv, realpath, streq,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::get_elf;
-use crate::front::stdtree::built_files_std2;
+use crate::front::stdtree::built_files_std;
 use crate::tools::ctx::Tcx;
 use crate::tools::proc::{buf_cstr, read_file_if, write_file_if};
 
+// UNSAFE: POSIX's file functions: std's files are written under the
+// user's cache directory, atomically (rename) and read-only (chmod).
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
     fn mkdir(path: *mut u8, mode: i32) -> i32;
     fn access(path: *mut u8, mode: i32) -> i32;
@@ -39,6 +45,12 @@ extern "C" {
 // real path when it is there (as a client names the files: no `..`, no
 // link); -1 when there is no home.
 pub fn cache_base(make: bool) -> i64 {
+    // UNSAFE: getenv and realpath are C's; the variables' first bytes are
+    // read.
+    // SAFETY: the names are literals; xdg and home are checked not null
+    // before their first byte is read; buf_cstr gives the path as a C
+    // string; realpath with a null buffer returns a new C string or null,
+    // checked before it is copied.
     unsafe {
         let b = buf_new();
         let xdg = getenv(c"XDG_CACHE_HOME");
@@ -54,7 +66,7 @@ pub fn cache_base(make: bool) -> i64 {
             buf_str(b, if get_elf() { c"/.cache/vole" } else { c"/Library/Caches/vole" });
         }
         if make {
-            make_dirs(buf_slice(b));
+            make_dirs(&buf_copy(b));
         }
         let real = realpath(buf_cstr(b), 0 as *mut u8);
         if real == 0 as *mut u8 {
@@ -73,7 +85,7 @@ pub fn is_std_path(path: &[u8]) -> bool {
     if base < 0 {
         return false;
     }
-    let b = buf_slice(base);
+    let b = buf_copy(base);
     path.len() as i64 > b.len() as i64 + 5 && path[0..b.len()] == b
         && path[b.len() as i64 as usize..(b.len() as i64 + 5) as usize] == b"/std-"
 }
@@ -81,6 +93,8 @@ pub fn is_std_path(path: &[u8]) -> bool {
 // Makes directory path and the ones above it (errors ignored: the file
 // written in it says).
 fn make_dirs(path: &[u8]) {
+    // UNSAFE: mkdir is C's.
+    // SAFETY: buf_cstr gives each prefix of the path as a C string.
     unsafe {
         for i in 1..path.len() as i64 + 1 {
             if i == path.len() as i64 || path[i as usize] == b'/' {
@@ -123,40 +137,38 @@ fn add_segment(from: i64, to: i64, name: &[u8], tcx: &mut Tcx<Comp>) {
 // std's segments (SEG_*), from std_files and the tail's lengths; false
 // when the text is not the one they describe.
 fn find_segments(f: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let base = pcx.files[f as usize].start;
-        let len = pcx.files[f as usize].end - base;
-        let mut starts = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut names = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        built_files_std2(&mut starts, &mut names);
-        if names.count == 0 || starts.count != names.count + 1
-            || (*starts.data.add(names.count as usize)) > len {
-            return false;
-        }
-        for k in 0..names.count {
-            // (a file ends at the first banner after it: its first module's,
-            // or its own module's end)
-            let next = (*starts.data.add((k + 1) as usize));
-            let mut p = (*starts.data.add(k as usize));
-            let mut to = next;
-            while p < next && to == next {
-                if banner_at(base + p, pcx.files[f as usize].end) {
-                    to = p;
-                }
-                while p < next && get_src()[(base + p) as usize] != b'\n' {
-                    p += 1;
-                }
+    let base = pcx.files[f as usize].start;
+    let len = pcx.files[f as usize].end - base;
+    let mut starts: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut names: Vec<i64, Comp> = Vec::new_in(Comp {});
+    built_files_std(&mut starts, &mut names);
+    if names.len() as i64 == 0 || starts.len() as i64 != names.len() as i64 + 1
+        || (starts[names.len() as i64 as usize]) > len {
+        return false;
+    }
+    for k in 0..names.len() as i64 {
+        // (a file ends at the first banner after it: its first module's,
+        // or its own module's end)
+        let next = (starts[(k + 1) as usize]);
+        let mut p = (starts[k as usize]);
+        let mut to = next;
+        while p < next && to == next {
+            if banner_at(base + p, pcx.files[f as usize].end) {
+                to = p;
+            }
+            while p < next && get_src()[(base + p) as usize] != b'\n' {
                 p += 1;
             }
-            add_segment(base + (*starts.data.add(k as usize)), base + to,
-                cstr((*names.data.add(k as usize)) as *mut u8), tcx);
+            p += 1;
         }
-        // the end, what std2_tail adds after the files: std::__rt, the Gpa,
-        // the system's module, one file
-        let end = (*starts.data.add(names.count as usize));
-        add_segment(base + end, pcx.files[f as usize].end, b"rt/tail.vl", tcx);
-        true
+        add_segment(base + (starts[k as usize]), base + to,
+            &cstr((names[k as usize]) as *mut u8), tcx);
     }
+    // the end, what std_tail adds after the files: std::__rt, the Gpa,
+    // the system's module, one file
+    let end = (starts[names.len() as i64 as usize]);
+    add_segment(base + end, pcx.files[f as usize].end, b"rt/tail.vl", tcx);
+    true
 }
 
 // 64-bit FNV-1a of SRC[from..to], 16 hex digits into b.
@@ -174,6 +186,9 @@ fn put_hash(b: i64, from: i64, to: i64) {
 // The segments and the directory, std's files written when they are not
 // there; false when std is not the built-in text (or no home).
 pub fn std_files_ready(tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
+    // UNSAFE: access is C's (streq reads the paths, C strings in the front
+    // end's table).
+    // SAFETY: buf_cstr gives the directory's path as a C string.
     unsafe {
         if tcx.std_dir >= 0 {
             return true;
@@ -196,14 +211,14 @@ pub fn std_files_ready(tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
             return false;
         }
         let dir = buf_new();
-        buf_bytes(dir, buf_slice(base));
+        buf_append(dir, base);
         buf_str(dir, c"/std-");
         buf_str(dir, crate::version());
         buf_byte(dir, b'-');
         put_hash(dir, pcx.files[f as usize].start, pcx.files[f as usize].end);
         let there = access(buf_cstr(dir), 0) == 0;
-        if !(there && std_files_match(buf_slice(dir), tcx))
-            && !write_std_files(buf_slice(dir), there, tcx) {
+        if !(there && std_files_match(&buf_copy(dir), tcx))
+            && !write_std_files(&buf_copy(dir), there, tcx) {
             tcx.std_f = -1;
             return false;
         }
@@ -216,18 +231,19 @@ pub fn std_files_ready(tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
 // directory there that is not std's text, `stale`, renamed away and
 // removed first); whether dir then holds std's text.
 fn write_std_files(dir: &[u8], stale: bool, tcx: &Tcx<Comp>) -> bool {
+    // UNSAFE: getpid, mkdir, chmod and rename are C's.
+    // SAFETY: buf_cstr gives each path as a C string.
     unsafe {
         let tmp = buf_new();
         buf_bytes(tmp, dir);
         buf_fmt(tmp, format_args(".tmp{}", getpid()));
         mkdir(buf_cstr(tmp), 493);
-        for k in 0..tcx.seg_name.count {
-            let p = segment_file(buf_slice(tmp), k, tcx);
-            make_dirs(dir_of(buf_slice(p)));
+        for k in 0..tcx.seg_name.len() as i64 {
+            let p = segment_file(&buf_copy(tmp), k, tcx);
+            make_dirs(dir_of(&buf_copy(p)));
             write_file_if(buf_cstr(p),
                 &get_src()[
-                    (*tcx.seg_from.data.add(k as usize)) as usize..(
-                        *tcx.seg_to.data.add(k as usize)) as usize]);
+                    (tcx.seg_from[k as usize]) as usize..(tcx.seg_to[k as usize]) as usize]);
             chmod(buf_cstr(p), 292);
         }
         let d = buf_new();
@@ -237,12 +253,12 @@ fn write_std_files(dir: &[u8], stale: bool, tcx: &Tcx<Comp>) -> bool {
             buf_bytes(old, dir);
             buf_fmt(old, format_args(".stale{}", getpid()));
             if rename(buf_cstr(d), buf_cstr(old)) == 0 {
-                remove_segments(buf_slice(old), tcx);
+                remove_segments(&buf_copy(old), tcx);
             }
         }
         if rename(buf_cstr(tmp), buf_cstr(d)) != 0 {
             // (another server wrote it first: this copy removed)
-            remove_segments(buf_slice(tmp), tcx);
+            remove_segments(&buf_copy(tmp), tcx);
         }
         std_files_match(dir, tcx)
     }
@@ -250,45 +266,41 @@ fn write_std_files(dir: &[u8], stale: bool, tcx: &Tcx<Comp>) -> bool {
 
 // The path of segment k's file in directory dir (a buffer).
 fn segment_file(dir: &[u8], k: i64, tcx: &Tcx<Comp>) -> i64 {
-    unsafe {
-        let p = buf_new();
-        buf_bytes(p, dir);
-        buf_byte(p, b'/');
-        buf_bytes(p, buf_slice((*tcx.seg_name.data.add(k as usize))));
-        p
-    }
+    let p = buf_new();
+    buf_bytes(p, dir);
+    buf_byte(p, b'/');
+    buf_append(p, (tcx.seg_name[k as usize]));
+    p
 }
 
 // Whether directory dir holds std's text: each segment's file, the same
 // bytes (a directory of the name that another compiler, or a hand, left
 // otherwise is not used: no answer depends on what the cache held).
 fn std_files_match(dir: &[u8], tcx: &Tcx<Comp>) -> bool {
-    unsafe {
-        let text = buf_new();
-        for k in 0..tcx.seg_name.count {
-            (*get_bufs().add(text as usize)).len = 0;
-            if !read_file_if(buf_cstr(segment_file(dir, k, tcx)), text)
-                || buf_slice(text)
-                != &get_src()[
-                    (*tcx.seg_from.data.add(k as usize)) as usize..(
-                        *tcx.seg_to.data.add(k as usize)) as usize] {
-                return false;
-            }
+    let text = buf_new();
+    for k in 0..tcx.seg_name.len() as i64 {
+        buf_clear(text);
+        if !read_file_if(buf_cstr(segment_file(dir, k, tcx)), text)
+            || !buf_eq(text, &get_src()[
+                (tcx.seg_from[k as usize]) as usize..(tcx.seg_to[k as usize]) as usize]) {
+            return false;
         }
-        true
     }
+    true
 }
 
 // Removes the segments' files from directory dir, then their directories
 // and dir (what else is there stays).
 fn remove_segments(dir: &[u8], tcx: &Tcx<Comp>) {
+    // UNSAFE: unlink and rmdir are C's.
+    // SAFETY: buf_cstr gives each path as a C string.
     unsafe {
-        for k in 0..tcx.seg_name.count {
+        for k in 0..tcx.seg_name.len() as i64 {
             unlink(buf_cstr(segment_file(dir, k, tcx)));
         }
-        let mut k = tcx.seg_name.count - 1;
+        let mut k = tcx.seg_name.len() as i64 - 1;
         while k >= 0 {
-            let mut sub = dir_of(buf_slice(segment_file(dir, k, tcx)));
+            let mut sub = dir_of(buf_done(segment_file(dir, k, tcx)));
             while sub.len() > dir.len() {
                 let s = buf_new();
                 buf_bytes(s, sub);
@@ -306,64 +318,59 @@ fn remove_segments(dir: &[u8], tcx: &Tcx<Comp>) {
 // The segment of position pos in std's text (one in a banner: the next
 // segment's), or -1 when pos is not in std's text.
 pub fn segment_of(pos: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if tcx.std_dir < 0 || pos < pcx.files[tcx.std_f as usize].start
-            || pos > pcx.files[tcx.std_f as usize].end {
-            return -1;
-        }
-        for k in 0..tcx.seg_from.count {
-            if pos < (*tcx.seg_to.data.add(k as usize)) || k + 1 == tcx.seg_from.count {
-                return k;
-            }
-        }
-        -1
+    if tcx.std_dir < 0 || pos < pcx.files[tcx.std_f as usize].start
+        || pos > pcx.files[tcx.std_f as usize].end {
+        return -1;
     }
+    for k in 0..tcx.seg_from.len() as i64 {
+        if pos < (tcx.seg_to[k as usize]) || k + 1 == tcx.seg_from.len() as i64 {
+            return k;
+        }
+    }
+    -1
 }
 
 pub fn segment_from(k: i64, tcx: &Tcx<Comp>) -> i64 {
-    unsafe { (*tcx.seg_from.data.add(k as usize)) }
+    (tcx.seg_from[k as usize])
 }
 
 pub fn segment_to(k: i64, tcx: &Tcx<Comp>) -> i64 {
-    unsafe { (*tcx.seg_to.data.add(k as usize)) }
+    (tcx.seg_to[k as usize])
 }
 
 // The path of segment k's file into b.
 pub fn put_segment_path(b: i64, k: i64, tcx: &Tcx<Comp>) {
-    unsafe {
-        buf_bytes(b, buf_slice(tcx.std_dir));
-        buf_byte(b, b'/');
-        buf_bytes(b, buf_slice((*tcx.seg_name.data.add(k as usize))));
-    }
+    buf_append(b, tcx.std_dir);
+    buf_byte(b, b'/');
+    buf_append(b, (tcx.seg_name[k as usize]));
 }
 
 // The path of segment k's file under the directory (`std.vl`,
 // `collections/hash_map.vl`).
 pub fn segment_name(k: i64, tcx: &Tcx<Comp>) -> &[u8] {
-    unsafe { buf_slice((*tcx.seg_name.data.add(k as usize))) }
+    // (a segment's name is written once, add_segment)
+    buf_done((tcx.seg_name[k as usize]))
 }
 
 // The segment whose file is at path, or -1.
 pub fn segment_by_path(path: &[u8], tcx: &Tcx<Comp>) -> i64 {
-    unsafe {
-        if tcx.std_dir < 0 {
-            return -1;
-        }
-        let d = buf_slice(tcx.std_dir);
-        if path.len() as i64 <= d.len() as i64 + 1 || &path[0..d.len()] != d
-            || path[d.len()] != b'/' {
-            return -1;
-        }
-        let rest = &path[(d.len() as i64 + 1) as usize..];
-        for k in 0..tcx.seg_name.count {
-            if buf_slice((*tcx.seg_name.data.add(k as usize))) == rest {
-                return k;
-            }
-        }
-        -1
+    if tcx.std_dir < 0 {
+        return -1;
     }
+    let d = buf_copy(tcx.std_dir);
+    if path.len() as i64 <= d.len() as i64 + 1 || &path[0..d.len()] != d
+        || path[d.len()] != b'/' {
+        return -1;
+    }
+    let rest = &path[(d.len() as i64 + 1) as usize..];
+    for k in 0..tcx.seg_name.len() as i64 {
+        if buf_eq((tcx.seg_name[k as usize]), rest) {
+            return k;
+        }
+    }
+    -1
 }
 
 pub fn segment_count(tcx: &Tcx<Comp>) -> i64 {
-    tcx.seg_name.count
+    tcx.seg_name.len() as i64
 }

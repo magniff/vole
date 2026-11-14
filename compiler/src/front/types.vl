@@ -5,8 +5,8 @@
 // exactly when their ids are. The primitive types have fixed ids.
 
 use crate::base::{
-    alloc_array, alloc_zeroed, buf_byte, buf_int, buf_new, buf_slice, buf_str, die, free, intern,
-    intern_c, sym_name, sym_table,
+    buf_byte, buf_int, buf_new, buf_str, die, intern_buf, intern_c, sym_name, sym_table,
+    sym_table_len,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -56,6 +56,7 @@ const FIRST_CONSTRUCTED: i64 = 16;
 
 fn add_type(kind: TyKind, a: i64, b: i64, list: i64, count: i64, pcx: &mut Ctx<Comp>) -> i64 {
     pcx.types.push(Type { kind, a, b, list, count, size: -1, align: 1 });
+    pcx.freeze_memo.push(std::sync::atomic::Atomic::new(0));
     if pcx.types.len() as i64 - 1 >= FIRST_CONSTRUCTED {
         type_hash_insert(pcx.types.len() as i64 - 1, pcx);
     }
@@ -63,7 +64,7 @@ fn add_type(kind: TyKind, a: i64, b: i64, list: i64, count: i64, pcx: &mut Ctx<C
 }
 
 pub fn type_elem(t: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (*pcx.tlists.data.add((pcx.types[t as usize].list + i) as usize)) }
+    (pcx.tlists[(pcx.types[t as usize].list + i) as usize])
 }
 
 // (0.27.2) The type of part i of a value matched by a tuple pattern: a
@@ -71,10 +72,7 @@ pub fn type_elem(t: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
 // patterns are tuple patterns over the fields in order). RULE: F27.1
 pub fn part_type(t: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
     if pcx.types[t as usize].kind == TyKind::Struct {
-        // UNSAFE: FIELDS is the checker's global field table (struct_field).
-        // SAFETY: t is a struct type and i one of its fields (the pattern's
-        // checker made one part per field).
-        return unsafe { (*struct_field(pcx.types[t as usize].a, i, pcx)).ty };
+        return (struct_field(pcx.types[t as usize].a, i, pcx)).ty;
     }
     type_elem(t, i, pcx)
 }
@@ -82,28 +80,24 @@ pub fn part_type(t: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
 // The interned type with these fields and the elements TSCRATCH[mark..],
 // which are popped.
 pub fn make_type(kind: TyKind, a: i64, b: i64, mark: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let count = pcx.tscratch.count - mark;
-        let mut pcx_tscratch = pcx.tscratch;
-        let found = type_hash_find(kind, a, b, pcx_tscratch.data.add(mark as usize), count, pcx);
-        pcx.tscratch = pcx_tscratch;
-        if found >= 0 {
-            pcx.tscratch.count = mark;
-            return found;
-        }
-        let list = pcx.tlists.count;
-        for i in mark..pcx.tscratch.count {
-            pcx.tlists.push((*pcx.tscratch.data.add(i as usize)));
-        }
-        pcx.tscratch.count = mark;
-        let t = add_type(kind, a, b, list, count, pcx);
-        // (0.27.0) A 256-bit vector's 128-bit half is made with it: lowering
-        // and the tasks' ABI find it (made_vector_half; a task makes no type).
-        if kind == Vector && b * lane_bytes(a) == 32 {
-            make_type(Vector, a, b / 2, pcx.tscratch.count, pcx);
-        }
-        t
+    let count = pcx.tscratch.len() as i64 - mark;
+    let found = type_hash_find(kind, a, b, &pcx.tscratch.as_slice()[mark as usize..], pcx);
+    if found >= 0 {
+        pcx.tscratch.truncate(mark as usize);
+        return found;
     }
+    let list = pcx.tlists.len() as i64;
+    for i in mark..pcx.tscratch.len() as i64 {
+        pcx.tlists.push((pcx.tscratch[i as usize]));
+    }
+    pcx.tscratch.truncate(mark as usize);
+    let t = add_type(kind, a, b, list, count, pcx);
+    // (0.27.0) A 256-bit vector's 128-bit half is made with it: lowering
+    // and the tasks' ABI find it (made_vector_half; a task makes no type).
+    if kind == Vector && b * lane_bytes(a) == 32 {
+        make_type(Vector, a, b / 2, pcx.tscratch.len() as i64, pcx);
+    }
+    t
 }
 
 // The size of a vector's lane type t (a scalar).
@@ -123,7 +117,7 @@ fn lane_bytes(t: i64) -> i64 {
 // -1: make_type's lookup alone, which writes nothing (a task's, where the
 // types are only read: middle::parallel).
 pub fn find_type(kind: TyKind, a: i64, b: i64, pcx: &Ctx<Comp>) -> i64 {
-    type_hash_find(kind, a, b, 0 as *mut i64, 0, pcx)
+    type_hash_find(kind, a, b, &[], pcx)
 }
 
 // The number of types made so far (ids are below it).
@@ -131,109 +125,153 @@ pub fn type_count(pcx: &Ctx<Comp>) -> i64 {
     pcx.types.len() as i64
 }
 
-fn same_elems(t: i64, elems: *mut i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        for i in 0..pcx.types[t as usize].count {
-            if type_elem(t, i, pcx) != (*elems.add(i as usize)) {
-                return false;
-            }
+fn same_elems(t: i64, elems: &[i64], pcx: &Ctx<Comp>) -> bool {
+    for i in 0..pcx.types[t as usize].count {
+        if type_elem(t, i, pcx) != elems[i as usize] {
+            return false;
         }
     }
     true
 }
 
-fn type_hash(kind: TyKind, a: i64, b: i64, elems: *mut i64, count: i64) -> i64 {
-    unsafe {
-        let mut h: u64 = 14695981039346656037;
-        h = (h ^ (kind as i64) as u64).wrapping_mul(1099511628211u64);
-        h = (h ^ a as u64).wrapping_mul(1099511628211u64);
-        h = (h ^ b as u64).wrapping_mul(1099511628211u64);
-        h = (h ^ count as u64).wrapping_mul(1099511628211u64);
-        for i in 0..count {
-            h = (h ^ (*elems.add(i as usize)) as u64).wrapping_mul(1099511628211u64);
-        }
-        ((h ^ (h >> 29)) & 0x7fffffffffffffff) as i64
+fn type_hash(kind: TyKind, a: i64, b: i64, elems: &[i64]) -> i64 {
+    let mut h: u64 = 14695981039346656037;
+    h = (h ^ (kind as i64) as u64).wrapping_mul(1099511628211u64);
+    h = (h ^ a as u64).wrapping_mul(1099511628211u64);
+    h = (h ^ b as u64).wrapping_mul(1099511628211u64);
+    h = (h ^ elems.len() as u64).wrapping_mul(1099511628211u64);
+    for &e in elems {
+        h = (h ^ e as u64).wrapping_mul(1099511628211u64);
     }
+    ((h ^ (h >> 29)) & 0x7fffffffffffffff) as i64
 }
 
 // The lowest id of a constructed type with these fields and the elements
 // elems[0..count], or -1 (it writes nothing).
-fn type_hash_find(kind: TyKind, a: i64, b: i64, elems: *mut i64, count: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if pcx.type_hash_size == 0 {
-            return -1;
-        }
-        let mask = pcx.type_hash_size - 1;
-        let mut slot = type_hash(kind, a, b, elems, count) & mask;
-        let mut found: i64 = -1;
-        while (*pcx.type_hash.add(slot as usize)) != 0 {
-            let t = (*pcx.type_hash.add(slot as usize)) - 1;
-            if pcx.types[t as usize].kind == kind && pcx.types[t as usize].a == a
-                && pcx.types[t as usize].b == b && pcx.types[t as usize].count == count
-                && same_elems(t, elems, pcx)
-                && (found < 0 || t < found) {
-                found = t;
-            }
-            slot = (slot + 1) & mask;
-        }
-        found
+fn type_hash_find(kind: TyKind, a: i64, b: i64, elems: &[i64], pcx: &Ctx<Comp>) -> i64 {
+    if pcx.type_hash_size == 0 {
+        return -1;
     }
+    let mask = pcx.type_hash_size - 1;
+    let count = elems.len() as i64;
+    let mut slot = type_hash(kind, a, b, elems) & mask;
+    let mut found: i64 = -1;
+    while pcx.type_hash[slot as usize] != 0 {
+        let t = pcx.type_hash[slot as usize] - 1;
+        if pcx.types[t as usize].kind == kind && pcx.types[t as usize].a == a
+            && pcx.types[t as usize].b == b && pcx.types[t as usize].count == count
+            && same_elems(t, elems, pcx)
+            && (found < 0 || t < found) {
+            found = t;
+        }
+        slot = (slot + 1) & mask;
+    }
+    found
 }
 
 fn type_hash_insert(t: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if (pcx.type_hash_used + 1) * 2 > pcx.type_hash_size {
-            let size: i64 = if pcx.type_hash_size == 0 { 1024 } else { pcx.type_hash_size * 2 };
-            free(pcx.type_hash as *mut u8);
-            pcx.type_hash = alloc_zeroed(size * 8) as *mut i64;
-            pcx.type_hash_size = size;
-            pcx.type_hash_used = 0;
-            for u in FIRST_CONSTRUCTED..t {
-                type_hash_put(u, pcx);
-            }
+    if (pcx.type_hash_used + 1) * 2 > pcx.type_hash_size {
+        let size: i64 = if pcx.type_hash_size == 0 { 1024 } else { pcx.type_hash_size * 2 };
+        pcx.type_hash.clear();
+        pcx.type_hash.resize(size as usize, 0);
+        pcx.type_hash_size = size;
+        pcx.type_hash_used = 0;
+        for u in FIRST_CONSTRUCTED..t {
+            type_hash_put(u, pcx);
         }
-        type_hash_put(t, pcx);
     }
+    type_hash_put(t, pcx);
 }
 
 fn type_hash_put(t: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let mask = pcx.type_hash_size - 1;
-        let mut slot = type_hash(pcx.types[t as usize].kind, pcx.types[t as usize].a,
-            pcx.types[t as usize].b, pcx.tlists.data.add(pcx.types[t as usize].list as usize),
-            pcx.types[t as usize].count) & mask;
-        while (*pcx.type_hash.add(slot as usize)) != 0 {
-            slot = (slot + 1) & mask;
-        }
-        (*pcx.type_hash.add(slot as usize)) = t + 1;
-        pcx.type_hash_used += 1;
+    let mask = pcx.type_hash_size - 1;
+    let list = pcx.types[t as usize].list;
+    let count = pcx.types[t as usize].count;
+    // (a type without elements has no list to be inside)
+    let elems: &[i64] = if count == 0 { &[] }
+        else { &pcx.tlists.as_slice()[list as usize..(list + count) as usize] };
+    let mut slot = type_hash(pcx.types[t as usize].kind, pcx.types[t as usize].a,
+        pcx.types[t as usize].b, elems) & mask;
+    while pcx.type_hash[slot as usize] != 0 {
+        slot = (slot + 1) & mask;
     }
+    pcx.type_hash[slot as usize] = t + 1;
+    pcx.type_hash_used += 1;
 }
 
+// `*mut T`, the raw pointer to t.
 pub fn ptr_to(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    make_type(Ptr, t, 0, pcx.tscratch.count, pcx)
+    make_type(Ptr, t, 0, pcx.tscratch.len() as i64, pcx)
+}
+
+// RULE: F30.5 (0.29) `*const T`, the raw pointer to t that is not
+// written through: a raw pointer (b == 0, as `*mut T`, so every test for
+// a raw pointer holds for both) whose `count` word is 1, its one
+// element the unit type, which stands for nothing. `*const T` and `*mut
+// T` are two types: two ids, one layout, one code.
+pub fn const_ptr_to(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mark = pcx.tscratch.len() as i64;
+    pcx.tscratch.push(TY_UNIT);
+    make_type(Ptr, t, 0, mark, pcx)
+}
+
+// Whether t is a raw pointer, `*const T` or `*mut T`.
+pub fn is_raw_ptr(t: i64, pcx: &Ctx<Comp>) -> bool {
+    t > 0 && pcx.types[t as usize].kind == Ptr && pcx.types[t as usize].b == 0
+}
+
+// Whether t is `*const T`.
+pub fn is_const_ptr(t: i64, pcx: &Ctx<Comp>) -> bool {
+    is_raw_ptr(t, pcx) && pcx.types[t as usize].count == 1
+}
+
+// Whether t is `*mut T`.
+pub fn is_mut_ptr(t: i64, pcx: &Ctx<Comp>) -> bool {
+    is_raw_ptr(t, pcx) && pcx.types[t as usize].count == 0
+}
+
+// The pointer type of t's kind (a reference's kind, a raw pointer's
+// constness) whose pointee is a: what rebuilds a pointer type around
+// another pointee (a substitution, an erasure).
+pub fn ptr_like(t: i64, a: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if is_const_ptr(t, pcx) {
+        return const_ptr_to(a, pcx);
+    }
+    make_type(Ptr, a, pcx.types[t as usize].b, pcx.tscratch.len() as i64, pcx)
+}
+
+// RULE: F30.5 Whether a raw pointer of type actual goes where expected
+// is expected with no cast: a `*mut T` where a `*const T` is (rustc's
+// coercion), never a `*const T` where a `*mut T` is; the pointee the
+// same type.
+pub fn raw_const_coerces(actual: i64, expected: i64, pcx: &Ctx<Comp>) -> bool {
+    if !is_raw_ptr(actual, pcx) || !is_raw_ptr(expected, pcx)
+        || pcx.types[actual as usize].a != pcx.types[expected as usize].a {
+        return false;
+    }
+    is_const_ptr(expected, pcx)
 }
 
 pub fn array_of(elem: i64, len: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    make_type(Array, elem, len, pcx.tscratch.count, pcx)
+    make_type(Array, elem, len, pcx.tscratch.len() as i64, pcx)
 }
 
 pub fn struct_type(s: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    make_type(Struct, s, 0, pcx.tscratch.count, pcx)
+    make_type(Struct, s, 0, pcx.tscratch.len() as i64, pcx)
 }
 
 pub fn enum_type(e: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    make_type(Enum, e, 0, pcx.tscratch.count, pcx)
+    make_type(Enum, e, 0, pcx.tscratch.len() as i64, pcx)
 }
 
 pub fn slice_of(elem: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    make_type(Slice, elem, 0, pcx.tscratch.count, pcx)
+    make_type(Slice, elem, 0, pcx.tscratch.len() as i64, pcx)
 }
 
 // RULE: Z9.1c (0.27.3) The unsized place type of view v (`[T]` of the
 // view `Slice(T)`, `str` of std's str), made in rust-edition positions.
 pub fn unsized_of(v: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    make_type(TyKind::Unsized, v, 0, pcx.tscratch.count, pcx)
+    make_type(TyKind::Unsized, v, 0, pcx.tscratch.len() as i64, pcx)
 }
 
 // Whether t is an unsized place type (Z9.1c).
@@ -263,24 +301,19 @@ pub fn find_place_of_view(t: i64, pcx: &Ctx<Comp>) -> i64 {
     if t <= 0 || is_raw_view(t, pcx) {
         return 0;
     }
-    // UNSAFE: type_hash_find reads the interned types by a raw element list.
-    // SAFETY: the list is empty (count 0), so the pointer is never read.
-    unsafe {
-        let none = pcx.tscratch.data;
-        let mut shared: i64 = 0;
-        if pcx.types[t as usize].kind == Slice && pcx.types[t as usize].b == 0 {
-            shared = t;
-        } else if pcx.types[t as usize].kind == Slice && pcx.types[t as usize].b == REF_MUT {
-            shared = type_hash_find(Slice, pcx.types[t as usize].a, 0, none, 0, pcx);
-        } else if crate::front::distinct::is_view_distinct(t, pcx) && !is_mut_slice(t, pcx) {
-            shared = t;
-        }
-        if shared <= 0 {
-            return 0;
-        }
-        let u = type_hash_find(TyKind::Unsized, shared, 0, none, 0, pcx);
-        if u < 0 { 0 } else { u }
+    let mut shared: i64 = 0;
+    if pcx.types[t as usize].kind == Slice && pcx.types[t as usize].b == 0 {
+        shared = t;
+    } else if pcx.types[t as usize].kind == Slice && pcx.types[t as usize].b == REF_MUT {
+        shared = type_hash_find(Slice, pcx.types[t as usize].a, 0, &[], pcx);
+    } else if crate::front::distinct::is_view_distinct(t, pcx) && !is_mut_slice(t, pcx) {
+        shared = t;
     }
+    if shared <= 0 {
+        return 0;
+    }
+    let u = type_hash_find(TyKind::Unsized, shared, 0, &[], pcx);
+    if u < 0 { 0 } else { u }
 }
 
 // References (0.17, docs/design/value-semantics.md §2.3): a pointer type
@@ -291,11 +324,11 @@ pub const REF_SHARED: i64 = 1;
 pub const REF_MUT: i64 = 2;
 
 pub fn ref_to(t: i64, kind: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    make_type(Ptr, t, kind, pcx.tscratch.count, pcx)
+    make_type(Ptr, t, kind, pcx.tscratch.len() as i64, pcx)
 }
 
 pub fn mut_slice_of(elem: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    make_type(Slice, elem, REF_MUT, pcx.tscratch.count, pcx)
+    make_type(Slice, elem, REF_MUT, pcx.tscratch.len() as i64, pcx)
 }
 
 // The reference kind of type t: REF_SHARED, REF_MUT, or 0 (not a
@@ -336,7 +369,8 @@ pub fn mut_view_of(v: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if pcx.types[v as usize].kind == TyKind::Distinct && s > 0
         && pcx.types[s as usize].kind == Slice {
         let view = mut_slice_of(pcx.types[s as usize].a, pcx);
-        return make_type(TyKind::Distinct, view, pcx.types[v as usize].b, pcx.tscratch.count, pcx);
+        return make_type(TyKind::Distinct, view, pcx.types[v as usize].b, pcx.tscratch.len() as i64,
+            pcx);
     }
     0
 }
@@ -346,7 +380,8 @@ pub fn mut_view_of(v: i64, pcx: &mut Ctx<Comp>) -> i64 {
 pub fn decay_ref(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if t > 0 && pcx.types[t as usize].kind == TyKind::Distinct && is_mut_slice(t, pcx) {
         let view = slice_of(pcx.types[pcx.types[t as usize].a as usize].a, pcx);
-        return make_type(TyKind::Distinct, view, pcx.types[t as usize].b, pcx.tscratch.count, pcx);
+        return make_type(TyKind::Distinct, view, pcx.types[t as usize].b, pcx.tscratch.len() as i64,
+            pcx);
     }
     if t <= 0 || pcx.types[t as usize].b == 0 {
         return t;
@@ -384,13 +419,15 @@ pub fn raw_view_of(v: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return 0;
     }
     if pcx.types[v as usize].kind == Slice {
-        return make_type(Slice, pcx.types[v as usize].a, REF_RAW, pcx.tscratch.count, pcx);
+        return make_type(Slice, pcx.types[v as usize].a, REF_RAW, pcx.tscratch.len() as i64, pcx);
     }
     let s = pcx.types[v as usize].a;
     if pcx.types[v as usize].kind == TyKind::Distinct && s > 0
         && pcx.types[s as usize].kind == Slice {
-        let raw = make_type(Slice, pcx.types[s as usize].a, REF_RAW, pcx.tscratch.count, pcx);
-        return make_type(TyKind::Distinct, raw, pcx.types[v as usize].b, pcx.tscratch.count, pcx);
+        let raw = make_type(Slice, pcx.types[s as usize].a, REF_RAW, pcx.tscratch.len() as i64,
+            pcx);
+        return make_type(TyKind::Distinct, raw, pcx.types[v as usize].b, pcx.tscratch.len() as i64,
+            pcx);
     }
     0
 }
@@ -401,7 +438,8 @@ pub fn raw_view_target(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if pcx.types[t as usize].kind == TyKind::Distinct {
         let s = pcx.types[t as usize].a;
         let view = slice_of(pcx.types[s as usize].a, pcx);
-        return make_type(TyKind::Distinct, view, pcx.types[t as usize].b, pcx.tscratch.count, pcx);
+        return make_type(TyKind::Distinct, view, pcx.types[t as usize].b, pcx.tscratch.len() as i64,
+            pcx);
     }
     slice_of(pcx.types[t as usize].a, pcx)
 }
@@ -412,15 +450,16 @@ pub fn init_types(pcx: &mut Ctx<Comp>) {
         add_type(Prim, 0, 0, 0, 0, pcx);
     }
     pcx.ty_u8_ptr = ptr_to(TY_U8, pcx);
+    pcx.ty_cstr = const_ptr_to(TY_U8, pcx);
     // A string literal is a `[u8]` (0.6; a `(*u8, u64)` tuple before).
     pcx.ty_string = slice_of(TY_U8, pcx);
     pcx.ty_error = add_type(TyKind::None, 1, 0, 0, 0, pcx);
-    pcx.ty_v2f64 = make_type(Vector, TY_F64, 2, pcx.tscratch.count, pcx);
-    pcx.ty_v4f32 = make_type(Vector, TY_F32, 4, pcx.tscratch.count, pcx);
-    pcx.ty_v2i64 = make_type(Vector, TY_I64, 2, pcx.tscratch.count, pcx);
-    pcx.ty_v4i32 = make_type(Vector, TY_I32, 4, pcx.tscratch.count, pcx);
-    pcx.ty_v8i16 = make_type(Vector, TY_I16, 8, pcx.tscratch.count, pcx);
-    pcx.ty_v16i8 = make_type(Vector, TY_I8, 16, pcx.tscratch.count, pcx);
+    pcx.ty_v2f64 = make_type(Vector, TY_F64, 2, pcx.tscratch.len() as i64, pcx);
+    pcx.ty_v4f32 = make_type(Vector, TY_F32, 4, pcx.tscratch.len() as i64, pcx);
+    pcx.ty_v2i64 = make_type(Vector, TY_I64, 2, pcx.tscratch.len() as i64, pcx);
+    pcx.ty_v4i32 = make_type(Vector, TY_I32, 4, pcx.tscratch.len() as i64, pcx);
+    pcx.ty_v8i16 = make_type(Vector, TY_I16, 8, pcx.tscratch.len() as i64, pcx);
+    pcx.ty_v16i8 = make_type(Vector, TY_I8, 16, pcx.tscratch.len() as i64, pcx);
     crate::front::cells::find_cell_sym(pcx);
 }
 
@@ -470,7 +509,7 @@ pub fn vec_mask_type(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if is_float_vector(t, pcx) {
         // (0.19: the signed vector of its width, v8f32 -> v8i32)
         let lane = if vec_elem(t, pcx) == TY_F32 { TY_I32 } else { TY_I64 };
-        return make_type(Vector, lane, vec_lanes(t, pcx), pcx.tscratch.count, pcx);
+        return make_type(Vector, lane, vec_lanes(t, pcx), pcx.tscratch.len() as i64, pcx);
     }
     t
 }
@@ -478,7 +517,7 @@ pub fn vec_mask_type(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // (0.19) The 128-bit half of 256-bit vector type t: its lanes' type, half
 // as many (lowering legalizes a 256-bit vector into two of them).
 pub fn vector_half(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    make_type(Vector, vec_elem(t, pcx), vec_lanes(t, pcx) / 2, pcx.tscratch.count, pcx)
+    make_type(Vector, vec_elem(t, pcx), vec_lanes(t, pcx) / 2, pcx.tscratch.len() as i64, pcx)
 }
 
 // (0.27.0) vector_half's type, found (a task's: the types only read):
@@ -498,29 +537,30 @@ pub fn made_vector_half(t: i64, pcx: &Ctx<Comp>) -> i64 {
 // makes them distinct, named so that only std::arch::x86_64's aliases can
 // spell them: arch/virtual.vl).
 fn init_arch_vector_types(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let names: [*mut u8; 24] = [c"v8i8", c"v4i16", c"v2i32", c"v1i64", c"v8u8", c"v4u16",
-            c"v2u32", c"v1u64", c"v2f32", c"v1f64", c"v16u8", c"v8u16", c"v4u32", c"v2u64",
-            c"v32i8", c"v16i16", c"v8i32", c"v4i64", c"v32u8", c"v16u16", c"v8u32", c"v4u64",
-            c"v8f32", c"v4f64"];
-        let elems: [i64; 24] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64,
-            TY_F32, TY_F64, TY_U8, TY_U16, TY_U32, TY_U64, TY_I8, TY_I16, TY_I32, TY_I64, TY_U8,
-            TY_U16, TY_U32, TY_U64, TY_F32, TY_F64];
-        let lanes: [i64; 24] = [8i64, 4, 2, 1, 8, 4, 2, 1, 2, 1, 16, 8, 4, 2, 32, 16, 8, 4, 32, 16,
-            8, 4, 8, 4];
-        for i in 0..24 {
-            (*pcx.sym_primitive.add(intern_c(names[i as usize], pcx) as usize)) = make_type(Vector,
-                elems[i as usize], lanes[i as usize], pcx.tscratch.count, pcx);
-        }
-        for i in 0..6 {
-            let mark = pcx.tscratch.count;
-            pcx.tscratch.push(i + 1);
-            let t = make_type(Vector, TY_I64, if i < 3 { 2 } else { 4 }, mark, pcx);
-            let name = buf_new();
-            buf_str(name, c"__vole");
-            buf_str(name, opaque_vector_name(t, pcx));
-            (*pcx.sym_primitive.add(intern(buf_slice(name), pcx) as usize)) = t;
-        }
+    let names: [*const u8; 24] = [c"v8i8", c"v4i16", c"v2i32", c"v1i64", c"v8u8", c"v4u16",
+        c"v2u32", c"v1u64", c"v2f32", c"v1f64", c"v16u8", c"v8u16", c"v4u32", c"v2u64",
+        c"v32i8", c"v16i16", c"v8i32", c"v4i64", c"v32u8", c"v16u16", c"v8u32", c"v4u64",
+        c"v8f32", c"v4f64"];
+    let elems: [i64; 24] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64,
+        TY_F32, TY_F64, TY_U8, TY_U16, TY_U32, TY_U64, TY_I8, TY_I16, TY_I32, TY_I64, TY_U8,
+        TY_U16, TY_U32, TY_U64, TY_F32, TY_F64];
+    let lanes: [i64; 24] = [8i64, 4, 2, 1, 8, 4, 2, 1, 2, 1, 16, 8, 4, 2, 32, 16, 8, 4, 32, 16,
+        8, 4, 8, 4];
+    for i in 0..24 {
+        let name = intern_c(names[i as usize], pcx) as usize;
+        let t = make_type(Vector, elems[i as usize], lanes[i as usize],
+            pcx.tscratch.len() as i64, pcx);
+        pcx.sym_primitive[name] = t;
+    }
+    for i in 0..6 {
+        let mark = pcx.tscratch.len() as i64;
+        pcx.tscratch.push(i + 1);
+        let t = make_type(Vector, TY_I64, if i < 3 { 2 } else { 4 }, mark, pcx);
+        let name = buf_new();
+        buf_str(name, c"__vole");
+        buf_str(name, opaque_vector_name(t, pcx));
+        let sym = intern_buf(name, pcx) as usize;
+        pcx.sym_primitive[sym] = t;
     }
 }
 
@@ -531,7 +571,7 @@ pub fn is_opaque_vector(t: i64, pcx: &Ctx<Comp>) -> bool {
 }
 
 // The name of opaque vector type t (0.19).
-pub fn opaque_vector_name(t: i64, pcx: &Ctx<Comp>) -> *mut u8 {
+pub fn opaque_vector_name(t: i64, pcx: &Ctx<Comp>) -> *const u8 {
     let k = type_elem(t, 0, pcx);
     if k == 1 { c"__m128i" } else if k == 2 { c"__m128" } else if k == 3 { c"__m128d" }
     else if k == 4 { c"__m256i" } else if k == 5 { c"__m256" } else { c"__m256d" }
@@ -587,7 +627,7 @@ pub fn fn_ty_unsafe(t: i64, pcx: &Ctx<Comp>) -> bool {
 
 // RULE: F19.3 Fn type t with `unsafe` (`fn(A) -> R` to `unsafe fn(A) -> R`).
 pub fn fn_ty_with_unsafe(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let mark = pcx.tscratch.count;
+    let mark = pcx.tscratch.len() as i64;
     for i in 0..pcx.types[t as usize].count {
         pcx.tscratch.push(type_elem(t, i, pcx));
     }
@@ -601,7 +641,7 @@ pub fn fn_ty_safe(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if t <= 0 || pcx.types[t as usize].kind != Fn || !fn_ty_unsafe(t, pcx) {
         return t;
     }
-    let mark = pcx.tscratch.count;
+    let mark = pcx.tscratch.len() as i64;
     for i in 0..pcx.types[t as usize].count {
         pcx.tscratch.push(type_elem(t, i, pcx));
     }
@@ -611,19 +651,15 @@ pub fn fn_ty_safe(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // Held in memory; expressions of these types produce an address. An enum
 // with fields lives in memory; a fieldless one is its tag, a scalar.
 pub fn is_compound(t: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let kind = pcx.types[t as usize].kind;
-        kind == Array || kind == Tuple || kind == Struct || kind == Slice || kind == Vector
-            || (kind == Enum && (*get_enums().add(pcx.types[t as usize].a as usize)).has_fields)
-            || (kind == TyKind::Distinct && is_compound(pcx.types[t as usize].a, pcx))
-    }
+    let kind = pcx.types[t as usize].kind;
+    kind == Array || kind == Tuple || kind == Struct || kind == Slice || kind == Vector
+        || (kind == Enum && (pcx.enums[pcx.types[t as usize].a as usize]).has_fields)
+        || (kind == TyKind::Distinct && is_compound(pcx.types[t as usize].a, pcx))
 }
 
 pub fn is_fieldless_enum(t: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        pcx.types[t as usize].kind == Enum
-            && !(*get_enums().add(pcx.types[t as usize].a as usize)).has_fields
-    }
+    pcx.types[t as usize].kind == Enum
+        && !(pcx.enums[pcx.types[t as usize].a as usize]).has_fields
 }
 
 pub fn is_slice(t: i64, pcx: &Ctx<Comp>) -> bool {
@@ -633,13 +669,11 @@ pub fn is_slice(t: i64, pcx: &Ctx<Comp>) -> bool {
 // The machine type of a scalar: the tag type for a fieldless enum, else
 // the type itself.
 pub fn scalar_type(t: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if pcx.types[t as usize].kind == Enum
-            && !(*get_enums().add(pcx.types[t as usize].a as usize)).has_fields {
-            return (*get_enums().add(pcx.types[t as usize].a as usize)).tag;
-        }
-        t
+    if pcx.types[t as usize].kind == Enum
+        && !(pcx.enums[pcx.types[t as usize].a as usize]).has_fields {
+        return (pcx.enums[pcx.types[t as usize].a as usize]).tag;
     }
+    t
 }
 
 pub fn is_void(t: i64) -> bool {
@@ -667,111 +701,112 @@ pub fn int_max(t: i64) -> u64 {
 // ---- Type names, for messages ----
 
 pub fn buf_type(out: i64, t: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        if t == pcx.ty_error && t != 0 {
-            set_err_poisoned(true);
-            buf_str(out, c"{error}");
-            return;
-        }
-        let kind = pcx.types[t as usize].kind;
-        if kind == TyKind::None || kind == Prim {
-            buf_str(out, primitive_name(t));
-        } else if kind == Vector && pcx.types[t as usize].count > 0 {
-            buf_str(out, opaque_vector_name(t, pcx));
-        } else if kind == Vector {
-            buf_byte(out, b'v');
-            buf_int(out, pcx.types[t as usize].b);
-            buf_str(out, primitive_name(pcx.types[t as usize].a));
-        } else if kind == Ptr {
-            // (0.17: references)
-            // (0.20: the conventions' words, `inout T` and `let T`; 0.28.0,
-            // the rust edition: rustc's, `&mut T` and `&T`)
-            if pcx.types[t as usize].b == REF_MUT {
-                buf_str(out, c"&mut ");
-            } else if pcx.types[t as usize].b == REF_SHARED {
-                buf_str(out, c"&");
-            } else {
-                buf_byte(out, b'*');
-            }
-            buf_type(out, pcx.types[t as usize].a, pcx);
-        } else if kind == Array {
-            buf_byte(out, b'[');
-            buf_type(out, pcx.types[t as usize].a, pcx);
-            buf_str(out, c"; ");
-            buf_int(out, pcx.types[t as usize].b);
-            buf_byte(out, b']');
-        } else if kind == Struct {
-            buf_str(out, sym_name(pcx.structs[pcx.types[t as usize].a as usize].name, pcx));
-        } else if kind == Enum {
-            buf_str(out, sym_name((*get_enums().add(pcx.types[t as usize].a as usize)).name, pcx));
-        } else if kind == TyKind::Distinct {
-            if is_raw_view(t, pcx) {
-                buf_byte(out, b'*');
-            } else if is_mut_slice(t, pcx) {
-                // (0.27.2: `&mut str`)
-                buf_str(out, c"&mut ");
-            } else if crate::front::distinct::is_view_distinct(t, pcx) {
-                // (0.28.0: the rust edition's str is `&str`)
-                buf_byte(out, b'&');
-            }
-            crate::front::distinct::buf_distinct(out, t, pcx);
-        } else if kind == TyKind::Unsized {
-            // (Z9.1c: `[T]` or `str`, its view's spelling; 0.28.0, the rust
-            // edition: without the view's `&`)
-            let v = pcx.types[t as usize].a;
-            if v > 0
-                && pcx.types[v as usize].kind == TyKind::Distinct {
-                crate::front::distinct::buf_distinct(out, v, pcx);
-            } else if v > 0
-                && pcx.types[v as usize].kind == Slice {
-                buf_byte(out, b'[');
-                buf_type(out, pcx.types[v as usize].a, pcx);
-                buf_byte(out, b']');
-            } else {
-                buf_type(out, v, pcx);
-            }
-        } else if kind == Slice {
-            if pcx.types[t as usize].b == REF_MUT {
-                buf_str(out, c"&mut ");
-            } else if pcx.types[t as usize].b == REF_RAW {
-                buf_byte(out, b'*');
-            } else {
-                // (0.28.0: the rust edition's `[T]` view is `&[T]`)
-                buf_byte(out, b'&');
-            }
-            buf_byte(out, b'[');
-            buf_type(out, pcx.types[t as usize].a, pcx);
-            buf_byte(out, b']');
-        } else if kind == Tuple {
-            buf_byte(out, b'(');
-            for i in 0..pcx.types[t as usize].count {
-                if i > 0 {
-                    buf_str(out, c", ");
-                }
-                buf_type(out, type_elem(t, i, pcx), pcx);
-            }
-            buf_byte(out, b')');
+    if t == pcx.ty_error && t != 0 {
+        set_err_poisoned(true);
+        buf_str(out, c"{error}");
+        return;
+    }
+    let kind = pcx.types[t as usize].kind;
+    if kind == TyKind::None || kind == Prim {
+        buf_str(out, primitive_name(t));
+    } else if kind == Vector && pcx.types[t as usize].count > 0 {
+        buf_str(out, opaque_vector_name(t, pcx));
+    } else if kind == Vector {
+        buf_byte(out, b'v');
+        buf_int(out, pcx.types[t as usize].b);
+        buf_str(out, primitive_name(pcx.types[t as usize].a));
+    } else if kind == Ptr {
+        // (0.17: references)
+        // (0.20: the conventions' words, `inout T` and `let T`; 0.28.0,
+        // the rust edition: rustc's, `&mut T` and `&T`)
+        if pcx.types[t as usize].b == REF_MUT {
+            buf_str(out, c"&mut ");
+        } else if pcx.types[t as usize].b == REF_SHARED {
+            buf_str(out, c"&");
+        } else if pcx.types[t as usize].count == 1 {
+            // (0.29: the two raw pointers, as rustc writes them)
+            buf_str(out, c"*const ");
         } else {
-            if fn_ty_unsafe(t, pcx) {
-                buf_str(out, c"unsafe ");
-            }
-            if fn_ty_c(t, pcx) {
-                buf_str(out, c"extern \"C\" ");
-            }
-            buf_str(out, c"fn(");
-            for i in 0..pcx.types[t as usize].count {
-                if i > 0 {
-                    buf_str(out, c", ");
-                }
-                buf_type(out, type_elem(t, i, pcx), pcx);
-            }
-            buf_str(out, c") -> ");
-            buf_type(out, pcx.types[t as usize].a, pcx);
+            buf_str(out, c"*mut ");
         }
+        buf_type(out, pcx.types[t as usize].a, pcx);
+    } else if kind == Array {
+        buf_byte(out, b'[');
+        buf_type(out, pcx.types[t as usize].a, pcx);
+        buf_str(out, c"; ");
+        buf_int(out, pcx.types[t as usize].b);
+        buf_byte(out, b']');
+    } else if kind == Struct {
+        buf_str(out, sym_name(pcx.structs[pcx.types[t as usize].a as usize].name, pcx));
+    } else if kind == Enum {
+        buf_str(out, sym_name((pcx.enums[pcx.types[t as usize].a as usize]).name, pcx));
+    } else if kind == TyKind::Distinct {
+        if is_raw_view(t, pcx) {
+            buf_byte(out, b'*');
+        } else if is_mut_slice(t, pcx) {
+            // (0.27.2: `&mut str`)
+            buf_str(out, c"&mut ");
+        } else if crate::front::distinct::is_view_distinct(t, pcx) {
+            // (0.28.0: the rust edition's str is `&str`)
+            buf_byte(out, b'&');
+        }
+        crate::front::distinct::buf_distinct(out, t, pcx);
+    } else if kind == TyKind::Unsized {
+        // (Z9.1c: `[T]` or `str`, its view's spelling; 0.28.0, the rust
+        // edition: without the view's `&`)
+        let v = pcx.types[t as usize].a;
+        if v > 0
+            && pcx.types[v as usize].kind == TyKind::Distinct {
+            crate::front::distinct::buf_distinct(out, v, pcx);
+        } else if v > 0
+            && pcx.types[v as usize].kind == Slice {
+            buf_byte(out, b'[');
+            buf_type(out, pcx.types[v as usize].a, pcx);
+            buf_byte(out, b']');
+        } else {
+            buf_type(out, v, pcx);
+        }
+    } else if kind == Slice {
+        if pcx.types[t as usize].b == REF_MUT {
+            buf_str(out, c"&mut ");
+        } else if pcx.types[t as usize].b == REF_RAW {
+            buf_byte(out, b'*');
+        } else {
+            // (0.28.0: the rust edition's `[T]` view is `&[T]`)
+            buf_byte(out, b'&');
+        }
+        buf_byte(out, b'[');
+        buf_type(out, pcx.types[t as usize].a, pcx);
+        buf_byte(out, b']');
+    } else if kind == Tuple {
+        buf_byte(out, b'(');
+        for i in 0..pcx.types[t as usize].count {
+            if i > 0 {
+                buf_str(out, c", ");
+            }
+            buf_type(out, type_elem(t, i, pcx), pcx);
+        }
+        buf_byte(out, b')');
+    } else {
+        if fn_ty_unsafe(t, pcx) {
+            buf_str(out, c"unsafe ");
+        }
+        if fn_ty_c(t, pcx) {
+            buf_str(out, c"extern \"C\" ");
+        }
+        buf_str(out, c"fn(");
+        for i in 0..pcx.types[t as usize].count {
+            if i > 0 {
+                buf_str(out, c", ");
+            }
+            buf_type(out, type_elem(t, i, pcx), pcx);
+        }
+        buf_str(out, c") -> ");
+        buf_type(out, pcx.types[t as usize].a, pcx);
     }
 }
 
-pub fn primitive_name(t: i64) -> *mut u8 {
+pub fn primitive_name(t: i64) -> *const u8 {
     if t == TY_I8 { return c"i8"; }
     if t == TY_I16 { return c"i16"; }
     if t == TY_I32 { return c"i32"; }
@@ -863,8 +898,6 @@ pub fn fn_attr_cold(f: i64, pcx: &Ctx<Comp>) -> bool {
     pub node: i64, pub ty: i64, pub mutable: bool, pub linkage: i64,
 }
 
-static mut FIELDS: *mut FieldInfo = 0 as *mut FieldInfo;
-
 // Enums: `tag` is the type of the discriminant; with `has_fields`, the
 // enum lives in memory, each variant laid out as its `shape`, the tuple
 // (tag, fields...).
@@ -886,164 +919,145 @@ static mut FIELDS: *mut FieldInfo = 0 as *mut FieldInfo;
 // Methods and associated functions: (type, name, function), from impls.
 #[derive(Clone, Copy)] pub struct MethodInfo { pub ty: i64, pub name: i64, pub f: i64 }
 
-static mut ENUMS: *mut EnumInfo = 0 as *mut EnumInfo;
-
 // The node of the item whose key (its qualified name) is `key`, 0 for
 // none. (0.25.3) Also 0 for a symbol beyond the table, and when there is
 // no table: a program from the tools' cache has no nodes (an index into
 // a table not made was a read through a null pointer).
 pub fn item_node_of(key: i64, pcx: &Ctx<Comp>) -> i64 {
-    if pcx.sym_item == 0 as *mut i64 || key < 0 || key >= pcx.syms.len() as i64 {
+    if pcx.sym_item.len() == 0 || key < 0 || key >= pcx.syms.len() as i64 {
         return 0;
     }
-    // UNSAFE: SYM_ITEM is a table by symbol (sym_table), a raw pointer the
-    // front end indexes at every name it resolves.
-    // SAFETY: the table is made and key is in 0..SYM_COUNT, checked above;
-    // sym_table and the symbols' growth keep every such table at least
-    // SYM_COUNT + 1 long.
-    unsafe { (*pcx.sym_item.add(key as usize)) }
+    (pcx.sym_item[key as usize])
 }
 
 pub fn init_declarations(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        // Names the checker makes (0.4): interned before the tables indexed
-        // by symbol are allocated.
-        // (0.14: and the names of the `for` and range desugaring, iterate.vl)
-        let made: [*mut u8; 18] = [c"__for_seq", c"__for_index", c"__invalid_value", c"size_of",
-            c"align_of", c"next", c"iter", c"as_slice", c"start", c"end", c"done", c"std",
-            c"Option", c"Some", c"Vec", c"SliceIter", c"Range", c"RangeInclusive"];
-        for i in 0..18 {
-            intern_c(made[i as usize], pcx);
-        }
-        let i8_sym = intern_c(c"i8", pcx);
-        // (0.27.2: the rust edition's `char`, below)
-        let char_sym: i64 = intern_c(c"char", pcx);
-        let names: [*mut u8; 13] = [c"i8", c"i16", c"i32", c"i64", c"u8", c"u16", c"u32", c"u64",
-            c"f32", c"f64", c"bool", c"isize", c"usize"];
-        let types: [i64; 13] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64,
-            TY_F32, TY_F64, TY_BOOL, TY_ISIZE, TY_USIZE];
-        let mut syms: [i64; 13] = [0i64; 13];
-        for i in 0..13 {
-            syms[i as usize] = intern_c(names[i as usize], pcx);
-        }
-        let vnames: [*mut u8; 6] = [c"v2f64", c"v4f32", c"v2i64", c"v4i32", c"v8i16", c"v16i8"];
-        let vtypes: [i64; 6] = [pcx.ty_v2f64, pcx.ty_v4f32, pcx.ty_v2i64, pcx.ty_v4i32,
-            pcx.ty_v8i16, pcx.ty_v16i8];
-        let mut vsyms: [i64; 6] = [0i64; 6];
-        for i in 0..6 {
-            vsyms[i as usize] = intern_c(vnames[i as usize], pcx);
-        }
-        sym_table(&mut pcx.sym_struct, pcx);
-        sym_table(&mut pcx.sym_enum, pcx);
-        sym_table(&mut pcx.sym_alias, pcx);
-        sym_table(&mut pcx.sym_fn, pcx);
-        sym_table(&mut pcx.sym_const, pcx);
-        sym_table(&mut pcx.sym_static, pcx);
-        sym_table(&mut pcx.sym_primitive, pcx);
-        sym_table(&mut pcx.alias_type, pcx);
-        sym_table(&mut pcx.alias_busy, pcx);
-        sym_table(&mut pcx.sym_item, pcx);
-        for i in 0..13 {
-            (*pcx.sym_primitive.add(syms[i as usize] as usize)) = types[i as usize];
-        }
-        // RULE: F1.1 (the rust edition's `char`: a type of its own with
-        // u32's representation, a distinct type the code generators see as
-        // u32; its alias node only names it)
-        pcx.char_type = 0;
-        if char_sym != 0 {
-            let alias = crate::front::ast::new_node(crate::front::ast::NodeKind::TyName, 0, 0,
-                pcx);
-            pcx.nodes[alias as usize].a = char_sym;
-            pcx.char_type = crate::front::distinct::distinct_type(alias, TY_U32,
-                pcx.tscratch.count, pcx);
-            (*pcx.sym_primitive.add(char_sym as usize)) = pcx.char_type;
-        }
-        // RULE: Z9.1 (0.27.2: with std2, `str` is the compiler's: a view of
-        // UTF-8 bytes, as MVS std's `type str = distinct [u8]` is, until
-        // the unsized representation)
-        if crate::front::known::on_std2(pcx) {
-            let alias = crate::front::ast::new_node(crate::front::ast::NodeKind::TyName, 0, 0,
-                pcx);
-            let str_sym = intern_c(c"str", pcx);
-            pcx.nodes[alias as usize].a = str_sym;
-            let bytes = slice_of(TY_U8, pcx);
-            pcx.str_type = crate::front::distinct::distinct_type(alias, bytes, pcx.tscratch.count,
-                pcx);
-            pcx.any_view_distinct = true;
-            (*pcx.sym_primitive.add(str_sym as usize)) = pcx.str_type;
-        }
-        // The vector types (0.10).
-        for i in 0..6 {
-            (*pcx.sym_primitive.add(vsyms[i as usize] as usize)) = vtypes[i as usize];
-        }
-        init_arch_vector_types(pcx);
-        if i8_sym != syms[0] {
-            die(c"internal error: symbol table");
-        }
+    // Names the checker makes (0.4): interned before the tables indexed
+    // by symbol are allocated.
+    // (0.14: and the names of the `for` and range desugaring, iterate.vl)
+    let made: [*const u8; 18] = [c"__for_seq", c"__for_index", c"__invalid_value", c"size_of",
+        c"align_of", c"next", c"iter", c"as_slice", c"start", c"end", c"done", c"std",
+        c"Option", c"Some", c"Vec", c"SliceIter", c"Range", c"RangeInclusive"];
+    for i in 0..18 {
+        intern_c(made[i as usize], pcx);
+    }
+    let i8_sym = intern_c(c"i8", pcx);
+    // (0.27.2: the rust edition's `char`, below)
+    let char_sym: i64 = intern_c(c"char", pcx);
+    let names: [*const u8; 13] = [c"i8", c"i16", c"i32", c"i64", c"u8", c"u16", c"u32", c"u64",
+        c"f32", c"f64", c"bool", c"isize", c"usize"];
+    let types: [i64; 13] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64,
+        TY_F32, TY_F64, TY_BOOL, TY_ISIZE, TY_USIZE];
+    let mut syms: [i64; 13] = [0i64; 13];
+    for i in 0..13 {
+        syms[i as usize] = intern_c(names[i as usize], pcx);
+    }
+    let vnames: [*const u8; 6] = [c"v2f64", c"v4f32", c"v2i64", c"v4i32", c"v8i16", c"v16i8"];
+    let vtypes: [i64; 6] = [pcx.ty_v2f64, pcx.ty_v4f32, pcx.ty_v2i64, pcx.ty_v4i32,
+        pcx.ty_v8i16, pcx.ty_v16i8];
+    let mut vsyms: [i64; 6] = [0i64; 6];
+    for i in 0..6 {
+        vsyms[i as usize] = intern_c(vnames[i as usize], pcx);
+    }
+    { let n = sym_table_len(pcx); sym_table(&mut pcx.sym_struct, n); }
+    { let n = sym_table_len(pcx); sym_table(&mut pcx.sym_enum, n); }
+    { let n = sym_table_len(pcx); sym_table(&mut pcx.sym_alias, n); }
+    { let n = sym_table_len(pcx); sym_table(&mut pcx.sym_fn, n); }
+    { let n = sym_table_len(pcx); sym_table(&mut pcx.sym_const, n); }
+    { let n = sym_table_len(pcx); sym_table(&mut pcx.sym_static, n); }
+    { let n = sym_table_len(pcx); sym_table(&mut pcx.sym_primitive, n); }
+    { let n = sym_table_len(pcx); sym_table(&mut pcx.alias_type, n); }
+    { let n = sym_table_len(pcx); sym_table(&mut pcx.alias_busy, n); }
+    { let n = sym_table_len(pcx); sym_table(&mut pcx.sym_item, n); }
+    for i in 0..13 {
+        (pcx.sym_primitive[syms[i as usize] as usize]) = types[i as usize];
+    }
+    // RULE: F1.1 (the rust edition's `char`: a type of its own with
+    // u32's representation, a distinct type the code generators see as
+    // u32; its alias node only names it)
+    pcx.char_type = 0;
+    if char_sym != 0 {
+        let alias = crate::front::ast::new_node(crate::front::ast::NodeKind::TyName, 0, 0,
+            pcx);
+        pcx.nodes[alias as usize].a = char_sym;
+        pcx.char_type = crate::front::distinct::distinct_type(alias, TY_U32,
+            pcx.tscratch.len() as i64, pcx);
+        (pcx.sym_primitive[char_sym as usize]) = pcx.char_type;
+    }
+    // RULE: Z9.1 (0.27.2: `str` is the compiler's: a view of
+    // UTF-8 bytes, until the unsized representation)
+    let alias = crate::front::ast::new_node(crate::front::ast::NodeKind::TyName, 0, 0, pcx);
+    let str_sym = intern_c(c"str", pcx);
+    pcx.nodes[alias as usize].a = str_sym;
+    let bytes = slice_of(TY_U8, pcx);
+    pcx.str_type = crate::front::distinct::distinct_type(alias, bytes,
+        pcx.tscratch.len() as i64, pcx);
+    pcx.any_view_distinct = true;
+    (pcx.sym_primitive[str_sym as usize]) = pcx.str_type;
+    // The vector types (0.10).
+    for i in 0..6 {
+        (pcx.sym_primitive[vsyms[i as usize] as usize]) = vtypes[i as usize];
+    }
+    init_arch_vector_types(pcx);
+    if i8_sym != syms[0] {
+        die(c"internal error: symbol table");
     }
 }
 
-pub fn struct_field(s: i64, i: i64, pcx: &Ctx<Comp>) -> *mut FieldInfo {
-    unsafe { get_fields().add((pcx.structs[s as usize].fields + i) as usize) }
+pub fn struct_field(s: i64, i: i64, pcx: &Ctx<Comp>) -> FieldInfo {
+    pcx.fields[(pcx.structs[s as usize].fields + i) as usize]
 }
 
 // The index of field `name` of struct `s`, or -1.
 pub fn find_field(s: i64, name: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        for i in 0..pcx.structs[s as usize].field_count {
-            if (*struct_field(s, i, pcx)).name == name {
-                return i;
-            }
+    for i in 0..pcx.structs[s as usize].field_count {
+        if (struct_field(s, i, pcx)).name == name {
+            return i;
         }
     }
     -1
 }
 
 pub fn fn_param(f: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (*pcx.tlists.data.add((pcx.fns[f as usize].params + i) as usize)) }
+    (pcx.tlists[(pcx.fns[f as usize].params + i) as usize])
 }
 
-pub fn enum_variant(e: i64, i: i64) -> i64 {
-    unsafe { (*get_enums().add(e as usize)).variants + i }
+pub fn enum_variant(e: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
+    (pcx.enums[e as usize]).variants + i
 }
 
 // The variant of enum `e` named `name`, or -1.
 pub fn find_variant(e: i64, name: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        for i in 0..(*get_enums().add(e as usize)).variant_count {
-            if pcx.variants[enum_variant(e, i) as usize].name == name {
-                return enum_variant(e, i);
-            }
+    for i in 0..(pcx.enums[e as usize]).variant_count {
+        if pcx.variants[enum_variant(e, i, pcx) as usize].name == name {
+            return enum_variant(e, i, pcx);
         }
     }
     -1
 }
 
 pub fn variant_field(v: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (*pcx.tlists.data.add((pcx.variants[v as usize].fields + i) as usize)) }
+    (pcx.tlists[(pcx.variants[v as usize].fields + i) as usize])
 }
 
 // The offset of field `i` of variant `v` (of an enum with fields): in the
 // tuple (tag, fields...), or for #[repr(C)] in the struct of its fields
 // after the tag (RFC 2195's layout: a C int, then a union of structs).
 pub fn variant_field_offset(v: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let e = pcx.variants[v as usize].enum_id;
-        // (0.18: the null niche holds only the pointer)
-        if crate::front::distinct::enum_niche(e, pcx) {
-            return 0;
-        }
-        if ((*get_enums().add(e as usize)).repr & REPR_C) != 0 {
-            // (0.27.0: the payload kept with the enum's layout, or laid out
-            // here as type_size does)
-            let t = find_type(Enum, e, 0, pcx);
-            let payload = if t >= 0
-                && pcx.types[t as usize].size >= 0 { (*get_enums().add(e as usize)).payload }
-                else { enum_layout(e, pcx).payload };
-            return payload + tuple_offset(pcx.variants[v as usize].shape, i, pcx);
-        }
-        tuple_offset(pcx.variants[v as usize].shape, i + 1, pcx)
+    let e = pcx.variants[v as usize].enum_id;
+    // (0.18: the null niche holds only the pointer)
+    if crate::front::distinct::enum_niche(e, pcx) {
+        return 0;
     }
+    if ((pcx.enums[e as usize]).repr & REPR_C) != 0 {
+        // (0.27.0: the payload kept with the enum's layout, or laid out
+        // here as type_size does)
+        let t = find_type(Enum, e, 0, pcx);
+        let payload = if t >= 0
+            && pcx.types[t as usize].size >= 0 { (pcx.enums[e as usize]).payload }
+            else { enum_layout(e, pcx).payload };
+        return payload + tuple_offset(pcx.variants[v as usize].shape, i, pcx);
+    }
+    tuple_offset(pcx.variants[v as usize].shape, i + 1, pcx)
 }
 
 // The method or associated function `name` of type `t`, or -1.
@@ -1070,7 +1084,7 @@ pub fn find_method(t: i64, name: i64, pcx: &Ctx<Comp>) -> i64 {
 // ---- Layout ----
 
 pub fn align_to(offset: i64, align: i64) -> i64 {
-    (offset + align - 1) & ~(align - 1)
+    (offset + align - 1) & !(align - 1)
 }
 
 // (0.27.0) A type's layout is read here and made by compute_layout, on
@@ -1082,64 +1096,66 @@ pub fn type_size(t: i64, pcx: &Ctx<Comp>) -> i64 {
     if pcx.types[t as usize].size >= 0 {
         return pcx.types[t as usize].size;
     }
-    layout_of(t, 0 as *mut i64, pcx).size
+    let mut none: Vec<i64, Comp> = Vec::new_in(Comp {});
+    layout_of(t, none.as_mut_slice(), pcx).size
 }
 
 pub fn type_align(t: i64, pcx: &Ctx<Comp>) -> i64 {
     if pcx.types[t as usize].size >= 0 {
         return pcx.types[t as usize].align;
     }
-    layout_of(t, 0 as *mut i64, pcx).align
+    let mut none: Vec<i64, Comp> = Vec::new_in(Comp {});
+    layout_of(t, none.as_mut_slice(), pcx).align
 }
 
 // Makes type t's layout and keeps it, the layouts of the types it holds
 // first, with a struct's fields' offsets and a #[repr(C)] enum's payload.
 pub fn compute_layout(t: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if pcx.types[t as usize].size >= 0 {
-            return;
-        }
-        let kind = pcx.types[t as usize].kind;
-        if kind == Vector || kind == TyKind::Distinct || kind == Array {
-            compute_layout(pcx.types[t as usize].a, pcx);
-        } else if kind == Tuple {
-            for i in 0..pcx.types[t as usize].count {
-                compute_layout(type_elem(t, i, pcx), pcx);
-            }
-        } else if kind == Struct {
-            let s = pcx.types[t as usize].a;
-            for i in 0..pcx.structs[s as usize].field_count {
-                compute_layout((*struct_field(s, i, pcx)).ty, pcx);
-            }
-        }
-        else if kind == Enum && !crate::front::distinct::enum_niche(pcx.types[t as usize].a, pcx) {
-            let e = pcx.types[t as usize].a;
-            compute_layout((*get_enums().add(e as usize)).tag, pcx);
-            for i in 0..(*get_enums().add(e as usize)).variant_count {
-                let shape = pcx.variants[enum_variant(e, i) as usize].shape;
-                if shape != 0 {
-                    compute_layout(shape, pcx);
-                }
-            }
-        }
-        let mut offsets = 0 as *mut i64;
-        if kind == Struct {
-            offsets = alloc_array::<i64>(
-                pcx.structs[pcx.types[t as usize].a as usize].field_count + 1);
-        }
-        let l = layout_of(t, offsets, pcx);
-        if kind == Struct {
-            let s = pcx.types[t as usize].a;
-            for i in 0..pcx.structs[s as usize].field_count {
-                (*struct_field(s, i, pcx)).offset = (*offsets.add(i as usize));
-            }
-            free(offsets as *mut u8);
-        } else if kind == Enum && l.payload >= 0 {
-            (*get_enums().add(pcx.types[t as usize].a as usize)).payload = l.payload;
-        }
-        pcx.types[t as usize].size = l.size;
-        pcx.types[t as usize].align = l.align;
+    if pcx.types[t as usize].size >= 0 {
+        return;
     }
+    let kind = pcx.types[t as usize].kind;
+    if kind == Vector || kind == TyKind::Distinct || kind == Array {
+        compute_layout(pcx.types[t as usize].a, pcx);
+    } else if kind == Tuple {
+        for i in 0..pcx.types[t as usize].count {
+            compute_layout(type_elem(t, i, pcx), pcx);
+        }
+    } else if kind == Struct {
+        let s = pcx.types[t as usize].a;
+        for i in 0..pcx.structs[s as usize].field_count {
+            compute_layout((struct_field(s, i, pcx)).ty, pcx);
+        }
+    }
+    else if kind == Enum && !crate::front::distinct::enum_niche(pcx.types[t as usize].a, pcx) {
+        let e = pcx.types[t as usize].a;
+        compute_layout((pcx.enums[e as usize]).tag, pcx);
+        for i in 0..(pcx.enums[e as usize]).variant_count {
+            let shape = pcx.variants[enum_variant(e, i, pcx) as usize].shape;
+            if shape != 0 {
+                compute_layout(shape, pcx);
+            }
+        }
+    }
+    // (a struct's offsets are asked for; another type gives the empty
+    // list, which layout_of leaves alone)
+    let mut offsets: Vec<i64, Comp> = Vec::new_in(Comp {});
+    if kind == Struct {
+        let n = pcx.structs[pcx.types[t as usize].a as usize].field_count + 1;
+        offsets.resize(n as usize, 0);
+    }
+    let l = layout_of(t, offsets.as_mut_slice(), pcx);
+    if kind == Struct {
+        let s = pcx.types[t as usize].a;
+        for i in 0..pcx.structs[s as usize].field_count {
+            let at = (pcx.structs[s as usize].fields + i) as usize;
+            pcx.fields[at].offset = (offsets[i as usize]);
+        }
+    } else if kind == Enum && l.payload >= 0 {
+        (pcx.enums[pcx.types[t as usize].a as usize]).payload = l.payload;
+    }
+    pcx.types[t as usize].size = l.size;
+    pcx.types[t as usize].align = l.align;
 }
 
 // (0.27.0) A layout: the size, the alignment and, for a #[repr(C)] enum
@@ -1148,8 +1164,8 @@ pub fn compute_layout(t: i64, pcx: &mut Ctx<Comp>) {
 
 // The layout of type t from its parts' (type_size and type_align), kept
 // nowhere; a struct's fields' offsets go to offsets[i] when offsets is not
-// null.
-fn layout_of(t: i64, offsets: *mut i64, pcx: &Ctx<Comp>) -> Layout {
+// empty.
+fn layout_of(t: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
     let kind = pcx.types[t as usize].kind;
     let mut size: i64 = 0;
     let mut align: i64 = 1;
@@ -1207,99 +1223,88 @@ fn layout_of(t: i64, offsets: *mut i64, pcx: &Ctx<Comp>) -> Layout {
 
 // The layout of enum e without a niche: its tag, then the largest variant.
 fn enum_layout(e: i64, pcx: &Ctx<Comp>) -> Layout {
-    // UNSAFE: ENUMS is the checker's raw table of enums (*EnumInfo).
-    // SAFETY: e is an enum id below ENUM_COUNT (an enum type's TYPES[t].a or
-    // a variant's enum_id); its variants' ids are below VARIANT_COUNT.
-    unsafe {
-        let mut size = type_size((*get_enums().add(e as usize)).tag, pcx);
-        let mut align = size;
-        let mut payload: i64 = -1;
-        let mut largest: i64 = 0;
-        let mut widest: i64 = 1;
-        for i in 0..(*get_enums().add(e as usize)).variant_count {
-            let shape = pcx.variants[enum_variant(e, i) as usize].shape;
-            if shape != 0 {
-                largest = max_i64(largest, type_size(shape, pcx));
-                widest = max_i64(widest, type_align(shape, pcx));
-            }
+    let mut size = type_size((pcx.enums[e as usize]).tag, pcx);
+    let mut align = size;
+    let mut payload: i64 = -1;
+    let mut largest: i64 = 0;
+    let mut widest: i64 = 1;
+    for i in 0..(pcx.enums[e as usize]).variant_count {
+        let shape = pcx.variants[enum_variant(e, i, pcx) as usize].shape;
+        if shape != 0 {
+            largest = max_i64(largest, type_size(shape, pcx));
+            widest = max_i64(widest, type_align(shape, pcx));
         }
-        if ((*get_enums().add(e as usize)).repr & REPR_C) != 0
-            && (*get_enums().add(e as usize)).has_fields {
-            payload = align_to(size, widest);
-            size = payload + largest;
-        } else {
-            size = max_i64(size, largest);
-        }
-        align = max_i64(align, widest);
-        size = align_to(size, align);
-        Layout { size, align, payload }
     }
+    if ((pcx.enums[e as usize]).repr & REPR_C) != 0
+        && (pcx.enums[e as usize]).has_fields {
+        payload = align_to(size, widest);
+        size = payload + largest;
+    } else {
+        size = max_i64(size, largest);
+    }
+    align = max_i64(align, widest);
+    size = align_to(size, align);
+    Layout { size, align, payload }
 }
 
 // The layout of struct s, its fields' offsets in offsets[i] when offsets
-// is not null.
-fn struct_layout(s: i64, offsets: *mut i64, pcx: &Ctx<Comp>) -> Layout {
-    // UNSAFE: the fields are the checker's raw table (struct_field), and
-    // order and offsets raw arrays.
-    // SAFETY: s is a struct id below STRUCT_COUNT, i and order[k] below its
-    // field_count; order has n + 1 elements, offsets (the caller's) at
-    // least n.
-    unsafe {
-        let mut align: i64 = 1;
-        let repr = pcx.structs[s as usize].repr;
-        let n = pcx.structs[s as usize].field_count;
-        // The order of the fields in memory: as declared for C (and
-        // 0.26.2, WGSL), by alignment (largest first, which leaves the
-        // least padding) otherwise.
-        let wgsl = (repr & REPR_WGSL) != 0;
-        let order = alloc_array::<i64>(n + 1);
-        for i in 0..n {
-            (*order.add(i as usize)) = i;
-        }
-        if (repr & REPR_C) == 0 && !wgsl {
-            for i in 1..n {
-                let mut j = i;
-                while j > 0
-                    && type_align((*struct_field(s, (*order.add((j - 1) as usize)), pcx)).ty, pcx)
-                    < type_align((*struct_field(s, (*order.add(j as usize)), pcx)).ty, pcx) {
-                    let swap = (*order.add(j as usize));
-                    (*order.add(j as usize)) = (*order.add((j - 1) as usize));
-                    (*order.add((j - 1) as usize)) = swap;
-                    j -= 1;
-                }
-            }
-        }
-        let mut offset: i64 = 0;
-        for k in 0..n {
-            let field_ty = (*struct_field(s, (*order.add(k as usize)), pcx)).ty;
-            // Packed: aligned to at most the packing (`align` holds it).
-            let natural = if wgsl { wgsl_align(field_ty, pcx) } else { type_align(field_ty, pcx) };
-            let field_align = if (repr & REPR_PACKED) != 0
-                && natural > pcx.structs[s as usize].align {
-                pcx.structs[s as usize].align
-            } else {
-                natural
-            };
-            align = max_i64(align, field_align);
-            if (repr & REPR_UNION) != 0 {
-                if offsets != 0 as *mut i64 {
-                    (*offsets.add((*order.add(k as usize)) as usize)) = 0;
-                }
-                offset = max_i64(offset, type_size(field_ty, pcx));
-            } else {
-                offset = align_to(offset, field_align);
-                if offsets != 0 as *mut i64 {
-                    (*offsets.add((*order.add(k as usize)) as usize)) = offset;
-                }
-                offset += type_size(field_ty, pcx);
-            }
-        }
-        free(order as *mut u8);
-        if (repr & REPR_PACKED) == 0 {
-            align = max_i64(align, pcx.structs[s as usize].align);
-        }
-        Layout { size: align_to(offset, align), align, payload: -1 }
+// is not empty.
+fn struct_layout(s: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
+    let mut align: i64 = 1;
+    let repr = pcx.structs[s as usize].repr;
+    let n = pcx.structs[s as usize].field_count;
+    // The order of the fields in memory: as declared for C (and
+    // 0.26.2, WGSL), by alignment (largest first, which leaves the
+    // least padding) otherwise.
+    let wgsl = (repr & REPR_WGSL) != 0;
+    let mut order_room: Vec<i64, Comp> = Vec::new_in(Comp {});
+    order_room.resize((n + 1) as usize, 0);
+    let order = order_room.as_mut_slice();
+    for i in 0..n {
+        (order[i as usize]) = i;
     }
+    if (repr & REPR_C) == 0 && !wgsl {
+        for i in 1..n {
+            let mut j = i;
+            while j > 0
+                && type_align((struct_field(s, (order[(j - 1) as usize]), pcx)).ty, pcx)
+                < type_align((struct_field(s, (order[j as usize]), pcx)).ty, pcx) {
+                let swap = (order[j as usize]);
+                (order[j as usize]) = (order[(j - 1) as usize]);
+                (order[(j - 1) as usize]) = swap;
+                j -= 1;
+            }
+        }
+    }
+    let mut offset: i64 = 0;
+    for k in 0..n {
+        let field_ty = (struct_field(s, (order[k as usize]), pcx)).ty;
+        // Packed: aligned to at most the packing (`align` holds it).
+        let natural = if wgsl { wgsl_align(field_ty, pcx) } else { type_align(field_ty, pcx) };
+        let field_align = if (repr & REPR_PACKED) != 0
+            && natural > pcx.structs[s as usize].align {
+            pcx.structs[s as usize].align
+        } else {
+            natural
+        };
+        align = max_i64(align, field_align);
+        if (repr & REPR_UNION) != 0 {
+            if offsets.len() > 0 {
+                (offsets[(order[k as usize]) as usize]) = 0;
+            }
+            offset = max_i64(offset, type_size(field_ty, pcx));
+        } else {
+            offset = align_to(offset, field_align);
+            if offsets.len() > 0 {
+                (offsets[(order[k as usize]) as usize]) = offset;
+            }
+            offset += type_size(field_ty, pcx);
+        }
+    }
+    if (repr & REPR_PACKED) == 0 {
+        align = max_i64(align, pcx.structs[s as usize].align);
+    }
+    Layout { size: align_to(offset, align), align, payload: -1 }
 }
 
 // (0.27.0) Lays out every type made so far: the main thread's, after
@@ -1356,21 +1361,16 @@ pub fn tuple_offset(t: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
 // The offset of field `i` of struct `s` (read: kept with the struct's
 // layout, or laid out here as type_size does).
 pub fn field_offset(s: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
-    // UNSAFE: the fields are the checker's raw table (struct_field), and
-    // offsets a raw array.
-    // SAFETY: s is a struct id below STRUCT_COUNT and i below its
-    // field_count; offsets has field_count + 1 elements.
-    unsafe {
-        let t = find_type(Struct, s, 0, pcx);
-        if t >= 0 && pcx.types[t as usize].size >= 0 {
-            return (*struct_field(s, i, pcx)).offset;
-        }
-        let offsets = alloc_array::<i64>(pcx.structs[s as usize].field_count + 1);
-        struct_layout(s, offsets, pcx);
-        let offset = (*offsets.add(i as usize));
-        free(offsets as *mut u8);
-        offset
+    let t = find_type(Struct, s, 0, pcx);
+    if t >= 0 && pcx.types[t as usize].size >= 0 {
+        return (struct_field(s, i, pcx)).offset;
     }
+    let mut offsets_room: Vec<i64, Comp> = Vec::new_in(Comp {});
+    offsets_room.resize((pcx.structs[s as usize].field_count + 1) as usize, 0);
+    let offsets = offsets_room.as_mut_slice();
+    struct_layout(s, offsets, pcx);
+    let offset = (offsets[i as usize]);
+    offset
 }
 
 // ---- C interoperability ----
@@ -1380,51 +1380,49 @@ pub fn field_offset(s: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
 // is fine), `extern "C" fn` pointers, and #[repr(C)] (or, for enums,
 // #[repr(int)]) types made of those; `()` and `!` as results.
 pub fn is_ffi_safe(t: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let kind = pcx.types[t as usize].kind;
-        if is_numeric(t) || t == TY_BOOL || kind == Ptr {
-            return true;
+    let kind = pcx.types[t as usize].kind;
+    if is_numeric(t) || t == TY_BOOL || kind == Ptr {
+        return true;
+    }
+    if kind == Fn {
+        return fn_ty_c(t, pcx);
+    }
+    // (0.18: a distinct type passes as its underlying type; the null
+    // niche, `Option<NonNull<T>>`, as a pointer)
+    if kind == TyKind::Distinct {
+        return is_ffi_safe(pcx.types[t as usize].a, pcx);
+    }
+    if kind == Enum && crate::front::distinct::enum_niche(pcx.types[t as usize].a, pcx) {
+        return true;
+    }
+    if kind == Struct {
+        let s = pcx.types[t as usize].a;
+        if (pcx.structs[s as usize].repr & REPR_C) == 0 {
+            return false;
         }
-        if kind == Fn {
-            return fn_ty_c(t, pcx);
-        }
-        // (0.18: a distinct type passes as its underlying type; the null
-        // niche, `Option<NonNull<T>>`, as a pointer)
-        if kind == TyKind::Distinct {
-            return is_ffi_safe(pcx.types[t as usize].a, pcx);
-        }
-        if kind == Enum && crate::front::distinct::enum_niche(pcx.types[t as usize].a, pcx) {
-            return true;
-        }
-        if kind == Struct {
-            let s = pcx.types[t as usize].a;
-            if (pcx.structs[s as usize].repr & REPR_C) == 0 {
+        for i in 0..pcx.structs[s as usize].field_count {
+            if !is_ffi_field((struct_field(s, i, pcx)).ty, pcx) {
                 return false;
             }
-            for i in 0..pcx.structs[s as usize].field_count {
-                if !is_ffi_field((*struct_field(s, i, pcx)).ty, pcx) {
+        }
+        return true;
+    }
+    if kind == Enum {
+        let e = pcx.types[t as usize].a;
+        if ((pcx.enums[e as usize]).repr & (REPR_C | REPR_INT)) == 0 {
+            return false;
+        }
+        for i in 0..(pcx.enums[e as usize]).variant_count {
+            let v = enum_variant(e, i, pcx);
+            for k in 0..pcx.variants[v as usize].field_count {
+                if !is_ffi_field(variant_field(v, k, pcx), pcx) {
                     return false;
                 }
             }
-            return true;
         }
-        if kind == Enum {
-            let e = pcx.types[t as usize].a;
-            if ((*get_enums().add(e as usize)).repr & (REPR_C | REPR_INT)) == 0 {
-                return false;
-            }
-            for i in 0..(*get_enums().add(e as usize)).variant_count {
-                let v = enum_variant(e, i);
-                for k in 0..pcx.variants[v as usize].field_count {
-                    if !is_ffi_field(variant_field(v, k, pcx), pcx) {
-                        return false;
-                    }
-                }
-            }
-            return true;
-        }
-        false
+        return true;
     }
+    false
 }
 
 // The same for a field of a C type: arrays of such types too.
@@ -1433,62 +1431,4 @@ pub fn is_ffi_field(t: i64, pcx: &Ctx<Comp>) -> bool {
         return is_ffi_field(pcx.types[t as usize].a, pcx);
     }
     is_ffi_safe(t, pcx)
-}
-
-// (0.28.0) FIELDS's accessors: every use of it is one of them.
-pub fn get_fields() -> *mut FieldInfo {
-    // UNSAFE: the struct field table, a process-wide static mut the tasks
-    // read; Rust has no safe access to a static mut
-    // SAFETY: its writers (collect_struct_fields, erase_all_types,
-    // closures, compute_layout's offset write through struct_field) are
-    // main-thread code outside the threads' and the join's reach; on a task
-    // struct_field only takes an entry's address, and every task-reachable
-    // caller (abi_leaves, natural_align, interior_of, struct_layout,
-    // field_offset) only reads through it
-    unsafe { FIELDS }
-}
-
-pub fn set_fields(v: *mut FieldInfo) {
-    // UNSAFE: the struct field table, a process-wide static mut the tasks
-    // read; Rust has no safe access to a static mut
-    // SAFETY: its writers (collect_struct_fields, erase_all_types,
-    // closures, compute_layout's offset write through struct_field) are
-    // main-thread code outside the threads' and the join's reach; on a task
-    // struct_field only takes an entry's address, and every task-reachable
-    // caller (abi_leaves, natural_align, interior_of, struct_layout,
-    // field_offset) only reads through it
-    unsafe {
-        FIELDS = v;
-    }
-}
-
-// (0.28.0) ENUMS's accessors: every use of it is one of them.
-pub fn get_enums() -> *mut EnumInfo {
-    // UNSAFE: the enum table, a process-wide static mut the tasks read;
-    // Rust has no safe access to a static mut
-    // SAFETY: every writer (front::check::collect, check::resolve,
-    // generics::enum_instance, types::compute_layout) is main-thread code
-    // outside the thread entries' reach and outside join_task's reach, so
-    // it runs only when no task runs: before pool_start (pthread_create
-    // orders it) or between phases (the next phase's tasks are handed over
-    // under MUTEX after it, and the main thread resumes only after it saw,
-    // holding MUTEX, the last task done); the assembler thread does not
-    // read it
-    unsafe { ENUMS }
-}
-
-pub fn set_enums(v: *mut EnumInfo) {
-    // UNSAFE: the enum table, a process-wide static mut the tasks read;
-    // Rust has no safe access to a static mut
-    // SAFETY: every writer (front::check::collect, check::resolve,
-    // generics::enum_instance, types::compute_layout) is main-thread code
-    // outside the thread entries' reach and outside join_task's reach, so
-    // it runs only when no task runs: before pool_start (pthread_create
-    // orders it) or between phases (the next phase's tasks are handed over
-    // under MUTEX after it, and the main thread resumes only after it saw,
-    // holding MUTEX, the last task done); the assembler thread does not
-    // read it
-    unsafe {
-        ENUMS = v;
-    }
 }

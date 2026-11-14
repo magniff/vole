@@ -24,20 +24,20 @@ mod wrap;
 mod uses;
 // (0.18: clauses, invariants, `distinct *T`)
 mod clauses;
-mod conv;
 
 use std::alloc::Arena;
 
 use crate::base::{
-    IntVec, SOURCE_VOLE, STDOUT, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice,
-    buf_str, buf_write_fd, get_src, load_sources,
+    SOURCE_VOLE, STDOUT, buf_append, buf_byte, buf_bytes, buf_clear, buf_copy, buf_done, buf_int,
+    buf_new, buf_str, buf_write_fd, get_src, load_sources,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, EV_FLAG, EV_WORD, Leaf, flag, is_opt, option};
 use crate::front::embed::wgsl::WgslCx;
 use crate::front::lexer::init_lexer;
-use crate::tools::ctx::Tcx;
+use crate::front::modules::file_made;
+use crate::tools::ctx::{Tcx, cptrs};
 use crate::tools::edit::edit_replace;
 use crate::tools::edit::apply::{apply_edit, set_command};
 use crate::tools::edit::cli::{edit_opts, take_edit_event};
@@ -52,8 +52,13 @@ use crate::tools::query::diagnostics::{
 };
 use crate::tools::query::refs::{file_text, put_bad_in, ref_in, resolve_in};
 
+// UNSAFE: C's opendir and closedir: whether a path is a directory.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
-    fn opendir(path: *mut u8) -> *mut u8;
+    fn opendir(path: *const u8) -> *mut u8;
     fn closedir(dir: *mut u8) -> i32;
 }
 
@@ -86,106 +91,91 @@ fn conflict_marker(text: &[u8]) -> i64 {
 // cannot be (pieces::bad_message, BAD_AT say why). With ranges (pairs of
 // byte offsets of text), only the lines they touch are laid out, and the
 // `use` runs they touch tidied.
-pub fn format_text(text: &[u8], ranges: *mut IntVec, out: i64, tcx: &mut Tcx<Comp>,
+pub fn format_text(text: &[u8], ranges: &[i64], out: i64, tcx: &mut Tcx<Comp>,
     pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        let marker = conflict_marker(text);
-        if marker >= 0 {
-            set_bad_message(b"merge conflict markers", tcx);
-            tcx.bad_at = marker;
+    let marker = conflict_marker(text);
+    if marker >= 0 {
+        set_bad_message(b"merge conflict markers", tcx);
+        tcx.bad_at = marker;
+        return false;
+    }
+    if !read_pieces(text, tcx, pcx) {
+        return false;
+    }
+    let whole = ranges.len() == 0;
+    let mut src = text;
+    // (the `use` runs: all of them, or the ones the ranges touch, then
+    // the ranges moved to the tidied text)
+    let mut mapped: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut lines: &[i64] = ranges;
+    let tidy = tidy_uses(ranges, &mut mapped, tcx, pcx);
+    if tidy >= 0 {
+        src = buf_done(tidy);
+        if !whole {
+            lines = mapped.as_slice();
+        }
+        if !read_pieces(src, tcx, pcx) {
             return false;
         }
-        if !read_pieces(text, tcx, pcx) {
+    }
+    tcx.ranged.clear();
+    for i in 0..tcx.p_kind.len() as i64 {
+        tcx.ranged.push(if whole
+            || touched(src, (tcx.p_start[i as usize]),
+                (tcx.p_end[i as usize]), lines) { 1 }
+            else { 0 });
+    }
+    keep_embedded(tcx);
+    lay_out(tcx);
+    write_layout(out, tcx);
+    // (0.25.1: trailing commas written or dropped change the lines'
+    // lengths: a whole file is laid out again, to its fixpoint)
+    let mut pass: i64 = 0;
+    while whole && tcx.commas_changed && pass < 3 {
+        let again = buf_new();
+        buf_append(again, out);
+        if !read_pieces(&buf_copy(again), tcx, pcx) {
             return false;
         }
-        let whole = ranges == 0 as *mut IntVec || (*ranges).count == 0;
-        let mut src = text;
-        // (the `use` runs: all of them, or the ones the ranges touch, then
-        // the ranges moved to the tidied text)
-        let mut mapped = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut lines = ranges;
-        let tidy = tidy_uses(if whole { 0 as *mut IntVec } else { ranges }, &mut mapped, tcx, pcx);
-        if tidy >= 0 {
-            src = buf_slice(tidy);
-            if !whole {
-                lines = &mut mapped;
-            }
-            if !read_pieces(src, tcx, pcx) {
-                return false;
-            }
-        }
-        // (0.20: the receivers' short form; with --syntax=0.20, no written
-        // let in a parameter list: fmt/conv.vl; a whole file only)
-        if whole {
-            let respelled = crate::tools::fmt::conv::respell_conventions(src, tcx, pcx);
-            if respelled >= 0 {
-                src = buf_slice(respelled);
-                if !read_pieces(src, tcx, pcx) {
-                    return false;
-                }
-            }
-        }
-        tcx.ranged.count = 0;
-        for i in 0..tcx.p_kind.count {
-            tcx.ranged.push(if whole
-                || touched(src, (*tcx.p_start.data.add(i as usize)),
-                    (*tcx.p_end.data.add(i as usize)), *lines) { 1 }
-                else { 0 });
+        tcx.ranged.clear();
+        for i in 0..tcx.p_kind.len() as i64 {
+            tcx.ranged.push(1);
         }
         keep_embedded(tcx);
         lay_out(tcx);
+        buf_clear(out);
         write_layout(out, tcx);
-        // (0.25.1: trailing commas written or dropped change the lines'
-        // lengths: a whole file is laid out again, to its fixpoint)
-        let mut pass: i64 = 0;
-        while whole && tcx.commas_changed && pass < 3 {
-            let again = buf_new();
-            buf_bytes(again, buf_slice(out));
-            if !read_pieces(buf_slice(again), tcx, pcx) {
-                return false;
-            }
-            tcx.ranged.count = 0;
-            for i in 0..tcx.p_kind.count {
-                tcx.ranged.push(1);
-            }
-            keep_embedded(tcx);
-            lay_out(tcx);
-            buf_clear(out);
-            write_layout(out, tcx);
-            pass += 1;
-        }
-        if !same_pieces(src, buf_slice(out), tcx, pcx) {
-            set_bad_message(b"formatting would change its tokens (a bug of fmt)", tcx);
-            tcx.bad_at = 0;
-            return false;
-        }
-        true
+        pass += 1;
     }
+    if !same_pieces(src, &buf_copy(out), tcx, pcx) {
+        set_bad_message(b"formatting would change its tokens (a bug of fmt)", tcx);
+        tcx.bad_at = 0;
+        return false;
+    }
+    true
 }
 
 // Whether the lines of text[s..e) meet a range.
-fn touched(text: &[u8], s: i64, e: i64, ranges: IntVec) -> bool {
-    unsafe {
-        let mut a = s;
-        while a > 0 && text[(a - 1) as usize] != b'\n' {
-            a -= 1;
-        }
-        let mut b = e;
-        while b < text.len() as i64 && text[b as usize] != b'\n' {
-            b += 1;
-        }
-        let mut k: i64 = 0;
-        while k + 1 < ranges.count {
-            let lo = (*ranges.data.add(k as usize));
-            let hi = (*ranges.data.add((k + 1) as usize));
-            let last = if hi > lo { hi - 1 } else { lo };
-            if a <= last && lo <= b {
-                return true;
-            }
-            k += 2;
-        }
-        false
+fn touched(text: &[u8], s: i64, e: i64, ranges: &[i64]) -> bool {
+    let mut a = s;
+    while a > 0 && text[(a - 1) as usize] != b'\n' {
+        a -= 1;
     }
+    let mut b = e;
+    while b < text.len() as i64 && text[b as usize] != b'\n' {
+        b += 1;
+    }
+    let mut k: i64 = 0;
+    while k + 1 < ranges.len() as i64 {
+        let lo = (ranges[k as usize]);
+        let hi = (ranges[(k + 1) as usize]);
+        let last = if hi > lo { hi - 1 } else { lo };
+        if a <= last && lo <= b {
+            return true;
+        }
+        k += 2;
+    }
+    false
 }
 
 // Whether a text is generated (it starts `// Generated by`, as
@@ -207,18 +197,16 @@ pub fn generated(text: &[u8]) -> bool {
 // The new text of an edited file (`text`, of which `ranges` are the
 // edited parts) with those lines formatted; -1 when it cannot be or
 // nothing changes.
-pub fn format_ranges(text: &[u8], ranges: *mut IntVec, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let saved = tcx.fmt_text.clone();
-        let out = buf_new();
-        let ok = (*ranges).count > 0 && !generated(text)
-            && format_text(text, ranges, out, tcx, pcx);
-        tcx.fmt_text = saved;
-        if !ok || same_bytes(buf_slice(out), text) {
-            return -1;
-        }
-        out
+pub fn format_ranges(text: &[u8], ranges: &[i64], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let saved = tcx.fmt_text.clone();
+    let out = buf_new();
+    let ok = ranges.len() > 0 && !generated(text)
+        && format_text(text, ranges, out, tcx, pcx);
+    tcx.fmt_text = saved;
+    if !ok || same_bytes(&buf_copy(out), text) {
+        return -1;
     }
+    out
 }
 
 // (0.25.1) A whole text formatted, for a caller in the process (the
@@ -229,9 +217,9 @@ pub fn format_ranges(text: &[u8], ranges: *mut IntVec, tcx: &mut Tcx<Comp>, pcx:
 pub fn format_source(text: &[u8], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     let saved = tcx.fmt_text.clone();
     let out = buf_new();
-    let ok = !generated(text) && format_text(text, 0 as *mut IntVec, out, tcx, pcx);
+    let ok = !generated(text) && format_text(text, &[], out, tcx, pcx);
     tcx.fmt_text = saved;
-    if !ok || same_bytes(buf_slice(out), text) {
+    if !ok || same_bytes(&buf_copy(out), text) {
         return -1;
     }
     out
@@ -244,7 +232,7 @@ pub fn run_fmt(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     status
 }
 
-fn usage(message: *mut u8, arg: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+fn usage(message: *const u8, arg: *const u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     let d = diag(c"error", c"fmt.usage", tcx);
     buf_str(d, message);
     if arg != 0 as *mut u8 {
@@ -253,11 +241,14 @@ fn usage(message: *mut u8, arg: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -
         buf_byte(d, b'\'');
     }
     buf_byte(d, b'\n');
-    try_end(try_begin(c"fmt --check --all", c_slice(c""), false, tcx, pcx));
+    try_end(try_begin(c"fmt --check --all", b"", false, tcx, pcx));
     2
 }
 
-pub fn is_dir(path: *mut u8) -> bool {
+pub fn is_dir(path: *const u8) -> bool {
+    // UNSAFE: opendir and closedir are C's.
+    // SAFETY: path is a C string of the caller's; the DIR is checked not
+    // null and closed once, never read.
     unsafe {
         let d = opendir(path);
         if d == 0 as *mut u8 {
@@ -269,132 +260,112 @@ pub fn is_dir(path: *mut u8) -> bool {
 }
 
 // Whether an argument is a path (it has a `/`), not a module.
-fn has_slash(a: *mut u8) -> bool {
-    unsafe {
-        let mut i: i64 = 0;
-        while (*a.add(i as usize)) != 0 {
-            if (*a.add(i as usize)) == b'/' {
-                return true;
-            }
-            i += 1;
+fn has_slash(a: *const u8) -> bool {
+    for &c in crate::base::cstr(a).as_slice() {
+        if c == b'/' {
+            return true;
         }
-        false
     }
+    false
 }
 
 fn cstr_less(a: *mut u8, b: *mut u8) -> bool {
-    unsafe {
-        let mut i: i64 = 0;
-        while (*a.add(i as usize)) != 0 && (*a.add(i as usize)) == (*b.add(i as usize)) {
-            i += 1;
-        }
-        (*a.add(i as usize)) < (*b.add(i as usize))
+    let x = crate::base::cstr(a);
+    let y = crate::base::cstr(b);
+    let mut i: usize = 0;
+    while i < x.len() && i < y.len() && x[i] == y[i] {
+        i += 1;
     }
+    // (the end of a string is below every byte, as its NUL was)
+    let cx: u8 = if i < x.len() { x[i] } else { 0 };
+    let cy: u8 = if i < y.len() { y[i] } else { 0 };
+    cx < cy
 }
 
 // The .vl files (0.21: and .vl) under directory dir, into out.
-fn tach_files(dir: *mut u8, out: &mut IntVec) -> bool {
-    unsafe {
-        let args = crate::base::alloc_array::<*mut u8>(12i64);
-        (*args.add(0)) = c"find";
-        (*args.add(1)) = dir;
-        (*args.add(2)) = c"-type";
-        (*args.add(3)) = c"f";
-        (*args.add(4)) = c"(";
-        (*args.add(5)) = c"-name";
-        (*args.add(6)) = c"*.vl";
-        (*args.add(7)) = c"-o";
-        (*args.add(8)) = c"-name";
-        (*args.add(9)) = c"*.vl";
-        (*args.add(10)) = c")";
-        (*args.add(11)) = 0 as *mut u8;
-        let listing = buf_new();
-        if run_capture(args, listing) != 0 {
-            return false;
-        }
-        let t = buf_slice(listing);
-        let mut i: i64 = 0;
-        while i < t.len() as i64 {
-            let mut e = i;
-            while e < t.len() as i64 && t[e as usize] != b'\n' {
-                e += 1;
-            }
-            if e > i {
-                let b = buf_new();
-                buf_bytes(b, &t[i as usize..e as usize]);
-                out.push(buf_cstr(b) as i64);
-            }
-            i = e + 1;
-        }
-        true
+fn tach_files(dir: *mut u8, out: &mut Vec<i64, Comp>) -> bool {
+    let mut args = cptrs(12i64);
+    (args[0]) = c"find";
+    (args[1]) = dir;
+    (args[2]) = c"-type";
+    (args[3]) = c"f";
+    (args[4]) = c"(";
+    (args[5]) = c"-name";
+    (args[6]) = c"*.vl";
+    (args[7]) = c"-o";
+    (args[8]) = c"-name";
+    (args[9]) = c"*.vl";
+    (args[10]) = c")";
+    (args[11]) = 0 as *mut u8;
+    let listing = buf_new();
+    if run_capture(args.as_slice(), listing) != 0 {
+        return false;
     }
+    let t = buf_copy(listing);
+    let mut i: i64 = 0;
+    while i < t.len() as i64 {
+        let mut e = i;
+        while e < t.len() as i64 && t[e as usize] != b'\n' {
+            e += 1;
+        }
+        if e > i {
+            let b = buf_new();
+            buf_bytes(b, &t[i as usize..e as usize]);
+            out.push(buf_cstr(b) as i64);
+        }
+        i = e + 1;
+    }
+    true
 }
 
 fn fixture(path: *mut u8) -> bool {
-    unsafe {
-        let a = c"tests/query/";
-        let b = c"tests/refactor/";
-        let mut i: i64 = 0;
-        while (*a.add(i as usize)) != 0 && (*path.add(i as usize)) == (*a.add(i as usize)) {
-            i += 1;
-        }
-        if (*a.add(i as usize)) == 0 {
-            return true;
-        }
-        i = 0;
-        while (*b.add(i as usize)) != 0 && (*path.add(i as usize)) == (*b.add(i as usize)) {
-            i += 1;
-        }
-        (*b.add(i as usize)) == 0
-    }
+    crate::base::c_starts(path, b"tests/query/") || crate::base::c_starts(path, b"tests/refactor/")
 }
 
 // `fmt PATH...`: the files and the files under the directories, sorted,
 // read into SRC; false after the diagnostic.
-fn read_paths(paths: IntVec, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        let mut files = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for k in 0..paths.count {
-            let p = (*paths.data.add(k as usize)) as *mut u8;
-            let before = files.count;
-            if crate::base::is_source_path(p) && !is_dir(p) {
-                if crate::front::cpp::directives::file_exists(p, pcx) {
-                    files.push(p as i64);
+fn read_paths(paths: &[i64], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
+    let mut files: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for k in 0..paths.len() as i64 {
+        let p = (paths[k as usize]) as *mut u8;
+        let before = files.len() as i64;
+        if crate::base::is_source_path(p) && !is_dir(p) {
+            if crate::front::cpp::directives::file_exists(p, pcx) {
+                files.push(p as i64);
+            }
+        } else if is_dir(p) {
+            tach_files(p, &mut files);
+            let mut kept = before;
+            for j in before..files.len() as i64 {
+                if !(tcx.fmt_all && fixture((files[j as usize]) as *mut u8)) {
+                    (files[kept as usize]) = (files[j as usize]);
+                    kept += 1;
                 }
-            } else if is_dir(p) {
-                tach_files(p, &mut files);
-                let mut kept = before;
-                for j in before..files.count {
-                    if !(tcx.fmt_all && fixture((*files.data.add(j as usize)) as *mut u8)) {
-                        (*files.data.add(kept as usize)) = (*files.data.add(j as usize));
-                        kept += 1;
-                    }
-                }
-                files.count = kept;
             }
-            if files.count == before {
-                let d = diag(c"error", c"fmt.no-file", tcx);
-                buf_str(d, c"no .vl file at '");
-                buf_str(d, p);
-                buf_str(d, c"'\n");
-                return false;
-            }
+            files.truncate(kept as usize);
         }
-        for k in 1..files.count {
-            let mut j = k;
-            while j > 0
-                && cstr_less((*files.data.add(j as usize)) as *mut u8,
-                    (*files.data.add((j - 1) as usize)) as *mut u8) {
-                let t = (*files.data.add(j as usize));
-                (*files.data.add(j as usize)) = (*files.data.add((j - 1) as usize));
-                (*files.data.add((j - 1) as usize)) = t;
-                j -= 1;
-            }
+        if files.len() as i64 == before {
+            let d = diag(c"error", c"fmt.no-file", tcx);
+            buf_str(d, c"no .vl file at '");
+            buf_str(d, p);
+            buf_str(d, c"'\n");
+            return false;
         }
-        init_lexer(pcx);
-        load_sources(files.data as *mut *mut u8, files.count, pcx);
-        true
     }
+    for k in 1..files.len() as i64 {
+        let mut j = k;
+        while j > 0
+            && cstr_less((files[j as usize]) as *mut u8,
+                (files[(j - 1) as usize]) as *mut u8) {
+            let t = (files[j as usize]);
+            (files[j as usize]) = (files[(j - 1) as usize]);
+            (files[(j - 1) as usize]) = t;
+            j -= 1;
+        }
+    }
+    init_lexer(pcx);
+    load_sources(files.as_slice(), pcx);
+    true
 }
 
 // Where formatting file f failed: `FILE:LINE: why`.
@@ -406,11 +377,11 @@ fn put_failure(d: i64, f: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) {
             &get_src()[pcx.files[f as usize].start as usize..pcx.files[f as usize].end as usize],
             tcx.bad_at));
     buf_str(d, c": ");
-    buf_bytes(d, bad_message(tcx));
+    buf_bytes(d, &bad_message(tcx));
 }
 
-fn try_fmt(option: *mut u8, f: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
-    let o = try_begin(c"fmt", c_slice(c""), false, tcx, pcx);
+fn try_fmt(option: *const u8, f: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
+    let o = try_begin(c"fmt", b"", false, tcx, pcx);
     if option != 0 as *mut u8 {
         buf_byte(o, b' ');
         buf_str(o, option);
@@ -426,7 +397,7 @@ fn try_fmt(option: *mut u8, f: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
 // would find untidy elsewhere. Paths relative to the current directory,
 // into paths, the transcript tests' programs left out (as by --all);
 // false after the diagnostic when git cannot tell.
-fn changed_vl_files(rev: *mut u8, paths: &mut IntVec, tcx: &mut Tcx<Comp>) -> bool {
+fn changed_vl_files(rev: *const u8, paths: &mut Vec<i64, Comp>, tcx: &mut Tcx<Comp>) -> bool {
     let listing = buf_new();
     let others = buf_new();
     if git_paths(rev, listing) != 0 || git_paths(0 as *mut u8, others) != 0 {
@@ -436,34 +407,30 @@ fn changed_vl_files(rev: *mut u8, paths: &mut IntVec, tcx: &mut Tcx<Comp>) -> bo
         buf_str(d, c": no checkout here, or no such revision\n");
         return false;
     }
-    add_vl_paths(buf_slice(listing), paths);
-    add_vl_paths(buf_slice(others), paths);
+    add_vl_paths(&buf_copy(listing), paths);
+    add_vl_paths(&buf_copy(others), paths);
     true
 }
 
 // `git diff --name-only --relative REV` (not the deleted files), or with
 // rev 0 `git ls-files --others --exclude-standard`, NUL-separated, into
 // out; git's exit status.
-fn git_paths(rev: *mut u8, out: i64) -> i64 {
-    let args = crate::base::alloc_array::<*mut u8>(9i64);
-    let words: [*mut u8; 8] = if rev != 0 as *mut u8 {
+pub fn git_paths(rev: *const u8, out: i64) -> i64 {
+    let mut args = cptrs(9i64);
+    let words: [*const u8; 8] = if rev != 0 as *const u8 {
         [c"git", c"diff", c"--name-only", c"--relative", c"--diff-filter=d", c"-z", rev, c"--"]
     } else {
         [c"git", c"ls-files", c"-z", c"--others", c"--exclude-standard", c"--", 0 as *mut u8,
             0 as *mut u8]
     };
     for k in 0..8 {
-        // UNSAFE: run_capture takes a C argv, a raw array of C strings that a
-        // null ends.
-        // SAFETY: args has 9 zeroed slots; k < 8 is written, slot 8 stays
-        // null.
-        unsafe { (*args.add(k as usize)) = words[k as usize]; }
+        (args[k as usize]) = words[k as usize];
     }
-    crate::tools::proc::run_capture(args, out)
+    crate::tools::proc::run_capture(args.as_slice(), out)
 }
 
 // The .vl paths of NUL-separated listing t, but the transcript tests'.
-fn add_vl_paths(t: &[u8], paths: &mut IntVec) {
+fn add_vl_paths(t: &[u8], paths: &mut Vec<i64, Comp>) {
     let mut i: i64 = 0;
     while i < t.len() as i64 {
         let mut e = i;
@@ -499,10 +466,10 @@ fn run_fmt_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     pcx.prog = c.prog();
     tcx.tool = 0 as *mut u8;
     tcx.format_edits = false;
-    let mut root = 0 as *mut u8;
+    let mut root = 0 as *const u8;
     let mut check = false;
-    let mut paths = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-    let mut module = 0 as *mut u8;
+    let mut paths: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut module = 0 as *const u8;
     for e in c.evs.iter().copied() {
         let mut ev = e;
         let a = ev.value;
@@ -522,7 +489,7 @@ fn run_fmt_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
             if !changed_vl_files(rev, &mut paths, tcx) {
                 return 1;
             }
-            if paths.count == 0 {
+            if paths.len() as i64 == 0 {
                 let d = diag(c"note", c"fmt.none", tcx);
                 buf_str(d, c"no .vl file changed since ");
                 buf_str(d, rev);
@@ -541,127 +508,123 @@ fn run_fmt_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
             return usage(c"one MODULE (or FILEs and DIRs), not also", a, tcx, pcx);
         }
     }
-    unsafe {
-        if paths.count > 0 && module != 0 as *mut u8 {
-            return usage(
-                c"FILEs and DIRs, or a MODULE of the program, not both: no file or directory",
-                module, tcx, pcx);
+    if paths.len() as i64 > 0 && module != 0 as *mut u8 {
+        return usage(
+            c"FILEs and DIRs, or a MODULE of the program, not both: no file or directory",
+            module, tcx, pcx);
+    }
+    let mut chosen: Vec<i64, Comp> = Vec::new_in(Comp {});
+    if paths.len() as i64 > 0 {
+        if !read_paths(paths.as_slice(), tcx, pcx) {
+            return 1;
         }
-        let mut chosen = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        if paths.count > 0 {
-            if !read_paths(paths, tcx, pcx) {
+        for f in 0..pcx.files.len() as i64 {
+            chosen.push(f);
+        }
+    } else {
+        tcx.root_given = root;
+        root = root_or_diag(root, c"fmt", b"", false, tcx, pcx);
+        if root == 0 as *mut u8 {
+            return 2;
+        }
+        if !load_program(root, tcx.target, tcx, pcx, wgx) {
+            program_errors(c"error", root, true, tcx, pcx);
+            return 1;
+        }
+        if module != 0 as *mut u8 {
+            pcx.opt_in = module;
+            if !resolve_in(&c_slice(module), tcx, pcx) {
+                let d = diag(c"error", c"fmt.bad-in", tcx);
+                put_bad_in(d, module, tcx);
+                try_end(try_begin(c"fmt", b"", false, tcx, pcx));
                 return 1;
             }
-            for f in 0..pcx.files.len() as i64 {
+        }
+        for f in 0..pcx.files.len() as i64 {
+            if !file_made(f, pcx)
+                && pcx.files[f as usize].kind == SOURCE_VOLE
+                && ref_in(pcx.files[f as usize].start, pcx) {
                 chosen.push(f);
             }
-        } else {
-            tcx.root_given = root;
-            root = root_or_diag(root, c"fmt", c_slice(c""), false, tcx, pcx);
-            if root == 0 as *mut u8 {
-                return 2;
-            }
-            if !load_program(root, tcx.target, tcx, pcx, wgx) {
-                program_errors(c"error", root, true, tcx, pcx);
-                return 1;
-            }
-            if module != 0 as *mut u8 {
-                pcx.opt_in = module;
-                if !resolve_in(c_slice(module), tcx, pcx) {
-                    let d = diag(c"error", c"fmt.bad-in", tcx);
-                    put_bad_in(d, module, tcx);
-                    try_end(try_begin(c"fmt", c_slice(c""), false, tcx, pcx));
-                    return 1;
-                }
-            }
-            for f in 0..pcx.files.len() as i64 {
-                if (*pcx.files[f as usize].path.add(0)) != b'<'
-                    && pcx.files[f as usize].kind == SOURCE_VOLE
-                    && ref_in(pcx.files[f as usize].start, pcx) {
-                    chosen.push(f);
-                }
-            }
         }
-        return format_files(chosen, check, paths.count == 0, tcx, pcx);
     }
+    return format_files(chosen.as_slice(), check, paths.len() as i64 == 0, tcx, pcx);
 }
 
 // Formats the chosen files (or, `check`, lists those that are not); a
 // file of a rust-edition program in the rust edition (root_says_rust;
 // program: the chosen files are the loaded program's).
-fn format_files(chosen: IntVec, check: bool, program: bool, tcx: &mut Tcx<Comp>,
+fn format_files(chosen: &[i64], check: bool, program: bool, tcx: &mut Tcx<Comp>,
     pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut changed = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut failed = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut first_bad = buf_new();
-        for k in 0..chosen.count {
-            let f = (*chosen.data.add(k as usize));
-            let text = &get_src()[
-                pcx.files[f as usize].start as usize..pcx.files[f as usize].end as usize];
-            if generated(text) {
-                continue;
+    let mut changed: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut failed: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut first_bad = buf_new();
+    for k in 0..chosen.len() as i64 {
+        let f = (chosen[k as usize]);
+        let text = &get_src()[
+            pcx.files[f as usize].start as usize..pcx.files[f as usize].end as usize];
+        if generated(text) {
+            continue;
+        }
+        let out = buf_new();
+        let formatted = format_text(text, &[], out, tcx, pcx);
+        if !formatted {
+            if failed.len() as i64 == 0 {
+                put_failure(first_bad, f, tcx, pcx);
             }
-            let out = buf_new();
-            let formatted = format_text(text, 0 as *mut IntVec, out, tcx, pcx);
-            if !formatted {
-                if failed.count == 0 {
-                    put_failure(first_bad, f, tcx, pcx);
-                }
-                failed.push(f);
-                continue;
-            }
-            if !same_bytes(buf_slice(out), text) {
-                changed.push(f);
-                if !check {
-                    edit_replace(pcx.files[f as usize].start, pcx.files[f as usize].end, out, pcx);
-                }
+            failed.push(f);
+            continue;
+        }
+        if !same_bytes(&buf_copy(out), text) {
+            changed.push(f);
+            if !check {
+                edit_replace(pcx.files[f as usize].start, pcx.files[f as usize].end, out, pcx);
             }
         }
-        let n = chosen.count;
-        if failed.count > 0 && n == 1 {
-            let d = diag(c"error", c"fmt.unreadable", tcx);
-            buf_bytes(d, buf_slice(first_bad));
-            buf_str(d, c"; left as it is\n");
-            return 1;
+    }
+    let n = chosen.len() as i64;
+    if failed.len() as i64 > 0 && n == 1 {
+        let d = diag(c"error", c"fmt.unreadable", tcx);
+        buf_append(d, first_bad);
+        buf_str(d, c"; left as it is\n");
+        return 1;
+    }
+    if failed.len() as i64 > 0 {
+        let d = diag(c"note", c"fmt.skipped", tcx);
+        buf_int(d, failed.len() as i64);
+        buf_str(d, if failed.len() as i64 == 1 { c" file" } else { c" files" });
+        buf_str(d, c" left as they are (not lexed, or unbalanced brackets); first: ");
+        buf_append(d, first_bad);
+        buf_byte(d, b'\n');
+    }
+    if check {
+        let list = buf_new();
+        for k in 0..changed.len() as i64 {
+            buf_bytes(list, file_text((changed[k as usize]), pcx));
+            buf_byte(list, b'\n');
         }
-        if failed.count > 0 {
-            let d = diag(c"note", c"fmt.skipped", tcx);
-            buf_int(d, failed.count);
-            buf_str(d, if failed.count == 1 { c" file" } else { c" files" });
-            buf_str(d, c" left as they are (not lexed, or unbalanced brackets); first: ");
-            buf_bytes(d, buf_slice(first_bad));
-            buf_byte(d, b'\n');
-        }
-        if check {
-            let list = buf_new();
-            for k in 0..changed.count {
-                buf_bytes(list, file_text((*changed.data.add(k as usize)), pcx));
-                buf_byte(list, b'\n');
-            }
-            buf_write_fd(list, STDOUT);
-            if changed.count == 0 {
-                return 0;
-            }
-            let d = diag(c"error", c"fmt.unformatted", tcx);
-            buf_int(d, changed.count);
-            buf_str(d, c" of ");
-            buf_int(d, n);
-            buf_str(d,
-                if n == 1 { c" file is not formatted\n" } else { c" files are not formatted\n" });
-            try_fmt(c"--dry-run", (*changed.data.add(0)), tcx, pcx);
-            try_fmt(0 as *mut u8, (*changed.data.add(0)), tcx, pcx);
-            return 1;
-        }
-        if changed.count == 0 {
-            let d = diag(c"note", c"fmt.none", tcx);
-            buf_int(d, n - failed.count);
-            buf_str(d,
-                if n - failed.count == 1 { c" file formatted already\n" }
-                else { c" files formatted already\n" });
+        buf_write_fd(list, STDOUT);
+        if changed.len() as i64 == 0 {
             return 0;
         }
-        tcx.skip_check = true;
-        apply_edit(c_slice(c"formatted"), pcx.files[(*changed.data.add(0)) as usize].path, tcx, pcx)
+        let d = diag(c"error", c"fmt.unformatted", tcx);
+        buf_int(d, changed.len() as i64);
+        buf_str(d, c" of ");
+        buf_int(d, n);
+        buf_str(d,
+            if n == 1 { c" file is not formatted\n" } else { c" files are not formatted\n" });
+        try_fmt(c"--dry-run", (changed[0]), tcx, pcx);
+        try_fmt(0 as *mut u8, (changed[0]), tcx, pcx);
+        return 1;
     }
+    if changed.len() as i64 == 0 {
+        let d = diag(c"note", c"fmt.none", tcx);
+        buf_int(d, n - failed.len() as i64);
+        buf_str(d,
+            if n - failed.len() as i64 == 1 { c" file formatted already\n" }
+            else { c" files formatted already\n" });
+        return 0;
+    }
+    tcx.skip_check = true;
+    apply_edit(b"formatted", pcx.files[(changed[0]) as usize].path, tcx, pcx)
 }

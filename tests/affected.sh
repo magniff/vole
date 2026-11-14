@@ -1,14 +1,23 @@
 #!/bin/sh
 # The tests a change touches (0.25.2), for an agent's checks before it
 # reports (AGENTS.md, tier 2): the paths changed since BASE (`git diff
-# --name-only BASE...HEAD`, plus the work tree's changes and new files)
-# are looked up in tests/affected.map, which names for each path prefix
+# --name-only BASE...HEAD`, plus the work tree's changes to the files
+# git tracks, a new file once it is added) are looked up in tests/affected.map, which names for each path prefix
 # the tests/run.sh filters (cases, suites, checks), example builds and
 # other test scripts that would see the change; the union runs, in one
 # tests/run.sh per level. A changed test runs itself; a path no rule
 # names gets the smoke set, never nothing.
 #
-# usage: tests/affected.sh [BASE] [-O LEVEL]... [--list] [--linux] [--head REV] [-c COMPILER] [-j JOBS]
+# (0.29) A file git does not track is not the branch's until it is added
+# (`git add`): a leftover of another run (an output directory, a tool's
+# temporary file under compiler/src) made the plan of a branch that
+# changed one example 3079 of 5270 cases. Such files are named in the
+# plan, not counted; --untracked counts them (a new test not added yet).
+# The index is what says a file belongs to the branch: a rule that
+# guesses (a file beside a changed one) would have counted the temporary
+# file, which sat beside the file it was made for.
+#
+# usage: tests/affected.sh [BASE] [-O LEVEL]... [--list] [--linux] [--head REV] [--untracked] [-c COMPILER] [-j JOBS]
 #
 #   BASE          what the change is against (default: the release-*
 #                 branch, or main, whose merge-base with HEAD is the
@@ -25,6 +34,9 @@
 #   --head REV    the change is BASE...REV, without the work tree (an
 #                 integrator's look at another branch; the tests named
 #                 are this tree's)
+#   --untracked   count the files git does not track (and does not
+#                 ignore) as changes too; without it the plan names them
+#                 and leaves them out
 #   -c COMPILER   the compiler (default target/volec)
 #   -j JOBS       tests/run.sh's -j
 #
@@ -44,6 +56,7 @@ LINUX=0
 COMPILER="$ROOT/target/volec"
 JOBS=""
 HEAD_REV=""
+UNTRACKED=0
 
 die() {
     echo "tests/affected.sh: $*" >&2
@@ -56,6 +69,7 @@ while [ $# -gt 0 ]; do
         --list) LIST=1; shift ;;
         --linux) LINUX=1; shift ;;
         --head) [ $# -ge 2 ] || die "--head needs a revision"; HEAD_REV=$2; shift 2 ;;
+        --untracked) UNTRACKED=1; shift ;;
         -c) [ $# -ge 2 ] || die "-c needs a compiler"; COMPILER=$2; shift 2 ;;
         -j) [ $# -ge 2 ] || die "-j needs a number"; JOBS=$2; shift 2 ;;
         -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -89,11 +103,15 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-affected.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 
+# (the files git does not track: named, and counted only with --untracked)
+: >"$WORK/untracked"
+[ -n "$HEAD_REV" ] || git ls-files --others --exclude-standard | sed '/^$/d' >"$WORK/untracked"
+NUNTRACKED=$(wc -l <"$WORK/untracked" | tr -d ' ')
 {
     git diff --name-only "$MB" "$HEAD_IS"
     if [ -z "$HEAD_REV" ]; then
         git diff --name-only HEAD
-        git ls-files --others --exclude-standard
+        [ $UNTRACKED = 1 ] && cat "$WORK/untracked"
     fi
 } | sort -u | sed '/^$/d' >"$WORK/changed"
 NCHANGED=$(wc -l <"$WORK/changed" | tr -d ' ')
@@ -225,6 +243,18 @@ while IFS='|' read -r path prefix items why raw; do
                 c=$(mentions "$path")
                 if [ -n "$c" ]; then got="$got $c"; else got="$got =example_helloworld"; fi ;;
             @example)
+                # (0.29) Prose in an example (a README, a note): no case
+                # reads it and no build changes, so the layout checks
+                # alone; the walkthroughs only when the README is one
+                # they run (it has a ```console session).
+                case "$path" in
+                    *.md)
+                        got="$got =example_layout =readme_sync"
+                        if [ "${path##*/}" = README.md ] && grep -q '^```console' "$path" 2>/dev/null; then
+                            got="$got =walkthrough"
+                        fi
+                        continue ;;
+                esac
                 rest=${path#examples/}
                 ex=""
                 acc=""
@@ -243,7 +273,7 @@ while IFS='|' read -r path prefix items why raw; do
                         *) echo "examples/$ex/main.vl" >>"$WORK/builds"; got="$got build:examples/$ex" ;;
                     esac
                 fi
-                case "$path" in */README.md) got="$got =walkthrough" ;; esac ;;
+                ;;
             !*) map_cmd "${it#!}" >>"$WORK/cmds"; got="$got $it" ;;
             +linux) echo "linux $path" >>"$WORK/flags" ;;
             +broad) echo "broad $path" >>"$WORK/flags" ;;
@@ -299,6 +329,14 @@ summary_plan() {
     echo "  levels: $(echo $LEVELS | sed 's/\([0-2]\)/-O\1/g'): all of it at -O$first_level$( [ "$(echo $LEVELS | wc -w)" -gt 1 ] && echo "; at the others $NLEVELED (the cases that compile, and gpu/arch-gen when in)")"
     [ -s "$WORK/builds" ] && echo "  builds: $(tr '\n' ' ' <"$WORK/builds")(volec FILE -o x, as example_build)"
     [ -s "$WORK/cmds" ] && sed 's/^/  command: /' "$WORK/cmds"
+    if [ "$NUNTRACKED" -gt 0 ]; then
+        names="$(head -4 "$WORK/untracked" | tr '\n' ' ' | sed 's/ $//')$( [ "$NUNTRACKED" -gt 4 ] && echo ', ...')"
+        if [ $UNTRACKED = 1 ]; then
+            echo "  untracked, counted (--untracked): $NUNTRACKED file(s): $names"
+        else
+            echo "  untracked, not counted: $NUNTRACKED file(s): $names (git add what is the branch's, or --untracked counts them all)"
+        fi
+    fi
     if grep -q '^broad ' "$WORK/flags"; then
         echo "  broad: the change can alter what any program means ($(grep '^broad ' "$WORK/flags" | cut -d' ' -f2 | sort -u | head -3 | tr '\n' ' ' | sed 's/ $//')$( [ "$(grep -c '^broad ' "$WORK/flags")" -gt 3 ] && echo ', ...')): most of the suite"
     fi

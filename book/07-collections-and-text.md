@@ -445,7 +445,7 @@ are `String`s, so a new key has to be one too:
 use std::collections::HashMap;
 
 fn main(gpa: Gpa) {
-    let mut ages: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    let mut ages: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     ages.insert("ada", 36);
     println("{:?}", ages.get("ada"));
 }
@@ -588,7 +588,7 @@ key quickly, however many there are:
 use std::collections::HashMap;
 
 fn main(gpa: Gpa) {
-    let mut ages: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut ages: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     ages.insert("ada", 36);
     ages.insert("alan", 41);
     let old = ages.insert("ada", 37);
@@ -604,8 +604,13 @@ true 2
 Some(41) 1
 ```
 
-`HashMap<&str, i64, Gpa>` maps `&str` keys to `i64` values. It isn't in
-the prelude, so the program starts with a `use` line. `insert` returns
+`HashMap<&str, i64, Gpa, FixedState>` maps `&str` keys to `i64` values.
+Its last two type arguments say where its memory comes from and how
+its keys are hashed: the allocator, as for a `Vec`, and the hasher.
+Neither has a default. `FixedState` is the hasher `HashMap::new_in`
+makes: a fast hash with a fixed seed, so a map's order is the same in
+every run. Neither `HashMap` nor `FixedState` is in the prelude, so the
+program starts with two `use` lines. `insert` returns
 the value the key had before, if any. `get` returns an `Option`: a
 reference to the value, or `None` when the key isn't there. `remove`
 takes the key out and gives back its value.
@@ -619,7 +624,7 @@ of its own:
 use std::collections::HashMap;
 
 fn main(gpa: Gpa) {
-    let mut counts: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut counts: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     for w in "a b a c a b".split(' ') {
         *counts.entry(w).or_insert(0) += 1;
     }
@@ -671,7 +676,7 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 
 fn main(gpa: Gpa) {
-    let mut seen: HashSet<i64, Gpa> = HashSet::new_in(gpa);
+    let mut seen: HashSet<i64, Gpa, FixedState> = HashSet::new_in(gpa);
     println("{} {} {}", seen.insert(3), seen.insert(3), seen.contains(&3));
 
     let mut grades: BTreeMap<i64, &str, Gpa> = BTreeMap::new_in(gpa);
@@ -738,8 +743,8 @@ fn trim_punct(word: &str) -> &str {
     &word[start..end]
 }
 
-fn count_words(text: &str, gpa: Gpa) -> HashMap<String<Gpa>, i64, Gpa> {
-    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+fn count_words(text: &str, gpa: Gpa) -> HashMap<String<Gpa>, i64, Gpa, FixedState> {
+    let mut counts: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -880,8 +885,8 @@ fn trim_punct(word: &str) -> &str {
     &word[start..end]
 }
 
-fn count_words(text: &str, gpa: Gpa) -> HashMap<String<Gpa>, i64, Gpa> {
-    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+fn count_words(text: &str, gpa: Gpa) -> HashMap<String<Gpa>, i64, Gpa, FixedState> {
+    let mut counts: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -894,7 +899,7 @@ fn count_words(text: &str, gpa: Gpa) -> HashMap<String<Gpa>, i64, Gpa> {
 
 // The pairs, most common first; words with the same count in
 // alphabetical order.
-fn sorted_counts(counts: &HashMap<String<Gpa>, i64, Gpa>, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
+fn sorted_counts(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
     let mut rows: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, n) in counts {
         rows.push((word.clone(), *n));

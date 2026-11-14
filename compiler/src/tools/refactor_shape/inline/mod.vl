@@ -25,16 +25,14 @@ mod text;
 
 use std::alloc::Arena;
 
-use crate::base::{
-    IntVec, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, get_bufs, get_src,
-};
+use crate::base::{buf_byte, buf_bytes, buf_copy, buf_int, buf_len, buf_new, buf_str, get_src};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::cli::line::Call;
 use crate::front::ast::{NodeKind, child};
 use crate::front::embed::wgsl::WgslCx;
 use crate::front::lexer::Tok;
-use crate::front::modules::{file_of_pos, module_at};
+use crate::front::modules::{file_made, file_of_pos, module_at};
 use crate::tools::ctx::Tcx;
 use crate::tools::edit::edit_replace;
 use crate::tools::edit::apply::{finish_edit, prepare_edit, set_command};
@@ -77,254 +75,248 @@ pub fn run_inline(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
 
 fn inline_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
-    unsafe {
-        set_command(c.line, tcx);
-        pcx.prog = c.prog();
-        tcx.tool = c"refactor";
-        tcx.sub = c"inline";
-        let mut root = 0 as *mut u8;
-        let mut words = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut opts = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let example = c"FN [--at FILE:LINE] --dry-run";
-        if !take_args(c, shape_options("inline"), &mut root, &mut words, &mut opts, tcx, pcx) {
-            return 2;
-        }
-        if words.count != 1 {
-            return usage_error(if words.count == 0 { c"a function FN is needed" }
-                else { c"one FN at a time" }, example, tcx, pcx);
-        }
-        let at = opt(opts, c"--at", false);
-        let mut keep = at != 0 as *mut u8;
-        for i in 0..opts.count {
-            if bytes_is(c_slice((*opts.data.add(i as usize)) as *mut u8), c"--keep", pcx) {
-                keep = true;
-            }
-        }
-        let mut at_file = 0 as *mut u8;
-        let mut at_line: i64 = 0;
-        if at != 0 as *mut u8 && !file_line(c_slice(at), &mut at_file, &mut at_line) {
-            return usage_error(c"--at takes FILE:LINE, the line of a call", example, tcx, pcx);
-        }
-        let name = c_slice((*words.data.add(0)) as *mut u8);
-        tcx.root_given = root;
-        root = root_or_diag(root, tcx.sub, name, true, tcx, pcx);
-        if root == 0 as *mut u8 {
-            return 2;
-        }
-        let mut status: i64 = 0;
-        let d = load_and_find(root, name, (1 << K_FN) | (1 << K_METHOD), c"function", &mut status,
-            tcx, pcx, wgx);
-        if d < 0 {
-            return status;
-        }
-        let f = pcx.defs[d as usize].node;
-        let body = pcx.nodes[f as usize].c;
-        let fqn = sym_text(pcx.defs[d as usize].fqn, pcx);
-        if pcx.nodes[f as usize].y == 1 {
-            let e = diag(c"error", c"refactor.extern", tcx);
-            buf_bytes(e, fqn);
-            buf_str(e, c" is an extern \"C\" function: C code may call it\n");
-            return 1;
-        }
-        if body <= 0 || pcx.nodes[f as usize].g != 0
-            || (pcx.nodes[f as usize].h != 0 && pcx.nodes[pcx.nodes[f as usize].h as usize].g != 0) {
-            let e = diag(c"error", c"refactor.generic", tcx);
-            buf_bytes(e, fqn);
-            buf_str(e,
-                if body <= 0 { c" has no body\n" }
-                else { c" is generic: its body is checked once per instance\n" });
-            return 1;
-        }
-        if !load_callee(d, f, fqn, tcx, pcx) {
-            return 1;
-        }
-        // The calls (as written), each once; with --at, the one on that line.
-        let mut calls = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut checked = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for n in 1..pcx.nodes.len() as i64 {
-            if pcx.nodes[n as usize].kind != NodeKind::Call || pcx.nodes[n as usize].x <= 0
-                || def_of_node(pcx.fns[(pcx.nodes[n as usize].x - 1) as usize].node, tcx, pcx)
-                != d {
-                continue;
-            }
-            let mut o = orig_of(n, NodeKind::Call, tcx, pcx);
-            if o < 0 {
-                o = orig_of(n, NodeKind::MethodCall, tcx, pcx);
-            }
-            if o < 0 || contains(calls, o) {
-                continue;
-            }
-            if at != 0 as *mut u8
-                && !(line_of(pstart(o, pcx), pcx) == at_line
-                    && ends_with(pcx.files[file_of_pos(pstart(o, pcx), pcx) as usize].path,
-                        c_slice(at_file))) {
-                continue;
-            }
-            calls.push(o);
-            checked.push(n);
-        }
-        if calls.count == 0 {
-            let e = diag(c"error", c"refactor.no-call", tcx);
-            buf_bytes(e, fqn);
-            buf_str(e,
-                if at != 0 as *mut u8 { c" is not called on " } else { c" is not called\n" });
-            if at != 0 as *mut u8 {
-                buf_str(e, at);
-                buf_byte(e, b'\n');
-            }
-            try_query_name(c"refs", fqn, tcx, pcx);
-            return 1;
-        }
-        if at != 0 as *mut u8 && calls.count > 1 {
-            let e = diag(c"error", c"refactor.ambiguous", tcx);
-            buf_str(e, at);
-            buf_str(e, c" has ");
-            buf_int(e, calls.count);
-            buf_str(e, c" calls of ");
-            buf_bytes(e, fqn);
-            buf_str(e, c"; inline them all, or put one on a line of its own\n");
-            return 1;
-        }
-        // (a call inside another's arguments: the outer one only)
-        let mut nested: i64 = 0;
-        let mut done = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for i in 0..calls.count {
-            let o = (*calls.data.add(i as usize));
-            let mut inner = false;
-            for j in 0..calls.count {
-                let q = (*calls.data.add(j as usize));
-                if j != i && pstart(q, pcx) <= pstart(o, pcx) && pend(o, pcx) <= pend(q, pcx)
-                    && (pstart(q, pcx) < pstart(o, pcx) || pend(o, pcx) < pend(q, pcx)) {
-                    inner = true;
-                }
-            }
-            if inner {
-                nested += 1;
-                continue;
-            }
-            if !inline_call(d, o, (*checked.data.add(i as usize)), fqn, tcx, pcx) {
-                return 1;
-            }
-            done.push(o);
-        }
-        // FN, when nothing else uses it: deleted, with its imports.
-        let mut deleted = false;
-        if !keep && nested == 0 {
-            deleted = delete_unused(d, done, tcx, pcx);
-        }
-        let status = prepare_edit(tcx, pcx);
-        if status >= 0 {
-            return status;
-        }
-        fix_round(root, c"imports,pub", tcx, pcx);
-        tidy_round(root, tcx, pcx);
-        let what = buf_new();
-        buf_str(what, c"inlined ");
-        buf_bytes(what, fqn);
-        buf_str(what, c" at ");
-        buf_int(what, done.count);
-        buf_str(what, if done.count == 1 { c" call" } else { c" calls" });
-        if deleted {
-            buf_str(what, c", deleted it");
-        }
-        if nested > 0 {
-            let e = diag(c"note", c"refactor.nested", tcx);
-            buf_int(e, nested);
-            buf_str(e, if nested == 1 { c" call is" } else { c" calls are" });
-            buf_str(e, c" in the arguments of another: inline again for them\n");
-        }
-        finish_edit(buf_slice(what), root, tcx, pcx)
+    set_command(c.line, tcx);
+    pcx.prog = c.prog();
+    tcx.tool = c"refactor";
+    tcx.sub = c"inline";
+    let mut root = 0 as *const u8;
+    let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut opts: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let example = c"FN [--at FILE:LINE] --dry-run";
+    if !take_args(c, shape_options("inline"), &mut root, &mut words, &mut opts, tcx, pcx) {
+        return 2;
     }
+    if words.len() as i64 != 1 {
+        return usage_error(if words.len() as i64 == 0 { c"a function FN is needed" }
+            else { c"one FN at a time" }, example, tcx, pcx);
+    }
+    let at = opt(opts.as_slice(), c"--at", false);
+    let mut keep = at != 0 as *mut u8;
+    for i in 0..opts.len() as i64 {
+        if bytes_is(&c_slice((opts[i as usize]) as *mut u8), c"--keep", pcx) {
+            keep = true;
+        }
+    }
+    let mut at_file = 0 as *const u8;
+    let mut at_line: i64 = 0;
+    if at != 0 as *mut u8 && !file_line(&c_slice(at), &mut at_file, &mut at_line) {
+        return usage_error(c"--at takes FILE:LINE, the line of a call", example, tcx, pcx);
+    }
+    let name = c_slice((words[0]) as *mut u8);
+    tcx.root_given = root;
+    root = root_or_diag(root, tcx.sub, &name, true, tcx, pcx);
+    if root == 0 as *mut u8 {
+        return 2;
+    }
+    let mut status: i64 = 0;
+    let d = load_and_find(root, &name, (1 << K_FN) | (1 << K_METHOD), c"function", &mut status,
+        tcx, pcx, wgx);
+    if d < 0 {
+        return status;
+    }
+    let f = pcx.defs[d as usize].node;
+    let body = pcx.nodes[f as usize].c;
+    let fqn = sym_text(pcx.defs[d as usize].fqn, pcx);
+    if pcx.nodes[f as usize].y == 1 {
+        let e = diag(c"error", c"refactor.extern", tcx);
+        buf_bytes(e, fqn);
+        buf_str(e, c" is an extern \"C\" function: C code may call it\n");
+        return 1;
+    }
+    if body <= 0 || pcx.nodes[f as usize].g != 0
+        || (pcx.nodes[f as usize].h != 0 && pcx.nodes[pcx.nodes[f as usize].h as usize].g != 0) {
+        let e = diag(c"error", c"refactor.generic", tcx);
+        buf_bytes(e, fqn);
+        buf_str(e,
+            if body <= 0 { c" has no body\n" }
+            else { c" is generic: its body is checked once per instance\n" });
+        return 1;
+    }
+    if !load_callee(d, f, fqn, tcx, pcx) {
+        return 1;
+    }
+    // The calls (as written), each once; with --at, the one on that line.
+    let mut calls: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut checked: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n as usize].kind != NodeKind::Call || pcx.nodes[n as usize].x <= 0
+            || def_of_node(pcx.fns[(pcx.nodes[n as usize].x - 1) as usize].node, tcx, pcx)
+            != d {
+            continue;
+        }
+        let mut o = orig_of(n, NodeKind::Call, tcx, pcx);
+        if o < 0 {
+            o = orig_of(n, NodeKind::MethodCall, tcx, pcx);
+        }
+        if o < 0 || contains(calls.as_slice(), o) {
+            continue;
+        }
+        if at != 0 as *mut u8
+            && !(line_of(pstart(o, pcx), pcx) == at_line
+                && ends_with(pcx.files[file_of_pos(pstart(o, pcx), pcx) as usize].path,
+                    &c_slice(at_file))) {
+            continue;
+        }
+        calls.push(o);
+        checked.push(n);
+    }
+    if calls.len() as i64 == 0 {
+        let e = diag(c"error", c"refactor.no-call", tcx);
+        buf_bytes(e, fqn);
+        buf_str(e,
+            if at != 0 as *mut u8 { c" is not called on " } else { c" is not called\n" });
+        if at != 0 as *mut u8 {
+            buf_str(e, at);
+            buf_byte(e, b'\n');
+        }
+        try_query_name(c"refs", fqn, tcx, pcx);
+        return 1;
+    }
+    if at != 0 as *mut u8 && calls.len() as i64 > 1 {
+        let e = diag(c"error", c"refactor.ambiguous", tcx);
+        buf_str(e, at);
+        buf_str(e, c" has ");
+        buf_int(e, calls.len() as i64);
+        buf_str(e, c" calls of ");
+        buf_bytes(e, fqn);
+        buf_str(e, c"; inline them all, or put one on a line of its own\n");
+        return 1;
+    }
+    // (a call inside another's arguments: the outer one only)
+    let mut nested: i64 = 0;
+    let mut done: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..calls.len() as i64 {
+        let o = (calls[i as usize]);
+        let mut inner = false;
+        for j in 0..calls.len() as i64 {
+            let q = (calls[j as usize]);
+            if j != i && pstart(q, pcx) <= pstart(o, pcx) && pend(o, pcx) <= pend(q, pcx)
+                && (pstart(q, pcx) < pstart(o, pcx) || pend(o, pcx) < pend(q, pcx)) {
+                inner = true;
+            }
+        }
+        if inner {
+            nested += 1;
+            continue;
+        }
+        if !inline_call(d, o, (checked[i as usize]), fqn, tcx, pcx) {
+            return 1;
+        }
+        done.push(o);
+    }
+    // FN, when nothing else uses it: deleted, with its imports.
+    let mut deleted = false;
+    if !keep && nested == 0 {
+        deleted = delete_unused(d, done.as_slice(), tcx, pcx);
+    }
+    let status = prepare_edit(tcx, pcx);
+    if status >= 0 {
+        return status;
+    }
+    fix_round(root, c"imports,pub", tcx, pcx);
+    tidy_round(root, tcx, pcx);
+    let what = buf_new();
+    buf_str(what, c"inlined ");
+    buf_bytes(what, fqn);
+    buf_str(what, c" at ");
+    buf_int(what, done.len() as i64);
+    buf_str(what, if done.len() as i64 == 1 { c" call" } else { c" calls" });
+    if deleted {
+        buf_str(what, c", deleted it");
+    }
+    if nested > 0 {
+        let e = diag(c"note", c"refactor.nested", tcx);
+        buf_int(e, nested);
+        buf_str(e, if nested == 1 { c" call is" } else { c" calls are" });
+        buf_str(e, c" in the arguments of another: inline again for them\n");
+    }
+    finish_edit(&buf_copy(what), root, tcx, pcx)
 }
 
 // What inlining needs of FN's body (node f): its parameters and their
 // uses, its locals' names, the other names it uses. False after a
 // diagnostic (a `return`, a call of itself).
 fn load_callee(d: i64, f: i64, fqn: &[u8], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        load_free_defs(pcx.nodes[f as usize].c, tcx, pcx);
-        load_body(f, tcx, pcx);
-        for n in 1..pcx.nodes.len() as i64 {
-            if !in_body(n, tcx) {
-                continue;
-            }
-            let k = pcx.nodes[n as usize].kind;
-            // (0.14: a closure's `return` leaves the closure)
-            // (0.15: `e?` may return, as a `return` does)
-            if (k == NodeKind::Return || k == NodeKind::Try) && closure_around(n, tcx, pcx) < 0 {
-                let e = diag(c"error", c"refactor.escapes", tcx);
-                buf_bytes(e, fqn);
-                buf_str(e, if k == NodeKind::Try { c" may return early (`?`), on line " }
-                    else { c" returns early, on line " });
-                buf_int(e, line_of(pcx.nodes[n as usize].start, pcx));
-                buf_str(e, c": inline takes a function that ends with its value\n");
-                try_at(pcx.nodes[n as usize].start, tcx, pcx);
-                return false;
-            }
-            if k == NodeKind::Call && pcx.nodes[n as usize].x > 0
-                && def_of_node(pcx.fns[(pcx.nodes[n as usize].x - 1) as usize].node, tcx, pcx)
-                == d {
-                let e = diag(c"error", c"refactor.recursive", tcx);
-                buf_bytes(e, fqn);
-                buf_str(e, c" calls itself, on line ");
-                buf_int(e, line_of(pcx.nodes[n as usize].start, pcx));
-                buf_byte(e, b'\n');
-                return false;
-            }
-            if k == NodeKind::PatBind || (k == NodeKind::Param && pcx.nodes[n as usize].a != 0) {
-                tcx.body_locals.push(pcx.nodes[n as usize].a);
-            }
-            if k == NodeKind::Ident && local_of(n, pcx) < 0 {
-                tcx.body_free.push(pcx.nodes[n as usize].a);
-            }
+    load_free_defs(pcx.nodes[f as usize].c, tcx, pcx);
+    load_body(f, tcx, pcx);
+    for n in 1..pcx.nodes.len() as i64 {
+        if !in_body(n, tcx) {
+            continue;
         }
-        for i in 0..pcx.nodes[f as usize].count {
-            let p = child(f, i, pcx);
-            tcx.p_local.push(pcx.nodes[p as usize].x);
-            tcx.p_name.push(pcx.nodes[p as usize].a);
-            tcx.p_uses.push(0);
-            tcx.p_changed.push(0);
+        let k = pcx.nodes[n as usize].kind;
+        // (0.14: a closure's `return` leaves the closure)
+        // (0.15: `e?` may return, as a `return` does)
+        if (k == NodeKind::Return || k == NodeKind::Try) && closure_around(n, tcx, pcx) < 0 {
+            let e = diag(c"error", c"refactor.escapes", tcx);
+            buf_bytes(e, fqn);
+            buf_str(e, if k == NodeKind::Try { c" may return early (`?`), on line " }
+                else { c" returns early, on line " });
+            buf_int(e, line_of(pcx.nodes[n as usize].start, pcx));
+            buf_str(e, c": inline takes a function that ends with its value\n");
+            try_at(pcx.nodes[n as usize].start, tcx, pcx);
+            return false;
         }
-        for n in 1..pcx.nodes.len() as i64 {
-            let l = local_of(n, pcx);
-            if l < 0 || !in_body(n, tcx) {
-                continue;
-            }
-            for j in 0..tcx.p_local.count {
-                if (*tcx.p_local.data.add(j as usize)) != l {
-                    continue;
-                }
-                tcx.u_start.push(pcx.nodes[n as usize].start);
-                tcx.u_end.push(pcx.nodes[n as usize].end);
-                tcx.u_param.push(j);
-                (*tcx.p_uses.data.add(j as usize)) += 1;
-                let k = use_kind(n, tcx, pcx);
-                if k != USE_VALUE && k != USE_FIELD_READ {
-                    (*tcx.p_changed.data.add(j as usize)) = 1;
-                }
-            }
+        if k == NodeKind::Call && pcx.nodes[n as usize].x > 0
+            && def_of_node(pcx.fns[(pcx.nodes[n as usize].x - 1) as usize].node, tcx, pcx)
+            == d {
+            let e = diag(c"error", c"refactor.recursive", tcx);
+            buf_bytes(e, fqn);
+            buf_str(e, c" calls itself, on line ");
+            buf_int(e, line_of(pcx.nodes[n as usize].start, pcx));
+            buf_byte(e, b'\n');
+            return false;
         }
-        true
+        if k == NodeKind::PatBind || (k == NodeKind::Param && pcx.nodes[n as usize].a != 0) {
+            tcx.body_locals.push(pcx.nodes[n as usize].a);
+        }
+        if k == NodeKind::Ident && local_of(n, pcx) < 0 {
+            tcx.body_free.push(pcx.nodes[n as usize].a);
+        }
     }
+    for i in 0..pcx.nodes[f as usize].count {
+        let p = child(f, i, pcx);
+        tcx.p_local.push(pcx.nodes[p as usize].x);
+        tcx.p_name.push(pcx.nodes[p as usize].a);
+        tcx.p_uses.push(0);
+        tcx.p_changed.push(0);
+    }
+    for n in 1..pcx.nodes.len() as i64 {
+        let l = local_of(n, pcx);
+        if l < 0 || !in_body(n, tcx) {
+            continue;
+        }
+        for j in 0..tcx.p_local.len() as i64 {
+            if (tcx.p_local[j as usize]) != l {
+                continue;
+            }
+            tcx.u_start.push(pcx.nodes[n as usize].start);
+            tcx.u_end.push(pcx.nodes[n as usize].end);
+            tcx.u_param.push(j);
+            (tcx.p_uses[j as usize]) += 1;
+            let k = use_kind(n, tcx, pcx);
+            if k != USE_VALUE && k != USE_FIELD_READ {
+                (tcx.p_changed[j as usize]) = 1;
+            }
+        }
+    }
+    true
 }
 
 // The items FN's body (node body) names (FREE_DEF: functions, types,
 // constants, statics; not a variant, a field, a method): from every
 // reference the checker resolved (load_refs, which copy_imports needs too).
 fn load_free_defs(body: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        load_refs(tcx, pcx);
-        for r in 0..tcx.r_pos.count {
-            let pos = (*tcx.r_pos.data.add(r as usize));
-            let x = (*tcx.r_def.data.add(r as usize));
-            let k = pcx.defs[x as usize].kind;
-            if ((*tcx.r_flags.data.add(r as usize)) & QF_DEF) == 0
-                && pos >= pcx.nodes[body as usize].start && pos < pcx.nodes[body as usize].end
-                && pcx.defs[x as usize].parent < 0 && k != K_METHOD && k != K_IMPL_METHOD
-                && k != K_MOD
-                && !contains(tcx.free_def, x) {
-                tcx.free_def.push(x);
-            }
+    load_refs(tcx, pcx);
+    for r in 0..tcx.r_pos.len() as i64 {
+        let pos = (tcx.r_pos[r as usize]);
+        let x = (tcx.r_def[r as usize]);
+        let k = pcx.defs[x as usize].kind;
+        if ((tcx.r_flags[r as usize]) & QF_DEF) == 0
+            && pos >= pcx.nodes[body as usize].start && pos < pcx.nodes[body as usize].end
+            && pcx.defs[x as usize].parent < 0 && k != K_METHOD && k != K_IMPL_METHOD
+            && k != K_MOD
+            && !contains(tcx.free_def.as_slice(), x) {
+            tcx.free_def.push(x);
         }
     }
 }
@@ -333,19 +325,16 @@ fn load_free_defs(body: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
 // caller's (module m): made `pub` (once each), so that the imports the
 // fix round adds reach them.
 fn publish_free_defs(m: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        for i in 0..tcx.free_def.count {
-            let x = (*tcx.free_def.data.add(i as usize));
-            if pcx.defs[x as usize].module == m || pcx.defs[x as usize].public
-                || contains(tcx.pubbed, x)
-                || (*pcx.files[file_of_pos(pcx.defs[x as usize].start, pcx) as usize].path.add(0))
-                == b'<' {
-                continue;
-            }
-            tcx.pubbed.push(x);
-            let at = item_head(x, tcx, pcx);
-            edit_replace(at, at, text_of_c(c"pub "), pcx);
+    for i in 0..tcx.free_def.len() as i64 {
+        let x = (tcx.free_def[i as usize]);
+        if pcx.defs[x as usize].module == m || pcx.defs[x as usize].public
+            || contains(tcx.pubbed.as_slice(), x)
+            || file_made(file_of_pos(pcx.defs[x as usize].start, pcx), pcx) {
+            continue;
         }
+        tcx.pubbed.push(x);
+        let at = item_head(x, tcx, pcx);
+        edit_replace(at, at, text_of_c(c"pub "), pcx);
     }
 }
 
@@ -366,9 +355,9 @@ fn copy_imports(m: i64, cm: i64, body: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<C
         let after_dot = t > 0
             && (pcx.toks[(t - 1) as usize].kind == Tok::Dot
                 || pcx.toks[(t - 1) as usize].kind == Tok::ColonColon);
-        if pcx.toks[t as usize].kind != Tok::Ident || after_dot || contains(tcx.body_locals, s)
-            || contains(tcx.p_name, s)
-            || contains(tcx.copied, cm * 1000003 + s) {
+        if pcx.toks[t as usize].kind != Tok::Ident || after_dot
+            || contains(tcx.body_locals.as_slice(), s) || contains(tcx.p_name.as_slice(), s)
+            || contains(tcx.copied.as_slice(), cm * 1000003 + s) {
             t += 1;
             continue;
         }
@@ -419,7 +408,7 @@ fn copy_imports(m: i64, cm: i64, body: i64, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<C
     }
 }
 
-fn text_of_c(s: *mut u8) -> i64 {
+fn text_of_c(s: *const u8) -> i64 {
     let b = buf_new();
     buf_str(b, s);
     b
@@ -428,220 +417,220 @@ fn text_of_c(s: *mut u8) -> i64 {
 // The call o (as written; n, as checked) of FN replaced by its body:
 // false after a diagnostic.
 fn inline_call(d: i64, o: i64, n: i64, fqn: &[u8], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        let f = pcx.defs[d as usize].node;
-        let body = pcx.nodes[f as usize].c;
-        // The arguments, the receiver first.
-        let mut args = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        if pk(o, pcx) == NodeKind::MethodCall {
-            args.push(pa(o, pcx));
+    let f = pcx.defs[d as usize].node;
+    let body = pcx.nodes[f as usize].c;
+    // The arguments, the receiver first.
+    let mut args: Vec<i64, Comp> = Vec::new_in(Comp {});
+    if pk(o, pcx) == NodeKind::MethodCall {
+        args.push(pa(o, pcx));
+    }
+    for i in 0..pcount(o, pcx) {
+        args.push(pchild(o, i, pcx));
+    }
+    // (0.15: by the parameters' order: a labelled argument's value,
+    // and a parameter's default where the call leaves it out)
+    if args.len() as i64 <= tcx.p_local.len() as i64 {
+        let first = args.len() as i64 - pcount(o, pcx);
+        let mut by_param: Vec<i64, Comp> = Vec::new_in(Comp {});
+        for j in 0..tcx.p_local.len() as i64 {
+            by_param.push(if j < first { (args[j as usize]) } else { 0 });
         }
+        let mut ok = true;
         for i in 0..pcount(o, pcx) {
-            args.push(pchild(o, i, pcx));
-        }
-        // (0.15: by the parameters' order: a labelled argument's value,
-        // and a parameter's default where the call leaves it out)
-        if args.count <= tcx.p_local.count {
-            let first = args.count - pcount(o, pcx);
-            let mut by_param = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            for j in 0..tcx.p_local.count {
-                by_param.push(if j < first { (*args.data.add(j as usize)) } else { 0 });
-            }
-            let mut ok = true;
-            for i in 0..pcount(o, pcx) {
-                let a = pchild(o, i, pcx);
-                let mut j = first + i;
-                if pk(a, pcx) == NodeKind::NamedArg {
-                    j = -1;
-                    for k in 0..tcx.p_name.count {
-                        if (*tcx.p_name.data.add(k as usize)) == pa(a, pcx) {
-                            j = k;
-                        }
+            let a = pchild(o, i, pcx);
+            let mut j = first + i;
+            if pk(a, pcx) == NodeKind::NamedArg {
+                j = -1;
+                for k in 0..tcx.p_name.len() as i64 {
+                    if (tcx.p_name[k as usize]) == pa(a, pcx) {
+                        j = k;
                     }
                 }
-                if j < 0 || j >= by_param.count {
+            }
+            if j < 0 || j >= by_param.len() as i64 {
+                ok = false;
+            } else {
+                (by_param[j as usize]) = if pk(a, pcx)
+                    == NodeKind::NamedArg { pb(a, pcx) }
+                    else { a };
+            }
+        }
+        for j in 0..by_param.len() as i64 {
+            if (by_param[j as usize]) == 0 {
+                let dflt = ph(pchild(f, j, pcx), pcx);
+                if dflt == 0 {
                     ok = false;
-                } else {
-                    (*by_param.data.add(j as usize)) = if pk(a, pcx)
-                        == NodeKind::NamedArg { pb(a, pcx) }
-                        else { a };
                 }
-            }
-            for j in 0..by_param.count {
-                if (*by_param.data.add(j as usize)) == 0 {
-                    let dflt = ph(pchild(f, j, pcx), pcx);
-                    if dflt == 0 {
-                        ok = false;
-                    }
-                    (*by_param.data.add(j as usize)) = dflt;
-                }
-            }
-            if ok {
-                args = by_param;
+                (by_param[j as usize]) = dflt;
             }
         }
-        if args.count != tcx.p_local.count {
-            let e = diag(c"error", c"refactor.internal", tcx);
-            buf_str(e, c"the call on line ");
+        if ok {
+            args = by_param;
+        }
+    }
+    if args.len() as i64 != tcx.p_local.len() as i64 {
+        let e = diag(c"error", c"refactor.internal", tcx);
+        buf_str(e, c"the call on line ");
+        buf_int(e, line_of(pstart(o, pcx), pcx));
+        buf_str(e, c" has an argument per parameter of its own; nothing written\n");
+        return false;
+    }
+    // The names the caller's locals hide.
+    let c = enclosing(pstart(o, pcx), tcx, pcx);
+    let cf: i64 = if c >= 0 { pcx.defs[c as usize].node } else { -1 };
+    for i in 0..tcx.body_free.len() as i64 {
+        let name = (tcx.body_free[i as usize]);
+        if cf > 0 && local_named(cf, name, pcx) {
+            let e = diag(c"error", c"refactor.clash", tcx);
+            buf_bytes(e, fqn);
+            buf_str(e, c" names ");
+            buf_bytes(e, sym_text(name, pcx));
+            buf_str(e, c", a local of ");
+            buf_bytes(e, sym_text(pcx.defs[c as usize].fqn, pcx));
+            buf_str(e, c" where it is called (line ");
             buf_int(e, line_of(pstart(o, pcx), pcx));
-            buf_str(e, c" has an argument per parameter of its own; nothing written\n");
+            buf_str(e, c"): rename the local first\n");
+            try_at(pstart(o, pcx), tcx, pcx);
             return false;
         }
-        // The names the caller's locals hide.
-        let c = enclosing(pstart(o, pcx), tcx, pcx);
-        let cf: i64 = if c >= 0 { pcx.defs[c as usize].node } else { -1 };
-        for i in 0..tcx.body_free.count {
-            let name = (*tcx.body_free.data.add(i as usize));
-            if cf > 0 && local_named(cf, name, pcx) {
-                let e = diag(c"error", c"refactor.clash", tcx);
-                buf_bytes(e, fqn);
-                buf_str(e, c" names ");
-                buf_bytes(e, sym_text(name, pcx));
-                buf_str(e, c", a local of ");
-                buf_bytes(e, sym_text(pcx.defs[c as usize].fqn, pcx));
-                buf_str(e, c" where it is called (line ");
+    }
+    publish_free_defs(module_at(pstart(o, pcx), pcx), tcx, pcx);
+    copy_imports(pcx.defs[d as usize].module, module_at(pstart(o, pcx), pcx), body, tcx, pcx);
+    // Each parameter: the argument put in for it, or bound first.
+    let single = pcx.nodes[body as usize].count == 0 && pcx.nodes[body as usize].a > 0;
+    let mut complex: i64 = 0;
+    for j in 0..args.len() as i64 {
+        if !simple_arg((args[j as usize]), tcx, pcx) {
+            complex += 1;
+        }
+    }
+    let binds = buf_new();
+    let mut u_text: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut sub: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for j in 0..args.len() as i64 {
+        let a = (args[j as usize]);
+        let text = &get_src()[pstart(a, pcx) as usize..pend(a, pcx) as usize];
+        let t = buf_new();
+        if j == 0 && pk(o, pcx) == NodeKind::MethodCall && autoref(n, pcx) {
+            // (the receiver, a place the method took the address of)
+            if !self_as_base(f, pcx) || !place_path(text) {
+                let e = diag(c"error", c"refactor.receiver", tcx);
+                buf_str(e, c"the receiver on line ");
                 buf_int(e, line_of(pstart(o, pcx), pcx));
-                buf_str(e, c"): rename the local first\n");
+                buf_str(e, c" is borrowed, and ");
+                buf_bytes(e, fqn);
+                buf_str(e,
+                    c" uses self other than as self.f or self.m(...): bind it to a local first\n");
                 try_at(pstart(o, pcx), tcx, pcx);
                 return false;
             }
+            buf_bytes(t, text);
+            sub.push(1);
         }
-        publish_free_defs(module_at(pstart(o, pcx), pcx), tcx, pcx);
-        copy_imports(pcx.defs[d as usize].module, module_at(pstart(o, pcx), pcx), body, tcx, pcx);
-        // Each parameter: the argument put in for it, or bound first.
-        let single = pcx.nodes[body as usize].count == 0 && pcx.nodes[body as usize].a > 0;
-        let mut complex: i64 = 0;
-        for j in 0..args.count {
-            if !simple_arg((*args.data.add(j as usize)), tcx, pcx) {
-                complex += 1;
-            }
+        else if (tcx.p_changed[j as usize]) == 0
+            && (tcx.p_uses[j as usize]) > 0
+            && simple_arg(a, tcx, pcx) {
+            buf_bytes(t, text);
+            sub.push(1);
         }
-        let binds = buf_new();
-        let mut u_text = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut sub = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for j in 0..args.count {
-            let a = (*args.data.add(j as usize));
-            let text = &get_src()[pstart(a, pcx) as usize..pend(a, pcx) as usize];
-            let t = buf_new();
-            if j == 0 && pk(o, pcx) == NodeKind::MethodCall && autoref(n, pcx) {
-                // (the receiver, a place the method took the address of)
-                if !self_as_base(f, pcx) || !place_path(text) {
-                    let e = diag(c"error", c"refactor.receiver", tcx);
-                    buf_str(e, c"the receiver on line ");
-                    buf_int(e, line_of(pstart(o, pcx), pcx));
-                    buf_str(e, c" is borrowed, and ");
-                    buf_bytes(e, fqn);
-                    buf_str(e, c" uses self other than as self.f or self.m(...): bind it to a local first\n");
-                    try_at(pstart(o, pcx), tcx, pcx);
-                    return false;
-                }
+        else if (tcx.p_changed[j as usize]) == 0
+            && (tcx.p_uses[j as usize]) == 1 && single
+            && complex == 1 {
+            if binding_level(a, pcx) < 99 {
+                buf_byte(t, b'(');
                 buf_bytes(t, text);
-                sub.push(1);
-            }
-            else if (*tcx.p_changed.data.add(j as usize)) == 0
-                && (*tcx.p_uses.data.add(j as usize)) > 0
-                && simple_arg(a, tcx, pcx) {
+                buf_byte(t, b')');
+            } else {
                 buf_bytes(t, text);
-                sub.push(1);
             }
-            else if (*tcx.p_changed.data.add(j as usize)) == 0
-                && (*tcx.p_uses.data.add(j as usize)) == 1 && single
-                && complex == 1 {
-                if binding_level(a, pcx) < 99 {
-                    buf_byte(t, b'(');
-                    buf_bytes(t, text);
-                    buf_byte(t, b')');
-                } else {
-                    buf_bytes(t, text);
-                }
-                sub.push(1);
-            } else {
-                // `let [mut] NAME = ARG;`, NAME renamed when an argument
-                // has it
-                let mut name = sym_text((*tcx.p_name.data.add(j as usize)), pcx);
-                if bytes_is(name, c"self", pcx) || named_in_args(args, name, pcx) {
-                    name = fresh_name(name, args, tcx, pcx);
-                }
-                buf_bytes(t, name);
-                buf_str(binds, c"let ");
-                if (*tcx.p_changed.data.add(j as usize)) != 0 {
-                    buf_str(binds, c"mut ");
-                }
-                buf_bytes(binds, name);
-                buf_str(binds, c" = ");
-                buf_bytes(binds, text);
-                buf_str(binds, c";\n");
-                sub.push(0);
-            }
-            u_text.push(t);
-        }
-        // The uses of the parameters, replaced.
-        let mut rs = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut re = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut rt = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for i in 0..tcx.u_start.count {
-            let j = (*tcx.u_param.data.add(i as usize));
-            rs.push((*tcx.u_start.data.add(i as usize)));
-            re.push((*tcx.u_end.data.add(i as usize)));
-            if shorthand_at((*tcx.u_start.data.add(i as usize)), tcx, pcx) {
-                // (0.15: `S { x }` becomes `S { x: ARG }`)
-                rt.push(shorthand_text(sym_text((*tcx.p_name.data.add(j as usize)), pcx),
-                    buf_slice((*u_text.data.add(j as usize)))));
-            } else {
-                rt.push((*u_text.data.add(j as usize)));
-            }
-        }
-        let call_indent = indent_of(pstart(o, pcx), pcx);
-        let out = buf_new();
-        let stmt = statement_of(o, tcx, pcx);
-        if stmt >= 0 && (*get_bufs().add(binds as usize)).len == 0 && tcx.body_locals.count == 0 {
-            // A statement of its own (`f(x);`), with no local to keep
-            // apart: the body's statements in its place.
-            let text = text_with(pcx.nodes[body as usize].start + 1,
-                pcx.nodes[body as usize].end - 1, rs, re, rt);
-            let lines = buf_new();
-            reindent(lines, trim_blank_lines(buf_slice(text)), call_indent);
-            let s = buf_slice(lines);
-            let tail = pcx.nodes[body as usize].a;
-            buf_bytes(out, skip_indent(trim_blank_lines(s)));
-            if tail > 0 && !block_like(tail, pcx) {
-                buf_byte(out, b';');
-            }
-            edit_replace(pstart(o, pcx), statement_end(o, stmt, pcx), out, pcx);
-            return true;
-        }
-        if single && (*get_bufs().add(binds as usize)).len == 0 {
-            // An expression: the tail, in parentheses when it binds
-            // looser than the call's place.
-            let tail = pcx.nodes[body as usize].a;
-            let text = text_with(pcx.nodes[tail as usize].start, pcx.nodes[tail as usize].end, rs,
-                re, rt);
-            let parens = expr_level(tail, pcx) < slot_level(o, tcx, pcx);
-            if parens {
-                buf_byte(out, b'(');
-            }
-            shift_lines(out, buf_slice(text),
-                indent_of(pcx.nodes[tail as usize].start, pcx).len() as i64, call_indent);
-            if parens {
-                buf_byte(out, b')');
-            }
+            sub.push(1);
         } else {
-            // A block: the bindings, then the body's lines.
-            let inner = buf_new();
-            buf_bytes(inner, call_indent);
-            buf_str(inner, c"    ");
-            buf_str(out, c"{\n");
-            reindent(out, buf_slice(binds), buf_slice(inner));
-            let text = text_with(pcx.nodes[body as usize].start + 1,
-                pcx.nodes[body as usize].end - 1, rs, re, rt);
-            reindent(out, trim_blank_lines(buf_slice(text)), buf_slice(inner));
-            buf_bytes(out, call_indent);
-            buf_byte(out, b'}');
+            // `let [mut] NAME = ARG;`, NAME renamed when an argument
+            // has it
+            let mut name = sym_text((tcx.p_name[j as usize]), pcx);
+            if bytes_is(name, c"self", pcx) || named_in_args(args.as_slice(), name, pcx) {
+                name = fresh_name(name, args.as_slice(), tcx, pcx);
+            }
+            buf_bytes(t, name);
+            buf_str(binds, c"let ");
+            if (tcx.p_changed[j as usize]) != 0 {
+                buf_str(binds, c"mut ");
+            }
+            buf_bytes(binds, name);
+            buf_str(binds, c" = ");
+            buf_bytes(binds, text);
+            buf_str(binds, c";\n");
+            sub.push(0);
         }
-        edit_replace(pstart(o, pcx), pend(o, pcx),
-            if in_fstring(o, tcx, pcx) { one_line(out) } else { out }, pcx);
-        true
+        u_text.push(t);
     }
+    // The uses of the parameters, replaced.
+    let mut rs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut re: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut rt: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..tcx.u_start.len() as i64 {
+        let j = (tcx.u_param[i as usize]);
+        rs.push((tcx.u_start[i as usize]));
+        re.push((tcx.u_end[i as usize]));
+        if shorthand_at((tcx.u_start[i as usize]), tcx, pcx) {
+            // (0.15: `S { x }` becomes `S { x: ARG }`)
+            rt.push(shorthand_text(sym_text((tcx.p_name[j as usize]), pcx),
+                &buf_copy((u_text[j as usize]))));
+        } else {
+            rt.push((u_text[j as usize]));
+        }
+    }
+    let call_indent = indent_of(pstart(o, pcx), pcx);
+    let out = buf_new();
+    let stmt = statement_of(o, tcx, pcx);
+    if stmt >= 0 && buf_len(binds) == 0
+        && tcx.body_locals.len() as i64 == 0 {
+        // A statement of its own (`f(x);`), with no local to keep
+        // apart: the body's statements in its place.
+        let text = text_with(pcx.nodes[body as usize].start + 1,
+            pcx.nodes[body as usize].end - 1, rs.as_slice(), re.as_slice(), rt.as_slice());
+        let lines = buf_new();
+        reindent(lines, trim_blank_lines(&buf_copy(text)), call_indent);
+        let s = buf_copy(lines);
+        let tail = pcx.nodes[body as usize].a;
+        buf_bytes(out, skip_indent(trim_blank_lines(&s)));
+        if tail > 0 && !block_like(tail, pcx) {
+            buf_byte(out, b';');
+        }
+        edit_replace(pstart(o, pcx), statement_end(o, stmt, pcx), out, pcx);
+        return true;
+    }
+    if single && buf_len(binds) == 0 {
+        // An expression: the tail, in parentheses when it binds
+        // looser than the call's place.
+        let tail = pcx.nodes[body as usize].a;
+        let text = text_with(pcx.nodes[tail as usize].start, pcx.nodes[tail as usize].end,
+            rs.as_slice(), re.as_slice(), rt.as_slice());
+        let parens = expr_level(tail, pcx) < slot_level(o, tcx, pcx);
+        if parens {
+            buf_byte(out, b'(');
+        }
+        shift_lines(out, &buf_copy(text),
+            indent_of(pcx.nodes[tail as usize].start, pcx).len() as i64, call_indent);
+        if parens {
+            buf_byte(out, b')');
+        }
+    } else {
+        // A block: the bindings, then the body's lines.
+        let inner = buf_new();
+        buf_bytes(inner, call_indent);
+        buf_str(inner, c"    ");
+        buf_str(out, c"{\n");
+        reindent(out, &buf_copy(binds), &buf_copy(inner));
+        let text = text_with(pcx.nodes[body as usize].start + 1,
+            pcx.nodes[body as usize].end - 1, rs.as_slice(), re.as_slice(), rt.as_slice());
+        reindent(out, trim_blank_lines(&buf_copy(text)), &buf_copy(inner));
+        buf_bytes(out, call_indent);
+        buf_byte(out, b'}');
+    }
+    edit_replace(pstart(o, pcx), pend(o, pcx),
+        if in_fstring(o, tcx, pcx) { one_line(out) } else { out }, pcx);
+    true
 }
 
 // The statement call o is the whole of (`f(x);`, as written; not a
@@ -676,7 +665,7 @@ fn in_fstring(o: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
 // (0.17) Text t on one line: each line break and the indentation after it
 // a space; t itself when it has a `//` comment.
 fn one_line(t: i64) -> i64 {
-    let s = buf_slice(t);
+    let s = buf_copy(t);
     for i in 1..s.len() as i64 {
         if s[(i - 1) as usize] == b'/' && s[i as usize] == b'/' {
             return t;
@@ -725,57 +714,55 @@ fn block_like(n: i64, pcx: &Ctx<Comp>) -> bool {
 
 // FN deleted when nothing but the calls inlined (calls) uses it: its
 // text, and the names of the `use` lines importing it. Whether it is.
-fn delete_unused(d: i64, calls: IntVec, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        let mut targets = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        targets.push(d);
-        refs_of(targets, tcx, pcx);
-        let mut imports = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for r in 0..tcx.r_pos.count {
-            let pos = (*tcx.r_pos.data.add(r as usize));
-            if (*tcx.r_def.data.add(r as usize)) != d
-                || ((*tcx.r_flags.data.add(r as usize)) & QF_DEF) != 0 {
-                continue;
-            }
-            let mut inlined = false;
-            for i in 0..calls.count {
-                let o = (*calls.data.add(i as usize));
-                if pstart(o, pcx) <= pos && pos < pend(o, pcx) {
-                    inlined = true;
-                }
-            }
-            if inlined {
-                continue;
-            }
-            if ((*tcx.r_flags.data.add(r as usize)) & QF_USE) == 0 {
-                return false;
-            }
-            imports.push(pos);
+fn delete_unused(d: i64, calls: &[i64], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
+    let mut targets: Vec<i64, Comp> = Vec::new_in(Comp {});
+    targets.push(d);
+    refs_of(targets.as_slice(), tcx, pcx);
+    let mut imports: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for r in 0..tcx.r_pos.len() as i64 {
+        let pos = (tcx.r_pos[r as usize]);
+        if (tcx.r_def[r as usize]) != d
+            || ((tcx.r_flags[r as usize]) & QF_DEF) != 0 {
+            continue;
         }
-        delete_lines(line_start(text_start(d, pcx), pcx), item_tail(d, tcx, pcx), pcx);
-        for i in 0..imports.count {
-            let pos = (*imports.data.add(i as usize));
-            for u in 1..pcx.nodes.len() as i64 {
-                if pcx.nodes[u as usize].kind != NodeKind::Use || pcx.nodes[u as usize].start > pos
-                    || pcx.nodes[u as usize].end <= pos {
-                    continue;
-                }
-                for k in 0..pcx.nodes[u as usize].count {
-                    let id = child(u, k, pcx);
-                    if pcx.nodes[id as usize].start <= pos && pos < pcx.nodes[id as usize].end {
-                        if pcx.nodes[u as usize].count == 1 {
-                            delete_lines(line_start(node_head(pcx.nodes[u as usize].start, pcx),
-                                pcx),
-                                pcx.nodes[u as usize].end, pcx);
-                        } else {
-                            remove_use_name(u, k, pcx);
-                        }
+        let mut inlined = false;
+        for i in 0..calls.len() as i64 {
+            let o = (calls[i as usize]);
+            if pstart(o, pcx) <= pos && pos < pend(o, pcx) {
+                inlined = true;
+            }
+        }
+        if inlined {
+            continue;
+        }
+        if ((tcx.r_flags[r as usize]) & QF_USE) == 0 {
+            return false;
+        }
+        imports.push(pos);
+    }
+    delete_lines(line_start(text_start(d, pcx), pcx), item_tail(d, tcx, pcx), pcx);
+    for i in 0..imports.len() as i64 {
+        let pos = (imports[i as usize]);
+        for u in 1..pcx.nodes.len() as i64 {
+            if pcx.nodes[u as usize].kind != NodeKind::Use || pcx.nodes[u as usize].start > pos
+                || pcx.nodes[u as usize].end <= pos {
+                continue;
+            }
+            for k in 0..pcx.nodes[u as usize].count {
+                let id = child(u, k, pcx);
+                if pcx.nodes[id as usize].start <= pos && pos < pcx.nodes[id as usize].end {
+                    if pcx.nodes[u as usize].count == 1 {
+                        delete_lines(line_start(node_head(pcx.nodes[u as usize].start, pcx),
+                            pcx),
+                            pcx.nodes[u as usize].end, pcx);
+                    } else {
+                        remove_use_name(u, k, pcx);
                     }
                 }
             }
         }
-        true
     }
+    true
 }
 
 // Whether a local of function node cf (a parameter, a binding) is named
@@ -795,19 +782,17 @@ fn local_named(cf: i64, name: i64, pcx: &Ctx<Comp>) -> bool {
 // An argument put in as it is: a name (not one the body declares), a
 // literal.
 fn simple_arg(a: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let k = pk(a, pcx);
-        if k == NodeKind::Ident {
-            for i in 0..tcx.body_locals.count {
-                if (*tcx.body_locals.data.add(i as usize)) == pa(a, pcx) {
-                    return false;
-                }
+    let k = pk(a, pcx);
+    if k == NodeKind::Ident {
+        for i in 0..tcx.body_locals.len() as i64 {
+            if (tcx.body_locals[i as usize]) == pa(a, pcx) {
+                return false;
             }
-            return true;
         }
-        k == NodeKind::Int || k == NodeKind::Float || k == NodeKind::Char || k == NodeKind::Bool
-            || k == NodeKind::Str || k == NodeKind::CStr || k == NodeKind::Unit
+        return true;
     }
+    k == NodeKind::Int || k == NodeKind::Float || k == NodeKind::Char || k == NodeKind::Bool
+        || k == NodeKind::Str || k == NodeKind::CStr || k == NodeKind::Unit
 }
 
 // Whether the checked call n takes the address of its receiver (`v.m()`
@@ -853,28 +838,26 @@ fn expr_level(n: i64, pcx: &Ctx<Comp>) -> i64 {
 // The binding level the place of call o needs (0: an argument, a
 // statement, a `let`'s value).
 fn slot_level(o: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut best: i64 = -1;
-        let mut level: i64 = 0;
-        for p in 1..tcx.program_end {
-            if p == o || pstart(p, pcx) > pstart(o, pcx) || pend(p, pcx) < pend(o, pcx) {
-                continue;
-            }
-            if best >= 0 && pend(p, pcx) - pstart(p, pcx) >= pend(best, pcx) - pstart(best, pcx) {
-                continue;
-            }
-            let mut kids = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            let mut levels = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            expr_slots(p, &mut kids, &mut levels, pcx);
-            for i in 0..kids.count {
-                if (*kids.data.add(i as usize)) == o {
-                    best = p;
-                    level = (*levels.data.add(i as usize));
-                }
+    let mut best: i64 = -1;
+    let mut level: i64 = 0;
+    for p in 1..tcx.program_end {
+        if p == o || pstart(p, pcx) > pstart(o, pcx) || pend(p, pcx) < pend(o, pcx) {
+            continue;
+        }
+        if best >= 0 && pend(p, pcx) - pstart(p, pcx) >= pend(best, pcx) - pstart(best, pcx) {
+            continue;
+        }
+        let mut kids: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut levels: Vec<i64, Comp> = Vec::new_in(Comp {});
+        expr_slots(p, &mut kids, &mut levels, pcx);
+        for i in 0..kids.len() as i64 {
+            if (kids[i as usize]) == o {
+                best = p;
+                level = (levels[i as usize]);
             }
         }
-        level
     }
+    level
 }
 
 // `try: PROG query show FILE:LINE` of pos.
@@ -887,7 +870,7 @@ fn try_at(pos: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
     put_path(b, file_of_pos(pos, pcx), pcx);
     buf_byte(b, b':');
     buf_int(b, line_of(pos, pcx));
-    put_word(out, buf_slice(b));
+    put_word(out, &buf_copy(b));
     put_root(out, tcx);
     try_end(out);
 }

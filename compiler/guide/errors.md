@@ -44,7 +44,19 @@ let v: Vec<i64> = Vec::new_in(gpa);
 error[alloc.default] 'Vec' names no allocator: its 'A' is written
 ```
 The allocator is part of the type: `Vec<i64, Gpa>`, `String<Gpa>`,
-`HashMap<K, V, Gpa>`, `Box<T, Gpa>`.
+`HashMap<K, V, Gpa, FixedState>`, `Box<T, Gpa>`.
+
+```vole
+let m: std::collections::HashMap<i64, i64, Gpa> = std::collections::HashMap::new_in(gpa);
+```
+```err
+error[hash.default] 'HashMap' names no hasher: its 'S' is written, last
+```
+The hasher is part of the type too, after the allocator, and has no
+default: `HashMap<i64, i64, Gpa, FixedState>`, `HashSet<T, Gpa,
+FixedState>` (in the prelude, as `Gpa`; what `new_in` makes; in an item
+generic over `S: BuildHasher`, its `S`). `volec fix --suggested` writes
+it.
 
 ```vole
 struct Parser { toks: Vec<u8, Gpa> }
@@ -293,7 +305,7 @@ error[type error] no method 'push_string' on type 'String<Gpa>' | help: did you 
 ```
 
 ```vole
-fn main(gpa: Gpa) -> i32 { let m: HashMap<i64, i64, Gpa> = HashMap::new_in(gpa); 0 }
+fn main(gpa: Gpa) -> i32 { let m: HashMap<i64, i64, Gpa, FixedState> = HashMap::new_in(gpa); 0 }
 ```
 ```err
 error[type error] unknown type 'HashMap' | help: add `use std::collections::HashMap;`
@@ -305,7 +317,7 @@ error[type error] unknown type 'HashMap' | help: add `use std::collections::Hash
 use std::collections::HashMap;
 struct K { a: i64 }
 fn main(gpa: Gpa) -> i32 {
-    let mut m: HashMap<K, i64, Gpa> = HashMap::new_in(gpa);
+    let mut m: HashMap<K, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     m.insert(K { a: 1 }, 2);
     0
 }
@@ -623,10 +635,22 @@ then `f(5)`. `fix --suggested` drops the `&`.
 fn first(p: *const i64) -> i64 { p[1] }
 ```
 ```err
-error[type error] cannot index into a value of type '*i64' | help: a raw pointer is not indexed: offset it and read, `unsafe { *p.add(i) }`
+error[type error] cannot index into a value of type '*const i64' | help: a raw pointer is not indexed: offset it and read, `unsafe { *p.add(i) }`
 ```
 A pointer is one value; for many, take a slice `&[i64]`: a slice or a
 Vec indexes its elements, checked and safe.
+
+```vole
+fn bump(p: *mut i64) {}
+fn main() { let x = 1i64; let c: *const i64 = &x; bump(c); }
+```
+```err
+error[type error] expected '*mut i64', got '*const i64' | help: the types differ in mutability (rustc E0308): a `*const T` does not convert to a `*mut T`; cast it, if what it points to may be written through it
+```
+`*const T` and `*mut T` are two types, as in Rust. A `*mut T` goes where
+a `*const T` is wanted; the other way is a cast, `c as *mut i64` (`fix
+--suggested` writes it), or the parameter declared `*const i64` when it
+only reads. A `&x` gives a `*const T`: `&mut x` for a `*mut T`.
 
 ```vole
 fn read(x: *const i64) -> i64 { *x }
@@ -663,7 +687,7 @@ fn main() -> i32 { let mut q = 1i64; bump(q); q as i32 }
 error[type error] expected '&mut i64', got 'i64'
 ```
 `bump(&mut q)`: the call shows what may change. Where a `&T` goes, a
-value is `edition.lenient: 'q' is a value where a reference goes`: pass
+value is `type.ref-value: 'q' is a value where a reference goes`: pass
 `&q`.
 
 ```vole

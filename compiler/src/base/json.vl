@@ -3,7 +3,8 @@
 // harness (a hook, the agent eval; docs/query.md, "JSON").
 
 use crate::base::{
-    IntVec, buf_byte, buf_bytes, buf_clear, buf_fmt, buf_int, buf_new, buf_slice, buf_str, cstr,
+    IntVec, buf_append, buf_byte, buf_bytes, buf_clear, buf_copy, buf_fmt, buf_int, buf_new,
+    buf_str, cstr,
 };
 use crate::base::diag::put_short_positions;
 
@@ -18,61 +19,49 @@ use crate::base::diag::put_short_positions;
 // are in the short form (`file:line:col`). Any other line of output:
 // {"kind":"output","fields":[...]}, its tab-separated fields. Every key is
 // always there. Set by `--json` anywhere on the command line (main).
-static mut DIAG_JSON: bool = false;
+static DIAG_JSON: std::sync::atomic::Atomic<bool> = std::sync::atomic::Atomic::new(false);
 
 // s as a JSON string: quoted, escaped.
 pub fn buf_json_str(out: i64, s: &[u8]) {
-    unsafe {
-        let hex = c"0123456789abcdef";
-        buf_byte(out, b'"');
-        for i in 0..s.len() {
-            let c = s[i];
-            if c == b'"' || c == 92 as u8 {
-                // (a byte each: `{c:c}` is MVS's, the rust edition has no `c`)
-                buf_byte(out, 92 as u8);
-                buf_byte(out, c);
-            } else if c == b'\n' {
-                buf_str(out, c"\\n");
-            } else if c == b'\t' {
-                buf_str(out, c"\\t");
-            } else if c < 32 as u8 {
-                buf_str(out, c"\\u00");
-                buf_byte(out, (*hex.add((c >> 4) as i64 as usize)));
-                buf_byte(out, (*hex.add((c & 15) as i64 as usize)));
-            } else {
-                buf_byte(out, c);
-            }
+    let hex = b"0123456789abcdef";
+    buf_byte(out, b'"');
+    for i in 0..s.len() {
+        let c = s[i];
+        if c == b'"' || c == 92 as u8 {
+            // (a byte each: `{c:c}` is MVS's, the rust edition has no `c`)
+            buf_byte(out, 92 as u8);
+            buf_byte(out, c);
+        } else if c == b'\n' {
+            buf_str(out, c"\\n");
+        } else if c == b'\t' {
+            buf_str(out, c"\\t");
+        } else if c < 32 as u8 {
+            buf_str(out, c"\\u00");
+            buf_byte(out, hex[(c >> 4) as usize]);
+            buf_byte(out, hex[(c & 15) as usize]);
+        } else {
+            buf_byte(out, c);
         }
-        buf_byte(out, b'"');
     }
+    buf_byte(out, b'"');
 }
 
-// Whether s starts with p.
-fn bytes_start(s: &[u8], p: *mut u8) -> bool {
-    unsafe {
-        let mut i: i64 = 0;
-        while (*p.add(i as usize)) != 0 {
-            if i >= s.len() as i64 || s[i as usize] != (*p.add(i as usize)) {
-                return false;
-            }
-            i += 1;
-        }
-        true
-    }
+// Whether s starts with p (a C string).
+fn bytes_start(s: &[u8], p: *const u8) -> bool {
+    let n = crate::base::c_len(p) as usize;
+    s.len() >= n && crate::base::c_eq(p, &s[0..n])
 }
 
 // `,"key":[...]`: the buffers of items as JSON strings.
-fn json_list(out: i64, key: *mut u8, items: IntVec) {
-    unsafe {
-        buf_fmt(out, format_args(",\"{}\":[", str::from_utf8(cstr(key)).unwrap()));
-        for i in 0..items.count {
-            if i > 0 {
-                buf_byte(out, b',');
-            }
-            buf_json_str(out, buf_slice((*items.data.add(i as usize))));
+fn json_list(out: i64, key: *const u8, items: IntVec) {
+    buf_fmt(out, format_args(",\"{}\":[", str::from_utf8(&cstr(key)).unwrap()));
+    for i in 0..items.len() as i64 {
+        if i > 0 {
+            buf_byte(out, b',');
         }
-        buf_byte(out, b']');
+        buf_json_str(out, &buf_copy((items[i as usize])));
     }
+    buf_byte(out, b']');
 }
 
 // The lists of a diagnostic: its help, notes and try lines.
@@ -138,7 +127,7 @@ fn json_diag(out: i64, sev: &[u8], code: &[u8], file: &[u8], line: i64, col: i64
     buf_str(out, c",\"message\":");
     let m = buf_new();
     put_short_positions(m, message);
-    buf_json_str(out, buf_slice(m));
+    buf_json_str(out, &buf_copy(m));
     json_list(out, c"help", tails.help);
     json_list(out, c"notes", tails.notes);
     json_list(out, c"try", tails.tries);
@@ -348,7 +337,7 @@ pub fn json_tool_diags(out: i64, text: &[u8]) {
             if s >= 0 {
                 head = l;
             } else if short {
-                buf_bytes(out, buf_slice(probe));
+                buf_append(out, probe);
             } else {
                 json_output_line(out, l);
             }
@@ -411,22 +400,12 @@ pub fn json_output(out: i64, text: &[u8]) {
 }
 
 // (0.28.0) DIAG_JSON's accessors: every use of it is one of them.
+// (0.29) An atomic, Relaxed: set by the options before any thread
+// starts; the threads only read it (buf_write_fd).
 pub fn get_diag_json() -> bool {
-    // UNSAFE: the --json flag, a process-wide static mut the threads read;
-    // Rust has no safe access to a static mut
-    // SAFETY: written only by main while it parses the command line
-    // (main.vl:285), before build/compile_program (main.vl:339) starts any
-    // thread; read-only after
-    unsafe { DIAG_JSON }
+    DIAG_JSON.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn set_diag_json(v: bool) {
-    // UNSAFE: the --json flag, a process-wide static mut the threads read;
-    // Rust has no safe access to a static mut
-    // SAFETY: written only by main while it parses the command line
-    // (main.vl:285), before build/compile_program (main.vl:339) starts any
-    // thread; read-only after
-    unsafe {
-        DIAG_JSON = v;
-    }
+    DIAG_JSON.store(v, std::sync::atomic::Ordering::Relaxed);
 }

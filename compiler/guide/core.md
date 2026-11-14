@@ -70,7 +70,7 @@ fn main(gpa: Gpa) -> i32 { // gpa: the program's allocator; 0 = exit status
     write(&mut b, "{}", o.len()).unwrap();
     println("{b}");
     if s == "hi" && !first(s).is_ascii_digit() { println("{}", first(s)); }
-    let mut m: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut m: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     *m.entry("k").or_insert(0) += 1;
     let z = 0;
     println("{} {} {}", !0u8, 250u8.wrapping_add(7), m["k"]); // x / 0 panics
@@ -98,12 +98,12 @@ needs them, `Box<T, A>`; no `dyn`. A struct is moved unless it derives
 `Clone, Copy`. A reference is used as in Rust: `*x` reads or writes
 through it, a field or method needs no `*` (`p.x`, `v.len()`), and
 `match e` on an `e: &E` binds references (`E::A(n) => *n + 1`). The
-prelude (no `use`) is Rust's plus `Gpa`: `Option`, `Result`, `Vec`,
-`String`, `Box`, the common traits, and as functions Rust's macros:
-`print`, `println`, `eprintln`, `format_in`, `write`, `writeln`,
-`panic`, `assert`, `assert_eq`, `unreachable`, `todo`. The rest of std
-is `use std::...` (`std::collections::HashMap`); `use crate::lexer::Tok;`
-reaches the program's module `lexer`.
+prelude (no `use`) is Rust's plus `Gpa`, `FixedState`: `Option`,
+`Result`, `Vec`, `String`, `Box`, the common traits, and as functions
+Rust's macros: `print`, `println`, `eprintln`, `format_in`, `write`,
+`writeln`, `panic`, `assert`, `assert_eq`, `unreachable`, `todo`. The
+rest of std is `use std::...` (`std::collections::HashMap`); `use
+crate::lexer::Tok;` reaches the program's module `lexer`.
 
 ## std: what programs use most
 
@@ -119,7 +119,7 @@ fn main(gpa: Gpa) -> i32 {
     let mut toks = lines.next().unwrap().split_whitespace();
     let n: i64 = toks.next().unwrap().parse().unwrap(); // parse: a Result<i64, ParseIntError>
     let mut items: Vec<Item, Gpa> = Vec::new_in(gpa);
-    let mut seen: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut seen: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     for _ in 0..n {
         let name = toks.next().unwrap();       // Option<&str>: a slice of input
         let qty = toks.next().unwrap_or("").parse().unwrap_or(0);
@@ -155,9 +155,10 @@ io::stdin().read_line(&mut b).unwrap() > 0 { ... }` (appends, with the
 `let w = v;`, a struct field or a `return`: `v` is dead after it
 (`borrowck.use_moved`); pass `&v` to lend it, or `v.clone()`. A `Copy`
 value (numbers, `&T`, a struct deriving it) is copied. A temporary is
-dropped at the end of its statement. A slice of `v` (`&v[a..b]`) borrows
-it: `v` does not grow while the slice is used. What allocates has Rust's
-name with `_in` and takes the allocator last: `collect_in(gpa)`,
+dropped at the end of its statement (`if let`'s: before `else`). A
+slice of `v` (`&v[a..b]`) borrows it: `v` does not grow while the slice
+is used. What allocates has Rust's name with `_in` and takes the
+allocator last: `collect_in(gpa)`,
 `to_string_in(gpa)`, `format_in(.., gpa)`. std's most used items:
 `volec guide std`; all, a line each: `volec guide std#the-api`; one name
 with its comment: `volec guide --find split_once`.
@@ -168,7 +169,7 @@ with its comment: `volec guide --find split_once`.
 |---|---|
 | `'println!' is a macro call: vole has no macros` | `println("{a}")`, the help's form |
 | `'Vec::new' allocates from nothing` (`alloc.no_in`) | `Vec::new_in(gpa)`: main's `gpa`, passed down; `volec fix --only alloc` |
-| `'Vec' names no allocator` (`alloc.default`) | `Vec<i64, Gpa>`, `HashMap<K, V, Gpa>`; a struct holding one: `struct P<A: Allocator> { v: Vec<i64, A> }`, used as `P<Gpa>` (`volec fix --only alloc` writes both) |
+| `'Vec' names no allocator` (`alloc.default`) | `Vec<i64, Gpa>`, `HashMap<K, V, Gpa, FixedState>`; a struct holding one: `struct P<A: Allocator> { v: Vec<i64, A> }`, used as `P<Gpa>` (`volec fix --only alloc` writes both) |
 | `expected 'String<Gpa>', got '&str'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: &str` takes literals and a String's `&s` |
 | `cannot assign to immutable variable 'a'` | `let mut a` |
 | `borrowck.borrow_immutable: cannot borrow 'w' as mutable, as it is not declared as mutable` | `let mut w`: `w.push(1)` and `&mut w` change it |
@@ -191,12 +192,13 @@ Float math: Rust's methods on f32 and f64 (`x.sqrt()`, `y.atan2(x)`,
 `x.powi(2)`) and constants (`std::f64::consts::PI`): `volec guide math`.
 SIMD and CPU intrinsics: `std::arch`, the vendors' names (`vaddq_u8`)
 checked against the CPU: `volec guide arch`; `query arch WORDS`.
-GPU compute and rendering: `std::gpu`, wgpu's objects on Metal: `volec guide gpu`.
+GPU work (shader, check, headless): `volec guide gpu-workflow`; the API:
+`volec guide gpu`.
 
 ## The loop
 
-Write the program, then `volec check` (a check hook, where there is
-one, runs it after each edit); fix the first error first. A clean check
+Write the program, then `volec check` (a hook may run it
+after each edit); fix the first error first. A clean check
 ends with `ok: 0 errors in main.vl`, a build with `ok: built prog`. Before writing a construct
 you are unsure of, `volec guide --find WORDS` (`--find read a line`)
 or `volec guide TOPIC#SECTION` prints the lines on it; `volec

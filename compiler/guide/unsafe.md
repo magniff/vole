@@ -30,6 +30,10 @@ escape hatch:
 - `&x as *const T` and `&mut x as *mut T` make one, and a `&mut x`
   passed where a `*mut T` is wanted (a C function's parameter) converts
   to it; `c"..."` is a `*const u8` to read-only memory, NUL-terminated.
+- The two are two types, as in Rust: a `*mut T` goes where a `*const T`
+  is wanted, a `*const T` becomes a `*mut T` only by a cast (`p as *mut
+  T`, `p.cast_mut()`), and nothing is written through a `*const T`. A
+  `&x` gives a `*const T` only: `&mut x` for a `*mut T`.
 - In `unsafe` code `&*p` and `&mut *p` make a reference of the pointee:
   the code vouches for it. A raw pointer never becomes a reference by
   itself.
@@ -100,6 +104,10 @@ defined:
 - it makes no pointer into a Vec's header from the Vec's own buffer
   pointer, nor puts a Vec inside its own buffer (the optimizer takes a
   store to an element as never reaching that Vec's header);
+- it gives a Vec no buffer that is a static, a local, or the struct the
+  Vec is a field of (`from_raw_parts` takes a block of the Vec's
+  allocator): the optimizer keeps a Vec's pointer and length across a
+  call whose callee only writes elements, of any Vec;
 - a type whose safe methods manage memory through raw pointers (a
   growable buffer of its own) implements `Drop`: that keeps it from
   being `Copy`, so a copy cannot outlive a reallocation.
@@ -111,19 +119,26 @@ defined:
 - Each unsafe site says why, in the comments right above it (the
   statement's or item's, no blank line between): `// UNSAFE:` why it
   cannot be safe, `// SAFETY:` why it is sound. `volec check` warns
-  about a site without both (`unsafe.unjustified`). (0.25.3)
+  about a site without both (`unsafe.unjustified`). (0.25.3) With
+  `--deny=unsafe` (0.29) each such site is an error where it is, and
+  so is each unsafe block with nothing unsafe inside
+  (`unsafe.unneeded`); the compiler's own source is held to none of
+  either.
 - `volec query unsafe [FILE...|std]` (0.25.3) lists every unsafe block,
   `unsafe fn` and extern block: `FILE:LINE`, kind, item, class (`ffi`,
   `alloc`, `intrinsic`, `transmute/cast`, `raw-pointer`, `static-mut`:
   through a pointer held in a static, `other`), its comments, and the
   operations inside that need unsafe; `none (unneeded)`: a block with
-  nothing unsafe inside, to remove. `--unjustified`, `--summary`
-  (counts by class, module, file), `--json`, `--no-std`.
+  nothing unsafe inside, to remove. `--unjustified`, `--unneeded`,
+  `--summary` (counts by class, module, file), `--json`, `--no-std`.
 - `volec fix --only unneeded-unsafe` (0.25.4) takes the `none
-  (unneeded)` blocks away and keeps their code in its scope; a block it
-  cannot open so (one that declares and is not last) is left and
-  counted. `--only unneeded-justified` (0.25.5) takes the justified ones
-  too, with their `// UNSAFE:` and `// SAFETY:` comments.
+  (unneeded)` blocks away and keeps their code in its scope, over
+  several lines too (a `let`'s value, an `if` or `while` condition), laid
+  out as `volec fmt` would; a block it cannot open so (one that declares,
+  with code after it) loses the word `unsafe` alone: a plain `{ }`
+  block. A block it leaves gets a note that says why
+  (`fix.unneeded-left`). `--only unneeded-justified` (0.25.5) takes the
+  justified ones too, with their `// UNSAFE:` and `// SAFETY:` comments.
 - `volec --check-unsafe -O1 prog.vl -o prog` checks raw-pointer
   accesses against the heap blocks at run time (`malloc`/`free`):
   out-of-bounds and use-after-free stop the program with `unsafe access

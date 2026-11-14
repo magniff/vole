@@ -37,7 +37,7 @@ Two choices make it fast.
 
 **Bitmask constraints.** Each row, column and box keeps a 9-bit mask of
 the digits it holds, bit `d - 1` for digit `d`. A cell's candidates are
-`0x1ff & ~(rows[r] | cols[c] | boxes[b])`: three loads, two ORs, a NOT.
+`0x1ff & !(rows[r] | cols[c] | boxes[b])`: three loads, two ORs, a NOT.
 Placing and erasing a digit set and clear one bit in three masks.
 
 **Most constrained cell first** (the "minimum remaining values"

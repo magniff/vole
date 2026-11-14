@@ -29,7 +29,8 @@
 // read its value (HOLE_ALIAS: the `=fK` of that hole).
 
 use std::alloc::Allocator; use crate::base::{
-    IntVec, get_src, buf_byte, buf_bytes, buf_done, buf_fmt, buf_new, buf_slice, intern, sym_text,
+    get_src, buf_byte, buf_bytes, buf_done, buf_fmt, buf_new, intern, sym_text, buf_append,
+    buf_copy, buf_ptr, intern_buf,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -49,10 +50,10 @@ pub const FMT_PLUS: i64 = 2048;
 pub const FMT_ALT: i64 = 4096;
 pub const FMT_OCT: i64 = 8192;
 pub const FMT_PTR: i64 = 16384;
-// (0.27.2) The checker's too: std2's `{:?}` of an array writes its slice
+// (0.27.2) The checker's too: std's `{:?}` of an array writes its slice
 // (`&x[..]`), [T; N] having no impl of its own. RULE: F16.4
 pub const FMT_AS_SLICE: i64 = 32768;
-// (0.27.2.1) `-`: std2's Formatter::sign_minus (its flag bit 2).
+// (0.27.2.1) `-`: std's Formatter::sign_minus (its flag bit 2).
 pub const FMT_MINUS: i64 = 65536;
 
 // An InterpHole's b: HOLE_DEBUG (`?`), its fill byte (0: a space) at
@@ -88,7 +89,7 @@ const FK_ASSERT: i64 = 4;
 const FK_DEBUG_ASSERT: i64 = 5;
 const FK_METHOD: i64 = 6;
 
-// (0.27.2) std2's fmt::write and writeln: the destination, then the format
+// (0.27.2) std's fmt::write and writeln: the destination, then the format
 // literal (F16.2).
 const FK_WRITE: i64 = 7;
 
@@ -97,9 +98,7 @@ const FK_WRITE: i64 = 7;
 // panic; assert, debug_assert; and the methods Buf::push_fmt,
 // String::push_fmt, Fmt::write.
 fn format_kind(f: i64, method: bool, pcx: &Ctx<Comp>) -> i64 {
-    // UNSAFE: FNS is the table of functions, a raw pointer (front/types).
-    // SAFETY: f >= 0 is the called function's index (the caller's), below FN_COUNT.
-    let info = unsafe { pcx.fns[f as usize] };
+    let info = pcx.fns[f as usize];
     if pcx.std_module < 0 || !within_std(info.module, pcx) || info.node <= 0 {
         return 0;
     }
@@ -116,16 +115,16 @@ fn format_kind(f: i64, method: bool, pcx: &Ctx<Comp>) -> i64 {
     if name == b"print" || name == b"println" || name == b"eprint" || name == b"eprintln"
         || name == b"format_args" {
         FK_PRINT
-    } else if (name == b"write" || name == b"writeln") && crate::front::known::on_std2(pcx)
+    } else if (name == b"write" || name == b"writeln")
         && sym_text(pcx.modules[info.module as usize].name, pcx) == "fmt".as_bytes() {
         // (0.28.0: std::fmt's alone: std::fs::write, a module's own `write`
         // called by its path, `msl::write(&m, a, out, refl)`, are functions
         // like any, not the format call they were read as by the name)
-        // RULE: F16.1 (std2's fmt::write, writeln: the literal is the second)
+        // RULE: F16.1 (fmt::write, writeln: the literal is the second)
         FK_WRITE
     } else if name == b"format_in" {
         FK_FORMAT_IN
-    } else if name == b"panic_str" || name == b"panic" && crate::front::known::on_std2(pcx) {
+    } else if name == b"panic_str" || name == b"panic" {
         FK_PANIC
     } else if name == b"assert" {
         FK_ASSERT
@@ -151,9 +150,7 @@ pub fn is_format_literal(n: i64, pcx: &Ctx<Comp>) -> bool {
 // none.
 fn std_fn(name: &[u8], pcx: &Ctx<Comp>) -> i64 {
     for f in 0..pcx.fns.len() as i64 {
-        // UNSAFE: FNS is the table of functions, a raw pointer (front/types).
-        // SAFETY: f < FN_COUNT, the table's length.
-        let info = unsafe { pcx.fns[f as usize] };
+        let info = pcx.fns[f as usize];
         if info.tmpl == 0 && info.node > 0 && within_std(info.module, pcx)
             && sym_text(pcx.nodes[info.node as usize].a, pcx) == name {
             return f;
@@ -230,12 +227,12 @@ pub fn format_call(n: i64, f: i64, method: bool, pcx: &mut Ctx<Comp>) -> i64 {
     if pcx.nodes[made as usize].kind != NodeKind::Interp {
         return f;
     }
-    // RULE: F16.3 (on std2, panic's message is written in place:
-    // interp::direct_body_std2)
-    if k == FK_PANIC && crate::front::known::on_std2(pcx) {
+    // RULE: F16.3 (panic's message is written in place:
+    // interp::direct_body_fmt)
+    if k == FK_PANIC {
         return f;
     }
-    if k == FK_PANIC || k == FK_ASSERT || k == FK_DEBUG_ASSERT {
+    if k == FK_ASSERT || k == FK_DEBUG_ASSERT {
         return panic_call(n, f, k, pcx);
     }
     f
@@ -265,16 +262,14 @@ fn panic_call(n: i64, f: i64, k: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if target < 0 {
         return f;
     }
-    // UNSAFE: FNS is the table of functions, a raw pointer (front/types).
-    // SAFETY: CUR_FN, when >= 0, is the function being checked, below FN_COUNT.
-    let in_std = pcx.cur_fn >= 0 && within_std(unsafe { pcx.fns[pcx.cur_fn as usize].module }, pcx);
+    let in_std = pcx.cur_fn >= 0 && within_std(pcx.fns[pcx.cur_fn as usize].module, pcx);
     let bare = pcx.nodes[n as usize].count == (if k == FK_PANIC { 1 } else { 2 });
     if !in_std && !pcx.no_positions && bare {
         let b = buf_new();
         crate::front::contracts::checks::put_position(b, pcx.nodes[n as usize].start, pcx);
         let s = new_node(NodeKind::Str, pcx.nodes[n as usize].start, pcx.nodes[n as usize].start,
             pcx);
-        pcx.nodes[s as usize].a = add_string(buf_slice(b));
+        pcx.nodes[s as usize].a = add_string(&buf_copy(b), pcx);
         let mark = list_begin(pcx);
         for i in 0..pcx.nodes[n as usize].count {
             list_push(child(n, i, pcx), pcx);
@@ -323,7 +318,7 @@ const R_INT: i64 = 5;
 // The texts and holes of a literal, in order: `texts[i]` (a string id, -1
 // for none) comes before hole i; one more text ends it.
 struct Parsed<A: Allocator> {
-    texts: IntVec, holes: Vec<Hole, A>, ok: bool, braces: bool,
+    texts: Vec<i64, A>, holes: Vec<Hole, A>, ok: bool, braces: bool,
 }
 
 // The literal lit of call n, its arguments n's children first..last: an
@@ -331,7 +326,7 @@ struct Parsed<A: Allocator> {
 // an error. n may be a node holding the arguments in its list (a
 // contract's message) or 0.
 fn make_format(lit: i64, n: i64, first: i64, last: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let s = str_at(pcx.nodes[lit as usize].a);
+    let s = str_at(pcx.nodes[lit as usize].a, pcx);
     // (no brace at all: the literal as it is, the common case)
     if !has_brace(lit, pcx) {
         if last > first {
@@ -343,17 +338,17 @@ fn make_format(lit: i64, n: i64, first: i64, last: i64, pcx: &mut Ctx<Comp>) -> 
         return lit;
     }
     let map = raw_map(lit, pcx);
-    let mut p = parse(lit, s, map, pcx);
+    let mut p = parse(lit, s, &map, pcx);
     if !p.ok {
         return 0;
     }
-    let made = build(lit, n, first, last, &mut p, map, pcx);
+    let made = build(lit, n, first, last, &mut p, &map, pcx);
     made
 }
 
 // Whether literal lit's text has a brace (else it is its own text).
 fn has_brace(lit: i64, pcx: &Ctx<Comp>) -> bool {
-    let s = str_at(pcx.nodes[lit as usize].a);
+    let s = str_at(pcx.nodes[lit as usize].a, pcx);
     for i in 0..s.len() {
         if s[i] == b'{' || s[i] == b'}' {
             return true;
@@ -365,9 +360,9 @@ fn has_brace(lit: i64, pcx: &Ctx<Comp>) -> bool {
 // The raw position (in SRC) of each byte of literal lit's text, and of its
 // end: escapes read as the lexer reads them, a text block's indentation
 // skipped. Positions only (the tools' `{x}`), so a near one will do.
-fn raw_map(lit: i64, pcx: &Ctx<Comp>) -> IntVec {
-    let s = str_at(pcx.nodes[lit as usize].a);
-    let mut map = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+fn raw_map(lit: i64, pcx: &Ctx<Comp>) -> Vec<i64, Comp> {
+    let s = str_at(pcx.nodes[lit as usize].a, pcx);
+    let mut map: Vec<i64, Comp> = Vec::new_in(Comp {});
     let start = pcx.nodes[lit as usize].start;
     let end = pcx.nodes[lit as usize].end;
     let mut raw = false;
@@ -402,7 +397,7 @@ fn raw_map(lit: i64, pcx: &Ctx<Comp>) -> IntVec {
             map.push(i);
             if e == b'\n' {
                 // (a line continuation: no byte)
-                map.count -= 1;
+                map.pop();
                 i += 2;
                 while i < end
                     && (get_src()[i as usize] == b' ' || get_src()[i as usize] == b'\t'
@@ -470,9 +465,9 @@ fn is_digit(c: u8) -> bool {
 
 // The literal's text s parsed into texts and holes (errors reported:
 // format.syntax, format.spec, format.expr-hole).
-fn parse(lit: i64, s: &[u8], map: IntVec, pcx: &mut Ctx<Comp>) -> Parsed<Comp> {
+fn parse(lit: i64, s: &[u8], map: &[i64], pcx: &mut Ctx<Comp>) -> Parsed<Comp> {
     let mut p = Parsed {
-        texts: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
+        texts: Vec::new_in(crate::base::comp::Comp {}),
         holes: Vec::new_in(crate::base::comp::Comp {}), ok: true, braces: false,
     };
     let text = buf_new();
@@ -492,7 +487,7 @@ fn parse(lit: i64, s: &[u8], map: IntVec, pcx: &mut Ctx<Comp>) -> Parsed<Comp> {
             continue;
         }
         if c == b'}' {
-            syntax_error(lit, map.get(i), b"unmatched '}' in a format string",
+            syntax_error(lit, map[i as usize], b"unmatched '}' in a format string",
                 b"a '}' of the text is written '}}'", pcx);
             p.ok = false;
             return p;
@@ -503,7 +498,7 @@ fn parse(lit: i64, s: &[u8], map: IntVec, pcx: &mut Ctx<Comp>) -> Parsed<Comp> {
             continue;
         }
         // A hole.
-        p.texts.push(text_id(text));
+        p.texts.push(text_id(text, pcx));
         let open = i;
         let mut close = i + 1;
         while close < s.len() as i64 && s[close as usize] != b'}' && s[close as usize] != b'{' {
@@ -515,7 +510,7 @@ fn parse(lit: i64, s: &[u8], map: IntVec, pcx: &mut Ctx<Comp>) -> Parsed<Comp> {
             if e < s.len() as i64 && e > i + 1 {
                 expr_hole(lit, s, map, open, e, pcx);
             } else {
-                syntax_error(lit, map.get(open),
+                syntax_error(lit, map[open as usize],
                     b"a hole of the format string is not closed: expected '}'",
                     b"a '{' of the text is written '{{'", pcx);
             }
@@ -523,7 +518,7 @@ fn parse(lit: i64, s: &[u8], map: IntVec, pcx: &mut Ctx<Comp>) -> Parsed<Comp> {
             return p;
         }
         let mut h = Hole {
-            kind: R_NEXT, value: 0, pos: map.get(open + 1), end: map.get(close),
+            kind: R_NEXT, value: 0, pos: map[(open + 1) as usize], end: map[close as usize],
             fill: 0, flags: 0, debug: false, wkind: R_NONE, wvalue: 0, pkind: R_NONE, pvalue: -1,
             wpos: 0, wend: 0, ppos: 0, pend: 0,
         };
@@ -543,8 +538,8 @@ fn parse(lit: i64, s: &[u8], map: IntVec, pcx: &mut Ctx<Comp>) -> Parsed<Comp> {
             }
             h.kind = R_NAME;
             h.value = intern(&s[from as usize..k as usize], pcx);
-            h.pos = map.get(from);
-            h.end = map.get(k);
+            h.pos = map[from as usize];
+            h.end = map[k as usize];
         }
         let arg_end = k;
         while k < close && s[k as usize] == b' ' {
@@ -554,7 +549,7 @@ fn parse(lit: i64, s: &[u8], map: IntVec, pcx: &mut Ctx<Comp>) -> Parsed<Comp> {
         // not doubled)
         if k < close && s[k as usize] != b':' && k > arg_end
             && (arg_end == i + 1 || is_ident_start(s[k as usize]) || is_digit(s[k as usize])) {
-            syntax_error(lit, map.get(open),
+            syntax_error(lit, map[open as usize],
                 b"a hole of the format string is not closed: expected '}'",
                 b"a '{' of the text is written '{{'", pcx);
             p.ok = false;
@@ -576,14 +571,14 @@ fn parse(lit: i64, s: &[u8], map: IntVec, pcx: &mut Ctx<Comp>) -> Parsed<Comp> {
         p.holes.push(h);
         i = close + 1;
     }
-    p.texts.push(text_id(text));
+    p.texts.push(text_id(text, pcx));
     p
 }
 
 // The text gathered so far, as a string id (-1 when empty), and cleared.
-fn text_id(b: i64) -> i64 {
-    let t = buf_slice(b);
-    let id: i64 = if t.len() > 0 { add_string(t) } else { -1 };
+fn text_id(b: i64, pcx: &Ctx<Comp>) -> i64 {
+    let t = buf_copy(b);
+    let id: i64 = if t.len() > 0 { add_string(&t, pcx) } else { -1 };
     crate::base::buf_clear(b);
     id
 }
@@ -620,7 +615,7 @@ fn expr_end(s: &[u8], k: i64) -> i64 {
 
 // The spec s[from..to] of hole h, into its fields; false after an error
 // (format.spec).
-fn parse_spec(lit: i64, s: &[u8], map: IntVec, from: i64, to: i64, h: &mut Hole,
+fn parse_spec(lit: i64, s: &[u8], map: &[i64], from: i64, to: i64, h: &mut Hole,
     pcx: &mut Ctx<Comp>) -> bool {
     let mut i = from;
     let spec = &s[from as usize..to as usize];
@@ -629,7 +624,7 @@ fn parse_spec(lit: i64, s: &[u8], map: IntVec, from: i64, to: i64, h: &mut Hole,
         && (s[(i + 1) as usize] == b'<' || s[(i + 1) as usize] == b'^'
             || s[(i + 1) as usize] == b'>') {
         if s[i as usize] >= 128 {
-            spec_error(lit, map.get(i), spec, b"a fill is one ASCII character in this release",
+            spec_error(lit, map[i as usize], spec, b"a fill is one ASCII character in this release",
                 pcx);
             return false;
         }
@@ -661,13 +656,13 @@ fn parse_spec(lit: i64, s: &[u8], map: IntVec, from: i64, to: i64, h: &mut Hole,
     let w = count(s, i, to, pcx);
     if w.kind == R_INT || w.kind == R_INDEX || w.kind == R_NAME {
         if w.kind == R_INT && w.value > 65535 {
-            spec_error(lit, map.get(i), spec, b"a format width is at most 65535", pcx);
+            spec_error(lit, map[i as usize], spec, b"a format width is at most 65535", pcx);
             return false;
         }
         h.wkind = w.kind;
         h.wvalue = w.value;
-        h.wpos = map.get(i);
-        h.wend = map.get(w.end - 1);
+        h.wpos = map[i as usize];
+        h.wend = map[(w.end - 1) as usize];
         i = w.end;
     }
     if i < to && s[i as usize] == b'.' {
@@ -678,18 +673,18 @@ fn parse_spec(lit: i64, s: &[u8], map: IntVec, from: i64, to: i64, h: &mut Hole,
         } else {
             let pr = count(s, i, to, pcx);
             if pr.kind == R_NONE {
-                spec_error(lit, map.get(i), spec,
+                spec_error(lit, map[i as usize], spec,
                     b"expected the precision after '.': digits, 'N$', 'name$' or '*'", pcx);
                 return false;
             }
             if pr.kind == R_INT && pr.value > 65535 {
-                spec_error(lit, map.get(i), spec, b"a format precision is at most 65535", pcx);
+                spec_error(lit, map[i as usize], spec, b"a format precision is at most 65535", pcx);
                 return false;
             }
             h.pkind = pr.kind;
             h.pvalue = pr.value;
-            h.ppos = map.get(i);
-            h.pend = map.get(pr.end - 1);
+            h.ppos = map[i as usize];
+            h.pend = map[(pr.end - 1) as usize];
             i = pr.end;
         }
     }
@@ -730,15 +725,10 @@ fn parse_spec(lit: i64, s: &[u8], map: IntVec, from: i64, to: i64, h: &mut Hole,
                 { let rest = str::from_utf8(rest).unwrap();
                     format_args("unknown format trait '{rest}'") });
         }
-        spec_error(lit, map.get(i), spec, buf_slice(b), pcx);
+        spec_error(lit, map[i as usize], spec, &buf_copy(b), pcx);
         return false;
     }
-    // (0.27.2: std2's Formatter carries `#`, F16.3)
-    if (h.flags & FMT_ALT) != 0 && h.debug && !crate::front::known::on_std2(pcx) {
-        spec_error(lit, map.get(from), spec,
-            b"'{:#?}', Debug written over several lines, is not in this release", pcx);
-        return false;
-    }
+    // (0.27.2: the Formatter carries `#`, F16.3)
     true
 }
 
@@ -777,15 +767,17 @@ fn count(s: &[u8], i: i64, to: i64, pcx: &mut Ctx<Comp>) -> Count {
 
 // The arguments of a format call: n's children first..last, positional
 // (P) then named (`name = e`, N).
-#[derive(Clone, Copy)] struct Args { pos: IntVec, named: IntVec, uses: IntVec, value_uses: IntVec }
+struct Args<A: Allocator> {
+    pos: Vec<i64, A>, named: Vec<i64, A>, uses: Vec<i64, A>, value_uses: Vec<i64, A>,
+}
 
-fn build(lit: i64, n: i64, first: i64, last: i64, p: &mut Parsed<Comp>, map: IntVec,
+fn build(lit: i64, n: i64, first: i64, last: i64, p: &mut Parsed<Comp>, map: &[i64],
     pcx: &mut Ctx<Comp>) -> i64 {
     let mut a = Args {
-        pos: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-        named: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-        uses: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
-        value_uses: IntVec { data: 0 as *mut i64, count: 0, cap: 0 },
+        pos: Vec::new_in(crate::base::comp::Comp {}),
+        named: Vec::new_in(crate::base::comp::Comp {}),
+        uses: Vec::new_in(crate::base::comp::Comp {}),
+        value_uses: Vec::new_in(crate::base::comp::Comp {}),
     };
     for i in first..last {
         let arg = child(n, i, pcx);
@@ -807,18 +799,18 @@ fn build(lit: i64, n: i64, first: i64, last: i64, p: &mut Parsed<Comp>, map: Int
         // (only `{{`, `}}`: the text)
         let s = new_node(NodeKind::Str, pcx.nodes[lit as usize].start, pcx.nodes[lit as usize].end,
             pcx);
-        pcx.nodes[s as usize].a = if p.texts.get(0) >= 0 { p.texts.get(0) }
-            else { add_string(b"") };
+        pcx.nodes[s as usize].a = if p.texts[0 as usize] >= 0 { p.texts[0 as usize] }
+            else { add_string(b"", pcx) };
         return s;
     }
     // Each hole's value, width and precision: the argument it takes (an
     // index into the arguments, positional then named), or -1 - sym for a
     // name in scope.
-    let np = a.pos.count;
+    let np = a.pos.len() as i64;
     let mut next: i64 = 0;
-    let mut vals = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-    let mut widths = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-    let mut precs = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+    let mut vals: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut widths: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut precs: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut order: i64 = -1;
     let mut simple = true;
     let mut missing = false;
@@ -846,13 +838,13 @@ fn build(lit: i64, n: i64, first: i64, last: i64, p: &mut Parsed<Comp>, map: Int
         }
         for r in [w, pr] {
             if r >= 0 {
-                a.uses.set(r, a.uses.get(r) + 1);
+                a.uses[r as usize] = a.uses[r as usize] + 1;
                 simple = false;
             }
         }
         if v >= 0 {
-            a.uses.set(v, a.uses.get(v) + 1);
-            a.value_uses.set(v, a.value_uses.get(v) + 1);
+            a.uses[v as usize] = a.uses[v as usize] + 1;
+            a.value_uses[v as usize] = a.value_uses[v as usize] + 1;
             if v <= order {
                 simple = false;
             }
@@ -862,9 +854,9 @@ fn build(lit: i64, n: i64, first: i64, last: i64, p: &mut Parsed<Comp>, map: Int
         widths.push(w);
         precs.push(pr);
     }
-    for i in 0..a.uses.count {
-        if a.uses.get(i) == 0 {
-            let arg = if i < np { a.pos.get(i) } else { a.named.get(i - np) };
+    for i in 0..a.uses.len() as i64 {
+        if a.uses[i as usize] == 0 {
+            let arg = if i < np { a.pos[i as usize] } else { a.named[(i - np) as usize] };
             args_error(pcx.nodes[arg as usize].start,
                 if i < np { b"this argument is never used: no hole of the format string takes it" }
                 else {
@@ -873,7 +865,7 @@ fn build(lit: i64, n: i64, first: i64, last: i64, p: &mut Parsed<Comp>, map: Int
                 b"write a hole for it, '{}', or remove it", pcx);
             return 0;
         }
-        if a.value_uses.get(i) != 1 {
+        if a.value_uses[i as usize] != 1 {
             simple = false;
         }
     }
@@ -881,10 +873,11 @@ fn build(lit: i64, n: i64, first: i64, last: i64, p: &mut Parsed<Comp>, map: Int
     let interp = new_node(NodeKind::Interp, pcx.nodes[lit as usize].start,
         pcx.nodes[lit as usize].end, pcx);
     let mark = list_begin(pcx);
-    let nargs = a.uses.count;
+    let nargs = a.uses.len() as i64;
     if !simple {
         for i in 0..nargs {
-            let arg = if i < np { a.pos.get(i) } else { pcx.nodes[a.named.get(i - np) as usize].b };
+            let arg = if i < np { a.pos[i as usize] }
+                else { pcx.nodes[a.named[(i - np) as usize] as usize].b };
             let h = new_node(NodeKind::InterpHole, pcx.nodes[arg as usize].start,
                 pcx.nodes[arg as usize].end, pcx);
             pcx.nodes[h as usize].a = arg;
@@ -895,20 +888,20 @@ fn build(lit: i64, n: i64, first: i64, last: i64, p: &mut Parsed<Comp>, map: Int
         }
     }
     for i in 0..p.holes.len() as i64 {
-        let t = p.texts.get(i);
+        let t = p.texts[i as usize];
         if t >= 0 {
             list_push(text_node(t, lit, pcx), pcx);
         }
         let h = p.holes[i as usize];
         let hole = new_node(NodeKind::InterpHole, h.pos, h.end, pcx);
-        let v = vals.get(i);
+        let v = vals[i as usize];
         pcx.nodes[hole as usize].b = (if h.debug { HOLE_DEBUG } else { 0 }) + h.fill * HOLE_FILL;
         if v < 0 {
             // a name in scope, at its position in the text
             pcx.nodes[hole as usize].a = name_node(-v - 1, h.pos, h.end, pcx);
         } else if simple {
-            pcx.nodes[hole as usize].a = if v < np { a.pos.get(v) }
-                else { pcx.nodes[a.named.get(v - np) as usize].b };
+            pcx.nodes[hole as usize].a = if v < np { a.pos[v as usize] }
+                else { pcx.nodes[a.named[(v - np) as usize] as usize].b };
         } else {
             pcx.nodes[hole as usize].a = name_node(hidden_name(v, pcx), h.pos, h.end, pcx);
             pcx.nodes[hole as usize].b += (v + 1) * HOLE_ALIAS;
@@ -916,19 +909,19 @@ fn build(lit: i64, n: i64, first: i64, last: i64, p: &mut Parsed<Comp>, map: Int
         pcx.nodes[hole as usize].c = if h.wkind == R_INT { h.wvalue } else { -1 };
         pcx.nodes[hole as usize].d = if h.pkind == R_INT { h.pvalue } else { -1 };
         pcx.nodes[hole as usize].p = h.flags;
-        let w = widths.get(i);
+        let w = widths[i as usize];
         if w != -2 {
             pcx.nodes[hole as usize].g = if w < 0 { name_node(-w - 1, h.wpos, h.wend, pcx) }
                 else { name_node(hidden_name(w, pcx), h.pos, h.end, pcx) };
         }
-        let pr = precs.get(i);
+        let pr = precs[i as usize];
         if pr != -2 {
             pcx.nodes[hole as usize].h = if pr < 0 { name_node(-pr - 1, h.ppos, h.pend, pcx) }
                 else { name_node(hidden_name(pr, pcx), h.pos, h.end, pcx) };
         }
         list_push(hole, pcx);
     }
-    let t = p.texts.get(p.holes.len() as i64);
+    let t = p.texts[p.holes.len() as i64 as usize];
     if t >= 0 {
         list_push(text_node(t, lit, pcx), pcx);
     }
@@ -938,7 +931,7 @@ fn build(lit: i64, n: i64, first: i64, last: i64, p: &mut Parsed<Comp>, map: Int
 
 // The argument (positional, then named) a reference takes, or -1 - sym for
 // a name in scope; -2 for none. `next` counts the `{}` holes.
-fn resolve_ref(kind: i64, value: i64, a: &mut Args, next: &mut i64, pcx: &Ctx<Comp>) -> i64 {
+fn resolve_ref(kind: i64, value: i64, a: &mut Args<Comp>, next: &mut i64, pcx: &Ctx<Comp>) -> i64 {
     if kind == R_NEXT {
         let v = *next;
         *next += 1;
@@ -948,9 +941,9 @@ fn resolve_ref(kind: i64, value: i64, a: &mut Args, next: &mut i64, pcx: &Ctx<Co
         return value;
     }
     if kind == R_NAME {
-        for i in 0..a.named.count {
-            if pcx.nodes[a.named.get(i) as usize].a == value {
-                return a.pos.count + i;
+        for i in 0..a.named.len() as i64 {
+            if pcx.nodes[a.named[i as usize] as usize].a == value {
+                return a.pos.len() as i64 + i;
             }
         }
         return -1 - value;
@@ -962,7 +955,7 @@ fn resolve_ref(kind: i64, value: i64, a: &mut Args, next: &mut i64, pcx: &Ctx<Co
 fn hidden_name(k: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let b = buf_new();
     buf_fmt(b, format_args("=f{k}"));
-    intern(buf_slice(b), pcx)
+    intern_buf(b, pcx)
 }
 
 fn name_node(sym: i64, start: i64, end: i64, pcx: &mut Ctx<Comp>) -> i64 {
@@ -1005,7 +998,7 @@ fn missing_error(lit: i64, p: &mut Parsed<Comp>, np: i64, pcx: &mut Ctx<Comp>) {
     buf_fmt(b,
         format_args("{asked} positional argument{} in the format string, but the call has {np}",
             if asked == 1 { "" } else { "s" }));
-    args_error(pcx.nodes[lit as usize].start, buf_slice(b),
+    args_error(pcx.nodes[lit as usize].start, &buf_copy(b),
         b"give each '{}' (and '{N}', 'N$', '.*') its argument after the format string", pcx);
 }
 
@@ -1023,7 +1016,7 @@ fn help_text(help: &[u8], pcx: &Ctx<Comp>) {
     let h = buf_new();
     buf_bytes(h, help);
     buf_byte(h, 0);
-    err_help(buf_slice(h).ptr, pcx);
+    err_help(buf_ptr(h), pcx);
 }
 
 // format.syntax at pos; its fix doubles the literal's braces (its text as
@@ -1043,7 +1036,7 @@ fn syntax_error(lit: i64, pos: i64, message: &[u8], help: &[u8], pcx: &mut Ctx<C
         }
         buf_byte(fixed, raw[i]);
     }
-    err_fix(pcx.nodes[lit as usize].start, pcx.nodes[lit as usize].end, buf_slice(fixed), pcx);
+    err_fix(pcx.nodes[lit as usize].start, pcx.nodes[lit as usize].end, &buf_copy(fixed), pcx);
     err_end_soft(pcx);
     pcx.err_kind = saved;
 }
@@ -1065,7 +1058,7 @@ fn spec_error(lit: i64, pos: i64, spec: &[u8], message: &[u8], pcx: &mut Ctx<Com
 // format.expr-hole: the hole s[open..close] (`{a.b}`) holds an expression;
 // its fix makes it `{}` (its spec kept) and the expression an argument,
 // when the call has no other positional argument.
-fn expr_hole(lit: i64, s: &[u8], map: IntVec, open: i64, close: i64, pcx: &mut Ctx<Comp>) {
+fn expr_hole(lit: i64, s: &[u8], map: &[i64], open: i64, close: i64, pcx: &mut Ctx<Comp>) {
     let saved = pcx.err_kind;
     pcx.err_kind = c"format.expr-hole";
     let inner = &s[(open + 1) as usize..close as usize];
@@ -1084,7 +1077,7 @@ fn expr_hole(lit: i64, s: &[u8], map: IntVec, open: i64, close: i64, pcx: &mut C
         }
     }
     let expr = if colon >= 0 { &inner[0..colon as usize] } else { inner };
-    err_begin(map.get(open + 1), pcx);
+    err_begin(map[(open + 1) as usize], pcx);
     err_fmt({
         let expr = str::from_utf8(expr).unwrap();
         format_args("'{{{expr}}}': a hole of a format string holds a name, not an expression")
@@ -1103,8 +1096,8 @@ fn expr_hole(lit: i64, s: &[u8], map: IntVec, open: i64, close: i64, pcx: &mut C
 // Literal lit's source with each expression hole written `{}` (or `{:spec}`)
 // and the expressions after it, `"a {} {x}", e`: empty when the literal has
 // a `{}` or `{N}` of its own (its arguments would move).
-fn fixed_literal(lit: i64, map: IntVec, pcx: &Ctx<Comp>) -> &'static [u8] {
-    let s = str_at(pcx.nodes[lit as usize].a);
+fn fixed_literal(lit: i64, map: &[i64], pcx: &Ctx<Comp>) -> &'static [u8] {
+    let s = str_at(pcx.nodes[lit as usize].a, pcx);
     let raw = &get_src()[
         pcx.nodes[lit as usize].start as usize..pcx.nodes[lit as usize].end as usize];
     let base = pcx.nodes[lit as usize].start;
@@ -1153,8 +1146,8 @@ fn fixed_literal(lit: i64, map: IntVec, pcx: &Ctx<Comp>) -> &'static [u8] {
                     colon = q;
                 }
             }
-            let rs = map.get(i + 1) - base;
-            let re = map.get(i + 1 + colon) - base;
+            let rs = map[(i + 1) as usize] - base;
+            let re = map[(i + 1 + colon) as usize] - base;
             if rs < r || re < rs || re > raw.len() as i64 {
                 return b"";
             }
@@ -1166,7 +1159,7 @@ fn fixed_literal(lit: i64, map: IntVec, pcx: &Ctx<Comp>) -> &'static [u8] {
         i = close + 1;
     }
     buf_bytes(out, &raw[r as usize..]);
-    buf_bytes(out, buf_slice(exprs));
+    buf_append(out, exprs);
     // (out is not written again: its view lasts the process, buf_done)
     buf_done(out)
 }

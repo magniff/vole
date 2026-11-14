@@ -43,7 +43,7 @@ make one program; `mod name;` loads `name.vl`.
 |---|---|
 | `println!("{}", x)`, `format!`, `vec!`, `assert!` | no macros: functions, `println("x = {x:>4} {:?}", v)`, `format_in("..", args, gpa)` (a `String`), `assert(c)`, `panic("..")` (`guide formatting`) |
 | `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (`guide allocators`) |
-| `Vec<T>`, `String`, `HashMap<K, V>`, `Box<T>` | the allocator is in the type: `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa>`, `Box<T, Gpa>`; a struct that holds one is generic over it (`struct S<A: Allocator> { v: Vec<u8, A> }`) |
+| `Vec<T>`, `String`, `HashMap<K, V>`, `Box<T>` | the allocator is in the type: `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa, FixedState>` (the hasher too; `FixedState` is in the prelude, as `Gpa`), `Box<T, Gpa>`; a struct that holds one is generic over it (`struct S<A: Allocator> { v: Vec<u8, A> }`) |
 | `s.to_string()`, `it.collect()`, `s.to_uppercase()` | what allocates has the name with `_in` and takes the allocator last: `to_string_in(gpa)`, `collect_in(gpa)` (`alloc.no_in` names it; `volec fix --only alloc`) |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
 | `a as i64` to widen | written or not: an `i32` goes where an `i64` does, losslessly; `a as i32` narrows (`guide conversions`) |
@@ -343,7 +343,7 @@ fn main(gpa: Gpa) -> i32 {                 // the program's allocator
     let last = v.pop();                    // Option<i64>
     println("{}", last.unwrap_or(-1));
 
-    let mut m: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut m: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     m.insert("a", 1);
     m.insert("b", 2);
     match m.get("a") { Some(x) => println("{x}"), None => println("none") }
@@ -504,7 +504,7 @@ c-interop`.
 | `wildcard imports are not allowed` | `use m::{a, b};` |
 | `borrowck.use_moved: 'v' is used here after it moved` | lend it (`&v`), or pass `v.clone()` |
 | `borrowck.conflict: cannot borrow 'u' as mutable because it is also borrowed as immutable` | use the shared borrow before the change, or take it again after |
-| `edition.lenient: 'n' is a value where a reference goes` | `f(&n)` |
+| `type.ref-value: 'n' is a value where a reference goes` | `f(&n)` |
 | `expected '&mut Vec<i64, Gpa>', got 'Vec<i64, Gpa>'` | `f(&mut v)` |
 | `cannot assign to immutable variable 'x'` | `let mut x` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |

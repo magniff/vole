@@ -5,25 +5,34 @@
 // that the program does not define but std does is asked again, by the
 // same command run with std (VOLE_QUERY_STD=1).
 
-use crate::base::{IntVec, buf_bytes, buf_new, buf_slice, intern, sym_text};
+use crate::base::{buf_append, buf_bytes, buf_copy, buf_done, buf_len, buf_new, intern, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::cpp::directives::file_exists;
 use crate::front::modules::lookup::is_prelude_name;
-use crate::front::stdsrc_rust::std2_source;
+use crate::front::stdsrc::std_source;
 use crate::tools::ctx::Tcx;
 use crate::tools::proc::{buf_cstr, write_file_if};
 use crate::tools::query::defs::{K_IMPL_METHOD, K_METHOD, find_defs, last_segment};
 use crate::tools::query::names::canonical_name;
 
+// UNSAFE: C's getenv, setenv and execvp: the query runs itself again with
+// std's program.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
-    fn getenv(name: *mut u8) -> *mut u8;
-    fn setenv(name: *mut u8, value: *mut u8, overwrite: i32) -> i32;
-    fn execvp(file: *mut u8, args: *mut *mut u8) -> i32;
+    fn getenv(name: *const u8) -> *mut u8;
+    fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32;
+    fn execvp(file: *const u8, args: *const *const u8) -> i32;
 }
 
 // Whether the query was run again with std (by ask_with_std).
 pub fn std_requested() -> bool {
+    // UNSAFE: getenv is C's; the variable's first byte is read.
+    // SAFETY: the name is a literal; v is checked not null before its first
+    // byte is read.
     unsafe {
         let v = getenv(c"VOLE_QUERY_STD");
         v != 0 as *mut u8 && (*v.add(0)) == b'1'
@@ -41,12 +50,13 @@ pub fn names_std(a: &[u8]) -> bool {
 }
 
 // std's source.
-fn std_text(tcx: &mut Tcx<Comp>) -> &[u8] {
+fn std_text(tcx: &mut Tcx<Comp>) -> &'static [u8] {
     if tcx.std_text < 0 {
         tcx.std_text = buf_new();
-        std2_source(tcx.std_text);
+        std_source(tcx.std_text);
     }
-    buf_slice(tcx.std_text)
+    // (written once, above)
+    buf_done(tcx.std_text)
 }
 
 fn is_word(c: u8) -> bool {
@@ -109,47 +119,46 @@ pub fn std_defines(word: &[u8], tcx: &mut Tcx<Comp>) -> bool {
 
 // Whether some NAME of the command is one std defines and the program
 // does not (after the program is read without std).
-pub fn wants_std(args: IntVec, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        for i in 0..args.count {
-            let name = canonical_name(
-                crate::tools::query::c_slice((*args.data.add(i as usize)) as *mut u8));
-            if name.len() == 0
-                || name[(name.len() as i64 - 1) as usize] >= b'0'
-                && name[(name.len() as i64 - 1) as usize] <= b'9' {
-                continue;
-            }
-            let mut found = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            find_defs(name, false, &mut found, tcx, pcx);
-            if found.count == 0 && std_defines(last_segment(name), tcx) {
-                return true;
-            }
+pub fn wants_std(args: &[i64], tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
+    for i in 0..args.len() as i64 {
+        let name = canonical_name(
+            crate::base::c_kept((args[i as usize]) as *mut u8));
+        if name.len() == 0
+            || name[(name.len() as i64 - 1) as usize] >= b'0'
+            && name[(name.len() as i64 - 1) as usize] <= b'9' {
+            continue;
         }
-        false
+        let mut found: Vec<i64, Comp> = Vec::new_in(Comp {});
+        find_defs(name, false, &mut found, tcx, pcx);
+        if found.len() as i64 == 0 && std_defines(last_segment(name), tcx) {
+            return true;
+        }
     }
+    false
 }
 
 // Whether every NAME of args is one std defines (a question about std
 // asked where there is no program).
-pub fn all_std(args: IntVec, tcx: &mut Tcx<Comp>) -> bool {
-    unsafe {
-        if args.count == 0 {
+pub fn all_std(args: &[i64], tcx: &mut Tcx<Comp>) -> bool {
+    if args.len() as i64 == 0 {
+        return false;
+    }
+    for i in 0..args.len() as i64 {
+        let a = crate::tools::query::c_slice((args[i as usize]) as *mut u8);
+        if !names_std(&a) && !std_defines(last_segment(canonical_name(&a)), tcx) {
             return false;
         }
-        for i in 0..args.count {
-            let a = crate::tools::query::c_slice((*args.data.add(i as usize)) as *mut u8);
-            if !names_std(a) && !std_defines(last_segment(canonical_name(a)), tcx) {
-                return false;
-            }
-        }
-        true
     }
+    true
 }
 
 // The root of a program of nothing but `fn main`, for std's questions
 // where there is no program (made in $TMPDIR once); 0 when it cannot be
 // written.
 pub fn std_root(pcx: &Ctx<Comp>) -> *mut u8 {
+    // UNSAFE: getenv is C's; the variable's first byte is read.
+    // SAFETY: the name is a literal; tmp is checked not null before its
+    // first byte is read.
     unsafe {
         let b = buf_new();
         let tmp = getenv(c"TMPDIR");
@@ -158,7 +167,7 @@ pub fn std_root(pcx: &Ctx<Comp>) -> *mut u8 {
         } else {
             buf_bytes(b, b"/tmp");
         }
-        let s = buf_slice(b);
+        let s = buf_copy(b);
         if s.len() > 0 && s[(s.len() as i64 - 1) as usize] != b'/' {
             buf_bytes(b, b"/");
         }
@@ -177,10 +186,14 @@ pub fn std_root(pcx: &Ctx<Comp>) -> *mut u8 {
 // when it can run).
 pub fn ask_with_std(tcx: &Tcx<Comp>) {
     let words = crate::tools::query::roots::command_words(tcx);
-    let args = crate::tools::proc::exec_words(words);
+    let args = crate::tools::proc::exec_words(words.as_slice());
+    // UNSAFE: setenv and execvp are C's.
+    // SAFETY: the names are literals; args is a list of the command's words
+    // (C strings) and a null (exec_words), alive until exec replaces the
+    // process; its first word is the program as this one was run.
     unsafe {
         setenv(c"VOLE_QUERY_STD", c"1", 1);
-        execvp(words.get(0) as *mut u8, args);
+        execvp(words[0 as usize] as *mut u8, args.as_ptr() as *const *const u8);
     }
 }
 
@@ -232,9 +245,9 @@ pub fn put_std_use(out: i64, d: i64, tcx: &Tcx<Comp>, pcx: &mut Ctx<Comp>) {
         buf_bytes(line, path);
         buf_bytes(line, b";");
     }
-    if buf_slice(line).len() > 0 {
+    if (buf_len(line) as usize) > 0 {
         buf_bytes(out, b"// ");
-        buf_bytes(out, buf_slice(line));
+        buf_append(out, line);
         buf_bytes(out, b"\n");
     }
 }

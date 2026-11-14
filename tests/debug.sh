@@ -5,6 +5,13 @@
 # stop there, and the backtrace of the crash that follows must give every
 # frame's function, file and line.
 #
+# (0.29) First, without a debugger: tests/debug/tests.vl, a test build
+# (`--test-build`), compiled with -g to an object at -O0 and -O2, must
+# have a line table with a row of that file. At -O2 everything of the
+# program is inlined into the `main` the compiler writes, and no function
+# of the file is emitted: the table had no row, and dsymutil could not
+# load it.
+#
 # usage: tests/debug.sh [-c COMPILER] [-t TARGET]
 #
 #   -c COMPILER   the volec to test (default: target/volec)
@@ -32,16 +39,59 @@ case "$TARGET" in
     *-macos) DEBUGGER=lldb ;;
     *) DEBUGGER=gdb ;;
 esac
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-debug.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
+
+# The rows of an object's line table that name file $2: one line each.
+table_rows() {
+    case "$TARGET" in
+        *-macos) dwarfdump --debug-line "$1" | awk -v f="$2" '
+            index($0, "name: \"" f "\"") { named = 1 }
+            /^0x[0-9a-f]+ / { rows++ }
+            END { if (named) print rows + 0; else print 0 }' ;;
+        *) objdump --dwarf=decodedline "$1" | awk -v f="$2" '
+            NF >= 3 && $3 ~ /^0x/ && index($1, f) { rows++ }
+            END { print rows + 0 }' ;;
+    esac
+}
+
+failed=0
+case "$TARGET" in
+    *-macos) TABLE_TOOL=dwarfdump ;;
+    *) TABLE_TOOL=objdump ;;
+esac
+if command -v "$TABLE_TOOL" >/dev/null 2>&1; then
+    for o in 0 2; do
+        obj="$WORK/tests$o.o"
+        if ! (cd "$ROOT" && "$COMPILER" --target "$TARGET" -g "-O$o" --test-build -c tests/debug/tests.vl -o "$obj") >"$WORK/out" 2>&1; then
+            echo "FAIL -O$o --test-build: compilation: $(head -c 300 "$WORK/out")"
+            failed=$((failed + 1))
+            continue
+        fi
+        rows=$(table_rows "$obj" tests.vl)
+        if [ "${rows:-0}" -lt 1 ]; then
+            echo "FAIL -O$o --test-build: the line table of tests/debug/tests.vl's object has no row of tests.vl ($TABLE_TOOL)"
+            failed=$((failed + 1))
+            continue
+        fi
+        echo "ok -O$o --test-build: $rows rows"
+    done
+else
+    echo "debug: no $TABLE_TOOL here: the test build's line table is not checked"
+fi
+if [ "$failed" -ne 0 ]; then
+    echo "debug: tests/debug/tests.vl's line table at -O0 and -O2 for $TARGET, $failed failing"
+    exit 1
+fi
+
 command -v "$DEBUGGER" >/dev/null 2>&1 || { echo "debug: no $DEBUGGER here: not checked"; exit 0; }
 if [ "$TARGET" = x86_64-macos ] && [ "$(uname -m)" = arm64 ]; then
     # (lldb does not debug programs run by Rosetta)
     echo "debug: x86_64-macos programs run under Rosetta here, which lldb cannot debug: not checked"
     exit 0
 fi
-
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-debug.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
-trap 'exit 130' INT TERM
 
 # What the debugger must print, one pattern per line, in order: a
 # breakpoint in each file (with its frame), then the frames of the crash.
@@ -108,5 +158,5 @@ for o in 0 2; do
     fi
     echo "ok -O$o"
 done
-echo "debug: tests/debug/crash.vl at -O0 and -O2 under $DEBUGGER for $TARGET, $failed failing"
+echo "debug: tests/debug/crash.vl at -O0 and -O2 under $DEBUGGER for $TARGET (and the line table of a test build), $failed failing"
 [ "$failed" -eq 0 ]

@@ -28,4 +28,4 @@ pub fn first(text: &'static [u8]) -> &'static [u8] {
 }
 $ fmt --check words.vl main.vl
 $ check main.vl
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (2 files, 0 shaders)

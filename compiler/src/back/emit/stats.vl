@@ -3,12 +3,11 @@
 
 use crate::back::emit::machine::reg_sp;
 use crate::base::{
-    STDERR, buf_byte, buf_bytes, buf_fmt, buf_new, buf_str, buf_write_fd, cstr, get_bufs, sym_text,
+    STDERR, buf_byte, buf_bytes, buf_copy, buf_fmt, buf_new, buf_str, buf_write_fd, cstr, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::middle::ctx::FnCtx;
-use crate::middle::ir::get_irfuncs;
 
 // ---- Statistics (--stats) ----
 
@@ -37,9 +36,7 @@ const ST_FUNCS: i64 = 8;
 
 const ST_COUNT: i64 = 9;
 
-static mut ST_ALL: [i64; 9] = [0i64; 9];
-
-fn st_names(k: i64) -> *mut u8 {
+fn st_names(k: i64) -> *const u8 {
     if k == ST_INSTS { c"instructions" }
     else if k == ST_MOVES { c"moves" }
     else if k == ST_SPILLS { c"spill stores" }
@@ -52,7 +49,7 @@ fn st_names(k: i64) -> *mut u8 {
 }
 
 // The spill traffic of the move to or from [sp + offset].
-pub fn st_spill(cx: &mut FnCtx, load: bool, base: i64, offset: i64) {
+pub fn st_spill(cx: &mut FnCtx<Comp>, load: bool, base: i64, offset: i64) {
     if cx.mem_index < 0 && base == reg_sp() && offset >= cx.spill_base
         && offset < cx.save_base {
         cx.st_fn[(if load { ST_RELOADS } else { ST_SPILLS }) as usize] += 1;
@@ -61,46 +58,40 @@ pub fn st_spill(cx: &mut FnCtx, load: bool, base: i64, offset: i64) {
 
 // The instructions of the function just emitted: lines of CODE indented
 // by four spaces that are not directives.
-fn st_count_instructions(cx: &mut FnCtx) -> i64 {
-    unsafe {
-        let data = (*get_bufs().add(cx.code as usize)).data;
-        let len = (*get_bufs().add(cx.code as usize)).len;
-        let mut n: i64 = 0;
-        let mut i: i64 = 0;
-        while i < len {
-            if i + 4 < len && (*data.add(i as usize)) == b' '
-                && (*data.add((i + 4) as usize)) != b'.' && (*data.add((i + 4) as usize)) != b' ' {
-                n += 1;
-            }
-            while i < len && (*data.add(i as usize)) != b'\n' {
-                i += 1;
-            }
+fn st_count_instructions(cx: &mut FnCtx<Comp>) -> i64 {
+    let data = buf_copy(cx.code);
+    let len = data.len();
+    let mut n: i64 = 0;
+    let mut i: usize = 0;
+    while i < len {
+        if i + 4 < len && data[i] == b' ' && data[i + 4] != b'.' && data[i + 4] != b' ' {
+            n += 1;
+        }
+        while i < len && data[i] != b'\n' {
             i += 1;
         }
-        n
+        i += 1;
     }
+    n
 }
 
-pub fn st_function_done(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        cx.st_fn[ST_INSTS as usize] = st_count_instructions(cx);
-        cx.st_fn[ST_FUNCS as usize] = 1;
-        if pcx.stats > 1 {
-            let out = buf_new();
-            buf_str(out, c"stats ");
-            let name = pcx.fns[(*get_irfuncs().add(fi as usize)).f as usize].name;
-            buf_bytes(out, sym_text(name, pcx));
-            for k in 0..ST_COUNT - 1 {
-                buf_fmt(out, format_args(" {}", cx.st_fn[k as usize]));
-            }
-            buf_byte(out, b'\n');
-            buf_write_fd(out, STDERR);
+pub fn st_function_done(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
+    cx.st_fn[ST_INSTS as usize] = st_count_instructions(cx);
+    cx.st_fn[ST_FUNCS as usize] = 1;
+    if pcx.stats > 1 {
+        let out = buf_new();
+        buf_str(out, c"stats ");
+        let name = pcx.fns[pcx.ir_fn[fi as usize] as usize].name;
+        buf_bytes(out, sym_text(name, pcx));
+        for k in 0..ST_COUNT - 1 {
+            buf_fmt(out, format_args(" {}", cx.st_fn[k as usize]));
         }
-        for k in 0..ST_COUNT {
-            { let mut st_all_copy = get_st_all(); st_all_copy[k as usize] += cx.st_fn[k as usize];
-                set_st_all(st_all_copy); }
-            cx.st_fn[k as usize] = 0;
-        }
+        buf_byte(out, b'\n');
+        buf_write_fd(out, STDERR);
+    }
+    for k in 0..ST_COUNT {
+        pcx.st_all.lock().unwrap()[k as usize] += cx.st_fn[k as usize];
+        cx.st_fn[k as usize] = 0;
     }
 }
 
@@ -114,30 +105,9 @@ pub fn print_stats(pcx: &Ctx<Comp>) {
     for k in 0..ST_COUNT {
         buf_str(out, if k == 0 { c" " } else { c", " });
         buf_fmt(out,
-            format_args("{} {}", get_st_all()[k as usize],
-                str::from_utf8(cstr(st_names(k))).unwrap()));
+            format_args("{} {}", pcx.st_all.lock().unwrap()[k as usize],
+                str::from_utf8(&cstr(st_names(k))).unwrap()));
     }
     buf_byte(out, b'\n');
     buf_write_fd(out, STDERR);
-}
-
-// (0.28.0) ST_ALL's accessors: every use of it is one of them.
-fn get_st_all() -> [i64; 9] {
-    // UNSAFE: --stats's totals, a process-wide static mut; Rust has no safe
-    // access to a static mut
-    // SAFETY: written only by st_function_done, whose only call is under
-    // pcx.stats > 0, and --stats makes the compile serial
-    // (parallel::serial_only), so only one thread ever writes it
-    unsafe { ST_ALL }
-}
-
-fn set_st_all(v: [i64; 9]) {
-    // UNSAFE: --stats's totals, a process-wide static mut; Rust has no safe
-    // access to a static mut
-    // SAFETY: written only by st_function_done, whose only call is under
-    // pcx.stats > 0, and --stats makes the compile serial
-    // (parallel::serial_only), so only one thread ever writes it
-    unsafe {
-        ST_ALL = v;
-    }
 }

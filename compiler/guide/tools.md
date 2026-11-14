@@ -15,7 +15,7 @@ small queries.
 ## The loop
 
 1. Write the program; `volec check` (the front end only: fast, every
-   error, one line each; `ok: 0 errors in main.vl` when there is none). Before writing a construct you are unsure of,
+   error, one line each; `ok: 0 errors in main.vl (1 file, 0 shaders)` when there is none: the program checked). Before writing a construct you are unsure of,
    `volec guide --find WORDS` or `volec guide TOPIC#SECTION`
    prints the lines on it.
 2. Fix each error: `volec query show FILE:LINE` prints the item at

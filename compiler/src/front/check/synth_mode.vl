@@ -5,8 +5,8 @@
 // (`size_of`, `align_of`) folded to constants.
 
 use crate::base::{
-    buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, buf_uint, get_src, intern, intern_c,
-    sym_text,
+    buf_byte, buf_bytes, buf_copy, buf_done, buf_fmt, buf_new, buf_ptr, buf_str, buf_uint, c_first,
+    get_src, intern, intern_buf, intern_c, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -15,7 +15,7 @@ use crate::base::diag::{
     err_int, err_str, err_sym, err_try_fmt, report_warning,
 };
 use crate::front::ast::{
-    CONV_NEW, NODE_CHECKED, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, child, list_begin,
+    NODE_CHECKED, NODE_IMPLICIT, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, child, list_begin,
     list_end, list_push, new_node,
 };
 use crate::front::ast::NodeKind::{
@@ -66,7 +66,7 @@ use crate::front::traits::{binary_op_trait, has_impl, negation_call, operator_ca
 use crate::front::types::{
     REF_MUT, REF_SHARED, TY_BOOL, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64, TY_I8, TY_ISIZE, TY_NEVER,
     TY_U16, TY_U32, TY_U64, TY_U8, TY_UNIT, TY_USIZE, TyKind, array_of, buf_type, enum_variant,
-    err_type, find_field, find_method, get_enums, int_bits, int_max, is_compound, is_fieldless_enum,
+    err_type, find_field, find_method, int_bits, int_max, is_compound, is_fieldless_enum,
     is_integer, is_numeric, is_opaque_vector, is_pointer, is_ref, is_signed, is_vector, make_type,
     mut_slice_of, primitive_name, ptr_to, ref_to, slice_of, struct_field, type_align, type_elem,
     type_size,
@@ -108,14 +108,16 @@ fn synth_expr_inner(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             else { TY_U8 },
         Bool => TY_BOOL,
         Unit => TY_UNIT,
-        // RULE: F23.1 (0.27.2: on std2 a rust-edition string literal is a
-        // `&'static str`, std2's str, not the bytes: `panic("..")` finds
+        // RULE: F23.1 (0.27.2: on std a rust-edition string literal is a
+        // `&'static str`, std's str, not the bytes: `panic("..")` finds
         // `str: Display`)
         // (0.27.3: `b"..."`, b 2, is its bytes, `&[u8]`)
-        Str => if crate::front::known::on_std2(pcx) && pcx.str_type > 0
+        Str => if pcx.str_type > 0
             && pcx.nodes[n as usize].b != 2 { pcx.str_type }
             else { pcx.ty_string },
-        CStr => pcx.ty_u8_ptr,
+        // RULE: F30.5 (0.29: a `c"..."` literal is a `*const u8`: its bytes
+        // are read only)
+        CStr => pcx.ty_cstr,
         Ident => synth_name(n, pcx),
         EnumPanic => {
             synth_expr(pcx.nodes[n as usize].a, pcx);
@@ -133,7 +135,7 @@ fn synth_expr_inner(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         FieldAccess => synth_field(n, pcx),
         TupleField => synth_tuple_field(n, pcx),
         Tuple => {
-            let mark = pcx.tscratch.count;
+            let mark = pcx.tscratch.len() as i64;
             for i in 0..pcx.nodes[n as usize].count {
                 let elem = synth_expr(child(n, i, pcx), pcx);
                 pcx.tscratch.push(elem);
@@ -321,6 +323,46 @@ fn synth_cast(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let ref_to_raw = from > 0 && to > 0 && pcx.types[from as usize].kind == TyKind::Ptr
         && pcx.types[from as usize].b != 0 && pcx.types[to as usize].kind == TyKind::Ptr
         && pcx.types[to as usize].b == 0 && pcx.types[from as usize].a != pcx.types[to as usize].a;
+    // RULE: F29.1 (0.29: a reference casts to no integer, `p as usize` of
+    // a `p: &T`; the address is asked of a raw pointer, `p as *const T as
+    // usize`; rustc E0606)
+    if from > 0 && pcx.types[from as usize].kind == TyKind::Ptr && pcx.types[from as usize].b != 0
+        && is_integer(to) {
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"type.cast";
+        err_begin(pcx.nodes[operand as usize].start, pcx);
+        err_str(c"cannot cast the reference '", pcx);
+        err_type(from_ty, pcx);
+        err_str(c"' to the integer '", pcx);
+        err_type(to_ty, pcx);
+        err_str(c"'", pcx);
+        if pcx.types[from as usize].b == REF_MUT {
+            err_help(c"a reference is not a number: its address is a raw pointer's, `p as *mut T as usize`; the value it refers to is `*p`", pcx);
+        } else {
+            err_help(c"a reference is not a number: its address is a raw pointer's, `p as *const T as usize`; the value it refers to is `*p`", pcx);
+        }
+        err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
+        return to_ty;
+    }
+    // RULE: F30.5 (0.29: a `&T` casts to `*const T`, not to `*mut T`,
+    // rustc E0606; a `&mut T` to either)
+    if from > 0 && to > 0
+        && pcx.types[from as usize].kind == TyKind::Ptr && pcx.types[from as usize].b == REF_SHARED
+        && crate::front::types::is_mut_ptr(to, pcx) {
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"type.cast";
+        err_begin(pcx.nodes[operand as usize].start, pcx);
+        err_str(c"cannot cast '", pcx);
+        err_type(from_ty, pcx);
+        err_str(c"' to '", pcx);
+        err_type(to_ty, pcx);
+        err_str(c"'", pcx);
+        err_help(c"a shared reference casts to `*const T` only (rustc E0606): borrow it `&mut` to write through the pointer, or cast the `*const T` (`r as *const T as *mut T`) when something else makes the write sound", pcx);
+        err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
+        return to_ty;
+    }
     if !is_valid_cast(from, to, pcx)
         || ref_to_raw {
         err_begin(pcx.nodes[operand as usize].start, pcx);
@@ -361,59 +403,57 @@ fn bytes_as_str_error(n: i64, operand: i64, pcx: &mut Ctx<Comp>) {
 //   match n { d0 => E::V0, d1 => E::V1, ..., v => <panic: invalid value> }
 // (the discriminants the operand's type can hold).
 fn enum_cast(n: i64, operand: i64, from: i64, to: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let e = pcx.types[to as usize].a;
-        let start = pcx.nodes[n as usize].start;
-        let end = pcx.nodes[n as usize].end;
-        let m = new_node(Match, start, end, pcx);
-        pcx.nodes[m as usize].a = operand;
-        let mark = list_begin(pcx);
-        for i in 0..(*get_enums().add(e as usize)).variant_count {
-            let v = enum_variant(e, i);
-            let d = pcx.variants[v as usize].discr;
-            let fits = if is_signed(from) {
-                let half = 1 << (int_bits(from) - 1) as u64;
-                int_bits(from) == 64 || (d >= 0 - half && d < half)
-            } else {
-                d >= 0 && (int_bits(from) == 64 || d as u64 <= int_max(from))
-            };
-            if !fits {
-                continue;
-            }
-            let lit = new_node(Int, start, end, pcx);
-            pcx.nodes[lit as usize].a = if d < 0 { 0 - d } else { d };
-            let mut value = lit;
-            if d < 0 {
-                value = new_node(Unary, start, end, pcx);
-                pcx.nodes[value as usize].op = Tok::Minus;
-                pcx.nodes[value as usize].b = lit;
-            }
-            let pat = new_node(PatLit, start, end, pcx);
-            pcx.nodes[pat as usize].a = value;
-            let body = new_node(Path, start, end, pcx);
-            pcx.nodes[body as usize].a = (*get_enums().add(e as usize)).name;
-            pcx.nodes[body as usize].b = pcx.variants[v as usize].name;
-            let arm = new_node(Arm, start, end, pcx);
-            pcx.nodes[arm as usize].a = pat;
-            pcx.nodes[arm as usize].c = body;
-            list_push(arm, pcx);
+    let e = pcx.types[to as usize].a;
+    let start = pcx.nodes[n as usize].start;
+    let end = pcx.nodes[n as usize].end;
+    let m = new_node(Match, start, end, pcx);
+    pcx.nodes[m as usize].a = operand;
+    let mark = list_begin(pcx);
+    for i in 0..(pcx.enums[e as usize]).variant_count {
+        let v = enum_variant(e, i, pcx);
+        let d = pcx.variants[v as usize].discr;
+        let fits = if is_signed(from) {
+            let half = 1 << (int_bits(from) - 1) as u64;
+            int_bits(from) == 64 || (d >= 0 - half && d < half)
+        } else {
+            d >= 0 && (int_bits(from) == 64 || d as u64 <= int_max(from))
+        };
+        if !fits {
+            continue;
         }
-        let name = intern_c(c"__invalid_value", pcx);
-        let bind = new_node(PatBind, start, end, pcx);
-        pcx.nodes[bind as usize].a = name;
-        let value = new_node(Ident, start, end, pcx);
-        pcx.nodes[value as usize].a = name;
-        let panic = new_node(EnumPanic, start, end, pcx);
-        pcx.nodes[panic as usize].a = value;
-        pcx.nodes[panic as usize].x = enum_panic_kind(e, pcx);
+        let lit = new_node(Int, start, end, pcx);
+        pcx.nodes[lit as usize].a = if d < 0 { 0 - d } else { d };
+        let mut value = lit;
+        if d < 0 {
+            value = new_node(Unary, start, end, pcx);
+            pcx.nodes[value as usize].op = Tok::Minus;
+            pcx.nodes[value as usize].b = lit;
+        }
+        let pat = new_node(PatLit, start, end, pcx);
+        pcx.nodes[pat as usize].a = value;
+        let body = new_node(Path, start, end, pcx);
+        pcx.nodes[body as usize].a = (pcx.enums[e as usize]).name;
+        pcx.nodes[body as usize].b = pcx.variants[v as usize].name;
         let arm = new_node(Arm, start, end, pcx);
-        pcx.nodes[arm as usize].a = bind;
-        pcx.nodes[arm as usize].c = panic;
+        pcx.nodes[arm as usize].a = pat;
+        pcx.nodes[arm as usize].c = body;
         list_push(arm, pcx);
-        list_end(m, mark, pcx);
-        pcx.nodes[n as usize] = pcx.nodes[m as usize];
-        synth_expr(n, pcx)
     }
+    let name = intern_c(c"__invalid_value", pcx);
+    let bind = new_node(PatBind, start, end, pcx);
+    pcx.nodes[bind as usize].a = name;
+    let value = new_node(Ident, start, end, pcx);
+    pcx.nodes[value as usize].a = name;
+    let panic = new_node(EnumPanic, start, end, pcx);
+    pcx.nodes[panic as usize].a = value;
+    pcx.nodes[panic as usize].x = enum_panic_kind(e, pcx);
+    let arm = new_node(Arm, start, end, pcx);
+    pcx.nodes[arm as usize].a = bind;
+    pcx.nodes[arm as usize].c = panic;
+    list_push(arm, pcx);
+    list_end(m, mark, pcx);
+    pcx.nodes[n as usize] = pcx.nodes[m as usize];
+    synth_expr(n, pcx)
 }
 
 // `T` as a type node: for casts the checker adds.
@@ -522,7 +562,7 @@ fn synth_index(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             if crate::front::check::rust::index_through_trait(n, pointee, pcx) {
                 return synth_expr(n, pcx);
             }
-            pcx.nodes[base as usize].p &= ~NODE_CHECKED;
+            pcx.nodes[base as usize].p &= !NODE_CHECKED;
             // RULE: F20.7 (through the reference to a type with Deref and
             // no Index, `g[i]` of a `g: &Wrap`: `(*g)[i]`, then below)
             if crate::front::check::rust::deref_projection(pointee, pcx) > 0 {
@@ -535,10 +575,9 @@ fn synth_index(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             }
         }
     }
-    // RULE: Z9.1b (0.28.0: a program's `s[a..b]` of a `&str`: std2's
+    // RULE: Z9.1b (0.28.0: a program's `s[a..b]` of a `&str`: std's
     // Index, checked to fall between characters)
     if base_ty == pcx.str_type && pcx.str_type > 0 && pcx.nodes[index as usize].kind == Range
-        && crate::front::known::on_std2(pcx)
         && !crate::front::modules::within_std(pcx.cur_mod, pcx) {
         pcx.nodes[base as usize].p |= NODE_CHECKED;
         // (the ends are usize, which a literal takes: SliceIndex<str> is
@@ -645,7 +684,6 @@ fn synth_index(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return synth_expr(n, pcx);
     }
     if (base_kind == TyKind::Array || base_kind == TyKind::Slice)
-        && crate::front::known::on_std2(pcx)
         && crate::front::check::rust::index_range_value(n,
             if base_kind == TyKind::Array { base_ty } else { 0 }, pcx) {
         // (0.27.3: `a[r]` of a range value, F26.3)
@@ -675,7 +713,7 @@ fn synth_index(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
                     { let b = str::from_utf8(b).unwrap();
                         { let i = str::from_utf8(i).unwrap();
                             format_args("{b}.as_slice()[{i}]") } });
-                err_fix(pcx.nodes[n as usize].start, pcx.nodes[n as usize].end, buf_slice(t), pcx);
+                err_fix(pcx.nodes[n as usize].start, pcx.nodes[n as usize].end, &buf_copy(t), pcx);
             } else if is_std_named(base_ty, c"HashMap", pcx) {
                 err_help(c"a HashMap is read with `m.get(k)` (an Option) and written with `m.insert(k, v)`", pcx);
                 err_try_fmt({
@@ -718,40 +756,56 @@ fn synth_index(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     pcx.types[base_ty as usize].a
 }
 
-// (0.27.2) Whether position pos is in std2's `ptr` module, where the raw
-// pointers' own primitives (`read`, `write`, `slice_parts`) are written
-// with MVS's raw indexing: std::ptr of a program on std2, or the file
-// compiler/std/ptr.vl of std2's own check. RULE: F30.3
-fn in_std_ptr(pos: i64, pcx: &Ctx<Comp>) -> bool {
+// Whether position pos is in std's module `name` (a child of std's
+// root): that module of a program's std, or std's file `tail` when std
+// itself is checked.
+fn in_std_module(pos: i64, name: &[u8], tail: &[u8], pcx: &Ctx<Comp>) -> bool {
     let m = pcx.cur_mod;
-    // UNSAFE: the module and file tables are the compiler's raw-pointer
-    // globals; a file's path is a C string.
-    // SAFETY: m is a module of the table (cur_mod, set by the checker); f
-    // is the file pos is in (file_of_pos), its path NUL-terminated, read
-    // only below its length.
-    unsafe {
-        if m >= 0 && pcx.std_module >= 0 && pcx.modules[m as usize].parent == pcx.std_module
-            && crate::base::sym_text(pcx.modules[m as usize].name, pcx) == b"ptr" {
-            return true;
-        }
-        let f = crate::front::modules::file_of_pos(pos, pcx);
-        if f < 0 {
-            return false;
-        }
-        let path = pcx.files[f as usize].path;
-        let n = crate::base::strlen(path) as i64;
-        let tail = "std2/ptr.vl";
-        let k = tail.len() as i64;
-        if n < k {
-            return false;
-        }
-        for i in 0..k {
-            if (*path.add((n - k + i) as usize)) != tail[i as usize] {
-                return false;
-            }
-        }
-        true
+    if m >= 0 && pcx.std_module >= 0 && pcx.modules[m as usize].parent == pcx.std_module
+        && crate::base::sym_text(pcx.modules[m as usize].name, pcx) == name {
+        return true;
     }
+    let f = crate::front::modules::file_of_pos(pos, pcx);
+    if f < 0 {
+        return false;
+    }
+    let path = crate::front::modules::file_path(f, pcx);
+    path.len() >= tail.len() && &path[path.len() - tail.len()..] == tail
+}
+
+// (0.27.2) Whether position pos is in std's `ptr` module, where the raw
+// pointers' own primitives (`read`, `write`, `slice_parts`) are written
+// with MVS's raw indexing: std::ptr of a program on std, or the file
+// compiler/std/ptr.vl of std's own check. RULE: F30.3
+fn in_std_ptr(pos: i64, pcx: &Ctx<Comp>) -> bool {
+    in_std_module(pos, b"ptr", b"std/ptr.vl", pcx)
+}
+
+// (0.29) Whether position pos is in one of std::slice's three methods
+// that read the two words of a slice reference, `len`, `as_ptr` and
+// `as_mut_ptr`: there the words are the fields `len` and `ptr`, the
+// built-in form those methods are made of, which no other code may
+// write (rustc has no such fields). RULE: F30.4
+fn in_std_slice(pos: i64, pcx: &Ctx<Comp>) -> bool {
+    if pcx.cur_fn < 0 || !in_std_module(pos, b"slice", b"std/slice.vl", pcx) {
+        return false;
+    }
+    let name = crate::base::sym_text(pcx.fns[pcx.cur_fn as usize].display, pcx);
+    ends_with_name(name, b"len") || ends_with_name(name, b"as_ptr")
+        || ends_with_name(name, b"as_mut_ptr")
+}
+
+// Whether the path `text` ends with the name `last` (`[T]::len` with
+// `len`, not `byte_len`).
+fn ends_with_name(text: &[u8], last: &[u8]) -> bool {
+    if text.len() < last.len() || &text[text.len() - last.len()..] != last {
+        return false;
+    }
+    if text.len() == last.len() {
+        return true;
+    }
+    let c = text[text.len() - last.len() - 1];
+    c == b':' || c == b'.' || c == b'>' || c == b' '
 }
 
 // (0.17) Whether a value of type t (a struct) is indexed through its
@@ -838,8 +892,8 @@ fn check_index_type(index: i64, raw: bool, pcx: &mut Ctx<Comp>) {
                 buf_fmt(t,
                     { let text = str::from_utf8(text).unwrap(); format_args("({text}) as usize") });
             }
-            err_try_fmt(str::from_utf8(buf_slice(t)).unwrap(), pcx);
-            err_fix(s, e, buf_slice(t), pcx);
+            err_try_fmt(str::from_utf8(&buf_copy(t)).unwrap(), pcx);
+            err_fix(s, e, &buf_copy(t), pcx);
         }
         err_end(pcx);
     }
@@ -881,138 +935,145 @@ fn index_cast_type(index: i64, text: &[u8], pcx: &Ctx<Comp>) -> i64 {
 // Fields of structs (also through a pointer to one: y = 1) and the `ptr`
 // and `len` of slices (y = 2, x = 0 for ptr and 1 for len).
 fn synth_field(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut base_ty = synth_expr(pcx.nodes[n as usize].a, pcx);
-        let name = pcx.nodes[n as usize].b;
-        pcx.nodes[n as usize].y = 0;
-        // RULE: F7.3 (0.28.0, the rust edition: a field through a reference
-        // to a reference, `e.n` of `e: &&E` in a `filter(|e| ..)`, derefs
-        // each but the last, as rustc's auto-deref)
-        let mut depth: i64 = 0;
-        while depth < 8 && pcx.types[base_ty as usize].kind == TyKind::Ptr
-            && (pcx.types[base_ty as usize].b == crate::front::types::REF_SHARED
-                || pcx.types[base_ty as usize].b == crate::front::types::REF_MUT)
-            && pcx.types[pcx.types[base_ty as usize].a as usize].kind == TyKind::Ptr {
-            let inner = pcx.nodes[n as usize].a;
-            let d = new_node(NodeKind::Unary, pcx.nodes[inner as usize].start,
-                pcx.nodes[inner as usize].end, pcx);
-            pcx.nodes[d as usize].op = Tok::Star;
-            pcx.nodes[d as usize].b = inner;
-            mark_synthed(inner, pcx);
-            pcx.nodes[n as usize].a = d;
-            base_ty = synth_expr(d, pcx);
-            depth += 1;
-        }
-        if pcx.types[base_ty as usize].kind == TyKind::Slice {
-            pcx.nodes[n as usize].y = 2;
-            if name == intern_c(c"len", pcx) {
-                // usize (0.26.2, as Rust; i64 from 0.4, u64 before)
-                pcx.nodes[n as usize].x = 1;
-                return TY_USIZE;
-            }
-            if name == intern_c(c"ptr", pcx) {
-                pcx.nodes[n as usize].x = 0;
-                return ptr_to(pcx.types[base_ty as usize].a, pcx);
-            }
-            err_begin(pcx.nodes[n as usize].start, pcx);
-            err_str(c"slices have the fields 'ptr' and 'len', not '", pcx);
-            err_sym(name, pcx);
-            err_str(c"'", pcx);
-            err_end(pcx);
-        }
-        // (0.17) `v.len` on std's Vec, Buf or HashMap (its field sealed, or
-        // none) reads as `v.len()`, and `a.len` on an array place as
-        // `a.len()`: both spellings are the length. A write (`v.len = n`,
-        // `&v.len`) stays the sealed field's error.
-        if name == intern_c(c"len", pcx) && (pcx.nodes[n as usize].p & NODE_NO_READ) == 0
-            && len_is_method(n, base_ty, pcx) {
-            { let at_ix = pcx.nodes[n as usize].a as usize; pcx.nodes[at_ix].p |= NODE_CHECKED };
-            pcx.nodes[n as usize].kind = MethodCall;
-            pcx.nodes[n as usize].x = 0;
-            pcx.nodes[n as usize].list = 0;
-            pcx.nodes[n as usize].count = 0;
-            return synth_method(n, pcx);
-        }
-        if pcx.types[base_ty as usize].kind == TyKind::Ptr
-            && pcx.types[pcx.types[base_ty as usize].a as usize].kind == TyKind::Struct {
-            pcx.nodes[n as usize].y = 1;
-            base_ty = pcx.types[base_ty as usize].a;
-            if !is_borrow(pcx.nodes[n as usize].a, pcx) {
-                pcx.nodes[n as usize].p |= NODE_RAW;
-                unsafe_through(n, pcx.nodes[n as usize].a, U_FIELD,
-                    c"access to a field through a raw pointer is unsafe", pcx);
-            }
-        }
-        if (pcx.types[base_ty as usize].kind != TyKind::Struct
-            || find_field(pcx.types[base_ty as usize].a, name, pcx) < 0)
-            && crate::front::check::rust::deref_field_base(n, pcx.nodes[n as usize].a, base_ty, pcx) {
-            // (0.27.0: a field of Deref's target, the rust edition's)
-            return synth_expr(n, pcx);
-        }
-        if pcx.types[base_ty as usize].kind != TyKind::Struct {
-            err_begin(pcx.nodes[n as usize].start, pcx);
-            err_str(c"cannot access field '", pcx);
-            err_sym(name, pcx);
-            err_str(c"' on type '", pcx);
-            err_type(base_ty, pcx);
-            err_str(c"'", pcx);
-            enum_field_help(base_ty, name, pcx.nodes[n as usize].a, pcx);
-            err_end(pcx);
-        }
-        let s = pcx.types[base_ty as usize].a;
-        let field = find_field(s, name, pcx);
-        // (0.26.0: an `embed wgsl` block's entry point, gpu.entry)
-        if field < 0
-            && crate::front::embed::wgsl::entry_error(n, pcx.structs[s as usize].node, name, pcx) {
-            return pcx.ty_error;
-        }
-        if field < 0 {
-            err_begin(pcx.nodes[n as usize].start, pcx);
-            err_str(c"struct '", pcx);
-            err_sym(pcx.structs[s as usize].name, pcx);
-            err_str(c"' has no field '", pcx);
-            err_sym(name, pcx);
-            err_str(c"'", pcx);
-            if find_method(base_ty, name, pcx) >= 0 {
-                err_help(c"'", pcx);
-                err_help_sym(name, pcx);
-                err_help(c"' is a method: call it with '(...)'", pcx);
-            }
-            help_near_field(s, name, pcx);
-            err_end(pcx);
-        }
-        // (0.26.2: a part's own `.src` or entry field, embed.part_use)
-        if pcx.block_struct.count > 0
-            && crate::front::embed::wgsl::part_use_error(n, pcx.structs[s as usize].node, name, pcx) {
-            return pcx.ty_error;
-        }
-        pcx.nodes[n as usize].x = field;
-        // (0.16: a #[sealed] struct's fields)
-        check_field(n, s, pcx);
-        if (pcx.structs[s as usize].repr & REPR_UNION) != 0
-            && (pcx.nodes[n as usize].p & NODE_NO_READ) == 0 {
-            unsafe_op(n, U_UNION, c"reading a field of a union is unsafe", pcx);
-        }
-        let fty = (*struct_field(s, field, pcx)).ty;
-        if (pcx.nodes[n as usize].p & CONV_NEW) == 0 && is_ref(fty, pcx)
-            && crate::front::conv::field_is_access(s, field, pcx) {
-            // (0.20) an access field: `p.q` is `*p.q`, the value it designates
-            let inner = new_node(NodeKind::None, pcx.nodes[n as usize].start,
-                pcx.nodes[n as usize].end, pcx);
-            pcx.nodes[inner as usize] = pcx.nodes[n as usize];
-            pcx.nodes[inner as usize].p |= CONV_NEW | NODE_CHECKED;
-            pcx.nodes[inner as usize].ty = fty;
-            pcx.nodes[n as usize].kind = NodeKind::Unary;
-            pcx.nodes[n as usize].op = Tok::Star;
-            pcx.nodes[n as usize].a = 0;
-            pcx.nodes[n as usize].b = inner;
-            pcx.nodes[n as usize].count = 0;
-            pcx.nodes[n as usize].list = 0;
-            pcx.nodes[n as usize].p = 0;
-            return synth_expr(n, pcx);
-        }
-        fty
+    let mut base_ty = synth_expr(pcx.nodes[n as usize].a, pcx);
+    let name = pcx.nodes[n as usize].b;
+    pcx.nodes[n as usize].y = 0;
+    // RULE: F7.3 (0.28.0, the rust edition: a field through a reference
+    // to a reference, `e.n` of `e: &&E` in a `filter(|e| ..)`, derefs
+    // each but the last, as rustc's auto-deref)
+    let mut depth: i64 = 0;
+    while depth < 8 && pcx.types[base_ty as usize].kind == TyKind::Ptr
+        && (pcx.types[base_ty as usize].b == crate::front::types::REF_SHARED
+            || pcx.types[base_ty as usize].b == crate::front::types::REF_MUT)
+        && pcx.types[pcx.types[base_ty as usize].a as usize].kind == TyKind::Ptr {
+        let inner = pcx.nodes[n as usize].a;
+        let d = new_node(NodeKind::Unary, pcx.nodes[inner as usize].start,
+            pcx.nodes[inner as usize].end, pcx);
+        pcx.nodes[d as usize].op = Tok::Star;
+        pcx.nodes[d as usize].b = inner;
+        mark_synthed(inner, pcx);
+        pcx.nodes[n as usize].a = d;
+        base_ty = synth_expr(d, pcx);
+        depth += 1;
     }
+    if pcx.types[base_ty as usize].kind == TyKind::Slice {
+        pcx.nodes[n as usize].y = 2;
+        let is_len = name == intern_c(c"len", pcx);
+        let is_ptr = name == intern_c(c"ptr", pcx);
+        // RULE: F30.4 (0.29: a slice has no fields, as rustc; its length
+        // and its pointer are the methods `len()`, `as_ptr()` and
+        // `as_mut_ptr()`. The two words are read as fields only by those
+        // methods in std::slice and by the nodes the checker makes)
+        if !is_len && !is_ptr {
+            err_begin(pcx.nodes[n as usize].start, pcx);
+            err_str(c"a slice has no field '", pcx);
+            err_sym(name, pcx);
+            err_str(c"'", pcx);
+            err_help(c"a slice has methods only: '.len()', '.as_ptr()', '.first()', ...", pcx);
+            err_end(pcx);
+        }
+        if (pcx.nodes[n as usize].p & NODE_IMPLICIT) == 0
+            && !in_std_slice(pcx.nodes[n as usize].start, pcx) {
+            let end = pcx.nodes[n as usize].end;
+            err_begin(pcx.nodes[n as usize].start, pcx);
+            err_str(c"a slice has no field '", pcx);
+            err_sym(name, pcx);
+            err_str(c"'", pcx);
+            if is_len {
+                err_help(c"call its method: '.len()'", pcx);
+                if end > pcx.nodes[n as usize].start && get_src()[(end - 1) as usize] == b'n' {
+                    err_fix(end, end, b"()", pcx);
+                }
+            } else {
+                err_help(c"call its method: '.as_ptr()' ('.as_mut_ptr()' for a '*mut T')", pcx);
+                if end - 3 > pcx.nodes[n as usize].start && get_src()[(end - 1) as usize] == b'r' {
+                    err_fix(end - 3, end, b"as_ptr()", pcx);
+                }
+            }
+            err_end_soft(pcx);
+        }
+        if is_len {
+            // usize (0.26.2, as Rust; i64 from 0.4, u64 before)
+            pcx.nodes[n as usize].x = 1;
+            return TY_USIZE;
+        }
+        pcx.nodes[n as usize].x = 0;
+        return ptr_to(pcx.types[base_ty as usize].a, pcx);
+    }
+    // (0.17) `v.len` on std's Vec, Buf or HashMap (its field sealed, or
+    // none) reads as `v.len()`, and `a.len` on an array place as
+    // `a.len()`: both spellings are the length. A write (`v.len = n`,
+    // `&v.len`) stays the sealed field's error.
+    if name == intern_c(c"len", pcx) && (pcx.nodes[n as usize].p & NODE_NO_READ) == 0
+        && len_is_method(n, base_ty, pcx) {
+        { let at_ix = pcx.nodes[n as usize].a as usize; pcx.nodes[at_ix].p |= NODE_CHECKED };
+        pcx.nodes[n as usize].kind = MethodCall;
+        pcx.nodes[n as usize].x = 0;
+        pcx.nodes[n as usize].list = 0;
+        pcx.nodes[n as usize].count = 0;
+        return synth_method(n, pcx);
+    }
+    if pcx.types[base_ty as usize].kind == TyKind::Ptr
+        && pcx.types[pcx.types[base_ty as usize].a as usize].kind == TyKind::Struct {
+        pcx.nodes[n as usize].y = 1;
+        base_ty = pcx.types[base_ty as usize].a;
+        if !is_borrow(pcx.nodes[n as usize].a, pcx) {
+            pcx.nodes[n as usize].p |= NODE_RAW;
+            unsafe_through(n, pcx.nodes[n as usize].a, U_FIELD,
+                c"access to a field through a raw pointer is unsafe", pcx);
+        }
+    }
+    if (pcx.types[base_ty as usize].kind != TyKind::Struct
+        || find_field(pcx.types[base_ty as usize].a, name, pcx) < 0)
+        && crate::front::check::rust::deref_field_base(n, pcx.nodes[n as usize].a, base_ty, pcx) {
+        // (0.27.0: a field of Deref's target, the rust edition's)
+        return synth_expr(n, pcx);
+    }
+    if pcx.types[base_ty as usize].kind != TyKind::Struct {
+        err_begin(pcx.nodes[n as usize].start, pcx);
+        err_str(c"cannot access field '", pcx);
+        err_sym(name, pcx);
+        err_str(c"' on type '", pcx);
+        err_type(base_ty, pcx);
+        err_str(c"'", pcx);
+        enum_field_help(base_ty, name, pcx.nodes[n as usize].a, pcx);
+        err_end(pcx);
+    }
+    let s = pcx.types[base_ty as usize].a;
+    let field = find_field(s, name, pcx);
+    // (0.26.0: an `embed wgsl` block's entry point, gpu.entry)
+    if field < 0
+        && crate::front::embed::wgsl::entry_error(n, pcx.structs[s as usize].node, name, pcx) {
+        return pcx.ty_error;
+    }
+    if field < 0 {
+        err_begin(pcx.nodes[n as usize].start, pcx);
+        err_str(c"struct '", pcx);
+        err_sym(pcx.structs[s as usize].name, pcx);
+        err_str(c"' has no field '", pcx);
+        err_sym(name, pcx);
+        err_str(c"'", pcx);
+        if find_method(base_ty, name, pcx) >= 0 {
+            err_help(c"'", pcx);
+            err_help_sym(name, pcx);
+            err_help(c"' is a method: call it with '(...)'", pcx);
+        }
+        help_near_field(s, name, pcx);
+        err_end(pcx);
+    }
+    // (0.26.2: a part's own `.src` or entry field, embed.part_use)
+    if pcx.block_struct.len() as i64 > 0
+        && crate::front::embed::wgsl::part_use_error(n, pcx.structs[s as usize].node, name, pcx) {
+        return pcx.ty_error;
+    }
+    pcx.nodes[n as usize].x = field;
+    // (0.16: a #[sealed] struct's fields)
+    check_field(n, s, pcx);
+    if (pcx.structs[s as usize].repr & REPR_UNION) != 0
+        && (pcx.nodes[n as usize].p & NODE_NO_READ) == 0 {
+        unsafe_op(n, U_UNION, c"reading a field of a union is unsafe", pcx);
+    }
+    (struct_field(s, field, pcx)).ty
 }
 
 // (0.17) Whether `x.len` (node n, x of type t) is read as `x.len()`: an
@@ -1031,13 +1092,11 @@ fn len_is_method(n: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
 
 // The help of an unknown field `name` of struct s: the nearest field.
 pub fn help_near_field(s: i64, name: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let mut near = near_to(name);
-        for i in 0..pcx.structs[s as usize].field_count {
-            near.offer((*struct_field(s, i, pcx)).name, pcx);
-        }
-        near.help(pcx);
+    let mut near = near_to(name);
+    for i in 0..pcx.structs[s as usize].field_count {
+        near.offer((struct_field(s, i, pcx)).name, pcx);
     }
+    near.help(pcx);
 }
 
 fn synth_tuple_field(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
@@ -1054,7 +1113,7 @@ fn synth_tuple_field(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         let name = buf_new();
         buf_fmt(name, format_args("{index}"));
         pcx.nodes[n as usize].kind = NodeKind::FieldAccess;
-        pcx.nodes[n as usize].b = intern(buf_slice(name), pcx);
+        pcx.nodes[n as usize].b = intern_buf(name, pcx);
         return synth_field(n, pcx);
     }
     if pcx.types[base_ty as usize].kind == TyKind::Ptr
@@ -1168,7 +1227,7 @@ pub fn is_context_value(e: i64, pcx: &Ctx<Comp>) -> bool {
 fn synth_operands(lhs: i64, rhs: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // RULE: F18.5 (a comparison of an open local with an untyped literal
     // keeps it open: the literal is typed with it)
-    if pcx.open_lets.count > 0 && pcx.binary_node > 0
+    if pcx.open_lets.len() as i64 > 0 && pcx.binary_node > 0
         && comparison_op(pcx.nodes[pcx.binary_node as usize].op) {
         let mut o: i64 = 0;
         let mut lit: i64 = 0;
@@ -1234,8 +1293,7 @@ fn synth_operands(lhs: i64, rhs: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // one impl of the comparison's trait)
     let bn = pcx.binary_node;
     if bn > 0 && comparison_op(pcx.nodes[bn as usize].op) && holds_bare_literal(lhs, pcx)
-        && !holds_bare_literal(rhs, pcx) && !takes_context(rhs, pcx)
-        && crate::front::known::on_std2(pcx) {
+        && !holds_bare_literal(rhs, pcx) && !takes_context(rhs, pcx) {
         let rhs_ty = synth_expr(rhs, pcx);
         let m = intern_c(crate::front::traits::rust_op_method(pcx.nodes[bn as usize].op), pcx);
         if rhs_ty > 0
@@ -1251,7 +1309,7 @@ fn synth_operands(lhs: i64, rhs: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if is_integer(lhs_ty) && !takes_context(rhs, pcx) {
         return join_operands(lhs, lhs_ty, rhs, pcx);
     }
-    // RULE: F26.3 (0.27.2.1: on std2 an operator on a struct or an enum
+    // RULE: F26.3 (0.27.2.1: on std an operator on a struct or an enum
     // with an operand of another type is its impl of the operator's trait
     // for that Rhs: `s == "x"` with `impl PartialEq<str> for String`, `v ==
     // [1, 2]`, `s + "bar"` with `impl Add<&str> for String`; the operand
@@ -1262,7 +1320,7 @@ fn synth_operands(lhs: i64, rhs: i64, pcx: &mut Ctx<Comp>) -> i64 {
             && comparison_op(pcx.nodes[n as usize].op))
         && (pcx.types[lhs_ty as usize].kind == TyKind::Struct
             || pcx.types[lhs_ty as usize].kind == TyKind::Enum)
-        && !is_distinct_type(lhs_ty, pcx) && crate::front::known::on_std2(pcx) {
+        && !is_distinct_type(lhs_ty, pcx) {
         // RULE: F26.3 (0.28.0: a comparison whose left type has one impl of
         // the operator's trait, a derive's `PartialEq for Option<T>`: the
         // right operand is of that type, its expected type as rustc infers
@@ -1338,8 +1396,8 @@ fn synth_binary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         } else {
             synth_expr(rhs, pcx)
         };
-        // RULE: F26.1 (0.27.2: on std2 `a << n` of a non-integer is Shl::shl)
-        if crate::front::known::on_std2(pcx) && !is_integer(strip_distinct(value_ty, pcx)) {
+        // RULE: F26.1 (0.27.2: `a << n` of a non-integer is Shl::shl)
+        if !is_integer(strip_distinct(value_ty, pcx)) {
             require_op_bound(n, lhs, op, false, pcx);
             if crate::front::traits::rust_op_trait(op, value_ty, false, pcx) >= 0 {
                 return crate::front::traits::operator_call(n, value_ty, true, pcx);
@@ -1439,121 +1497,129 @@ pub fn require_op_bound(n: i64, e: i64, op: Tok, assign: bool, pcx: &mut Ctx<Com
 // The type of binary node n (operator op, not a shift), whose operands are
 // checked, of type ty.
 pub fn binary_result(n: i64, op: Tok, ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let lhs = pcx.nodes[n as usize].b;
-        let rhs = pcx.nodes[n as usize].c;
-        if is_vector(ty, pcx) {
-            return vector_binary(n, op, ty, pcx);
-        }
-        // (0.9: an operator trait's impl for the type)
-        // RULE: F26.1, F26.2 (0.27.2: a rust program on std2: the operator
-        // is its ops trait's method, PartialEq, PartialOrd, Rem and the bit
-        // traits among them; on a parameter's value, the bound must give it)
-        if crate::front::known::on_std2(pcx) {
-            require_op_bound(n, lhs, op, false, pcx);
-            if crate::front::traits::rust_op_trait(op, ty, false, pcx) >= 0 {
-                return operator_call(n, ty, true, pcx);
-            }
-        }
-        if binary_op_trait(op, ty, pcx) >= 0 {
-            return operator_call(n, ty, false, pcx);
-        }
-        // RULE: F26.1 (0.28.0: a comparison of references with no impl of
-        // their own is of what they refer to, level by level, `impl
-        // PartialEq<&B> for &A`: `&a == &b` of two `&u8`, and `a == b` of `a:
-        // &T` with T = `&u8`, compared the addresses)
-        if comparison_op(op) && is_ref(ty, pcx)
-            && pcx.nodes[rhs as usize].ty == ty && pcx.nodes[lhs as usize].ty == ty {
-            let inner = pcx.types[ty as usize].a;
-            pcx.nodes[n as usize].b = synthetic_unary(Tok::Star, lhs, inner, pcx);
-            pcx.nodes[n as usize].c = synthetic_unary(Tok::Star, rhs, inner, pcx);
-            return binary_result(n, op, inner, pcx);
-        }
-        if op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash
-            || op == Tok::Percent {
-            if !is_numeric(ty) {
-                arithmetic_error(n, op, ty, pcx);
-            }
-            return ty;
-        }
-        if (op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq)
-            && is_fieldless_enum(ty, pcx) {
-            // 0.4: fieldless enums are ordered by declaration, which must be
-            // the order of their discriminants; compared as their tags.
-            let e = pcx.types[ty as usize].a;
-            for i in 1..(*get_enums().add(e as usize)).variant_count {
-                if pcx.variants[enum_variant(e, i) as usize].discr
-                    <= pcx.variants[enum_variant(e, i - 1) as usize].discr {
-                    err_begin(pcx.nodes[n as usize].start, pcx);
-                    err_str(c"'", pcx);
-                    err_sym((*get_enums().add(e as usize)).name, pcx);
-                    err_str(c"' cannot be ordered: its discriminants do not increase in declaration order", pcx);
-                    err_end(pcx);
-                }
-            }
-            pcx.nodes[n as usize].b = cast_node(pcx.nodes[n as usize].b,
-                (*get_enums().add(e as usize)).tag, pcx);
-            pcx.nodes[n as usize].c = cast_node(pcx.nodes[n as usize].c,
-                (*get_enums().add(e as usize)).tag, pcx);
-            synth_expr(pcx.nodes[n as usize].b, pcx);
-            synth_expr(pcx.nodes[n as usize].c, pcx);
-            return TY_BOOL;
-        }
-        if op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq {
-            if !(is_numeric(ty) || is_pointer(ty, pcx)) {
-                type_error_got(n, c"comparison requires numeric type", ty, pcx);
-            }
-            unsigned_compare(n, op, ty, pcx);
-            return TY_BOOL;
-        }
-        if op == Tok::EqEq || op == Tok::BangEq {
-            if ty == TY_NEVER || ty == pcx.ty_error {
-                return TY_BOOL;
-            }
-            // RULE: F26.4 (0.28.0: `==` is PartialEq's in the rust edition)
-            let miss = crate::front::check::equality::partial_eq_missing(ty, pcx);
-            if miss != 0 {
-                err_begin(pcx.nodes[n as usize].start, pcx);
-                err_str(c"binary operation `", pcx);
-                err_str(if op == Tok::EqEq { c"==" } else { c"!=" }, pcx);
-                err_str(c"` cannot be applied to type `", pcx);
-                err_type(ty, pcx);
-                err_str(c"`: `", pcx);
-                err_type(miss, pcx);
-                err_str(c"` has no `PartialEq` (rustc E0369)", pcx);
-                err_help(c"write `#[derive(PartialEq)]` on the type, or its `impl PartialEq`",
-                    pcx);
-                err_end(pcx);
-            }
-            let bad = eq_unsupported(ty, pcx);
-            if bad != 0 {
-                if bad == ty {
-                    type_error_got(n, c"equality requires numeric, bool, pointer or enum type, or a struct, tuple, array or slice of them", ty, pcx);
-                }
-                err_begin(pcx.nodes[n as usize].start, pcx);
-                err_str(c"cannot compare '", pcx);
-                err_type(ty, pcx);
-                err_str(c"' with ==: it holds a '", pcx);
-                err_type(bad, pcx);
-                err_str(c"', which has no ==", pcx);
-                err_end(pcx);
-            }
-            if is_compound(ty, pcx) {
-                structural_eq(n, ty, pcx);
-            }
-            return TY_BOOL;
-        }
-        if op == Tok::AmpAmp || op == Tok::PipePipe {
-            if ty != TY_BOOL {
-                type_error_got(n, c"logical operator requires bool", ty, pcx);
-            }
-            return TY_BOOL;
-        }
-        if !is_integer(ty) {
-            type_error_got(n, c"bitwise operator requires integer type", ty, pcx);
-        }
-        ty
+    // RULE: F18.6 (0.29: the operands' type may be a variable the other
+    // operand solved, `v[0] == 3` of a list nothing else types: the
+    // operator is asked of the solution, not of the variable, which has no
+    // operators and was "equality requires ..., got '_'")
+    let ty = crate::front::check::infer::resolve(ty, pcx);
+    let lhs = pcx.nodes[n as usize].b;
+    let rhs = pcx.nodes[n as usize].c;
+    if is_vector(ty, pcx) {
+        return vector_binary(n, op, ty, pcx);
     }
+    // (0.9: an operator trait's impl for the type)
+    // RULE: F26.1, F26.2 (0.27.2: the operator
+    // is its ops trait's method, PartialEq, PartialOrd, Rem and the bit
+    // traits among them; on a parameter's value, the bound must give it)
+    require_op_bound(n, lhs, op, false, pcx);
+    if crate::front::traits::rust_op_trait(op, ty, false, pcx) >= 0 {
+        return operator_call(n, ty, true, pcx);
+    }
+    if binary_op_trait(op, ty, pcx) >= 0 {
+        return operator_call(n, ty, false, pcx);
+    }
+    // RULE: F26.1 (0.28.0: a comparison of references with no impl of
+    // their own is of what they refer to, level by level, `impl
+    // PartialEq<&B> for &A`: `&a == &b` of two `&u8`, and `a == b` of `a:
+    // &T` with T = `&u8`, compared the addresses)
+    if comparison_op(op) && is_ref(ty, pcx)
+        && pcx.nodes[rhs as usize].ty == ty && pcx.nodes[lhs as usize].ty == ty {
+        let inner = pcx.types[ty as usize].a;
+        pcx.nodes[n as usize].b = synthetic_unary(Tok::Star, lhs, inner, pcx);
+        pcx.nodes[n as usize].c = synthetic_unary(Tok::Star, rhs, inner, pcx);
+        return binary_result(n, op, inner, pcx);
+    }
+    if op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash
+        || op == Tok::Percent {
+        if !is_numeric(ty) {
+            arithmetic_error(n, op, ty, pcx);
+        }
+        return ty;
+    }
+    if (op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq)
+        && is_fieldless_enum(ty, pcx) {
+        // 0.4: fieldless enums are ordered by declaration, which must be
+        // the order of their discriminants; compared as their tags.
+        let e = pcx.types[ty as usize].a;
+        for i in 1..(pcx.enums[e as usize]).variant_count {
+            if pcx.variants[enum_variant(e, i, pcx) as usize].discr
+                <= pcx.variants[enum_variant(e, i - 1, pcx) as usize].discr {
+                err_begin(pcx.nodes[n as usize].start, pcx);
+                err_str(c"'", pcx);
+                err_sym((pcx.enums[e as usize]).name, pcx);
+                err_str(
+                    c"' cannot be ordered: its discriminants do not increase in declaration order", pcx);
+                err_end(pcx);
+            }
+        }
+        pcx.nodes[n as usize].b = cast_node(pcx.nodes[n as usize].b,
+            (pcx.enums[e as usize]).tag, pcx);
+        pcx.nodes[n as usize].c = cast_node(pcx.nodes[n as usize].c,
+            (pcx.enums[e as usize]).tag, pcx);
+        synth_expr(pcx.nodes[n as usize].b, pcx);
+        synth_expr(pcx.nodes[n as usize].c, pcx);
+        return TY_BOOL;
+    }
+    if op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq {
+        if !(is_numeric(ty) || is_pointer(ty, pcx)) {
+            // RULE: F18.6 (0.29: an operand whose type is not known
+            // yet, an element of a Vec nothing gave a type: the
+            // `type.infer` of the call that made it, not "got '_'")
+            crate::front::check::infer::unknown_in(ty, pcx);
+            type_error_got(n, c"comparison requires numeric type", ty, pcx);
+        }
+        unsigned_compare(n, op, ty, pcx);
+        return TY_BOOL;
+    }
+    if op == Tok::EqEq || op == Tok::BangEq {
+        if ty == TY_NEVER || ty == pcx.ty_error {
+            return TY_BOOL;
+        }
+        // RULE: F26.4 (0.28.0: `==` is PartialEq's in the rust edition)
+        let miss = crate::front::check::equality::partial_eq_missing(ty, pcx);
+        if miss != 0 {
+            err_begin(pcx.nodes[n as usize].start, pcx);
+            err_str(c"binary operation `", pcx);
+            err_str(if op == Tok::EqEq { c"==" } else { c"!=" }, pcx);
+            err_str(c"` cannot be applied to type `", pcx);
+            err_type(ty, pcx);
+            err_str(c"`: `", pcx);
+            err_type(miss, pcx);
+            err_str(c"` has no `PartialEq` (rustc E0369)", pcx);
+            err_help(c"write `#[derive(PartialEq)]` on the type, or its `impl PartialEq`",
+                pcx);
+            err_end(pcx);
+        }
+        let bad = eq_unsupported(ty, pcx);
+        if bad != 0 {
+            if bad == ty {
+                // RULE: F18.6 (0.29: as the comparison above)
+                crate::front::check::infer::unknown_in(ty, pcx);
+                type_error_got(n, c"equality requires numeric, bool, pointer or enum type, or a struct, tuple, array or slice of them", ty, pcx);
+            }
+            err_begin(pcx.nodes[n as usize].start, pcx);
+            err_str(c"cannot compare '", pcx);
+            err_type(ty, pcx);
+            err_str(c"' with ==: it holds a '", pcx);
+            err_type(bad, pcx);
+            err_str(c"', which has no ==", pcx);
+            err_end(pcx);
+        }
+        if is_compound(ty, pcx) {
+            structural_eq(n, ty, pcx);
+        }
+        return TY_BOOL;
+    }
+    if op == Tok::AmpAmp || op == Tok::PipePipe {
+        if ty != TY_BOOL {
+            type_error_got(n, c"logical operator requires bool", ty, pcx);
+        }
+        return TY_BOOL;
+    }
+    if !is_integer(ty) {
+        type_error_got(n, c"bitwise operator requires integer type", ty, pcx);
+    }
+    ty
 }
 
 // (0.26.2) `i >= 0` or `i < 0` of a usize local i (a length, since
@@ -1581,7 +1647,7 @@ fn unsigned_compare(n: i64, op: Tok, ty: i64, pcx: &mut Ctx<Comp>) {
     buf_str(m, if always_true { c"' is never below 0: this comparison is always true" }
         else { c"' is never below 0: this comparison is always false" });
     buf_byte(m, 0);
-    report_warning(pcx.nodes[n as usize].start, 4, c"num.unsigned-cmp", buf_slice(m).ptr,
+    report_warning(pcx.nodes[n as usize].start, 4, c"num.unsigned-cmp", buf_ptr(m),
         c"a count down to 0 in an unsigned type: `while i > 0 { i -= 1; ... }`; or convert the length to i64 where it is made (`v.len() as i64`)", pcx);
 }
 
@@ -1632,7 +1698,7 @@ fn arithmetic_error(n: i64, op: Tok, ty: i64, pcx: &mut Ctx<Comp>) -> ! {
         err_help_fmt({
             let first = str::from_utf8(first).unwrap();
             format_args("' has no operator; its methods do it: {} (`a.{first}(b)`)",
-                str::from_utf8(buf_slice(found)).unwrap())
+                str::from_utf8(buf_done(found)).unwrap())
         }, pcx);
         let t = buf_new();
         let simple = crate::front::check::plain_operand_text(lt);
@@ -1642,8 +1708,8 @@ fn arithmetic_error(n: i64, op: Tok, ty: i64, pcx: &mut Ctx<Comp>) -> ! {
         buf_fmt(t, { let first = str::from_utf8(first).unwrap(); format_args(".{first}(") });
         buf_bytes(t, rt);
         buf_bytes(t, b")");
-        err_try_fmt(str::from_utf8(buf_slice(t)).unwrap(), pcx);
-        err_fix(bin.start, bin.end, buf_slice(t), pcx);
+        err_try_fmt(str::from_utf8(&buf_copy(t)).unwrap(), pcx);
+        err_fix(bin.start, bin.end, &buf_copy(t), pcx);
     }
     err_end(pcx)
 }
@@ -1703,9 +1769,6 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return ty;
     }
     if op == Tok::Star {
-        if star_on_access(n, operand, pcx) {
-            return synth_expr(n, pcx);
-        }
         // (0.27.3: an exclusive view that IndexMut gives, `&mut s[1..]` of a
         // String as `&mut *s.index_mut(1..)`, is read as the view, F26.3;
         // asked before the call is checked into a Call)
@@ -1730,27 +1793,21 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             // (0.27.0: `*x` through Deref, the rust edition's)
             return synth_expr(n, pcx);
         }
-        // RULE: Z4.1 (0.27.2, std2: `*s` of a shared view, `&str` or `&[T]`,
+        // RULE: Z4.1 (0.27.2, std: `*s` of a shared view, `&str` or `&[T]`,
         // is the unsized place, read as the view itself: `&**self` in Debug
         // for &T with T = str; an exclusive one stays an error until Z9.1)
         let view = if ty > 0
             && pcx.types[ty as usize].kind == TyKind::Distinct { pcx.types[ty as usize].a }
             else { ty };
         if view > 0 && pcx.types[view as usize].kind == TyKind::Slice
-            && (pcx.types[view as usize].b == 0 || index_mut)
-            && crate::front::known::on_std2(pcx) {
+            && (pcx.types[view as usize].b == 0 || index_mut) {
             pcx.nodes[n as usize] = pcx.nodes[operand as usize];
             // (0.27.5: as a receiver, the place: synth_method)
             pcx.view_deref = n;
             return ty;
         }
-        // RULE: Z4.1 (on std2 no edition.std_copy: `*x` of a value is the
-        // plain error below, rustc's E0614)
-        if !is_pointer(ty, pcx) && ty != pcx.ty_error && pcx.types[ty as usize].kind != TyKind::Fn
-            && !crate::front::known::on_std2(pcx) {
-            crate::front::check::rust::std_copy_error(n, operand, ty, pcx);
-            return ty;
-        }
+        // RULE: Z4.1 (`*x` of a value is the plain error below, rustc's
+        // E0614)
         if !is_pointer(ty, pcx) {
             err_begin(pcx.nodes[n as usize].start, pcx);
             err_str(c"cannot deref non-pointer type '", pcx);
@@ -1840,9 +1897,9 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             pcx.nodes[n as usize].p |= flags & NODE_REF_MUT;
             return if mutable { mut_slice_of(pcx.types[ty as usize].a, pcx) } else { ty };
         }
-        // RULE: Z9.1 (0.27.2: on std2, `&s[a..]` of a str is the str, its
+        // RULE: Z9.1 (0.27.2: `&s[a..]` of a str is the str, its
         // own view, as a slice's is, until the unsized representation)
-        if crate::front::known::on_std2(pcx) && is_view_distinct(ty, pcx) {
+        if is_view_distinct(ty, pcx) {
             let flags = pcx.nodes[n as usize].p;
             pcx.nodes[n as usize] = pcx.nodes[operand as usize];
             pcx.nodes[n as usize].p |= flags & NODE_REF_MUT;
@@ -1866,6 +1923,10 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // RULE: F30.1 (0.28.0: the rust edition's `&mut (*p).f`, `&(*p).v[i]`
     // is a reference, as `&*p` is and as rustc types it; `&raw mut` is
     // the raw pointer)
+    // RULE: F30.5 (0.29: no `&mut` of a place behind a `*const T`)
+    if mutable {
+        crate::front::check::rust::const_write(operand, true, pcx);
+    }
     ref_to(ty, if mutable { REF_MUT } else { REF_SHARED }, pcx)
 }
 
@@ -1918,73 +1979,43 @@ fn is_word_char(c: u8) -> bool {
     (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_'
 }
 
-// (0.20) `*x` where x is an access (a let or inout parameter, an `inout`
-// local): conv.rust, `*` is for raw pointers; n becomes x, the value.
-fn star_on_access(n: i64, operand: i64, pcx: &mut Ctx<Comp>) -> bool {
-    // (only a `*` written in the source: the checker's own desugarings,
-    // an owned assignment's `*x`, make one of a use too)
-    if pcx.nodes[operand as usize].kind != NodeKind::Ident
-        || (pcx.nodes[operand as usize].p & CONV_NEW) != 0
-        || pcx.nodes[n as usize].start >= pcx.nodes[operand as usize].start
-        || get_src()[pcx.nodes[n as usize].start as usize] != b'*' {
-        return false;
-    }
-    let l = lookup_local(pcx.nodes[operand as usize].a, pcx);
-    if l.is_none() || !pcx.locals[l.unwrap() as usize].access {
-        return false;
-    }
-    let text = &get_src()[
-        pcx.nodes[operand as usize].start as usize..pcx.nodes[operand as usize].end as usize];
-    let b = buf_new();
-    buf_bytes(b, b"'");
-    buf_bytes(b, text);
-    buf_bytes(b, b"' is an access, used as its value: '");
-    buf_bytes(b, text);
-    buf_bytes(b, b"' (`*` is for raw pointers)");
-    crate::front::conv::rust_spelling(pcx.nodes[n as usize].start, pcx.nodes[operand as usize].end,
-        buf_slice(b), text, pcx);
-    pcx.nodes[n as usize] = pcx.nodes[operand as usize];
-    true
-}
-
 // `&f` or `*f` (node n) of a function value f (operand): a function's name
 // is a `fn(..) -> ..` value, a pointer to its code already; it is called
 // as it is (`f(10)`). The fix (fix --suggested) writes f alone.
-fn fn_value_error(n: i64, operand: i64, what: *mut u8, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let ty = pcx.nodes[operand as usize].ty;
-        let f = &get_src()[
-            pcx.nodes[operand as usize].start as usize..pcx.nodes[operand as usize].end as usize];
-        let address = (*what.add(0)) == b'a';
-        err_begin(pcx.nodes[n as usize].start, pcx);
-        if address {
-            err_fmt(
-                { let f = str::from_utf8(f).unwrap(); format_args(
-                    "cannot take the address of '{f}': a function's name is already a pointer to it") }, pcx);
-        } else {
-            err_fmt({
-                let f = str::from_utf8(f).unwrap();
-                format_args("cannot dereference '{f}': a function value is called as it is")
-            },
-                pcx);
-        }
-        let t = buf_new();
-        buf_type(t, ty, pcx);
-        let tt = buf_slice(t);
-        if address {
-            err_help_fmt(
-                { let f = str::from_utf8(f).unwrap(); { let tt = str::from_utf8(tt).unwrap(); format_args("'{f}' is a value of type `{tt}`: `let g = {f};` keeps it, `g(x)` calls it, with no `&`") } }, pcx);
-        } else {
-            err_help_fmt({
-                let f = str::from_utf8(f).unwrap();
-                { let tt = str::from_utf8(tt).unwrap();
-                    format_args("'{f}' is a `{tt}`: call it as `{f}(...)`, without `*`") }
-            }, pcx);
-        }
-        err_try_fmt({ let f = str::from_utf8(f).unwrap(); format_args("{f}") }, pcx);
-        err_fix(pcx.nodes[n as usize].start, pcx.nodes[n as usize].end, f, pcx);
-        err_end_soft(pcx);
+fn fn_value_error(n: i64, operand: i64, what: *const u8, pcx: &mut Ctx<Comp>) {
+    let ty = pcx.nodes[operand as usize].ty;
+    let f = &get_src()[
+        pcx.nodes[operand as usize].start as usize..pcx.nodes[operand as usize].end as usize];
+    let address = c_first(what) == b'a';
+    err_begin(pcx.nodes[n as usize].start, pcx);
+    if address {
+        err_fmt(
+            { let f = str::from_utf8(f).unwrap(); format_args(
+                "cannot take the address of '{f}': a function's name is already a pointer to it") },
+            pcx);
+    } else {
+        err_fmt({
+            let f = str::from_utf8(f).unwrap();
+            format_args("cannot dereference '{f}': a function value is called as it is")
+        },
+            pcx);
     }
+    let t = buf_new();
+    buf_type(t, ty, pcx);
+    let tt = buf_copy(t);
+    if address {
+        err_help_fmt(
+            { let f = str::from_utf8(f).unwrap(); { let tt = str::from_utf8(&tt).unwrap(); format_args("'{f}' is a value of type `{tt}`: `let g = {f};` keeps it, `g(x)` calls it, with no `&`") } }, pcx);
+    } else {
+        err_help_fmt({
+            let f = str::from_utf8(f).unwrap();
+            { let tt = str::from_utf8(&tt).unwrap();
+                format_args("'{f}' is a `{tt}`: call it as `{f}(...)`, without `*`") }
+        }, pcx);
+    }
+    err_try_fmt({ let f = str::from_utf8(f).unwrap(); format_args("{f}") }, pcx);
+    err_fix(pcx.nodes[n as usize].start, pcx.nodes[n as usize].end, f, pcx);
+    err_end_soft(pcx);
 }
 
 // `size_of(T)` and `align_of(T)` (0.4): integer constants, typed like an
@@ -2030,7 +2061,7 @@ pub fn fold_layout_query(n: i64, pcx: &mut Ctx<Comp>) {
 
 // (0.27.2) `size_of::<T>()` of the rust edition (call n, no arguments):
 // the callee `size_of` or `align_of`, or a path ending in one, with one
-// type argument; n becomes the constant, a `usize` (`1usize`), as std2's
+// type argument; n becomes the constant, a `usize` (`1usize`), as std's
 // signature says.
 // RULE: F19.4
 fn rust_layout_query(n: i64, pcx: &mut Ctx<Comp>) {
@@ -2068,7 +2099,7 @@ fn rust_layout_query(n: i64, pcx: &mut Ctx<Comp>) {
 
 // RULE: F21.4 (0.27.2.1, Z9.1) `size_of_val(x)` of the rust edition (call
 // n, one argument) with x a slice or a str: its length times the
-// element's size, `x.len() * size_of::<T>()` (std2's body, `size_of(T)`,
+// element's size, `x.len() * size_of::<T>()` (std's body, `size_of(T)`,
 // would give the view's two words).
 fn rust_size_of_val(n: i64, pcx: &mut Ctx<Comp>) {
     let callee = pcx.nodes[n as usize].a;

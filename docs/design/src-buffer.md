@@ -172,6 +172,32 @@ cleared and are rewritten (lsp/complete's `signature`, `result_text`,
 read through a raw pointer (`text`, `intr_text`), `cstr` views of paths
 (linkfail's `root_path`), and views of tcx's own vectors.
 
+## A growing buffer has no borrowed view (0.29)
+
+`buf_slice(b)` returned a growing buffer's block as `&'static [u8]`,
+good only until the next write to the buffer, with nothing to check
+it. It is gone. A buffer is a number, so no borrow can end a view at
+the next write; what a reader gets instead says what it has:
+
+- `buf_copy(b)` (and `buf_copy_range`): the bytes copied into a `Vec`
+  of the caller's, `&buf_copy(b)` where a `&[u8]` is read in one
+  statement. A later write to `b` changes nothing in it.
+- `buf_done(b)`: the buffer frozen and its bytes as `&'static [u8]`,
+  which is true: every writer stops the compiler at a frozen buffer.
+  For a buffer written for the last time (a text built and returned,
+  a file read once).
+- The operation done in base on the block, by value: `buf_append(dst,
+  src)`, `intern_buf`, `find_sym_buf`, `buf_eq`, `buf_at`, `buf_len`.
+
+Of the 1383 callers, 986 read the view in the statement that made it,
+209 bound it and read it before any write (none held it across a
+write of the same buffer in its own function), and 83 let it out of
+its statement (returned it, stored it, or passed it on in a block's
+value): the borrow checker listed those when the type became honest.
+One wrote through the view's pointer (lsp/complete's put_completion:
+`buf_set` now). Where older sections below say `buf_slice`, read
+`buf_copy` or `buf_done`.
+
 ## Views of other storage (0.27.7)
 
 Gate 3's borrow checker ties a view to the parameter it was read

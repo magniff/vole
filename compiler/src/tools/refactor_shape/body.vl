@@ -4,17 +4,17 @@
 // written type of a local, how a use of a local uses it, and the lines of
 // a text re-indented.
 
-use crate::base::{IntVec, buf_byte, buf_bytes, buf_new, buf_slice, get_src, sym_text};
+use crate::base::{buf_append, buf_byte, buf_bytes, buf_copy, buf_new, get_src, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{BLOCK_UNSAFE, CLOSURE_MOVE, FN_UNSAFE, NODE_CAPTURE, NodeKind, child};
 use crate::front::check::Res;
 use crate::front::lexer::Tok;
-use crate::front::types::{TyKind, get_enums, is_pointer, type_elem};
+use crate::front::types::{TyKind, is_pointer, type_elem};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::ctx::Tcx;
 use crate::tools::edit::apply::{copy_rewritten, overlay_args};
-use crate::tools::proc::run_capture;
+use crate::tools::proc::{exec_words, run_capture};
 
 // How a use of a local uses it (use_kind).
 pub const USE_VALUE: i64 = 0;
@@ -27,7 +27,7 @@ pub const USE_FIELD_READ: i64 = 5;
 // The node children of checked node n (its expressions, statements,
 // patterns; not its types and names; 0.14: a closure's parameters and
 // body), into out.
-pub fn kids(n: i64, out: &mut IntVec, pcx: &Ctx<Comp>) {
+pub fn kids(n: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
     let k = pcx.nodes[n as usize].kind;
     let a = pcx.nodes[n as usize].a;
     let b = pcx.nodes[n as usize].b;
@@ -45,7 +45,7 @@ pub fn kids(n: i64, out: &mut IntVec, pcx: &Ctx<Comp>) {
     }
     else if k == NodeKind::Cast || k == NodeKind::FieldAccess || k == NodeKind::TupleField
         || k == NodeKind::Return
-        || k == NodeKind::ExprStmt || k == NodeKind::Defer || k == NodeKind::EnumPanic {
+        || k == NodeKind::ExprStmt || k == NodeKind::EnumPanic {
         push2(out, a, 0);
     }
     else if k == NodeKind::Index || k == NodeKind::Repeat || k == NodeKind::Range
@@ -89,7 +89,7 @@ pub fn kids(n: i64, out: &mut IntVec, pcx: &Ctx<Comp>) {
     }
 }
 
-fn push2(out: &mut IntVec, x: i64, y: i64) {
+fn push2(out: &mut Vec<i64, Comp>, x: i64, y: i64) {
     if x > 0 {
         out.push(x);
     }
@@ -98,7 +98,7 @@ fn push2(out: &mut IntVec, x: i64, y: i64) {
     }
 }
 
-fn list(n: i64, out: &mut IntVec, pcx: &Ctx<Comp>) {
+fn list(n: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
     for i in 0..pcx.nodes[n as usize].count {
         push2(out, child(n, i, pcx), 0);
     }
@@ -107,34 +107,32 @@ fn list(n: i64, out: &mut IntVec, pcx: &Ctx<Comp>) {
 // Walks the body of function node f: the parents of its nodes, the
 // declarations of its locals (its parameters' too).
 pub fn load_body(f: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
-    unsafe {
-        tcx.body_parent = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
-        tcx.decl = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
-        for i in 0..pcx.nodes[f as usize].count {
-            let p = child(f, i, pcx);
-            if pcx.nodes[p as usize].kind == NodeKind::Param {
-                tcx.decl.put(pcx.nodes[p as usize].x + 1, p + 1);
-            }
+    tcx.body_parent = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+    tcx.decl = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+    for i in 0..pcx.nodes[f as usize].count {
+        let p = child(f, i, pcx);
+        if pcx.nodes[p as usize].kind == NodeKind::Param {
+            tcx.decl.put(pcx.nodes[p as usize].x + 1, p + 1);
         }
-        let mut todo = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        if pcx.nodes[f as usize].c > 0 {
-            todo.push(pcx.nodes[f as usize].c);
+    }
+    let mut todo: Vec<i64, Comp> = Vec::new_in(Comp {});
+    if pcx.nodes[f as usize].c > 0 {
+        todo.push(pcx.nodes[f as usize].c);
+    }
+    while todo.len() as i64 > 0 {
+        let n = todo.pop().unwrap();
+        // (0.14: a closure's parameter with a plain name declares it)
+        if pcx.nodes[n as usize].kind == NodeKind::PatBind
+            || (pcx.nodes[n as usize].kind == NodeKind::Param && pcx.nodes[n as usize].d == 0) {
+            tcx.decl.put(pcx.nodes[n as usize].x + 1, n + 1);
         }
-        while todo.count > 0 {
-            let n = todo.pop();
-            // (0.14: a closure's parameter with a plain name declares it)
-            if pcx.nodes[n as usize].kind == NodeKind::PatBind
-                || (pcx.nodes[n as usize].kind == NodeKind::Param && pcx.nodes[n as usize].d == 0) {
-                tcx.decl.put(pcx.nodes[n as usize].x + 1, n + 1);
-            }
-            let mut ks = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            kids(n, &mut ks, pcx);
-            for i in 0..ks.count {
-                let c = (*ks.data.add(i as usize));
-                if c > 0 && c < pcx.nodes.len() as i64 && tcx.body_parent.get(c + 1) == 0 {
-                    tcx.body_parent.put(c + 1, n + 1);
-                    todo.push(c);
-                }
+        let mut ks: Vec<i64, Comp> = Vec::new_in(Comp {});
+        kids(n, &mut ks, pcx);
+        for i in 0..ks.len() as i64 {
+            let c = (ks[i as usize]);
+            if c > 0 && c < pcx.nodes.len() as i64 && tcx.body_parent.get(c + 1) == 0 {
+                tcx.body_parent.put(c + 1, n + 1);
+                todo.push(c);
             }
         }
     }
@@ -193,42 +191,40 @@ pub fn captured_by_move(n: i64, tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
 // Whether type t holds a closure (0.14: `closure(i64) -> i64`, a
 // `Map<I, F>` of one, a pointer to one): it has no name to write it by.
 pub fn has_closure(t: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        if t <= 0 || depth > 8 {
-            return false;
-        }
-        let kind = pcx.types[t as usize].kind;
-        if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
-            return has_closure(pcx.types[t as usize].a, depth + 1, pcx);
-        }
-        if kind == TyKind::Tuple {
-            for i in 0..pcx.types[t as usize].count {
-                if has_closure(type_elem(t, i, pcx), depth + 1, pcx) {
-                    return true;
-                }
-            }
-            return false;
-        }
-        let mut list: i64 = 0;
-        let mut count: i64 = 0;
-        if kind == TyKind::Struct {
-            let s = pcx.types[t as usize].a;
-            if pcx.structs[s as usize].closure != 0 {
-                return true;
-            }
-            list = pcx.structs[s as usize].targs;
-            count = pcx.structs[s as usize].targ_count;
-        } else if kind == TyKind::Enum {
-            list = (*get_enums().add(pcx.types[t as usize].a as usize)).targs;
-            count = (*get_enums().add(pcx.types[t as usize].a as usize)).targ_count;
-        }
-        for i in 0..count {
-            if has_closure((*pcx.tlists.data.add((list + i) as usize)), depth + 1, pcx) {
-                return true;
-            }
-        }
-        false
+    if t <= 0 || depth > 8 {
+        return false;
     }
+    let kind = pcx.types[t as usize].kind;
+    if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
+        return has_closure(pcx.types[t as usize].a, depth + 1, pcx);
+    }
+    if kind == TyKind::Tuple {
+        for i in 0..pcx.types[t as usize].count {
+            if has_closure(type_elem(t, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    let mut list: i64 = 0;
+    let mut count: i64 = 0;
+    if kind == TyKind::Struct {
+        let s = pcx.types[t as usize].a;
+        if pcx.structs[s as usize].closure != 0 {
+            return true;
+        }
+        list = pcx.structs[s as usize].targs;
+        count = pcx.structs[s as usize].targ_count;
+    } else if kind == TyKind::Enum {
+        list = (pcx.enums[pcx.types[t as usize].a as usize]).targs;
+        count = (pcx.enums[pcx.types[t as usize].a as usize]).targ_count;
+    }
+    for i in 0..count {
+        if has_closure((pcx.tlists[(list + i) as usize]), depth + 1, pcx) {
+            return true;
+        }
+    }
+    false
 }
 
 // How use n of a local (an Ident) uses it: assigned (`x = `, `x += `),
@@ -374,38 +370,36 @@ pub fn reindent(out: i64, s: &[u8], indent: &[u8]) {
 
 // The text of SRC[a..b) with the replacements (starts, ends, texts:
 // buffers) inside it, as a buffer.
-pub fn text_with(a: i64, b: i64, starts: IntVec, ends: IntVec, texts: IntVec) -> i64 {
-    unsafe {
-        let out = buf_new();
-        let mut cur = a;
-        loop {
-            // (the next replacement from cur)
-            let mut next: i64 = -1;
-            for i in 0..starts.count {
-                let s = (*starts.data.add(i as usize));
-                if s >= cur && s < b && (next < 0 || s < (*starts.data.add(next as usize))) {
-                    next = i;
-                }
+pub fn text_with(a: i64, b: i64, starts: &[i64], ends: &[i64], texts: &[i64]) -> i64 {
+    let out = buf_new();
+    let mut cur = a;
+    loop {
+        // (the next replacement from cur)
+        let mut next: i64 = -1;
+        for i in 0..starts.len() as i64 {
+            let s = (starts[i as usize]);
+            if s >= cur && s < b && (next < 0 || s < (starts[next as usize])) {
+                next = i;
             }
-            if next < 0 {
-                break;
-            }
-            buf_bytes(out, &get_src()[cur as usize..(*starts.data.add(next as usize)) as usize]);
-            buf_bytes(out, buf_slice((*texts.data.add(next as usize))));
-            cur = (*ends.data.add(next as usize));
         }
-        buf_bytes(out, &get_src()[cur as usize..b as usize]);
-        out
+        if next < 0 {
+            break;
+        }
+        buf_bytes(out, &get_src()[cur as usize..(starts[next as usize]) as usize]);
+        buf_append(out, (texts[next as usize]));
+        cur = (ends[next as usize]);
     }
+    buf_bytes(out, &get_src()[cur as usize..b as usize]);
+    out
 }
 
 // Rounds of `fix --round --only ONLY` on the edited program (its copies
 // as overlays), up to eight while they fix something (the checker stops
 // at a statement's first unknown name): the imports and
 // `pub` that code moved to another module needs.
-pub fn fix_round(root: *mut u8, only: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
+pub fn fix_round(root: *const u8, only: *const u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
     for _ in 0..8 {
-        let mut args = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut args: Vec<i64, Comp> = Vec::new_in(Comp {});
         args.push(pcx.prog as i64);
         args.push(c"fix" as i64);
         args.push(c"--round" as i64);
@@ -419,10 +413,10 @@ pub fn fix_round(root: *mut u8, only: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Co
         args.push(root as i64);
         args.push(0);
         let out = buf_new();
-        if run_capture(args.data as *mut *mut u8, out) != 0 {
+        if run_capture(exec_words(args.as_slice()).as_slice(), out) != 0 {
             return;
         }
-        let t = buf_slice(out);
+        let t = buf_copy(out);
         let mut any = false;
         let mut i: i64 = 0;
         while i < t.len() as i64 {

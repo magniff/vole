@@ -4,7 +4,7 @@
 
 // ---- Token kinds ----
 
-use std::io::Sink; mod strings;
+pub mod strings;
 // (0.25.3) text blocks: """ ... """, r""" ... """
 mod blocks;
 // (0.26.0) embedded blocks: `embed wgsl NAME { WGSL }`
@@ -13,8 +13,8 @@ pub mod embedded;
 // (Numbered as in 0.3: the keywords and the punctuation are kept in the
 // ranges the token dump of the seed expects.)
 use crate::base::{
-    alloc_array, buf_byte, buf_clear, buf_fmt, buf_hex, buf_new, buf_str, cstr, elem_at, get_bufs,
-    get_src, intern, intern_c, strtod, sym_name, sym_text,
+    buf_at, buf_byte, buf_clear, buf_copy, buf_fmt, buf_hex, buf_len, buf_new, buf_str, get_src,
+    intern, intern_c, strtod, sym_name, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -22,8 +22,8 @@ use crate::base::diag::error_at;
 
 use Tok::{
     Amp, AmpAmp, AmpEq, Arrow, As, At, Bang, BangEq, Break, CStr, Caret, CaretEq, Char, Colon,
-    ColonColon, Comma, Const, Continue, Defer, Dot, DotDot, DotDotEq, Ellipsis, Else, Enum, Eof, Eq,
-    EqEq, Extern, False, FatArrow, Float, Fn, For, Gt, GtEq, Hash, Ident, If, Impl, Import, In, Int,
+    ColonColon, Comma, Const, Continue, Dot, DotDot, DotDotEq, Ellipsis, Else, Enum, Eof, Eq, EqEq,
+    Extern, False, FatArrow, Float, Fn, For, Gt, GtEq, Hash, Ident, If, Impl, Import, In, Int,
     LBrace, LBracket, LParen, Let, Loop, Lt, LtEq, Match, Minus, MinusEq, Mod, Mut, Percent,
     PercentEq, Pipe, PipeEq, PipePipe, Plus, PlusEq, Pub, Question, RBrace, RBracket, RParen,
     Reserved, Return, Semi, Shl, ShlEq, Shr, ShrEq, Slash, SlashEq, Star, StarEq, Static, Str,
@@ -41,7 +41,7 @@ pub use strings::{add_string, hex_value, lex_char, lex_fstring, lex_string};
     While = 17, For = 18, In = 19, Break = 20, Continue = 21, True = 22,
     False = 23, As = 24, Return = 25, Extern = 26, Const = 27, Static = 28,
     Type = 29, Enum = 30, Match = 31, Impl = 32, Union = 33, Import = 34, Use = 35,
-    Pub = 36, Mod = 37, Defer = 38, Unsafe = 39,
+    Pub = 36, Mod = 37, Unsafe = 39,
     // Punctuation.
     PlusEq = 40, MinusEq = 41, StarEq = 42, SlashEq = 43, PercentEq = 44,
     AmpEq = 45, PipeEq = 46, CaretEq = 47, BangEq = 48, EqEq = 49, GtEq = 50,
@@ -63,8 +63,6 @@ pub use strings::{add_string, hex_value, lex_char, lex_fstring, lex_string};
     // string id, -1: none); an FHead has `suffix` 1 when the f-string has
     // no hole (the token is the whole literal).
     FHead = 92, FMid = 93, FTail = 94,
-    // Keywords of 0.21 (conventions.md D27; words by position in 0.20).
-    Var = 95, Inout = 96, Sink = 97,
     // (0.26.0) The text of an embedded block, `embed wgsl NAME { .. }`
     // (lexer/embedded.vl): start..end its bytes, between the braces; no
     // value.
@@ -96,31 +94,49 @@ pub const SUF_F64: i64 = 12;
     pub kind: Tok, pub start: i64, pub end: i64, pub value: u64, pub suffix: i64, pub joint: bool,
 }
 
-// String literals: their bytes, by id.
-static mut STRS: *mut &'static [u8] = 0 as *mut &'static [u8];
-static mut STR_COUNT: i64 = 0;
-static mut STR_CAP: i64 = 0;
-
-// String literal id's bytes: STRS[id] by its address (0.17: `STRS[id]`
-// would index the first slice).
-pub fn str_at(id: i64) -> &'static [u8] {
-    unsafe { *elem_at(get_strs(), id) }
+// The program's string literals and constant data, by id: each one's
+// bytes (a copy kept for the process, a NUL after it) and its alignment
+// (0: a string literal's; gen0::target::add_const_data gives the
+// optimizer's data theirs). The context keeps the table behind a lock:
+// the optimizer adds constant data through a shared context.
+pub struct StrTable<A: std::alloc::Allocator> {
+    pub texts: Vec<&'static [u8], A>, pub aligns: Vec<i64, A>,
 }
 
-fn add_keyword(text: *mut u8, kind: Tok, pcx: &mut Ctx<Comp>) {
-    let sym = intern_c(text, pcx);
-    unsafe { (*pcx.sym_keyword.add(sym as usize)) = kind; }
+pub fn str_table_new() -> StrTable<Comp> {
+    StrTable { texts: Vec::new_in(Comp {}), aligns: Vec::new_in(Comp {}) }
 }
 
-fn add_reserved(text: *mut u8, pcx: &mut Ctx<Comp>) {
+// String literal id's bytes.
+pub fn str_at(id: i64, pcx: &Ctx<Comp>) -> &'static [u8] {
+    pcx.strs.read().unwrap().texts[id as usize]
+}
+
+// The symbols that can be keywords: the lexer interns its words first
+// (init_lexer), so a keyword's symbol is under this.
+pub const SYM_KEYWORDS: usize = 64;
+
+// A numeric suffix's text (SUF_I8 .. SUF_F64; none: empty).
+fn suffix_text(suffix: i64) -> &'static [u8] {
+    let names: [&'static [u8]; 13] = [
+        b"", b"i8", b"i16", b"i32", b"i64", b"isize", b"u8", b"u16", b"u32", b"u64", b"usize",
+        b"f32", b"f64",
+    ];
+    names[suffix as usize]
+}
+
+fn add_keyword(text: *const u8, kind: Tok, pcx: &mut Ctx<Comp>) {
     let sym = intern_c(text, pcx);
-    unsafe { (*pcx.sym_keyword.add(sym as usize)) = Reserved; }
+    pcx.sym_keyword[sym as usize] = kind;
+}
+
+fn add_reserved(text: *const u8, pcx: &mut Ctx<Comp>) {
+    let sym = intern_c(text, pcx);
+    pcx.sym_keyword[sym as usize] = Reserved;
 }
 
 // Interns the keywords first, so their symbols are small numbers.
 pub fn init_lexer(pcx: &mut Ctx<Comp>) {
-    pcx.sym_keyword_count = 64;
-    pcx.sym_keyword = alloc_array::<Tok>(pcx.sym_keyword_count);
     add_keyword(c"fn", Fn, pcx);
     add_keyword(c"let", Let, pcx);
     add_keyword(c"mut", Mut, pcx);
@@ -149,22 +165,18 @@ pub fn init_lexer(pcx: &mut Ctx<Comp>) {
     add_keyword(c"use", Use, pcx);
     add_keyword(c"pub", Pub, pcx);
     add_keyword(c"mod", Mod, pcx);
-    add_keyword(c"defer", Defer, pcx);
     add_keyword(c"unsafe", Unsafe, pcx);
     add_keyword(c"trait", Trait, pcx);
     add_reserved(c"where", pcx);
     add_reserved(c"dyn", pcx);
     add_keyword(c"move", Tok::Move, pcx);
-    add_keyword(c"var", Tok::Var, pcx);
-    add_keyword(c"inout", Tok::Inout, pcx);
-    add_keyword(c"sink", Tok::Sink, pcx);
     init_suffixes(pcx);
 }
 
 impl Tok {
     // The text of a keyword or punctuation token, for messages and the token
     // dump.
-    pub fn text(self) -> *mut u8 {
+    pub fn text(self) -> *const u8 {
         match self {
             Eof => c"EOF",
             Fn => c"fn",
@@ -195,13 +207,9 @@ impl Tok {
             Use => c"use",
             Pub => c"pub",
             Mod => c"mod",
-            Defer => c"defer",
             Unsafe => c"unsafe",
             Trait => c"trait",
             Tok::Move => c"move",
-            Tok::Var => c"var",
-            Tok::Inout => c"inout",
-            Tok::Sink => c"sink",
             Tok::Embedded => c"embedded",
             Tok::FHead => c"f\"",
             Tok::FMid => c"}",
@@ -264,30 +272,15 @@ impl Tok {
     // Keywords: printed as the identifier they are spelled with.
     pub fn is_keyword(self) -> bool {
         let k = self as i64;
-        k >= Fn as i64 && k <= Mod as i64 || k >= Tok::Var as i64 && k <= Tok::Sink as i64
+        k >= Fn as i64 && k <= Mod as i64
     }
 }
 
 fn init_suffixes(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        pcx.suffix_name = alloc_array::<*mut u8>(13i64);
-        (*pcx.suffix_name.add(SUF_I8 as usize)) = c"i8";
-        (*pcx.suffix_name.add(SUF_I16 as usize)) = c"i16";
-        (*pcx.suffix_name.add(SUF_I32 as usize)) = c"i32";
-        (*pcx.suffix_name.add(SUF_I64 as usize)) = c"i64";
-        (*pcx.suffix_name.add(SUF_ISIZE as usize)) = c"isize";
-        (*pcx.suffix_name.add(SUF_U8 as usize)) = c"u8";
-        (*pcx.suffix_name.add(SUF_U16 as usize)) = c"u16";
-        (*pcx.suffix_name.add(SUF_U32 as usize)) = c"u32";
-        (*pcx.suffix_name.add(SUF_U64 as usize)) = c"u64";
-        (*pcx.suffix_name.add(SUF_USIZE as usize)) = c"usize";
-        (*pcx.suffix_name.add(SUF_F32 as usize)) = c"f32";
-        (*pcx.suffix_name.add(SUF_F64 as usize)) = c"f64";
-        // (the symbols they had when the tools' cache restored the table)
-        pcx.suffix_sym_base = intern_c((*pcx.suffix_name.add(1)), pcx);
-        for suffix in 2..13 {
-            intern_c((*pcx.suffix_name.add(suffix as usize)), pcx);
-        }
+    // (the symbols they had when the tools' cache restored the table)
+    pcx.suffix_sym_base = intern(suffix_text(1), pcx);
+    for suffix in 2..13 {
+        intern(suffix_text(suffix), pcx);
     }
 }
 
@@ -304,13 +297,18 @@ fn is_float_suffix(suffix: i64) -> bool {
 }
 
 pub fn keyword_of_sym(sym: i64, pcx: &Ctx<Comp>) -> Tok {
-    if sym < pcx.sym_keyword_count { unsafe { (*pcx.sym_keyword.add(sym as usize)) } } else { Eof }
+    if (sym as u64) < SYM_KEYWORDS as u64 { pcx.sym_keyword[sym as usize] } else { Eof }
 }
 
 // ---- The lexer ----
 
+// UNSAFE: C's memchr, which finds the end of a comment's line many bytes at a time: a C
+// function, which only an extern block can declare.
+// SAFETY: the declaration is memchr's C prototype on the targets vole builds for (64-bit macOS
+// and Linux: int is i32, size_t u64, long and long long i64, a pointer 8 bytes); what a call
+// must hold (n readable bytes at s) is said at the call.
 extern "C" {
-    fn memchr(s: *mut u8, c: i32, n: u64) -> *mut u8;
+    fn memchr(s: *const u8, c: i32, n: u64) -> *mut u8;
 }
 
 // ' ', '\t', '\r', '\n'
@@ -324,32 +322,28 @@ const CL_DIGIT: u8 = 8;
 const CL_OP: u8 = 16;
 
 fn init_byte_classes(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        pcx.byte_class = alloc_array::<u8>(256i64);
-        pcx.single_tok = alloc_array::<Tok>(256i64);
-        for b in 0..256 {
-            let c = b as u8;
-            let mut k: u8 = 0;
-            if is_whitespace(c) {
-                k |= CL_SPACE;
-            }
-            if is_ident_byte(c) {
-                k |= CL_IDENT;
-            }
-            if c == b'_' || is_alpha(c) {
-                k |= CL_ALPHA;
-            }
-            if is_digit(c) {
-                k |= CL_DIGIT;
-            }
-            (*pcx.byte_class.add(b as usize)) = k;
-            // (the bytes no two- or three-byte operator starts with)
-            if two_char_operator(c, b'=') == Eof && c != b'<' && c != b'>' && c != b'&' && c != b'|'
-                && c != b'-' && c != b'.' && c != b':' {
-                (*pcx.single_tok.add(b as usize)) = one_char_operator(c);
-            } else if one_char_operator(c) != Eof {
-                (*pcx.byte_class.add(b as usize)) = k | CL_OP;
-            }
+    for b in 0..256usize {
+        let c = b as u8;
+        let mut k: u8 = 0;
+        if is_whitespace(c) {
+            k |= CL_SPACE;
+        }
+        if is_ident_byte(c) {
+            k |= CL_IDENT;
+        }
+        if c == b'_' || is_alpha(c) {
+            k |= CL_ALPHA;
+        }
+        if is_digit(c) {
+            k |= CL_DIGIT;
+        }
+        pcx.byte_class[b] = k;
+        // (the bytes no two- or three-byte operator starts with)
+        if two_char_operator(c, b'=') == Eof && c != b'<' && c != b'>' && c != b'&' && c != b'|'
+            && c != b'-' && c != b'.' && c != b':' {
+            pcx.single_tok[b] = one_char_operator(c);
+        } else if one_char_operator(c) != Eof {
+            pcx.byte_class[b] = k | CL_OP;
         }
     }
 }
@@ -381,7 +375,7 @@ fn at_end(pcx: &Ctx<Comp>) -> bool {
 
 fn push_token(kind: Tok, start: i64, value: u64, suffix: i64, pcx: &mut Ctx<Comp>) {
     add_token(kind, start, pcx.lex_pos, value, suffix,
-        joint_at(get_src().ptr, pcx.byte_class, pcx.lex_pos, pcx.lex_end), pcx);
+        joint_at(get_src(), &pcx.byte_class, pcx.lex_pos, pcx.lex_end), pcx);
     pcx.lex_after_dot = kind == Dot;
 }
 
@@ -391,56 +385,63 @@ fn add_token(kind: Tok, start: i64, end: i64, value: u64, suffix: i64, joint: bo
 }
 
 // Nothing separates the token that ends at `pos` from the next one.
-fn joint_at(src: *mut u8, classes: *mut u8, pos: i64, end: i64) -> bool {
-    unsafe {
-        if pos >= end {
-            return false;
-        }
-        let c = (*src.add(pos as usize));
-        if ((*classes.add(c as i64 as usize)) & CL_SPACE) != 0 {
-            return false;
-        }
-        if c == b'/' && pos + 1 < end {
-            let next = (*src.add((pos + 1) as usize));
-            return !(next == b'/' || next == b'*');
-        }
-        true
+fn joint_at(src: &[u8], classes: &[u8; 256], pos: i64, end: i64) -> bool {
+    if pos >= end {
+        return false;
     }
+    let c = src[pos as usize];
+    if (classes[c as usize] & CL_SPACE) != 0 {
+        return false;
+    }
+    if c == b'/' && pos + 1 < end {
+        let next = src[(pos + 1) as usize];
+        return !(next == b'/' || next == b'*');
+    }
+    true
 }
 
 fn skip_whitespace_and_comments(pcx: &mut Ctx<Comp>) {
-    pcx.lex_pos = skip_blank(get_src().ptr, pcx.byte_class, pcx.lex_pos, pcx.lex_end, pcx);
+    pcx.lex_pos = skip_blank(get_src(), pcx.lex_pos, pcx.lex_end, pcx);
 }
 
 // The position of the first byte from `pos` that is neither whitespace nor
 // in a comment (`end` when none is).
-fn skip_blank(src: *mut u8, classes: *mut u8, pos: i64, end: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut p = pos;
-        loop {
-            while p < end
-                && ((*classes.add((*src.add(p as usize)) as i64 as usize)) & CL_SPACE) != 0 {
-                p += 1;
-            }
-            if p + 1 >= end || (*src.add(p as usize)) != b'/' {
-                return p;
-            }
-            let next = (*src.add((p + 1) as usize));
-            if next == b'/' {
-                // (to the end of the line, by memchr)
-                let nl = memchr(src.add(p as usize), 10, (end - p) as u64);
-                p = if nl == 0 as *mut u8 { end }
-                    else { p + (nl as i64 - (src.add(p as usize)) as i64) };
-            } else if next == b'*' {
-                pcx.lex_pos = p;
-                skip_block_comment(pcx);
-                p = pcx.lex_pos;
-            } else {
-                return p;
-            }
+fn skip_blank(src: &[u8], pos: i64, end: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut p = pos;
+    loop {
+        while p < end && (pcx.byte_class[src[p as usize] as usize] & CL_SPACE) != 0 {
+            p += 1;
         }
-        p
+        if p + 1 >= end || src[p as usize] != b'/' {
+            return p;
+        }
+        let next = src[(p + 1) as usize];
+        if next == b'/' {
+            // (to the end of the line, by memchr)
+            p = match find_byte(&src[p as usize..end as usize], b'\n') {
+                Some(at) => p + at as i64,
+                None => end,
+            };
+        } else if next == b'*' {
+            pcx.lex_pos = p;
+            skip_block_comment(pcx);
+            p = pcx.lex_pos;
+        } else {
+            return p;
+        }
     }
+    p
+}
+
+// Where byte b first is in hay.
+pub fn find_byte(hay: &[u8], b: u8) -> Option<usize> {
+    // UNSAFE: C's memchr, which searches many bytes at a time (a comment's
+    // line, the instruction table's lines); a C call
+    // SAFETY: hay.ptr points at hay.len() readable bytes, a slice's own
+    // guarantee, and memchr reads no further; its result is null or a
+    // pointer into those bytes, so the difference is under hay.len()
+    let found = unsafe { memchr(hay.as_ptr(), b as i32, hay.len() as u64) };
+    if found == 0 as *mut u8 { None } else { Some(found as usize - hay.as_ptr() as usize) }
 }
 
 // Block comments nest.
@@ -481,23 +482,17 @@ pub fn lex_range(start: i64, end: i64, last: bool, pcx: &mut Ctx<Comp>) {
     }
 }
 
-// RULE: Z5.2 (0.27.5) SRC[start..end), a run of std2's units, lexed as
+// RULE: Z5.2 (0.27.5) SRC[start..end), a run of std's units, lexed as
 // lex_range does, its last token's `joint` as when its whole text,
-// SRC[..text_end), is lexed (std2lazy.vl: lex_units).
+// SRC[..text_end), is lexed (stdlazy.vl: lex_units).
 pub fn lex_span(start: i64, end: i64, text_end: i64, pcx: &mut Ctx<Comp>) {
     let first = pcx.toks.len() as i64;
     lex_range(start, end, last: false, pcx: pcx);
     let last = pcx.toks.len() as i64 - 1;
     if last >= first {
-        pcx.toks[last as usize].joint = joint_at(get_src().ptr, pcx.byte_class,
+        pcx.toks[last as usize].joint = joint_at(get_src(), &pcx.byte_class,
             pcx.toks[last as usize].end, text_end);
     }
-}
-
-// (0.27.0) Whether keyword kind is MVS's and no keyword of Rust's: in the
-// rust edition the word is a name (`io::sink`, a field `var`).
-fn mvs_only_keyword(kind: Tok) -> bool {
-    kind == Tok::Var || kind == Tok::Inout || kind == Tok::Sink || kind == Defer
 }
 
 // (0.27.6) Whether SRC[p] is the NUL after a file's newline that
@@ -516,152 +511,137 @@ fn source_gap(p: i64, pcx: &Ctx<Comp>) -> bool {
 // the rest (strings, characters, other numbers, errors) by lex_token
 // (LEX_POS set around it).
 fn lex_loop(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let src = get_src().ptr;
-        let classes = pcx.byte_class;
-        let singles = pcx.single_tok;
-        let end = pcx.lex_end;
-        let mut pos = pcx.lex_pos;
-        while pos < end {
-            let mut c = (*src.add(pos as usize));
-            let mut class = (*classes.add(c as i64 as usize));
-            if (class & CL_SPACE) != 0 || c == b'/' {
-                pos = skip_blank(src, classes, pos, end, pcx);
-                if pos >= end {
-                    break;
+    let src = get_src();
+    let end = pcx.lex_end;
+    let mut pos = pcx.lex_pos;
+    while pos < end {
+        let mut c = src[pos as usize];
+        let mut class = pcx.byte_class[c as usize];
+        if (class & CL_SPACE) != 0 || c == b'/' {
+            pos = skip_blank(src, pos, end, pcx);
+            if pos >= end {
+                break;
+            }
+            c = src[pos as usize];
+            class = pcx.byte_class[c as usize];
+        }
+        // (0.27.6) the NUL that ends a file another was added after
+        // (base::add_source): blank, as the newlines around it
+        if c == 0 && source_gap(pos, pcx) {
+            pos += 1;
+            continue;
+        }
+        let mut kind = Eof;
+        let mut p = pos + 1;
+        let mut value: u64 = 0;
+        if (class & CL_ALPHA) != 0 {
+            let next = if p < end { src[p as usize] } else { 0 };
+            // (0.27.2: `b'x'`, a byte literal of the rust edition: lex_token's)
+            if !((c == b'c' || c == b'f') && next == b'"')
+                && !(c == b'r' && (next == b'#' || next == b'"'))
+                && !(c == b'b' && (next == b'\'' || next == b'"')) {
+                while p < end && (pcx.byte_class[src[p as usize] as usize] & CL_IDENT) != 0 {
+                    p += 1;
                 }
-                c = (*src.add(pos as usize));
-                class = (*classes.add(c as i64 as usize));
-            }
-            // (0.27.6) the NUL that ends a file another was added after
-            // (base::add_source): blank, as the newlines around it
-            if c == 0 && source_gap(pos, pcx) {
-                pos += 1;
-                continue;
-            }
-            let mut kind = Eof;
-            let mut p = pos + 1;
-            let mut value: u64 = 0;
-            if (class & CL_ALPHA) != 0 {
-                let next = if p < end { (*src.add(p as usize)) } else { 0 };
-                // (0.27.2: `b'x'`, a byte literal of the rust edition: lex_token's)
-                if !((c == b'c' || c == b'f') && next == b'"')
-                    && !(c == b'r' && (next == b'#' || next == b'"'))
-                    && !(c == b'b' && (next == b'\'' || next == b'"')) {
-                    while p < end
-                        && ((*classes.add((*src.add(p as usize)) as i64 as usize)) & CL_IDENT)
-                        != 0 {
-                        p += 1;
-                    }
-                    let sym = intern(std::slice::from_raw_parts(src.add((pos) as usize),
-                        (p - (pos)) as usize), pcx);
-                    kind = Ident;
-                    if sym < pcx.sym_keyword_count && (*pcx.sym_keyword.add(sym as usize)) != Eof {
-                        kind = (*pcx.sym_keyword.add(sym as usize));
-                        if mvs_only_keyword(kind) {
-                            // (0.27.0: a name in the rust edition)
+                let sym = intern(&src[pos as usize..p as usize], pcx);
+                kind = Ident;
+                if (sym as u64) < SYM_KEYWORDS as u64 && pcx.sym_keyword[sym as usize] != Eof {
+                    kind = pcx.sym_keyword[sym as usize];
+                    if kind == Union {
+                        // (0.27.0: as Rust's, `union` is a keyword only
+                        // before a name, `union U {`; `fn union`,
+                        // `a.union(b)` are the name)
+                        let mut q = p;
+                        while q < end
+                            && (pcx.byte_class[src[q as usize] as usize] & CL_SPACE) != 0 {
+                            q += 1;
+                        }
+                        if q >= end || (pcx.byte_class[src[q as usize] as usize] & CL_ALPHA) == 0 {
                             kind = Ident;
-                        } else if kind == Union {
-                            // (0.27.0: as Rust's, `union` is a keyword only
-                            // before a name, `union U {`; `fn union`,
-                            // `a.union(b)` are the name)
-                            let mut q = p;
-                            while q < end
-                                && ((*classes.add((*src.add(q as usize)) as i64 as usize))
-                                    & CL_SPACE) != 0 {
-                                q += 1;
-                            }
-                            if q >= end
-                                || ((*classes.add((*src.add(q as usize)) as i64 as usize))
-                                    & CL_ALPHA) == 0 {
-                                kind = Ident;
-                            }
                         }
                     }
-                    value = sym as u64;
                 }
-            } else {
-                kind = (*singles.add(c as i64 as usize));
-                if kind == Eof && (class & CL_OP) != 0 {
-                    // (lex_operator, here)
-                    let b = if p < end { (*src.add(p as usize)) } else { 0 };
-                    if pos + 2 < end && (c == b'<' || c == b'>' || c == b'.') {
-                        kind = three_char_operator(c, b, (*src.add((pos + 2) as usize)));
-                        p = pos + 3;
-                    }
-                    if kind == Eof && pos + 1 < end {
-                        kind = two_char_operator(c, b);
-                        p = pos + 2;
-                    }
-                    if kind == Eof {
-                        kind = one_char_operator(c);
-                        p = pos + 1;
-                    }
-                } else if kind == Eof && (class & CL_DIGIT) != 0 {
-                    let after = lex_plain_integer(src, classes, pos, end, pcx);
-                    if after > pos {
-                        pos = after;
-                        continue;
-                    }
+                value = sym as u64;
+            }
+        } else {
+            kind = pcx.single_tok[c as usize];
+            if kind == Eof && (class & CL_OP) != 0 {
+                // (lex_operator, here)
+                let b = if p < end { src[p as usize] } else { 0 };
+                if pos + 2 < end && (c == b'<' || c == b'>' || c == b'.') {
+                    kind = three_char_operator(c, b, src[(pos + 2) as usize]);
+                    p = pos + 3;
+                }
+                if kind == Eof && pos + 1 < end {
+                    kind = two_char_operator(c, b);
+                    p = pos + 2;
+                }
+                if kind == Eof {
+                    kind = one_char_operator(c);
+                    p = pos + 1;
+                }
+            } else if kind == Eof && (class & CL_DIGIT) != 0 {
+                let after = lex_plain_integer(src, pos, end, pcx);
+                if after > pos {
+                    pos = after;
+                    continue;
                 }
             }
-            if kind == Eof {
-                pcx.lex_pos = pos;
-                lex_token(pcx);
-                pos = pcx.lex_pos;
-                continue;
-            }
-            // (joint_at, here)
-            let mut joint = false;
-            if p < end {
-                let d = (*src.add(p as usize));
-                joint = ((*classes.add(d as i64 as usize)) & CL_SPACE) == 0
-                    && !(d == b'/' && p + 1 < end
-                        && ((*src.add((p + 1) as usize)) == b'/'
-                            || (*src.add((p + 1) as usize)) == b'*'));
-            }
-            pcx.toks.push(Token { kind, start: pos, end: p, value, suffix: 0, joint });
-            pcx.lex_after_dot = kind == Dot;
-            // (0.26.0: `embed LANG NAME {`: its text is one token, lexing
-            // resumes at its `}`)
-            if kind == LBrace && embedded::at_embedded_open(pcx) {
-                p = embedded::lex_embedded(pos, pcx);
-            }
-            pos = p;
         }
-        pcx.lex_pos = pos;
+        if kind == Eof {
+            pcx.lex_pos = pos;
+            lex_token(pcx);
+            pos = pcx.lex_pos;
+            continue;
+        }
+        // (joint_at, here)
+        let mut joint = false;
+        if p < end {
+            let d = src[p as usize];
+            joint = (pcx.byte_class[d as usize] & CL_SPACE) == 0
+                && !(d == b'/' && p + 1 < end
+                    && (src[(p + 1) as usize] == b'/' || src[(p + 1) as usize] == b'*'));
+        }
+        pcx.toks.push(Token { kind, start: pos, end: p, value, suffix: 0, joint });
+        pcx.lex_after_dot = kind == Dot;
+        // (0.26.0: `embed LANG NAME {`: its text is one token, lexing
+        // resumes at its `}`)
+        if kind == LBrace && embedded::at_embedded_open(pcx) {
+            p = embedded::lex_embedded(pos, pcx);
+        }
+        pos = p;
     }
+    pcx.lex_pos = pos;
 }
 
 // A decimal integer without '_' or a suffix at `pos`, not a float (or a
 // tuple index): its token added, its end returned; else `pos`, nothing
 // added (lex_number then lexes it, and reports its errors).
-fn lex_plain_integer(src: *mut u8, classes: *mut u8, pos: i64, end: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut p = pos;
-        let mut value: u64 = 0;
-        while p < end && ((*classes.add((*src.add(p as usize)) as i64 as usize)) & CL_DIGIT) != 0 {
-            let digit = ((*src.add(p as usize)) - b'0') as u64;
-            if value > (0xffffffffffffffff - digit) / 10 {
-                return pos;
-            }
-            value = value * 10 + digit;
-            p += 1;
+fn lex_plain_integer(src: &[u8], pos: i64, end: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut p = pos;
+    let mut value: u64 = 0;
+    while p < end && (pcx.byte_class[src[p as usize] as usize] & CL_DIGIT) != 0 {
+        let digit = (src[p as usize] - b'0') as u64;
+        if value > (0xffffffffffffffff - digit) / 10 {
+            return pos;
         }
-        if p < end {
-            let c = (*src.add(p as usize));
-            if ((*classes.add(c as i64 as usize)) & CL_IDENT) != 0 {
-                return pos;
-            }
-            if c == b'.' && !pcx.lex_after_dot && p + 1 < end
-                && ((*classes.add((*src.add((p + 1) as usize)) as i64 as usize)) & CL_DIGIT) != 0 {
-                return pos;
-            }
-        }
-        add_token(Int, pos, p, value, 0, joint_at(src, classes, p, end), pcx);
-        pcx.lex_after_dot = false;
-        p
+        value = value * 10 + digit;
+        p += 1;
     }
+    if p < end {
+        let c = src[p as usize];
+        if (pcx.byte_class[c as usize] & CL_IDENT) != 0 {
+            return pos;
+        }
+        if c == b'.' && !pcx.lex_after_dot && p + 1 < end
+            && (pcx.byte_class[src[(p + 1) as usize] as usize] & CL_DIGIT) != 0 {
+            return pos;
+        }
+    }
+    let joint = joint_at(src, &pcx.byte_class, p, end);
+    add_token(Int, pos, p, value, 0, joint, pcx);
+    pcx.lex_after_dot = false;
+    p
 }
 
 fn lex_token(pcx: &mut Ctx<Comp>) {
@@ -797,12 +777,12 @@ fn one_char_operator(c: u8) -> Tok {
 fn lex_operator(pcx: &mut Ctx<Comp>) {
     let start = pcx.lex_pos;
     let end = pcx.lex_end;
-    let src = get_src().ptr;
-    let a = unsafe { (*src.add(start as usize)) };
+    let src = get_src();
+    let a = src[start as usize];
     if start + 1 < end {
-        let b = unsafe { (*src.add((start + 1) as usize)) };
+        let b = src[(start + 1) as usize];
         if start + 2 < end {
-            let kind = three_char_operator(a, b, unsafe { (*src.add((start + 2) as usize)) });
+            let kind = three_char_operator(a, b, src[(start + 2) as usize]);
             if kind != Eof {
                 pcx.lex_pos = start + 3;
                 push_token(kind, start, 0, 0, pcx);
@@ -871,40 +851,38 @@ fn digit_value(c: u8, radix: u64) -> i64 {
 }
 
 fn lex_radix_digits(radix: u64, pcx: &mut Ctx<Comp>) -> u64 {
-    unsafe {
-        if at_end(pcx) || digit_value(peek_at(0, pcx), radix) < 0 {
-            error_at(pcx.lex_pos,
-                if radix == 16 { c"expected hex digit after '0x'" }
-                else if radix == 8 { c"expected octal digit after '0o'" }
-                else { c"expected binary digit after '0b'" }, pcx);
-        }
-        let mut value: u64 = 0;
-        let mut last_underscore = false;
-        let src = get_src().ptr;
-        let end = pcx.lex_end;
-        let mut p = pcx.lex_pos;
-        while p < end {
-            let c = (*src.add(p as usize));
-            if c == b'_' {
-                last_underscore = true;
-                p += 1;
-                continue;
-            }
-            let digit = digit_value(c, radix);
-            if digit < 0 {
-                break;
-            }
-            last_underscore = false;
-            if value > (0xffffffffffffffff - digit as u64) / radix {
-                error_at(p, c"literal overflow", pcx);
-            }
-            value = value * radix + digit as u64;
-            p += 1;
-        }
-        pcx.lex_pos = p;
-        check_trailing_underscore(last_underscore, pcx);
-        value
+    if at_end(pcx) || digit_value(peek_at(0, pcx), radix) < 0 {
+        error_at(pcx.lex_pos,
+            if radix == 16 { c"expected hex digit after '0x'" }
+            else if radix == 8 { c"expected octal digit after '0o'" }
+            else { c"expected binary digit after '0b'" }, pcx);
     }
+    let mut value: u64 = 0;
+    let mut last_underscore = false;
+    let src = get_src();
+    let end = pcx.lex_end;
+    let mut p = pcx.lex_pos;
+    while p < end {
+        let c = src[p as usize];
+        if c == b'_' {
+            last_underscore = true;
+            p += 1;
+            continue;
+        }
+        let digit = digit_value(c, radix);
+        if digit < 0 {
+            break;
+        }
+        last_underscore = false;
+        if value > (0xffffffffffffffff - digit as u64) / radix {
+            error_at(p, c"literal overflow", pcx);
+        }
+        value = value * radix + digit as u64;
+        p += 1;
+    }
+    pcx.lex_pos = p;
+    check_trailing_underscore(last_underscore, pcx);
+    value
 }
 
 // An identifier glued to a literal: its symbol, or -1.
@@ -920,8 +898,7 @@ fn read_suffix(pcx: &mut Ctx<Comp>) -> i64 {
 }
 
 fn bits_of_f64(value: f64) -> u64 {
-    let copy = value;
-    unsafe { *(&raw const copy as *mut u64) }
+    value.to_bits()
 }
 
 fn lex_int_suffix(value: u64, start: i64, decimal: bool, pcx: &mut Ctx<Comp>) {
@@ -979,57 +956,69 @@ fn at_exponent(pcx: &Ctx<Comp>) -> bool {
     is_digit(sign)
 }
 
+// The double C's strtod reads at the start of text, whose last byte is
+// the NUL that ends it, and how many bytes it read.
+pub fn c_double(text: &[u8]) -> (f64, usize) {
+    assert(text.len() > 0 && text[text.len() - 1] == 0);
+    let mut end = 0 as *const u8;
+    // UNSAFE: C's strtod, the correctly rounded conversion the float
+    // literals have always had; a C call
+    // SAFETY: text's last byte is 0 (checked above) and strtod reads no
+    // further than the first NUL, so it reads text's bytes only; it writes
+    // `end`, a local, with a pointer into those bytes
+    let value = unsafe { strtod(text.as_ptr(), &mut end) };
+    (value, end as usize - text.as_ptr() as usize)
+}
+
 fn lex_decimal_or_float(start: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let text = pcx.lex_scratch;
-        buf_clear(text);
-        read_decimal_digits(text, pcx);
-        let has_fraction = peek_at(0, pcx) == b'.' && pcx.lex_pos + 1 < pcx.lex_end
-            && is_digit(peek_at(1, pcx));
-        let has_exponent = at_exponent(pcx);
-        if pcx.lex_after_dot || !(has_fraction || has_exponent) {
-            let mut value: u64 = 0;
-            for i in 0..(*get_bufs().add(text as usize)).len {
-                let digit = ((*(*get_bufs().add(text as usize)).data.add(i as usize)) - b'0') as u64;
-                if value > (0xffffffffffffffff - digit) / 10 {
-                    error_at(pcx.lex_pos, c"integer overflow", pcx);
-                }
-                value = value * 10 + digit;
+    let text = pcx.lex_scratch;
+    buf_clear(text);
+    read_decimal_digits(text, pcx);
+    let has_fraction = peek_at(0, pcx) == b'.' && pcx.lex_pos + 1 < pcx.lex_end
+        && is_digit(peek_at(1, pcx));
+    let has_exponent = at_exponent(pcx);
+    if pcx.lex_after_dot || !(has_fraction || has_exponent) {
+        let mut value: u64 = 0;
+        for i in 0..buf_len(text) {
+            let digit = (buf_at(text, i) - b'0') as u64;
+            if value > (0xffffffffffffffff - digit) / 10 {
+                error_at(pcx.lex_pos, c"integer overflow", pcx);
             }
-            lex_int_suffix(value, start, !pcx.lex_after_dot, pcx);
-            return;
+            value = value * 10 + digit;
         }
-        if has_fraction {
-            pcx.lex_pos += 1;
-            buf_byte(text, b'.');
-            read_decimal_digits(text, pcx);
-        }
-        if !at_end(pcx) && (peek_at(0, pcx) == b'e' || peek_at(0, pcx) == b'E') {
-            pcx.lex_pos += 1;
-            buf_byte(text, b'e');
-            if !at_end(pcx) && (peek_at(0, pcx) == b'+' || peek_at(0, pcx) == b'-') {
-                buf_byte(text, peek_at(0, pcx));
-                pcx.lex_pos += 1;
-            }
-            if at_end(pcx) || !is_digit(peek_at(0, pcx)) {
-                error_at(pcx.lex_pos, c"expected digit in exponent", pcx);
-            }
-            read_decimal_digits(text, pcx);
-        }
-        buf_byte(text, 0);
-        let value = strtod((*get_bufs().add(text as usize)).data, 0 as *mut *mut u8);
-        let suffix_at = pcx.lex_pos;
-        let sym = read_suffix(pcx);
-        if sym < 0 {
-            push_token(Float, start, bits_of_f64(value), 0, pcx);
-            return;
-        }
-        let suffix = suffix_of_sym(sym, pcx);
-        if suffix == SUF_NONE || !is_float_suffix(suffix) {
-            error_at(suffix_at, c"invalid suffix on float literal", pcx);
-        }
-        push_token(Float, start, bits_of_f64(value), suffix, pcx);
+        lex_int_suffix(value, start, !pcx.lex_after_dot, pcx);
+        return;
     }
+    if has_fraction {
+        pcx.lex_pos += 1;
+        buf_byte(text, b'.');
+        read_decimal_digits(text, pcx);
+    }
+    if !at_end(pcx) && (peek_at(0, pcx) == b'e' || peek_at(0, pcx) == b'E') {
+        pcx.lex_pos += 1;
+        buf_byte(text, b'e');
+        if !at_end(pcx) && (peek_at(0, pcx) == b'+' || peek_at(0, pcx) == b'-') {
+            buf_byte(text, peek_at(0, pcx));
+            pcx.lex_pos += 1;
+        }
+        if at_end(pcx) || !is_digit(peek_at(0, pcx)) {
+            error_at(pcx.lex_pos, c"expected digit in exponent", pcx);
+        }
+        read_decimal_digits(text, pcx);
+    }
+    buf_byte(text, 0);
+    let value = c_double(&buf_copy(text)).0;
+    let suffix_at = pcx.lex_pos;
+    let sym = read_suffix(pcx);
+    if sym < 0 {
+        push_token(Float, start, bits_of_f64(value), 0, pcx);
+        return;
+    }
+    let suffix = suffix_of_sym(sym, pcx);
+    if suffix == SUF_NONE || !is_float_suffix(suffix) {
+        error_at(suffix_at, c"invalid suffix on float literal", pcx);
+    }
+    push_token(Float, start, bits_of_f64(value), suffix, pcx);
 }
 
 // ---- The token dump (`--tokens`) ----
@@ -1045,126 +1034,53 @@ pub fn dump_tokens(out: i64, base: i64, pcx: &Ctx<Comp>) {
     }
 }
 
-fn dump_hex_bytes(out: i64, id: i64) {
-    unsafe {
-        for i in 0..str_at(id).len() {
-            buf_hex(out, (*str_at(id).ptr.add(i)) as u64, 2);
-        }
+fn dump_hex_bytes(out: i64, id: i64, pcx: &Ctx<Comp>) {
+    for i in 0..str_at(id, pcx).len() {
+        buf_hex(out, str_at(id, pcx)[i] as u64, 2);
     }
 }
 
 fn dump_token_text(out: i64, tok: Token, pcx: &Ctx<Comp>) {
-    unsafe {
-        let kind = tok.kind;
-        let value = tok.value;
-        if kind == Int {
-            buf_fmt(out, format_args("int {value}"));
-        } else if kind == Float {
-            buf_str(out, c"float ");
-            buf_hex(out, value, 16);
-        } else if kind == Char {
-            buf_fmt(out, format_args("char {value}"));
-        } else if kind == Str {
-            buf_str(out, c"str ");
-            dump_hex_bytes(out, value as i64);
-        } else if kind == CStr {
-            buf_str(out, c"cstr ");
-            dump_hex_bytes(out, value as i64);
-        } else if kind == Tok::FHead || kind == Tok::FMid || kind == Tok::FTail {
-            // (0.15: an f-string's pieces, the spec after the text)
-            buf_str(out, if kind == Tok::FHead { c"fhead " } else if kind == Tok::FMid { c"fmid " }
-                else { c"ftail " });
-            dump_hex_bytes(out, value as i64);
-            if kind != Tok::FHead && tok.suffix >= 0 {
-                buf_str(out, c" spec ");
-                dump_hex_bytes(out, tok.suffix);
-            }
-            return;
-        } else if kind == Ident {
-            buf_fmt(out,
-                format_args("ident {}", str::from_utf8(sym_text(value as i64, pcx)).unwrap()));
-        } else if kind == Reserved {
-            buf_str(out, sym_name(value as i64, pcx));
-        } else {
-            buf_str(out, kind.text());
+    let kind = tok.kind;
+    let value = tok.value;
+    if kind == Int {
+        buf_fmt(out, format_args("int {value}"));
+    } else if kind == Float {
+        buf_str(out, c"float ");
+        buf_hex(out, value, 16);
+    } else if kind == Char {
+        buf_fmt(out, format_args("char {value}"));
+    } else if kind == Str {
+        buf_str(out, c"str ");
+        dump_hex_bytes(out, value as i64, pcx);
+    } else if kind == CStr {
+        buf_str(out, c"cstr ");
+        dump_hex_bytes(out, value as i64, pcx);
+    } else if kind == Tok::FHead || kind == Tok::FMid || kind == Tok::FTail {
+        // (0.15: an f-string's pieces, the spec after the text)
+        buf_str(out, if kind == Tok::FHead { c"fhead " } else if kind == Tok::FMid { c"fmid " }
+            else { c"ftail " });
+        dump_hex_bytes(out, value as i64, pcx);
+        if kind != Tok::FHead && tok.suffix >= 0 {
+            buf_str(out, c" spec ");
+            dump_hex_bytes(out, tok.suffix, pcx);
         }
-        if tok.suffix != SUF_NONE {
-            buf_fmt(out,
-                format_args(" {}",
-                    str::from_utf8(cstr((*pcx.suffix_name.add(tok.suffix as usize)))).unwrap()));
-        }
+        return;
+    } else if kind == Ident {
+        buf_fmt(out,
+            format_args("ident {}", str::from_utf8(sym_text(value as i64, pcx)).unwrap()));
+    } else if kind == Reserved {
+        buf_str(out, sym_name(value as i64, pcx));
+    } else {
+        buf_str(out, kind.text());
+    }
+    if tok.suffix != SUF_NONE {
+        buf_fmt(out,
+            format_args(" {}", str::from_utf8(suffix_text(tok.suffix)).unwrap()));
     }
 }
 
-// (0.28.0) STRS's accessors: every use of it is one of them.
-pub fn get_strs() -> *mut &'static [u8] {
-    // UNSAFE: the program's string table, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: a task reaches its only writer add_string only through
-    // gen0::target::add_const_data from parallel::const_data's serial
-    // branch (task_phase == 0); every task sets cx.task_phase non-zero
-    // before it can make constant data (run_task: P_CLEANUP, P_SIMPLIFY;
-    // run_component: P_COMPONENT; emit_task: P_DEFERRED, P_SLP, P_EMIT; the
-    // cache's replays set the recorded phase), so add_const_data runs only
-    // on the main thread outside phases (register_consts, after the phase)
-    // and serial code
-    unsafe { STRS }
-}
-
-pub fn set_strs(v: *mut &'static [u8]) {
-    // UNSAFE: the program's string table, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: a task reaches its only writer add_string only through
-    // gen0::target::add_const_data from parallel::const_data's serial
-    // branch (task_phase == 0); every task sets cx.task_phase non-zero
-    // before it can make constant data (run_task: P_CLEANUP, P_SIMPLIFY;
-    // run_component: P_COMPONENT; emit_task: P_DEFERRED, P_SLP, P_EMIT; the
-    // cache's replays set the recorded phase), so add_const_data runs only
-    // on the main thread outside phases (register_consts, after the phase)
-    // and serial code
-    unsafe {
-        STRS = v;
-    }
-}
-
-// (0.28.0) STR_COUNT's accessors: every use of it is one of them.
-pub fn get_str_count() -> i64 {
-    // UNSAFE: the string table's count, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: written only by add_string, which no task runs (STRS); the
-    // joining main thread reads it in give_id while tasks run, but no task
-    // writes it, and the main thread's own writes (register_consts) come
-    // after the phase
-    unsafe { STR_COUNT }
-}
-
-pub fn set_str_count(v: i64) {
-    // UNSAFE: the string table's count, a process-wide static mut; Rust has
-    // no safe access to a static mut
-    // SAFETY: written only by add_string, which no task runs (STRS); the
-    // joining main thread reads it in give_id while tasks run, but no task
-    // writes it, and the main thread's own writes (register_consts) come
-    // after the phase
-    unsafe {
-        STR_COUNT = v;
-    }
-}
-
-// (0.28.0) STR_CAP's accessors: every use of it is one of them.
-fn get_str_cap() -> i64 {
-    // UNSAFE: the string table's capacity, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: written only by add_string, which no task runs (see STRS:
-    // const_data's serial branch only); the join does not reach add_string
-    unsafe { STR_CAP }
-}
-
-fn set_str_cap(v: i64) {
-    // UNSAFE: the string table's capacity, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: written only by add_string, which no task runs (see STRS:
-    // const_data's serial branch only); the join does not reach add_string
-    unsafe {
-        STR_CAP = v;
-    }
+// How many strings the program has (their ids are below it).
+pub fn get_str_count(pcx: &Ctx<Comp>) -> i64 {
+    pcx.strs.read().unwrap().texts.len() as i64
 }

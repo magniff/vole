@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.29.0 (vole 0.29.0)
+
+- No change to the grammar: the version follows the compiler's. `~`
+  is no longer an operator of the language (it stays scoped as one,
+  so that the error reads in place), and `*const T` and `*mut T` are
+  two types.
+
 ## 0.28.0 (vole 0.28.0)
 
 - The grammar is the rust edition's: the scopes of `inout`, `sink`,

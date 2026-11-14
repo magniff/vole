@@ -98,13 +98,13 @@ tools_check gone
 printf 'two\n' >"$d/data/text.txt"
 tools_check back
 tools_check back-again
-want='same miss save | ok: 0 errors in main.vl
-again hit | ok: 0 errors in main.vl
-changed miss save | ok: 0 errors in main.vl
+want='same miss save | ok: 0 errors in main.vl (2 files, 0 shaders)
+again hit | ok: 0 errors in main.vl (2 files, 0 shaders)
+changed miss save | ok: 0 errors in main.vl (2 files, 0 shaders)
 not-utf8 miss save | data/mod.vl:1:24: error[embed.utf8] include_str("text.txt"): data/text.txt is not UTF-8 (at byte 0) | help: include_str'"'"'s text is a str, UTF-8; include_bytes gives any file'"'"'s bytes, a [u8] | try: volec fix --suggested main.vl
 gone miss save | data/mod.vl:1:24: error[embed.missing] include_str("text.txt"): cannot read data/text.txt | help: the path is relative to the directory of data/mod.vl, the file that holds the call
-back miss save | ok: 0 errors in main.vl
-back-again hit | ok: 0 errors in main.vl'
+back miss save | ok: 0 errors in main.vl (2 files, 0 shaders)
+back-again hit | ok: 0 errors in main.vl (2 files, 0 shaders)'
 got=$(sed "s|$COMPILER|volec|g" "$d/log")
 ok=0
 [ "$got" = "$want" ] && ok=1

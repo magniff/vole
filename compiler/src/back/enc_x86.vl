@@ -8,14 +8,13 @@
 
 use crate::arch::table::{insn_hex, insn_named, insn_text};
 use crate::back::objfile::{
-    FX_X86_BRANCH, FX_X86_GOT, FX_X86_RIP, NameMap, TAIL_JCC, TAIL_JMP, asym, c_bytes,
-    emit_relaxable, fixup, get_atext, here, name_get, name_put, out16, out32, out64, out8,
+    Asm, FX_X86_BRANCH, FX_X86_GOT, FX_X86_RIP, TAIL_JCC, TAIL_JMP, asym_text, emit_relaxable,
+    fixup, here, names_get, names_put, out16, out32, out64, out8,
 };
 use crate::back::objfile::assemble::{
-    asm_error, get_op_count, get_op_end, get_op_start, is_digit_start, parse_number, text_is,
+    asm_error, is_digit_start, mnemonic_copy, parse_number, text_is,
 };
-use crate::base::{alloc_array, buf_byte, buf_new, buf_str, get_bufs};
-use crate::middle::ctx::FnCtx;
+use crate::base::comp::Comp;
 
 const K_REG: i64 = 1;
 const K_IMM: i64 = 2;
@@ -31,23 +30,18 @@ const MOD_GOTPCREL: i64 = 2;
 // `rex8` (spl, bpl, sil, dil: need a REX prefix). Memory: `disp` + `sym`
 // (with `modifier`) + base `reg` (-1 none, 16 %rip) + `index` * `scale`.
 // K_IND: `*%reg`, in `reg`.
-#[derive(Clone, Copy)] struct XOp {
+#[derive(Clone, Copy)] pub struct XOp {
     kind: i64, reg: i64, size: i64, xmm: bool, rex8: bool, imm: i64, index: i64, scale: i64,
     sym: i64, modifier: i64,
 }
 
-static mut XOPS: *mut XOp = 0 as *mut XOp;
-
-// Registers by interned name: 1 + (number | size << 5 | rex8 << 10 |
-// xmm << 11 | ymm << 12) (0.19: a ymm register is a vector register of 32
-// bytes, size 32 in its XOp).
-static mut REGS: NameMap = NameMap {
-    ptrs: 0 as *mut i64, lens: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0,
-};
-// Mnemonics by interned name: 1 + (class | size << 8 | arg << 16).
-static mut XMN: NameMap = NameMap {
-    ptrs: 0 as *mut i64, lens: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0,
-};
+// No operand.
+pub fn xop_none() -> XOp {
+    XOp {
+        kind: 0, reg: 0, size: 0, xmm: false, rex8: false, imm: 0, index: 0, scale: 0, sym: 0,
+        modifier: 0,
+    }
+}
 
 const X_ALU: i64 = 1;
 const X_TEST: i64 = 2;
@@ -84,294 +78,284 @@ const X_SSESHIFT: i64 = 27;
 const X_VMOV: i64 = 28;
 const X_VZEROUPPER: i64 = 29;
 
-fn reg_def(name: *mut u8, num: i64, size: i64, rex8: bool, xmm: bool) {
-    { let mut regs_copy = get_regs(); name_put(&mut regs_copy, c_bytes(name),
+fn reg_def(name: &[u8], num: i64, size: i64, rex8: bool, xmm: bool, asm: &mut Asm<Comp>) {
+    names_put(&mut asm.xregs, name,
         1 + (num | (size & 31) << 5 | (if rex8 { 1 << 10 } else { 0 })
             | (if xmm { 1 << 11 } else { 0 }) | (if size == 32 { 1 << 12 } else { 0 })));
-        set_regs(regs_copy); }
 }
 
-fn mn(name: *mut u8, class: i64, size: i64, arg: i64) {
-    { let mut xmn_copy = get_xmn();
-        name_put(&mut xmn_copy, c_bytes(name), 1 + (class | size << 8 | arg << 16));
-        set_xmn(xmn_copy); }
+fn mn(name: &[u8], class: i64, size: i64, arg: i64, asm: &mut Asm<Comp>) {
+    names_put(&mut asm.xmn, name, 1 + (class | size << 8 | arg << 16));
 }
 
 // SSE: arg = mandatory prefix << 8 | opcode (after 0F).
-fn sse(name: *mut u8, class: i64, prefix: i64, opcode: i64) {
-    mn(name, class, 16, prefix << 8 | opcode);
+fn sse(name: &[u8], class: i64, prefix: i64, opcode: i64, asm: &mut Asm<Comp>) {
+    mn(name, class, 16, prefix << 8 | opcode, asm);
 }
 
-fn join(a: *mut u8, b: *mut u8) -> *mut u8 {
-    let out = buf_new();
-    buf_str(out, a);
-    buf_str(out, b);
-    buf_byte(out, 0);
-    unsafe { (*get_bufs().add(out as usize)).data }
+// The two names, one after the other, in `room`.
+fn joined<'r>(a: &[u8], b: &[u8], room: &'r mut [u8; 32]) -> &'r [u8] {
+    let n = a.len() + b.len();
+    room[..a.len()].copy_from_slice(a);
+    room[a.len()..n].copy_from_slice(b);
+    &room[..n]
 }
 
-pub fn init_x86() {
-    unsafe {
-        set_xops(alloc_array::<XOp>(8i64));
-        let r64: [*mut u8; 16] = [c"rax", c"rcx", c"rdx", c"rbx", c"rsp", c"rbp", c"rsi", c"rdi",
-            c"r8", c"r9", c"r10", c"r11", c"r12", c"r13", c"r14", c"r15"];
-        let r32: [*mut u8; 16] = [c"eax", c"ecx", c"edx", c"ebx", c"esp", c"ebp", c"esi", c"edi",
-            c"r8d", c"r9d", c"r10d", c"r11d", c"r12d", c"r13d", c"r14d", c"r15d"];
-        let r16: [*mut u8; 16] = [c"ax", c"cx", c"dx", c"bx", c"sp", c"bp", c"si", c"di", c"r8w",
-            c"r9w", c"r10w", c"r11w", c"r12w", c"r13w", c"r14w", c"r15w"];
-        let r8: [*mut u8; 16] = [c"al", c"cl", c"dl", c"bl", c"spl", c"bpl", c"sil", c"dil", c"r8b",
-            c"r9b", c"r10b", c"r11b", c"r12b", c"r13b", c"r14b", c"r15b"];
-        let xmm: [*mut u8; 16] = [c"xmm0", c"xmm1", c"xmm2", c"xmm3", c"xmm4", c"xmm5", c"xmm6",
-            c"xmm7", c"xmm8", c"xmm9", c"xmm10", c"xmm11", c"xmm12", c"xmm13", c"xmm14", c"xmm15"];
-        for i in 0..16 {
-            reg_def(r64[i as usize], i, 8, rex8: false, xmm: false);
-            reg_def(r32[i as usize], i, 4, rex8: false, xmm: false);
-            reg_def(r16[i as usize], i, 2, rex8: false, xmm: false);
-            reg_def(r8[i as usize], i, 1, i >= 4 && i < 8, xmm: false);
-            reg_def(xmm[i as usize], i, 16, rex8: false, xmm: true);
-            // (0.19: AVX's 256-bit registers)
-            reg_def(join(c"y", xmm[i as usize].add(1)), i, 32, rex8: false, xmm: true);
-        }
-        { let mut regs_copy = get_regs(); name_put(&mut regs_copy, b"rip", 1 + (16 | 8 << 5));
-            set_regs(regs_copy); }
-        let alu: [*mut u8; 6] = [c"add", c"or", c"and", c"sub", c"xor", c"cmp"];
-        let digit: [i64; 6] = [0i64, 1, 4, 5, 6, 7];
-        let sfx: [*mut u8; 4] = [c"b", c"w", c"l", c"q"];
-        let sizes: [i64; 4] = [1i64, 2, 4, 8];
-        for i in 0..6 {
-            for k in 0..4 {
-                mn(join(alu[i as usize], sfx[k as usize]), X_ALU, sizes[k as usize],
-                    digit[i as usize]);
-            }
-        }
-        for k in 0..4 {
-            mn(join(c"test", sfx[k as usize]), X_TEST, sizes[k as usize], 0);
-            mn(join(c"mov", sfx[k as usize]), X_MOV, sizes[k as usize], 0);
-            mn(join(c"lea", sfx[k as usize]), X_LEA, sizes[k as usize], 0);
-            mn(join(c"shl", sfx[k as usize]), X_SHIFT, sizes[k as usize], 4);
-            mn(join(c"shr", sfx[k as usize]), X_SHIFT, sizes[k as usize], 5);
-            mn(join(c"sar", sfx[k as usize]), X_SHIFT, sizes[k as usize], 7);
-            mn(join(c"imul", sfx[k as usize]), X_IMUL, sizes[k as usize], 0);
-            mn(join(c"neg", sfx[k as usize]), X_F7, sizes[k as usize], 3);
-            mn(join(c"not", sfx[k as usize]), X_F7, sizes[k as usize], 2);
-            mn(join(c"mul", sfx[k as usize]), X_F7, sizes[k as usize], 4);
-            mn(join(c"div", sfx[k as usize]), X_F7, sizes[k as usize], 6);
-            mn(join(c"idiv", sfx[k as usize]), X_F7, sizes[k as usize], 7);
-            mn(join(c"push", sfx[k as usize]), X_PUSH, sizes[k as usize], 0);
-            mn(join(c"pop", sfx[k as usize]), X_POP, sizes[k as usize], 0);
-        }
-        mn(c"movabsq", X_MOVABS, 8, 0);
-        // movzbl/movzbq/movzwl/movzwq: 0F B6/B7; movsbq/movswq: 0F BE/BF;
-        // movslq: 63.
-        mn(c"movzbl", X_MOVX, 4, 0x0fb6);
-        mn(c"movzbq", X_MOVX, 8, 0x0fb6);
-        mn(c"movzwl", X_MOVX, 4, 0x0fb7);
-        mn(c"movzwq", X_MOVX, 8, 0x0fb7);
-        mn(c"movsbl", X_MOVX, 4, 0x0fbe);
-        mn(c"movsbq", X_MOVX, 8, 0x0fbe);
-        mn(c"movswl", X_MOVX, 4, 0x0fbf);
-        mn(c"movswq", X_MOVX, 8, 0x0fbf);
-        mn(c"movslq", X_MOVX, 8, 0x63);
-        mn(c"cqto", X_CQTO, 8, 0);
-        mn(c"btcq", X_BT, 8, 7);
-        mn(c"btsq", X_BT, 8, 5);
-        mn(c"btrq", X_BT, 8, 6);
-        mn(c"btq", X_BT, 8, 4);
-        let conds: [*mut u8; 16] = [c"o", c"no", c"b", c"ae", c"e", c"ne", c"be", c"a", c"s", c"ns",
-            c"p", c"np", c"l", c"ge", c"le", c"g"];
-        for cc in 0..16 {
-            mn(join(c"set", conds[cc as usize]), X_SETCC, 1, cc);
-            mn(join(c"j", conds[cc as usize]), X_JCC, 0, cc);
-            mn(join(join(c"cmov", conds[cc as usize]), c"q"), X_CMOVCC, 8, cc);
-            mn(join(join(c"cmov", conds[cc as usize]), c"l"), X_CMOVCC, 4, cc);
-        }
-        mn(c"jmp", X_JMP, 0, 0);
-        mn(c"call", X_CALL, 0, 0);
-        mn(c"ret", X_RET, 0, 0);
-        mn(c"retq", X_RET, 0, 0);
-        mn(c"ud2", X_UD2, 0, 0);
-        sse(c"addsd", X_SSE, 0xf2, 0x58);
-        sse(c"mulsd", X_SSE, 0xf2, 0x59);
-        sse(c"subsd", X_SSE, 0xf2, 0x5c);
-        sse(c"divsd", X_SSE, 0xf2, 0x5e);
-        sse(c"sqrtsd", X_SSE, 0xf2, 0x51);
-        sse(c"addss", X_SSE, 0xf3, 0x58);
-        sse(c"mulss", X_SSE, 0xf3, 0x59);
-        sse(c"subss", X_SSE, 0xf3, 0x5c);
-        sse(c"divss", X_SSE, 0xf3, 0x5e);
-        sse(c"sqrtss", X_SSE, 0xf3, 0x51);
-        sse(c"movapd", X_SSE, 0x66, 0x28);
-        sse(c"movaps", X_SSE, 0, 0x28);
-        sse(c"xorpd", X_SSE, 0x66, 0x57);
-        sse(c"xorps", X_SSE, 0, 0x57);
-        sse(c"ucomisd", X_SSE, 0x66, 0x2e);
-        sse(c"ucomiss", X_SSE, 0, 0x2e);
-        sse(c"cvtss2sd", X_SSE, 0xf3, 0x5a);
-        sse(c"cvtsd2ss", X_SSE, 0xf2, 0x5a);
-        sse(c"movsd", X_SSEMOV, 0xf2, 0x10);
-        sse(c"movss", X_SSEMOV, 0xf3, 0x10);
-        sse(c"cvtsi2sdq", X_CVTSI2, 0xf2, 0x2a);
-        sse(c"cvtsi2ssq", X_CVTSI2, 0xf3, 0x2a);
-        sse(c"cvtsi2sdl", X_CVTSI2, 0xf2, 0x2a);
-        sse(c"cvtsi2ssl", X_CVTSI2, 0xf3, 0x2a);
-        sse(c"cvttsd2si", X_CVTT2SI, 0xf2, 0x2c);
-        sse(c"cvttss2si", X_CVTT2SI, 0xf3, 0x2c);
-        sse(c"cvttsd2siq", X_CVTT2SI, 0xf2, 0x2c);
-        sse(c"cvttss2siq", X_CVTT2SI, 0xf3, 0x2c);
-        mn(c"movd", X_MOVD, 0, 0);
-        // Vectors (0.10): SSE2.
-        let packed: [*mut u8; 33] = [c"addpd", c"addps", c"subpd", c"subps", c"mulpd", c"mulps",
-            c"divpd", c"divps", c"paddb", c"paddw", c"paddd", c"paddq", c"psubb", c"psubw",
-            c"psubd", c"psubq", c"pmullw", c"pand", c"pandn", c"por", c"pxor", c"pcmpeqb",
-            c"pcmpeqw", c"pcmpeqd", c"pcmpgtb", c"pcmpgtw", c"pcmpgtd", c"punpcklbw",
-            c"punpcklwd", c"punpckldq", c"punpcklqdq", c"unpcklpd", c"movdqa"];
-        let pfx: [i64; 33] = [0x66i64, 0, 0x66, 0, 0x66, 0, 0x66, 0, 0x66, 0x66, 0x66, 0x66, 0x66,
-            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-            0x66, 0x66, 0x66, 0x66, 0x66, 0x66];
-        let ops: [i64; 33] = [0x58i64, 0x58, 0x5c, 0x5c, 0x59, 0x59, 0x5e, 0x5e, 0xfc, 0xfd, 0xfe,
-            0xd4, 0xf8, 0xf9, 0xfa, 0xfb, 0xd5, 0xdb, 0xdf, 0xeb, 0xef, 0x74, 0x75, 0x76, 0x64,
-            0x65, 0x66, 0x60, 0x61, 0x62, 0x6c, 0x14, 0x6f];
-        for i in 0..33 {
-            sse(packed[i as usize], X_SSE, pfx[i as usize], ops[i as usize]);
-        }
-        sse(c"movups", X_SSEMOV, 0, 0x10);
-        sse(c"pshufd", X_SSEI, 0x66, 0x70);
-        sse(c"shufps", X_SSEI, 0, 0xc6);
-        sse(c"cmppd", X_SSEI, 0x66, 0xc2);
-        sse(c"cmpps", X_SSEI, 0, 0xc2);
-        // (0.19: by an xmm count too, opcode arg >> 24: F3, F2)
-        mn(c"psllq", X_SSESHIFT, 16, 0xf3 << 24 | 6 << 16 | 0x73);
-        mn(c"pslld", X_SSESHIFT, 16, 0xf2 << 24 | 6 << 16 | 0x72);
-        mn(c"vmovdqu", X_VMOV, 32, 0xf3);
-        mn(c"vmovdqa", X_VMOV, 32, 0x66);
-        mn(c"vzeroupper", X_VZEROUPPER, 0, 0);
+pub fn init_x86(asm: &mut Asm<Comp>) {
+    let mut room = [0u8; 32];
+    let r64: [&[u8]; 16] = [b"rax", b"rcx", b"rdx", b"rbx", b"rsp", b"rbp", b"rsi", b"rdi",
+        b"r8", b"r9", b"r10", b"r11", b"r12", b"r13", b"r14", b"r15"];
+    let r32: [&[u8]; 16] = [b"eax", b"ecx", b"edx", b"ebx", b"esp", b"ebp", b"esi", b"edi",
+        b"r8d", b"r9d", b"r10d", b"r11d", b"r12d", b"r13d", b"r14d", b"r15d"];
+    let r16: [&[u8]; 16] = [b"ax", b"cx", b"dx", b"bx", b"sp", b"bp", b"si", b"di", b"r8w",
+        b"r9w", b"r10w", b"r11w", b"r12w", b"r13w", b"r14w", b"r15w"];
+    let r8: [&[u8]; 16] = [b"al", b"cl", b"dl", b"bl", b"spl", b"bpl", b"sil", b"dil", b"r8b",
+        b"r9b", b"r10b", b"r11b", b"r12b", b"r13b", b"r14b", b"r15b"];
+    let xmm: [&[u8]; 16] = [b"xmm0", b"xmm1", b"xmm2", b"xmm3", b"xmm4", b"xmm5", b"xmm6",
+        b"xmm7", b"xmm8", b"xmm9", b"xmm10", b"xmm11", b"xmm12", b"xmm13", b"xmm14", b"xmm15"];
+    for i in 0..16 {
+        reg_def(r64[i as usize], i, 8, rex8: false, xmm: false, asm: asm);
+        reg_def(r32[i as usize], i, 4, rex8: false, xmm: false, asm: asm);
+        reg_def(r16[i as usize], i, 2, rex8: false, xmm: false, asm: asm);
+        reg_def(r8[i as usize], i, 1, i >= 4 && i < 8, xmm: false, asm: asm);
+        reg_def(xmm[i as usize], i, 16, rex8: false, xmm: true, asm: asm);
+        // (0.19: AVX's 256-bit registers)
+        reg_def(joined(b"y", &xmm[i as usize][1..], &mut room), i, 32, rex8: false, xmm: true,
+            asm: asm);
     }
+    names_put(&mut asm.xregs, b"rip", 1 + (16 | 8 << 5));
+    let alu: [&[u8]; 6] = [b"add", b"or", b"and", b"sub", b"xor", b"cmp"];
+    let digit: [i64; 6] = [0i64, 1, 4, 5, 6, 7];
+    let sfx: [&[u8]; 4] = [b"b", b"w", b"l", b"q"];
+    let sizes: [i64; 4] = [1i64, 2, 4, 8];
+    for i in 0..6 {
+        for k in 0..4 {
+            mn(joined(alu[i as usize], sfx[k as usize], &mut room), X_ALU, sizes[k as usize],
+                digit[i as usize], asm);
+        }
+    }
+    for k in 0..4 {
+        mn(joined(b"test", sfx[k as usize], &mut room), X_TEST, sizes[k as usize], 0, asm);
+        mn(joined(b"mov", sfx[k as usize], &mut room), X_MOV, sizes[k as usize], 0, asm);
+        mn(joined(b"lea", sfx[k as usize], &mut room), X_LEA, sizes[k as usize], 0, asm);
+        mn(joined(b"shl", sfx[k as usize], &mut room), X_SHIFT, sizes[k as usize], 4, asm);
+        mn(joined(b"shr", sfx[k as usize], &mut room), X_SHIFT, sizes[k as usize], 5, asm);
+        mn(joined(b"sar", sfx[k as usize], &mut room), X_SHIFT, sizes[k as usize], 7, asm);
+        mn(joined(b"imul", sfx[k as usize], &mut room), X_IMUL, sizes[k as usize], 0, asm);
+        mn(joined(b"neg", sfx[k as usize], &mut room), X_F7, sizes[k as usize], 3, asm);
+        mn(joined(b"not", sfx[k as usize], &mut room), X_F7, sizes[k as usize], 2, asm);
+        mn(joined(b"mul", sfx[k as usize], &mut room), X_F7, sizes[k as usize], 4, asm);
+        mn(joined(b"div", sfx[k as usize], &mut room), X_F7, sizes[k as usize], 6, asm);
+        mn(joined(b"idiv", sfx[k as usize], &mut room), X_F7, sizes[k as usize], 7, asm);
+        mn(joined(b"push", sfx[k as usize], &mut room), X_PUSH, sizes[k as usize], 0, asm);
+        mn(joined(b"pop", sfx[k as usize], &mut room), X_POP, sizes[k as usize], 0, asm);
+    }
+    mn(b"movabsq", X_MOVABS, 8, 0, asm);
+    // movzbl/movzbq/movzwl/movzwq: 0F B6/B7; movsbq/movswq: 0F BE/BF;
+    // movslq: 63.
+    mn(b"movzbl", X_MOVX, 4, 0x0fb6, asm);
+    mn(b"movzbq", X_MOVX, 8, 0x0fb6, asm);
+    mn(b"movzwl", X_MOVX, 4, 0x0fb7, asm);
+    mn(b"movzwq", X_MOVX, 8, 0x0fb7, asm);
+    mn(b"movsbl", X_MOVX, 4, 0x0fbe, asm);
+    mn(b"movsbq", X_MOVX, 8, 0x0fbe, asm);
+    mn(b"movswl", X_MOVX, 4, 0x0fbf, asm);
+    mn(b"movswq", X_MOVX, 8, 0x0fbf, asm);
+    mn(b"movslq", X_MOVX, 8, 0x63, asm);
+    mn(b"cqto", X_CQTO, 8, 0, asm);
+    mn(b"btcq", X_BT, 8, 7, asm);
+    mn(b"btsq", X_BT, 8, 5, asm);
+    mn(b"btrq", X_BT, 8, 6, asm);
+    mn(b"btq", X_BT, 8, 4, asm);
+    let conds: [&[u8]; 16] = [b"o", b"no", b"b", b"ae", b"e", b"ne", b"be", b"a", b"s", b"ns",
+        b"p", b"np", b"l", b"ge", b"le", b"g"];
+    for cc in 0..16 {
+        mn(joined(b"set", conds[cc as usize], &mut room), X_SETCC, 1, cc, asm);
+        mn(joined(b"j", conds[cc as usize], &mut room), X_JCC, 0, cc, asm);
+        let mut cmov_room = [0u8; 32];
+        let cmov = joined(b"cmov", conds[cc as usize], &mut cmov_room);
+        mn(joined(cmov, b"q", &mut room), X_CMOVCC, 8, cc, asm);
+        mn(joined(cmov, b"l", &mut room), X_CMOVCC, 4, cc, asm);
+    }
+    mn(b"jmp", X_JMP, 0, 0, asm);
+    mn(b"call", X_CALL, 0, 0, asm);
+    mn(b"ret", X_RET, 0, 0, asm);
+    mn(b"retq", X_RET, 0, 0, asm);
+    mn(b"ud2", X_UD2, 0, 0, asm);
+    sse(b"addsd", X_SSE, 0xf2, 0x58, asm);
+    sse(b"mulsd", X_SSE, 0xf2, 0x59, asm);
+    sse(b"subsd", X_SSE, 0xf2, 0x5c, asm);
+    sse(b"divsd", X_SSE, 0xf2, 0x5e, asm);
+    sse(b"sqrtsd", X_SSE, 0xf2, 0x51, asm);
+    sse(b"addss", X_SSE, 0xf3, 0x58, asm);
+    sse(b"mulss", X_SSE, 0xf3, 0x59, asm);
+    sse(b"subss", X_SSE, 0xf3, 0x5c, asm);
+    sse(b"divss", X_SSE, 0xf3, 0x5e, asm);
+    sse(b"sqrtss", X_SSE, 0xf3, 0x51, asm);
+    sse(b"movapd", X_SSE, 0x66, 0x28, asm);
+    sse(b"movaps", X_SSE, 0, 0x28, asm);
+    sse(b"xorpd", X_SSE, 0x66, 0x57, asm);
+    sse(b"xorps", X_SSE, 0, 0x57, asm);
+    sse(b"ucomisd", X_SSE, 0x66, 0x2e, asm);
+    sse(b"ucomiss", X_SSE, 0, 0x2e, asm);
+    sse(b"cvtss2sd", X_SSE, 0xf3, 0x5a, asm);
+    sse(b"cvtsd2ss", X_SSE, 0xf2, 0x5a, asm);
+    sse(b"movsd", X_SSEMOV, 0xf2, 0x10, asm);
+    sse(b"movss", X_SSEMOV, 0xf3, 0x10, asm);
+    sse(b"cvtsi2sdq", X_CVTSI2, 0xf2, 0x2a, asm);
+    sse(b"cvtsi2ssq", X_CVTSI2, 0xf3, 0x2a, asm);
+    sse(b"cvtsi2sdl", X_CVTSI2, 0xf2, 0x2a, asm);
+    sse(b"cvtsi2ssl", X_CVTSI2, 0xf3, 0x2a, asm);
+    sse(b"cvttsd2si", X_CVTT2SI, 0xf2, 0x2c, asm);
+    sse(b"cvttss2si", X_CVTT2SI, 0xf3, 0x2c, asm);
+    sse(b"cvttsd2siq", X_CVTT2SI, 0xf2, 0x2c, asm);
+    sse(b"cvttss2siq", X_CVTT2SI, 0xf3, 0x2c, asm);
+    mn(b"movd", X_MOVD, 0, 0, asm);
+    // Vectors (0.10): SSE2.
+    let packed: [&[u8]; 33] = [b"addpd", b"addps", b"subpd", b"subps", b"mulpd", b"mulps",
+        b"divpd", b"divps", b"paddb", b"paddw", b"paddd", b"paddq", b"psubb", b"psubw",
+        b"psubd", b"psubq", b"pmullw", b"pand", b"pandn", b"por", b"pxor", b"pcmpeqb",
+        b"pcmpeqw", b"pcmpeqd", b"pcmpgtb", b"pcmpgtw", b"pcmpgtd", b"punpcklbw",
+        b"punpcklwd", b"punpckldq", b"punpcklqdq", b"unpcklpd", b"movdqa"];
+    let pfx: [i64; 33] = [0x66i64, 0, 0x66, 0, 0x66, 0, 0x66, 0, 0x66, 0x66, 0x66, 0x66, 0x66,
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66];
+    let ops: [i64; 33] = [0x58i64, 0x58, 0x5c, 0x5c, 0x59, 0x59, 0x5e, 0x5e, 0xfc, 0xfd, 0xfe,
+        0xd4, 0xf8, 0xf9, 0xfa, 0xfb, 0xd5, 0xdb, 0xdf, 0xeb, 0xef, 0x74, 0x75, 0x76, 0x64,
+        0x65, 0x66, 0x60, 0x61, 0x62, 0x6c, 0x14, 0x6f];
+    for i in 0..33 {
+        sse(packed[i as usize], X_SSE, pfx[i as usize], ops[i as usize], asm);
+    }
+    sse(b"movups", X_SSEMOV, 0, 0x10, asm);
+    sse(b"pshufd", X_SSEI, 0x66, 0x70, asm);
+    sse(b"shufps", X_SSEI, 0, 0xc6, asm);
+    sse(b"cmppd", X_SSEI, 0x66, 0xc2, asm);
+    sse(b"cmpps", X_SSEI, 0, 0xc2, asm);
+    // (0.19: by an xmm count too, opcode arg >> 24: F3, F2)
+    mn(b"psllq", X_SSESHIFT, 16, 0xf3 << 24 | 6 << 16 | 0x73, asm);
+    mn(b"pslld", X_SSESHIFT, 16, 0xf2 << 24 | 6 << 16 | 0x72, asm);
+    mn(b"vmovdqu", X_VMOV, 32, 0xf3, asm);
+    mn(b"vmovdqa", X_VMOV, 32, 0x66, asm);
+    mn(b"vzeroupper", X_VZEROUPPER, 0, 0, asm);
 }
 
 // ---- Operands ----
 
-fn ch(cx: &mut FnCtx, i: i64) -> u8 {
-    unsafe { (*get_atext().add(i as usize)) }
+fn ch(i: i64, asm: &mut Asm<Comp>) -> u8 {
+    asm.text[i as usize]
 }
 
 // The register `%name` at [a, b) into op; false if unknown.
-fn parse_xreg(cx: &mut FnCtx, a: i64, b: i64, op: &mut XOp) -> bool {
-    unsafe {
-        if ch(cx, a) != b'%' {
-            return false;
-        }
-        let v = name_get(get_regs(),
-            std::slice::from_raw_parts(get_atext().add((a + 1) as usize), (b - (a + 1)) as usize));
-        if v == 0 {
-            return false;
-        }
-        let e = v - 1;
-        op.reg = e & 31;
-        op.size = if ((e >> 12) & 1) != 0 { 32 } else { (e >> 5) & 31 };
-        op.rex8 = ((e >> 10) & 1) != 0;
-        op.xmm = ((e >> 11) & 1) != 0;
-        true
+fn parse_xreg(a: i64, b: i64, op: &mut XOp, asm: &mut Asm<Comp>) -> bool {
+    if ch(a, asm) != b'%' {
+        return false;
     }
+    let v = names_get(&asm.xregs,
+        &asm.text[(a + 1) as usize..b as usize]);
+    if v == 0 {
+        return false;
+    }
+    let e = v - 1;
+    op.reg = e & 31;
+    op.size = if ((e >> 12) & 1) != 0 { 32 } else { (e >> 5) & 31 };
+    op.rex8 = ((e >> 10) & 1) != 0;
+    op.xmm = ((e >> 11) & 1) != 0;
+    true
 }
 
-fn parse_xsym(cx: &mut FnCtx, a: i64, b: i64, op: &mut XOp) {
-    unsafe {
-        let mut at = a;
-        while at < b && ch(cx, at) != b'@' {
-            at += 1;
-        }
-        op.sym = asym(std::slice::from_raw_parts(get_atext().add((a) as usize),
-            (at - (a)) as usize));
-        op.modifier = MOD_NONE;
-        if at < b {
-            if text_is(cx, at + 1, b, c"PLT") {
-                op.modifier = MOD_PLT;
-            } else if text_is(cx, at + 1, b, c"GOTPCREL") {
-                op.modifier = MOD_GOTPCREL;
-            } else {
-                asm_error(cx, c"unknown symbol modifier");
-            }
-        }
+fn parse_xsym(a: i64, b: i64, op: &mut XOp, asm: &mut Asm<Comp>) {
+    let mut at = a;
+    while at < b && ch(at, asm) != b'@' {
+        at += 1;
     }
-}
-
-fn parse_xop(cx: &mut FnCtx, k: i64) {
-    unsafe {
-        let a = get_op_start()[k as usize];
-        let b = get_op_end()[k as usize];
-        let mut op = XOp {
-            kind: 0, reg: -1, size: 0, xmm: false, rex8: false, imm: 0, index: -1, scale: 1,
-            sym: -1, modifier: 0,
-        };
-        let c = ch(cx, a);
-        if c == b'%' {
-            if !parse_xreg(cx, a, b, &mut op) {
-                asm_error(cx, c"unknown register");
-            }
-            op.kind = K_REG;
-        } else if c == b'$' {
-            op.kind = K_IMM;
-            op.imm = parse_number(cx, a + 1, b);
-        } else if c == b'*' {
-            op.kind = K_IND;
-            if !parse_xreg(cx, a + 1, b, &mut op) {
-                asm_error(cx, c"unknown register");
-            }
+    op.sym = asym_text(a, at, asm);
+    op.modifier = MOD_NONE;
+    if at < b {
+        if text_is(at + 1, b, b"PLT", asm) {
+            op.modifier = MOD_PLT;
+        } else if text_is(at + 1, b, b"GOTPCREL", asm) {
+            op.modifier = MOD_GOTPCREL;
         } else {
-            let mut paren = a;
-            while paren < b && ch(cx, paren) != b'(' {
-                paren += 1;
+            asm_error("unknown symbol modifier", asm);
+        }
+    }
+}
+
+fn parse_xop(k: i64, asm: &mut Asm<Comp>) {
+    let a = asm.op_start[k as usize];
+    let b = asm.op_end[k as usize];
+    let mut op = XOp {
+        kind: 0, reg: -1, size: 0, xmm: false, rex8: false, imm: 0, index: -1, scale: 1,
+        sym: -1, modifier: 0,
+    };
+    let c = ch(a, asm);
+    if c == b'%' {
+        if !parse_xreg(a, b, &mut op, asm) {
+            asm_error("unknown register", asm);
+        }
+        op.kind = K_REG;
+    } else if c == b'$' {
+        op.kind = K_IMM;
+        op.imm = parse_number(a + 1, b, asm);
+    } else if c == b'*' {
+        op.kind = K_IND;
+        if !parse_xreg(a + 1, b, &mut op, asm) {
+            asm_error("unknown register", asm);
+        }
+    } else {
+        let mut paren = a;
+        while paren < b && ch(paren, asm) != b'(' {
+            paren += 1;
+        }
+        if paren == b {
+            op.kind = K_SYM;
+            parse_xsym(a, b, &mut op, asm);
+        } else {
+            op.kind = K_MEM;
+            if paren > a {
+                if is_digit_start(ch(a, asm)) {
+                    op.imm = parse_number(a, paren, asm);
+                } else {
+                    parse_xsym(a, paren, &mut op, asm);
+                }
             }
-            if paren == b {
-                op.kind = K_SYM;
-                parse_xsym(cx, a, b, &mut op);
-            } else {
-                op.kind = K_MEM;
-                if paren > a {
-                    if is_digit_start(ch(cx, a)) {
-                        op.imm = parse_number(cx, a, paren);
-                    } else {
-                        parse_xsym(cx, a, paren, &mut op);
-                    }
+            // (base[,index[,scale]])
+            let close = b - 1;
+            if ch(close, asm) != b')' {
+                asm_error("bad memory operand", asm);
+            }
+            let mut i = paren + 1;
+            let mut j = i;
+            while j < close && ch(j, asm) != b',' {
+                j += 1;
+            }
+            let mut tmp = XOp {
+                kind: 0, reg: -1, size: 0, xmm: false, rex8: false, imm: 0, index: -1, scale: 1,
+                sym: -1, modifier: 0,
+            };
+            if j > i {
+                if !parse_xreg(i, j, &mut tmp, asm) {
+                    asm_error("bad base register", asm);
                 }
-                // (base[,index[,scale]])
-                let close = b - 1;
-                if ch(cx, close) != b')' {
-                    asm_error(cx, c"bad memory operand");
-                }
-                let mut i = paren + 1;
-                let mut j = i;
-                while j < close && ch(cx, j) != b',' {
+                op.reg = tmp.reg;
+            }
+            if j < close {
+                i = j + 1;
+                j = i;
+                while j < close && ch(j, asm) != b',' {
                     j += 1;
                 }
-                let mut tmp = XOp {
-                    kind: 0, reg: -1, size: 0, xmm: false, rex8: false, imm: 0, index: -1, scale: 1,
-                    sym: -1, modifier: 0,
-                };
-                if j > i {
-                    if !parse_xreg(cx, i, j, &mut tmp) {
-                        asm_error(cx, c"bad base register");
-                    }
-                    op.reg = tmp.reg;
+                if !parse_xreg(i, j, &mut tmp, asm) {
+                    asm_error("bad index register", asm);
                 }
+                op.index = tmp.reg;
                 if j < close {
-                    i = j + 1;
-                    j = i;
-                    while j < close && ch(cx, j) != b',' {
-                        j += 1;
-                    }
-                    if !parse_xreg(cx, i, j, &mut tmp) {
-                        asm_error(cx, c"bad index register");
-                    }
-                    op.index = tmp.reg;
-                    if j < close {
-                        op.scale = parse_number(cx, j + 1, close);
-                    }
+                    op.scale = parse_number(j + 1, close, asm);
                 }
             }
         }
-        (*get_xops().add(k as usize)) = op;
     }
+    asm.x86[k as usize] = op;
 }
 
 // ---- Encoding ----
@@ -380,9 +364,9 @@ fn fits8(v: i64) -> bool {
     v >= -128 && v <= 127
 }
 
-fn emit_imm(v: i64, size: i64) {
-    if size == 1 { out8(v); } else if size == 2 { out16(v); } else if size == 4 { out32(v); }
-    else if size == 8 { out64(v); }
+fn emit_imm(v: i64, size: i64, asm: &mut Asm<Comp>) {
+    if size == 1 { out8(v, asm); } else if size == 2 { out16(v, asm); }
+    else if size == 4 { out32(v, asm); } else if size == 8 { out64(v, asm); }
 }
 
 // One instruction with a ModRM byte: legacy prefix `pfx` (0, 0x66, 0xf2,
@@ -390,13 +374,13 @@ fn emit_imm(v: i64, size: i64) {
 // from `reg`, X and B from the r/m operand `rm`, or forced), `opcode`
 // (1 to 3 bytes, big-endian in `oplen`), ModRM with `reg` (a register or
 // an opcode digit) and operand rm, then an immediate of `imm_size` bytes.
-fn enc(cx: &mut FnCtx, pfx: i64, op16: bool, w: bool, opcode: i64, oplen: i64, reg: i64, rm: XOp,
-    force_rex: bool, imm: i64, imm_size: i64) {
+fn enc(pfx: i64, op16: bool, w: bool, opcode: i64, oplen: i64, reg: i64, rm: XOp,
+    force_rex: bool, imm: i64, imm_size: i64, asm: &mut Asm<Comp>) {
     if op16 {
-        out8(0x66);
+        out8(0x66, asm);
     }
     if pfx != 0 {
-        out8(pfx);
+        out8(pfx, asm);
     }
     let mut rex: i64 = 0;
     if w {
@@ -416,64 +400,64 @@ fn enc(cx: &mut FnCtx, pfx: i64, op16: bool, w: bool, opcode: i64, oplen: i64, r
         rex = rex | 1;
     }
     if rex != 0 || force_rex || (rm.kind == K_REG && rm.rex8) {
-        out8(0x40 | rex);
+        out8(0x40 | rex, asm);
     }
     if oplen == 3 {
-        out8(opcode >> 16);
+        out8(opcode >> 16, asm);
     }
     if oplen >= 2 {
-        out8(opcode >> 8);
+        out8(opcode >> 8, asm);
     }
-    out8(opcode);
-    modrm(cx, reg, rm, imm, imm_size, rex != 0);
+    out8(opcode, asm);
+    modrm(reg, rm, imm, imm_size, rex != 0, asm);
 }
 
 // The ModRM byte with `reg` and operand rm (and its SIB, displacement or
 // %rip fixup), then an immediate of `imm_size` bytes; `rex`: whether the
 // instruction has a REX prefix (a GOT load's relocation says so).
-fn modrm(cx: &mut FnCtx, reg: i64, rm: XOp, imm: i64, imm_size: i64, rex: bool) {
+fn modrm(reg: i64, rm: XOp, imm: i64, imm_size: i64, rex: bool, asm: &mut Asm<Comp>) {
     let r = (reg & 7) << 3;
     if rm.kind != K_MEM {
-        out8(0xc0 | r | (rm.reg & 7));
-        emit_imm(imm, imm_size);
+        out8(0xc0 | r | (rm.reg & 7), asm);
+        emit_imm(imm, imm_size, asm);
         return;
     }
     if rm.reg == 16 {
         // %rip: disp32 after ModRM (the end of the instruction is pc).
-        out8(r | 5);
-        let pos = here();
+        out8(r | 5, asm);
+        let pos = here(asm);
         if rm.sym >= 0 {
             let kind = if rm.modifier == MOD_GOTPCREL { FX_X86_GOT } else { FX_X86_RIP };
-            fixup(kind, pos, rm.sym, rm.imm, pos + 4 + imm_size, rex);
-            out32(0);
+            fixup(kind, pos, rm.sym, rm.imm, pos + 4 + imm_size, rex, asm);
+            out32(0, asm);
         } else {
-            out32(rm.imm);
+            out32(rm.imm, asm);
         }
-        emit_imm(imm, imm_size);
+        emit_imm(imm, imm_size, asm);
         return;
     }
     if rm.sym >= 0 {
-        asm_error(cx, c"a symbol needs %rip");
+        asm_error("a symbol needs %rip", asm);
     }
     let base = rm.reg;
     let disp = rm.imm;
     let need_sib = rm.index >= 0 || (base & 7) == 4;
     let md: i64 = if disp == 0 && (base & 7) != 5 { 0 } else if fits8(disp) { 1 } else { 2 };
     if need_sib {
-        out8(md << 6 | r | 4);
+        out8(md << 6 | r | 4, asm);
         let ss: i64 = if rm.scale == 8 { 3 } else if rm.scale == 4 { 2 } else if rm.scale == 2 { 1 }
             else { 0 };
         let idx: i64 = if rm.index >= 0 { rm.index & 7 } else { 4 };
-        out8(ss << 6 | idx << 3 | (base & 7));
+        out8(ss << 6 | idx << 3 | (base & 7), asm);
     } else {
-        out8(md << 6 | r | (base & 7));
+        out8(md << 6 | r | (base & 7), asm);
     }
     if md == 1 {
-        out8(disp);
+        out8(disp, asm);
     } else if md == 2 {
-        out32(disp);
+        out32(disp, asm);
     }
-    emit_imm(imm, imm_size);
+    emit_imm(imm, imm_size, asm);
 }
 
 // (0.19) One VEX-encoded instruction (AVX, AVX2, FMA, BMI): the prefix
@@ -483,8 +467,8 @@ fn modrm(cx: &mut FnCtx, reg: i64, rm: XOp, imm: i64, imm_size: i64, rex: bool) 
 // operand rm; then `opcode`, ModRM and the immediate. The two-byte form
 // (C5) when the map is 0F, W is 0 and rm needs neither X nor B, as the
 // assemblers choose.
-fn vex(cx: &mut FnCtx, pfx: i64, map: i64, w: bool, l: bool, opcode: i64, reg: i64, vvvv: i64,
-    rm: XOp, imm: i64, imm_size: i64) {
+fn vex(pfx: i64, map: i64, w: bool, l: bool, opcode: i64, reg: i64, vvvv: i64, rm: XOp,
+    imm: i64, imm_size: i64, asm: &mut Asm<Comp>) {
     let pp: i64 = if pfx == 0x66 { 1 } else if pfx == 0xf3 { 2 } else if pfx == 0xf2 { 3 }
         else { 0 };
     let mm: i64 = if map == 0x0f38 { 2 } else if map == 0x0f3a { 3 } else { 1 };
@@ -499,30 +483,29 @@ fn vex(cx: &mut FnCtx, pfx: i64, map: i64, w: bool, l: bool, opcode: i64, reg: i
     let r = reg >= 8;
     let tail = ((15 - (vvvv & 15)) << 3) | (if l { 4 } else { 0 }) | pp;
     if mm == 1 && !w && !x && !b {
-        out8(0xc5);
-        out8((if r { 0 } else { 0x80 }) | tail);
+        out8(0xc5, asm);
+        out8((if r { 0 } else { 0x80 }) | tail, asm);
     } else {
-        out8(0xc4);
+        out8(0xc4, asm);
         out8((if r { 0 } else { 0x80 }) | (if x { 0 } else { 0x40 }) | (if b { 0 } else { 0x20 })
-            | mm);
-        out8((if w { 0x80 } else { 0 }) | tail);
+            | mm,
+            asm);
+        out8((if w { 0x80 } else { 0 }) | tail, asm);
     }
-    out8(opcode);
-    modrm(cx, reg, rm, imm, imm_size, false);
+    out8(opcode, asm);
+    modrm(reg, rm, imm, imm_size, false, asm);
 }
 
-fn need_ops(cx: &mut FnCtx, n: i64) {
-    if get_op_count() != n {
-        asm_error(cx, c"wrong number of operands");
+fn need_ops(n: i64, asm: &mut Asm<Comp>) {
+    if asm.op_count != n {
+        asm_error("wrong number of operands", asm);
     }
 }
 
 // Whether a byte register operand forces a REX prefix.
-fn rex8(k: i64) -> bool {
-    unsafe {
-        k < get_op_count() && (*get_xops().add(k as usize)).kind == K_REG
-            && (*get_xops().add(k as usize)).rex8
-    }
+fn rex8(k: i64, asm: &mut Asm<Comp>) -> bool {
+    k < asm.op_count && asm.x86[k as usize].kind == K_REG
+        && asm.x86[k as usize].rex8
 }
 
 // size-dependent opcode: the byte form is one less (00/01, 88/89, 84/85...).
@@ -530,131 +513,124 @@ fn sized(op: i64, size: i64) -> i64 {
     if size == 1 { op - 1 } else { op }
 }
 
-fn alu(cx: &mut FnCtx, digit: i64, size: i64) {
-    unsafe {
-        need_ops(cx, 2);
-        let src = (*get_xops().add(0));
-        let dst = (*get_xops().add(1));
-        let w = size == 8;
-        let op16 = size == 2;
-        let base = digit << 3;
-        if src.kind == K_IMM {
-            let v = src.imm;
-            if size == 1 {
-                if dst.kind == K_REG && dst.reg == 0 {
-                    out8(base + 4);
-                    out8(v);
-                } else {
-                    enc(cx, 0, false, false, 0x80, 1, digit, dst, rex8(1), v, 1);
-                }
-            } else if fits8(v) {
-                enc(cx, 0, op16, w, 0x83, 1, digit, dst, false, v, 1);
-            } else if dst.kind == K_REG && dst.reg == 0 {
-                if op16 {
-                    out8(0x66);
-                }
-                if w {
-                    out8(0x48);
-                }
-                out8(base + 5);
-                emit_imm(v, if size == 2 { 2 } else { 4 });
+fn alu(digit: i64, size: i64, asm: &mut Asm<Comp>) {
+    need_ops(2, asm);
+    let src = asm.x86[0];
+    let dst = asm.x86[1];
+    let w = size == 8;
+    let op16 = size == 2;
+    let base = digit << 3;
+    if src.kind == K_IMM {
+        let v = src.imm;
+        if size == 1 {
+            if dst.kind == K_REG && dst.reg == 0 {
+                out8(base + 4, asm);
+                out8(v, asm);
             } else {
-                enc(cx, 0, op16, w, 0x81, 1, digit, dst, false, v, if size == 2 { 2 } else { 4 });
+                enc(0, false, false, 0x80, 1, digit, dst, rex8(1, asm), v, 1, asm);
             }
-            return;
-        }
-        if dst.kind == K_MEM {
-            enc(cx, 0, op16, w, sized(base + 1, size), 1, src.reg, dst, rex8(0), 0, 0);
-        } else if src.kind == K_MEM {
-            enc(cx, 0, op16, w, sized(base + 3, size), 1, dst.reg, src, rex8(1), 0, 0);
+        } else if fits8(v) {
+            enc(0, op16, w, 0x83, 1, digit, dst, false, v, 1, asm);
+        } else if dst.kind == K_REG && dst.reg == 0 {
+            if op16 {
+                out8(0x66, asm);
+            }
+            if w {
+                out8(0x48, asm);
+            }
+            out8(base + 5, asm);
+            emit_imm(v, if size == 2 { 2 } else { 4 }, asm);
         } else {
-            enc(cx, 0, op16, w, sized(base + 1, size), 1, src.reg, dst, rex8(0) || rex8(1), 0, 0);
+            enc(0, op16, w, 0x81, 1, digit, dst, false, v, if size == 2 { 2 } else { 4 }, asm);
         }
+        return;
+    }
+    if dst.kind == K_MEM {
+        enc(0, op16, w, sized(base + 1, size), 1, src.reg, dst, rex8(0, asm), 0, 0, asm);
+    } else if src.kind == K_MEM {
+        enc(0, op16, w, sized(base + 3, size), 1, dst.reg, src, rex8(1, asm), 0, 0, asm);
+    } else {
+        enc(0, op16, w, sized(base + 1, size), 1, src.reg, dst, rex8(0, asm) || rex8(1, asm),
+            0, 0, asm);
     }
 }
 
-fn mov(cx: &mut FnCtx, size: i64) {
-    unsafe {
-        need_ops(cx, 2);
-        let src = (*get_xops().add(0));
-        let dst = (*get_xops().add(1));
-        if src.xmm || dst.xmm {
-            movd(cx);
-            return;
-        }
-        let w = size == 8;
-        let op16 = size == 2;
-        if src.kind == K_IMM {
-            if dst.kind == K_REG && size != 8 {
-                // B8+r (B0+r for bytes) with an immediate of the operand size.
-                if op16 {
-                    out8(0x66);
-                }
-                if dst.reg >= 8 || dst.rex8 {
-                    out8(0x40 | (if dst.reg >= 8 { 1 } else { 0 }));
-                }
-                out8((if size == 1 { 0xb0 } else { 0xb8 }) + (dst.reg & 7));
-                emit_imm(src.imm, size);
-                return;
+fn mov(size: i64, asm: &mut Asm<Comp>) {
+    need_ops(2, asm);
+    let src = asm.x86[0];
+    let dst = asm.x86[1];
+    if src.xmm || dst.xmm {
+        movd(asm);
+        return;
+    }
+    let w = size == 8;
+    let op16 = size == 2;
+    if src.kind == K_IMM {
+        if dst.kind == K_REG && size != 8 {
+            // B8+r (B0+r for bytes) with an immediate of the operand size.
+            if op16 {
+                out8(0x66, asm);
             }
-            enc(cx, 0, op16, w, sized(0xc7, size), 1, 0, dst, rex8(1), src.imm,
-                if size == 8 { 4 } else { size });
+            if dst.reg >= 8 || dst.rex8 {
+                out8(0x40 | (if dst.reg >= 8 { 1 } else { 0 }), asm);
+            }
+            out8((if size == 1 { 0xb0 } else { 0xb8 }) + (dst.reg & 7), asm);
+            emit_imm(src.imm, size, asm);
             return;
         }
-        if src.kind == K_MEM {
-            enc(cx, 0, op16, w, sized(0x8b, size), 1, dst.reg, src, rex8(1), 0, 0);
-        } else {
-            enc(cx, 0, op16, w, sized(0x89, size), 1, src.reg, dst, rex8(0) || rex8(1), 0, 0);
-        }
+        enc(0, op16, w, sized(0xc7, size), 1, 0, dst, rex8(1, asm), src.imm,
+            if size == 8 { 4 } else { size }, asm);
+        return;
+    }
+    if src.kind == K_MEM {
+        enc(0, op16, w, sized(0x8b, size), 1, dst.reg, src, rex8(1, asm), 0, 0, asm);
+    } else {
+        enc(0, op16, w, sized(0x89, size), 1, src.reg, dst, rex8(0, asm) || rex8(1, asm), 0,
+            0, asm);
     }
 }
 
 // movd/movq between general and xmm registers.
-fn movd(cx: &mut FnCtx) {
-    unsafe {
-        let src = (*get_xops().add(0));
-        let dst = (*get_xops().add(1));
-        if src.xmm && dst.xmm {
-            // movq %xmm, %xmm: F3 0F 7E
-            enc(cx, 0xf3, false, false, 0x0f7e, 2, dst.reg, src, false, 0, 0);
-        } else if dst.xmm {
-            enc(cx, 0x66, false, src.size == 8, 0x0f6e, 2, dst.reg, src, false, 0, 0);
-        } else {
-            enc(cx, 0x66, false, dst.size == 8, 0x0f7e, 2, src.reg, dst, false, 0, 0);
-        }
+fn movd(asm: &mut Asm<Comp>) {
+    let src = asm.x86[0];
+    let dst = asm.x86[1];
+    if src.xmm && dst.xmm {
+        // movq %xmm, %xmm: F3 0F 7E
+        enc(0xf3, false, false, 0x0f7e, 2, dst.reg, src, false, 0, 0, asm);
+    } else if dst.xmm {
+        enc(0x66, false, src.size == 8, 0x0f6e, 2, dst.reg, src, false, 0, 0, asm);
+    } else {
+        enc(0x66, false, dst.size == 8, 0x0f7e, 2, src.reg, dst, false, 0, 0, asm);
     }
 }
 
-fn shift(cx: &mut FnCtx, digit: i64, size: i64) {
-    unsafe {
-        let w = size == 8;
-        if get_op_count() == 1 {
-            enc(cx, 0, size == 2, w, sized(0xd1, size), 1, digit, (*get_xops().add(0)), rex8(0), 0,
-                0);
-            return;
-        }
-        let src = (*get_xops().add(0));
-        let dst = (*get_xops().add(1));
-        if src.kind == K_IMM {
-            if src.imm == 1 {
-                enc(cx, 0, size == 2, w, sized(0xd1, size), 1, digit, dst, rex8(1), 0, 0);
-            } else {
-                enc(cx, 0, size == 2, w, sized(0xc1, size), 1, digit, dst, rex8(1), src.imm, 1);
-            }
+fn shift(digit: i64, size: i64, asm: &mut Asm<Comp>) {
+    let w = size == 8;
+    if asm.op_count == 1 {
+        enc(0, size == 2, w, sized(0xd1, size), 1, digit, asm.x86[0], rex8(0, asm),
+            0, 0, asm);
+        return;
+    }
+    let src = asm.x86[0];
+    let dst = asm.x86[1];
+    if src.kind == K_IMM {
+        if src.imm == 1 {
+            enc(0, size == 2, w, sized(0xd1, size), 1, digit, dst, rex8(1, asm), 0, 0, asm);
         } else {
-            // by %cl
-            enc(cx, 0, size == 2, w, sized(0xd3, size), 1, digit, dst, rex8(1), 0, 0);
+            enc(0, size == 2, w, sized(0xc1, size), 1, digit, dst, rex8(1, asm), src.imm, 1,
+                asm);
         }
+    } else {
+        // by %cl
+        enc(0, size == 2, w, sized(0xd3, size), 1, digit, dst, rex8(1, asm), 0, 0, asm);
     }
 }
 
-fn branch_target(cx: &mut FnCtx, k: i64) -> i64 {
-    unsafe {
-        if (*get_xops().add(k as usize)).kind != K_SYM {
-            asm_error(cx, c"expected a label");
-        }
-        (*get_xops().add(k as usize)).sym
+fn branch_target(k: i64, asm: &mut Asm<Comp>) -> i64 {
+    if asm.x86[k as usize].kind != K_SYM {
+        asm_error("expected a label", asm);
     }
+    asm.x86[k as usize].sym
 }
 
 // (0.19) The intrinsics' instructions the table above lacks
@@ -676,125 +652,123 @@ fn branch_target(cx: &mut FnCtx, k: i64) -> i64 {
 // nibble), `vexd` (src, dst: vvvv = dst, r/m = src, reg = the digit). L is
 // 1 when an operand is a ymm register. False when the table has no such
 // mnemonic.
-fn x86_table_instruction(cx: &mut FnCtx, name: &[u8]) -> bool {
-    unsafe {
-        let k = insn_named(name);
-        if k < 0 {
-            return false;
-        }
-        let class = insn_text(k, 1);
-        let pfx = insn_hex(k, 2);
-        let map = insn_hex(k, 3);
-        let opcode = insn_hex(k, 4);
-        let flags = insn_text(k, 5);
-        let w = has_word(flags, b"w");
-        let op16 = has_word(flags, b"o16");
-        let digit = word_value(flags, b'/');
-        let oplen: i64 = if map == 0x0f { 2 } else { 3 };
-        let full = map << 8 | opcode;
-        let mut l = false;
-        for i in 0..get_op_count() {
-            if (*get_xops().add(i as usize)).kind == K_REG
-                && (*get_xops().add(i as usize)).size == 32 {
-                l = true;
-            }
-        }
-        let any_rex8 = rex8(0) || rex8(1) || rex8(2);
-        if class == b"sse" {
-            need_ops(cx, 2);
-            enc(cx, pfx, op16, w, full, oplen, (*get_xops().add(1)).reg, (*get_xops().add(0)),
-                any_rex8, 0, 0);
-        } else if class == b"ssei" {
-            need_ops(cx, 3);
-            enc(cx, pfx, op16, w, full, oplen, (*get_xops().add(2)).reg, (*get_xops().add(1)),
-                any_rex8, (*get_xops().add(0)).imm, 1);
-        } else if class == b"sser" {
-            need_ops(cx, 2);
-            enc(cx, pfx, op16, w, full, oplen, (*get_xops().add(0)).reg, (*get_xops().add(1)),
-                any_rex8, 0, 0);
-        } else if class == b"sseir" {
-            need_ops(cx, 3);
-            enc(cx, pfx, op16, w, full, oplen, (*get_xops().add(1)).reg, (*get_xops().add(2)),
-                any_rex8, (*get_xops().add(0)).imm, 1);
-        } else if class == b"shift" {
-            need_ops(cx, 2);
-            if (*get_xops().add(0)).kind == K_IMM {
-                enc(cx, pfx, false, w, 0x0f00 | word_value(flags, b'='), 2, digit,
-                    (*get_xops().add(1)), false, (*get_xops().add(0)).imm, 1);
-            } else {
-                enc(cx, pfx, false, w, full, oplen, (*get_xops().add(1)).reg, (*get_xops().add(0)),
-                    false, 0, 0);
-            }
-        } else if class == b"sse0" {
-            need_ops(cx, 3);
-            if (*get_xops().add(0)).kind != K_REG || (*get_xops().add(0)).reg != 0
-                || !(*get_xops().add(0)).xmm {
-                asm_error(cx, c"this instruction's first operand is %xmm0");
-            }
-            enc(cx, pfx, false, w, full, oplen, (*get_xops().add(2)).reg, (*get_xops().add(1)),
-                false, 0, 0);
-        } else if class == b"vex" || class == b"vexi" {
-            let imm = class == b"vexi";
-            let at: i64 = if imm { 1 } else { 0 };
-            need_ops(cx, at + 3);
-            let mut src2 = (*get_xops().add(at as usize));
-            let mut src1 = (*get_xops().add((at + 1) as usize));
-            // (LLVM's assembler swaps the sources of a commutative operation
-            // when only the second is r8-r15: VEX.R is in the short prefix,
-            // VEX.B is not)
-            let commutes = has_word(flags, b"c")
-                || (has_word(flags, b"cmp") && ((*get_xops().add(0)).imm & 7) % 4 == 0
-                    || has_word(flags, b"cmp") && ((*get_xops().add(0)).imm & 7) % 4 == 3);
-            if commutes && map == 0x0f && !w && src2.kind == K_REG && src2.reg >= 8
-                && src1.reg < 8 {
-                let t = src2;
-                src2 = src1;
-                src1 = t;
-            }
-            vex(cx, pfx, map, w, l, opcode, (*get_xops().add((at + 2) as usize)).reg, src1.reg,
-                src2, if imm { (*get_xops().add(0)).imm } else { 0 }, if imm { 1 } else { 0 });
-        } else if class == b"vexv" {
-            need_ops(cx, 3);
-            vex(cx, pfx, map, w, l, opcode, (*get_xops().add(2)).reg, (*get_xops().add(0)).reg,
-                (*get_xops().add(1)), 0, 0);
-        } else if class == b"vex2" {
-            need_ops(cx, 2);
-            vex(cx, pfx, map, w, l, opcode, (*get_xops().add(1)).reg, 0, (*get_xops().add(0)), 0,
-                0);
-        } else if class == b"vex2r" {
-            need_ops(cx, 2);
-            vex(cx, pfx, map, w, l, opcode, (*get_xops().add(0)).reg, 0, (*get_xops().add(1)), 0,
-                0);
-        } else if class == b"vex2i" {
-            need_ops(cx, 3);
-            vex(cx, pfx, map, w, l, opcode, (*get_xops().add(2)).reg, 0, (*get_xops().add(1)),
-                (*get_xops().add(0)).imm, 1);
-        } else if class == b"vex2ir" {
-            need_ops(cx, 3);
-            vex(cx, pfx, map, w, l, opcode, (*get_xops().add(1)).reg, 0, (*get_xops().add(2)),
-                (*get_xops().add(0)).imm, 1);
-        } else if class == b"vexshift" {
-            need_ops(cx, 3);
-            if (*get_xops().add(0)).kind == K_IMM {
-                vex(cx, pfx, map, w, l, word_value(flags, b'='), digit, (*get_xops().add(2)).reg,
-                    (*get_xops().add(1)), (*get_xops().add(0)).imm, 1);
-            } else {
-                vex(cx, pfx, map, w, l, opcode, (*get_xops().add(2)).reg, (*get_xops().add(1)).reg,
-                    (*get_xops().add(0)), 0, 0);
-            }
-        } else if class == b"vex4" {
-            need_ops(cx, 4);
-            vex(cx, pfx, map, w, l, opcode, (*get_xops().add(3)).reg, (*get_xops().add(2)).reg,
-                (*get_xops().add(1)), (*get_xops().add(0)).reg << 4, 1);
-        } else if class == b"vexd" {
-            need_ops(cx, 2);
-            vex(cx, pfx, map, w, l, opcode, digit, (*get_xops().add(1)).reg, (*get_xops().add(0)),
-                0, 0);
-        } else {
-            asm_error(cx, c"internal error: an instruction class the encoder does not know");
-        }
-        true
+fn x86_table_instruction(name: &[u8], asm: &mut Asm<Comp>) -> bool {
+    let k = insn_named(name);
+    if k < 0 {
+        return false;
     }
+    let class = insn_text(k, 1);
+    let pfx = insn_hex(k, 2);
+    let map = insn_hex(k, 3);
+    let opcode = insn_hex(k, 4);
+    let flags = insn_text(k, 5);
+    let w = has_word(flags, b"w");
+    let op16 = has_word(flags, b"o16");
+    let digit = word_value(flags, b'/');
+    let oplen: i64 = if map == 0x0f { 2 } else { 3 };
+    let full = map << 8 | opcode;
+    let mut l = false;
+    for i in 0..asm.op_count {
+        if asm.x86[i as usize].kind == K_REG
+            && asm.x86[i as usize].size == 32 {
+            l = true;
+        }
+    }
+    let any_rex8 = rex8(0, asm) || rex8(1, asm) || rex8(2, asm);
+    if class == b"sse" {
+        need_ops(2, asm);
+        enc(pfx, op16, w, full, oplen, asm.x86[1].reg, asm.x86[0], any_rex8,
+            0, 0, asm);
+    } else if class == b"ssei" {
+        need_ops(3, asm);
+        enc(pfx, op16, w, full, oplen, asm.x86[2].reg, asm.x86[1], any_rex8,
+            asm.x86[0].imm, 1, asm);
+    } else if class == b"sser" {
+        need_ops(2, asm);
+        enc(pfx, op16, w, full, oplen, asm.x86[0].reg, asm.x86[1], any_rex8,
+            0, 0, asm);
+    } else if class == b"sseir" {
+        need_ops(3, asm);
+        enc(pfx, op16, w, full, oplen, asm.x86[1].reg, asm.x86[2], any_rex8,
+            asm.x86[0].imm, 1, asm);
+    } else if class == b"shift" {
+        need_ops(2, asm);
+        if asm.x86[0].kind == K_IMM {
+            enc(pfx, false, w, 0x0f00 | word_value(flags, b'='), 2, digit, asm.x86[1],
+                false, asm.x86[0].imm, 1, asm);
+        } else {
+            enc(pfx, false, w, full, oplen, asm.x86[1].reg, asm.x86[0],
+                false, 0, 0, asm);
+        }
+    } else if class == b"sse0" {
+        need_ops(3, asm);
+        if asm.x86[0].kind != K_REG || asm.x86[0].reg != 0
+            || !asm.x86[0].xmm {
+            asm_error("this instruction's first operand is %xmm0", asm);
+        }
+        enc(pfx, false, w, full, oplen, asm.x86[2].reg, asm.x86[1], false,
+            0, 0, asm);
+    } else if class == b"vex" || class == b"vexi" {
+        let imm = class == b"vexi";
+        let at: i64 = if imm { 1 } else { 0 };
+        need_ops(at + 3, asm);
+        let mut src2 = asm.x86[at as usize];
+        let mut src1 = asm.x86[(at + 1) as usize];
+        // (LLVM's assembler swaps the sources of a commutative operation
+        // when only the second is r8-r15: VEX.R is in the short prefix,
+        // VEX.B is not)
+        let commutes = has_word(flags, b"c")
+            || (has_word(flags, b"cmp") && (asm.x86[0].imm & 7) % 4 == 0
+                || has_word(flags, b"cmp") && (asm.x86[0].imm & 7) % 4 == 3);
+        if commutes && map == 0x0f && !w && src2.kind == K_REG && src2.reg >= 8
+            && src1.reg < 8 {
+            let t = src2;
+            src2 = src1;
+            src1 = t;
+        }
+        vex(pfx, map, w, l, opcode, asm.x86[(at + 2) as usize].reg, src1.reg, src2,
+            if imm { asm.x86[0].imm } else { 0 }, if imm { 1 } else { 0 }, asm);
+    } else if class == b"vexv" {
+        need_ops(3, asm);
+        vex(pfx, map, w, l, opcode, asm.x86[2].reg, asm.x86[0].reg,
+            asm.x86[1], 0, 0, asm);
+    } else if class == b"vex2" {
+        need_ops(2, asm);
+        vex(pfx, map, w, l, opcode, asm.x86[1].reg, 0, asm.x86[0], 0, 0,
+            asm);
+    } else if class == b"vex2r" {
+        need_ops(2, asm);
+        vex(pfx, map, w, l, opcode, asm.x86[0].reg, 0, asm.x86[1], 0, 0,
+            asm);
+    } else if class == b"vex2i" {
+        need_ops(3, asm);
+        vex(pfx, map, w, l, opcode, asm.x86[2].reg, 0, asm.x86[1],
+            asm.x86[0].imm, 1, asm);
+    } else if class == b"vex2ir" {
+        need_ops(3, asm);
+        vex(pfx, map, w, l, opcode, asm.x86[1].reg, 0, asm.x86[2],
+            asm.x86[0].imm, 1, asm);
+    } else if class == b"vexshift" {
+        need_ops(3, asm);
+        if asm.x86[0].kind == K_IMM {
+            vex(pfx, map, w, l, word_value(flags, b'='), digit, asm.x86[2].reg,
+                asm.x86[1], asm.x86[0].imm, 1, asm);
+        } else {
+            vex(pfx, map, w, l, opcode, asm.x86[2].reg, asm.x86[1].reg,
+                asm.x86[0], 0, 0, asm);
+        }
+    } else if class == b"vex4" {
+        need_ops(4, asm);
+        vex(pfx, map, w, l, opcode, asm.x86[3].reg, asm.x86[2].reg,
+            asm.x86[1], asm.x86[0].reg << 4, 1, asm);
+    } else if class == b"vexd" {
+        need_ops(2, asm);
+        vex(pfx, map, w, l, opcode, digit, asm.x86[1].reg, asm.x86[0], 0,
+            0, asm);
+    } else {
+        asm_error("internal error: an instruction class the encoder does not know", asm);
+    }
+    true
 }
 
 // Whether the space-separated `flags` hold `word`.
@@ -836,336 +810,250 @@ fn word_value(flags: &[u8], mark: u8) -> i64 {
 // (0.21) The atomic instructions (mc_x86_64/atomic.vl writes them): the
 // `lock` prefix on a line of its own, xadd, cmpxchg and xchg of a register
 // into memory (b w l q), mfence, pause. Whether `name` was one.
-fn x86_atomic(cx: &mut FnCtx, name: &[u8]) -> bool {
-    unsafe {
-        if name == b"lock" {
-            out8(0xf0);
-            return true;
-        }
-        if name == b"mfence" {
-            out8(0x0f);
-            out8(0xae);
-            out8(0xf0);
-            return true;
-        }
-        if name == b"pause" {
-            out8(0xf3);
-            out8(0x90);
-            return true;
-        }
-        if name.len() < 5 {
-            return false;
-        }
-        let base = &name[0..(name.len() as i64 - 1) as usize];
-        let s = name[(name.len() as i64 - 1) as usize];
-        let size: i64 = if s == b'b' { 1 } else if s == b'w' { 2 } else if s == b'l' { 4 }
-            else if s == b'q' { 8 } else { 0 };
-        if size == 0 {
-            return false;
-        }
-        let opcode: i64 = if base == b"xadd" { 0x0fc1 } else if base == b"cmpxchg" { 0x0fb1 }
-            else if base == b"xchg" { 0x87 } else { 0 };
-        if opcode == 0 {
-            return false;
-        }
-        need_ops(cx, 2);
-        let oplen: i64 = if opcode > 0xff { 2 } else { 1 };
-        enc(cx, 0, size == 2, size == 8, sized(opcode, size), oplen, (*get_xops().add(0)).reg,
-            (*get_xops().add(1)), rex8(0), 0, 0);
-        true
+fn x86_atomic(name: &[u8], asm: &mut Asm<Comp>) -> bool {
+    if name == b"lock" {
+        out8(0xf0, asm);
+        return true;
     }
+    if name == b"mfence" {
+        out8(0x0f, asm);
+        out8(0xae, asm);
+        out8(0xf0, asm);
+        return true;
+    }
+    if name == b"pause" {
+        out8(0xf3, asm);
+        out8(0x90, asm);
+        return true;
+    }
+    if name.len() < 5 {
+        return false;
+    }
+    let base = &name[0..(name.len() as i64 - 1) as usize];
+    let s = name[(name.len() as i64 - 1) as usize];
+    let size: i64 = if s == b'b' { 1 } else if s == b'w' { 2 } else if s == b'l' { 4 }
+        else if s == b'q' { 8 } else { 0 };
+    if size == 0 {
+        return false;
+    }
+    let opcode: i64 = if base == b"xadd" { 0x0fc1 } else if base == b"cmpxchg" { 0x0fb1 }
+        else if base == b"xchg" { 0x87 } else { 0 };
+    if opcode == 0 {
+        return false;
+    }
+    need_ops(2, asm);
+    let oplen: i64 = if opcode > 0xff { 2 } else { 1 };
+    enc(0, size == 2, size == 8, sized(opcode, size), oplen, asm.x86[0].reg,
+        asm.x86[1], rex8(0, asm), 0, 0, asm);
+    true
 }
 
-pub fn x86_instruction(cx: &mut FnCtx, a: i64, b: i64) {
-    unsafe {
-        for k in 0..get_op_count() {
-            parse_xop(cx, k);
-        }
-        let v = name_get(get_xmn(),
-            std::slice::from_raw_parts(get_atext().add((a) as usize), (b - (a)) as usize));
-        if v == 0
-            && x86_table_instruction(cx,
-                std::slice::from_raw_parts(get_atext().add((a) as usize), (b - (a)) as usize)) {
-            return;
-        }
-        if v == 0
-            && x86_atomic(cx,
-                std::slice::from_raw_parts(get_atext().add((a) as usize), (b - (a)) as usize)) {
-            return;
-        }
-        if v == 0 {
-            asm_error(cx, c"unknown instruction");
-        }
-        let e = v - 1;
-        let class = e & 255;
-        let size = (e >> 8) & 255;
-        let arg = e >> 16;
-        let w = size == 8;
-        if class == X_ALU {
-            alu(cx, arg, size);
-        } else if class == X_TEST {
-            need_ops(cx, 2);
-            let src = (*get_xops().add(0));
-            let dst = (*get_xops().add(1));
-            if src.kind == K_IMM {
-                if dst.kind == K_REG && dst.reg == 0 {
-                    if size == 2 {
-                        out8(0x66);
-                    }
-                    if w {
-                        out8(0x48);
-                    }
-                    out8(if size == 1 { 0xa8 } else { 0xa9 });
-                    emit_imm(src.imm, if size == 8 { 4 } else { size });
-                } else {
-                    enc(cx, 0, size == 2, w, sized(0xf7, size), 1, 0, dst, rex8(1), src.imm,
-                        if size == 8 { 4 } else { size });
+pub fn x86_instruction(a: i64, b: i64, asm: &mut Asm<Comp>) {
+    let mut room = [0u8; 32];
+    let name_len = mnemonic_copy(a, b, &mut room, asm);
+    let name = &room[..name_len];
+    for k in 0..asm.op_count {
+        parse_xop(k, asm);
+    }
+    let v = names_get(&asm.xmn,
+        name);
+    if v == 0
+        && x86_table_instruction(name,
+            asm) {
+        return;
+    }
+    if v == 0
+        && x86_atomic(name,
+            asm) {
+        return;
+    }
+    if v == 0 {
+        asm_error("unknown instruction", asm);
+    }
+    let e = v - 1;
+    let class = e & 255;
+    let size = (e >> 8) & 255;
+    let arg = e >> 16;
+    let w = size == 8;
+    if class == X_ALU {
+        alu(arg, size, asm);
+    } else if class == X_TEST {
+        need_ops(2, asm);
+        let src = asm.x86[0];
+        let dst = asm.x86[1];
+        if src.kind == K_IMM {
+            if dst.kind == K_REG && dst.reg == 0 {
+                if size == 2 {
+                    out8(0x66, asm);
                 }
-            } else {
-                enc(cx, 0, size == 2, w, sized(0x85, size), 1, src.reg, dst, rex8(0) || rex8(1), 0,
-                    0);
-            }
-        } else if class == X_MOV {
-            mov(cx, size);
-        } else if class == X_MOVABS {
-            need_ops(cx, 2);
-            let dst = (*get_xops().add(1));
-            out8(0x48 | (if dst.reg >= 8 { 1 } else { 0 }));
-            out8(0xb8 + (dst.reg & 7));
-            out64((*get_xops().add(0)).imm);
-        } else if class == X_MOVX {
-            need_ops(cx, 2);
-            let oplen: i64 = if arg > 0xff { 2 } else { 1 };
-            enc(cx, 0, false, w, arg, oplen, (*get_xops().add(1)).reg, (*get_xops().add(0)),
-                rex8(0), 0, 0);
-        } else if class == X_LEA {
-            need_ops(cx, 2);
-            enc(cx, 0, size == 2, w, 0x8d, 1, (*get_xops().add(1)).reg, (*get_xops().add(0)), false,
-                0, 0);
-        } else if class == X_SHIFT {
-            shift(cx, arg, size);
-        } else if class == X_IMUL {
-            if get_op_count() == 3 {
-                let imm = (*get_xops().add(0)).imm;
-                if fits8(imm) {
-                    enc(cx, 0, size == 2, w, 0x6b, 1, (*get_xops().add(2)).reg,
-                        (*get_xops().add(1)), false, imm, 1);
-                } else {
-                    enc(cx, 0, size == 2, w, 0x69, 1, (*get_xops().add(2)).reg,
-                        (*get_xops().add(1)), false, imm, if size == 2 { 2 } else { 4 });
+                if w {
+                    out8(0x48, asm);
                 }
-            } else if get_op_count() == 2 {
-                enc(cx, 0, size == 2, w, 0x0faf, 2, (*get_xops().add(1)).reg, (*get_xops().add(0)),
-                    false, 0, 0);
+                out8(if size == 1 { 0xa8 } else { 0xa9 }, asm);
+                emit_imm(src.imm, if size == 8 { 4 } else { size }, asm);
             } else {
-                enc(cx, 0, size == 2, w, sized(0xf7, size), 1, 5, (*get_xops().add(0)), rex8(0), 0,
-                    0);
+                enc(0, size == 2, w, sized(0xf7, size), 1, 0, dst, rex8(1, asm), src.imm,
+                    if size == 8 { 4 } else { size }, asm);
             }
-        } else if class == X_F7 {
-            need_ops(cx, 1);
-            enc(cx, 0, size == 2, w, sized(0xf7, size), 1, arg, (*get_xops().add(0)), rex8(0), 0,
-                0);
-        } else if class == X_CQTO {
-            out8(0x48);
-            out8(0x99);
-        } else if class == X_BT {
-            need_ops(cx, 2);
-            enc(cx, 0, false, w, 0x0fba, 2, arg, (*get_xops().add(1)), false,
-                (*get_xops().add(0)).imm, 1);
-        } else if class == X_SETCC {
-            need_ops(cx, 1);
-            enc(cx, 0, false, false, 0x0f90 + arg, 2, 0, (*get_xops().add(0)), rex8(0), 0, 0);
-        } else if class == X_CMOVCC {
-            need_ops(cx, 2);
-            enc(cx, 0, false, w, 0x0f40 + arg, 2, (*get_xops().add(1)).reg, (*get_xops().add(0)),
-                false, 0, 0);
-        } else if class == X_JCC {
-            need_ops(cx, 1);
-            emit_relaxable(TAIL_JCC, arg, branch_target(cx, 0));
-        } else if class == X_JMP {
-            need_ops(cx, 1);
-            if (*get_xops().add(0)).kind == K_IND {
-                enc(cx, 0, false, false, 0xff, 1, 4, reg_operand(0), false, 0, 0);
-            } else {
-                emit_relaxable(TAIL_JMP, 0, branch_target(cx, 0));
-            }
-        } else if class == X_CALL {
-            need_ops(cx, 1);
-            if (*get_xops().add(0)).kind == K_IND {
-                enc(cx, 0, false, false, 0xff, 1, 2, reg_operand(0), false, 0, 0);
-            } else {
-                out8(0xe8);
-                let pos = here();
-                fixup(FX_X86_BRANCH, pos, branch_target(cx, 0), 0, pos + 4, false);
-                out32(0);
-            }
-        } else if class == X_PUSH || class == X_POP {
-            need_ops(cx, 1);
-            let reg = (*get_xops().add(0)).reg;
-            if reg >= 8 {
-                out8(0x41);
-            }
-            out8((if class == X_PUSH { 0x50 } else { 0x58 }) + (reg & 7));
-        } else if class == X_RET {
-            out8(0xc3);
-        } else if class == X_UD2 {
-            out8(0x0f);
-            out8(0x0b);
-        } else if class == X_SSE {
-            need_ops(cx, 2);
-            let pfx = arg >> 8;
-            enc(cx, pfx, false, false, 0x0f00 | (arg & 255), 2, (*get_xops().add(1)).reg,
-                (*get_xops().add(0)), false, 0, 0);
-        } else if class == X_SSEMOV {
-            need_ops(cx, 2);
-            let pfx = arg >> 8;
-            if (*get_xops().add(1)).kind == K_MEM {
-                enc(cx, pfx, false, false, 0x0f11, 2, (*get_xops().add(0)).reg,
-                    (*get_xops().add(1)), false, 0, 0);
-            } else {
-                enc(cx, pfx, false, false, 0x0f10, 2, (*get_xops().add(1)).reg,
-                    (*get_xops().add(0)), false, 0, 0);
-            }
-        } else if class == X_CVTSI2 {
-            need_ops(cx, 2);
-            let pfx = arg >> 8;
-            let wide = (*get_xops().add(0)).kind == K_REG && (*get_xops().add(0)).size == 8
-                || text_is(cx, b - 1, b, c"q");
-            enc(cx, pfx, false, wide, 0x0f2a, 2, (*get_xops().add(1)).reg, (*get_xops().add(0)),
-                false, 0, 0);
-        } else if class == X_CVTT2SI {
-            need_ops(cx, 2);
-            let pfx = arg >> 8;
-            enc(cx, pfx, false, (*get_xops().add(1)).size == 8, 0x0f2c, 2, (*get_xops().add(1)).reg,
-                (*get_xops().add(0)), false, 0, 0);
-        } else if class == X_MOVD {
-            need_ops(cx, 2);
-            movd(cx);
-        } else if class == X_SSEI {
-            need_ops(cx, 3);
-            let pfx = arg >> 8;
-            enc(cx, pfx, false, false, 0x0f00 | (arg & 255), 2, (*get_xops().add(2)).reg,
-                (*get_xops().add(1)), false, (*get_xops().add(0)).imm, 1);
-        } else if class == X_VMOV {
-            // (load 6F, store 7F; between registers the store form when only
-            // the source is r8-r15, which keeps the short prefix, as LLVM does)
-            need_ops(cx, 2);
-            let l = (*get_xops().add(0)).size == 32 || (*get_xops().add(1)).size == 32;
-            if (*get_xops().add(1)).kind == K_MEM
-                || ((*get_xops().add(0)).kind == K_REG && (*get_xops().add(0)).reg >= 8
-                    && (*get_xops().add(1)).reg < 8) {
-                vex(cx, arg, 0x0f, false, l, 0x7f, (*get_xops().add(0)).reg, 0,
-                    (*get_xops().add(1)), 0, 0);
-            } else {
-                vex(cx, arg, 0x0f, false, l, 0x6f, (*get_xops().add(1)).reg, 0,
-                    (*get_xops().add(0)), 0, 0);
-            }
-        } else if class == X_VZEROUPPER {
-            out8(0xc5);
-            out8(0xf8);
-            out8(0x77);
-        } else if class == X_SSESHIFT && (*get_xops().add(0)).kind != K_IMM {
-            need_ops(cx, 2);
-            enc(cx, 0x66, false, false, 0x0f00 | (arg >> 24), 2, (*get_xops().add(1)).reg,
-                (*get_xops().add(0)), false, 0, 0);
-        } else if class == X_SSESHIFT {
-            need_ops(cx, 2);
-            enc(cx, 0x66, false, false, 0x0f00 | (arg & 255), 2, (arg >> 16) & 255,
-                (*get_xops().add(1)), false, (*get_xops().add(0)).imm, 1);
         } else {
-            asm_error(cx, c"unknown instruction");
+            enc(0, size == 2, w, sized(0x85, size), 1, src.reg, dst,
+                rex8(0, asm) || rex8(1, asm), 0, 0, asm);
         }
+    } else if class == X_MOV {
+        mov(size, asm);
+    } else if class == X_MOVABS {
+        need_ops(2, asm);
+        let dst = asm.x86[1];
+        out8(0x48 | (if dst.reg >= 8 { 1 } else { 0 }), asm);
+        out8(0xb8 + (dst.reg & 7), asm);
+        out64(asm.x86[0].imm, asm);
+    } else if class == X_MOVX {
+        need_ops(2, asm);
+        let oplen: i64 = if arg > 0xff { 2 } else { 1 };
+        enc(0, false, w, arg, oplen, asm.x86[1].reg, asm.x86[0],
+            rex8(0, asm), 0, 0, asm);
+    } else if class == X_LEA {
+        need_ops(2, asm);
+        enc(0, size == 2, w, 0x8d, 1, asm.x86[1].reg, asm.x86[0], false, 0,
+            0, asm);
+    } else if class == X_SHIFT {
+        shift(arg, size, asm);
+    } else if class == X_IMUL {
+        if asm.op_count == 3 {
+            let imm = asm.x86[0].imm;
+            if fits8(imm) {
+                enc(0, size == 2, w, 0x6b, 1, asm.x86[2].reg, asm.x86[1],
+                    false, imm, 1, asm);
+            } else {
+                enc(0, size == 2, w, 0x69, 1, asm.x86[2].reg, asm.x86[1],
+                    false, imm, if size == 2 { 2 } else { 4 }, asm);
+            }
+        } else if asm.op_count == 2 {
+            enc(0, size == 2, w, 0x0faf, 2, asm.x86[1].reg, asm.x86[0],
+                false, 0, 0, asm);
+        } else {
+            enc(0, size == 2, w, sized(0xf7, size), 1, 5, asm.x86[0], rex8(0, asm),
+                0, 0, asm);
+        }
+    } else if class == X_F7 {
+        need_ops(1, asm);
+        enc(0, size == 2, w, sized(0xf7, size), 1, arg, asm.x86[0], rex8(0, asm), 0,
+            0, asm);
+    } else if class == X_CQTO {
+        out8(0x48, asm);
+        out8(0x99, asm);
+    } else if class == X_BT {
+        need_ops(2, asm);
+        enc(0, false, w, 0x0fba, 2, arg, asm.x86[1], false, asm.x86[0].imm,
+            1, asm);
+    } else if class == X_SETCC {
+        need_ops(1, asm);
+        enc(0, false, false, 0x0f90 + arg, 2, 0, asm.x86[0], rex8(0, asm), 0, 0, asm);
+    } else if class == X_CMOVCC {
+        need_ops(2, asm);
+        enc(0, false, w, 0x0f40 + arg, 2, asm.x86[1].reg, asm.x86[0], false,
+            0, 0, asm);
+    } else if class == X_JCC {
+        need_ops(1, asm);
+        emit_relaxable(TAIL_JCC, arg, branch_target(0, asm), asm);
+    } else if class == X_JMP {
+        need_ops(1, asm);
+        if asm.x86[0].kind == K_IND {
+            enc(0, false, false, 0xff, 1, 4, reg_operand(0, asm), false, 0, 0, asm);
+        } else {
+            emit_relaxable(TAIL_JMP, 0, branch_target(0, asm), asm);
+        }
+    } else if class == X_CALL {
+        need_ops(1, asm);
+        if asm.x86[0].kind == K_IND {
+            enc(0, false, false, 0xff, 1, 2, reg_operand(0, asm), false, 0, 0, asm);
+        } else {
+            out8(0xe8, asm);
+            let pos = here(asm);
+            fixup(FX_X86_BRANCH, pos, branch_target(0, asm), 0, pos + 4, false, asm);
+            out32(0, asm);
+        }
+    } else if class == X_PUSH || class == X_POP {
+        need_ops(1, asm);
+        let reg = asm.x86[0].reg;
+        if reg >= 8 {
+            out8(0x41, asm);
+        }
+        out8((if class == X_PUSH { 0x50 } else { 0x58 }) + (reg & 7), asm);
+    } else if class == X_RET {
+        out8(0xc3, asm);
+    } else if class == X_UD2 {
+        out8(0x0f, asm);
+        out8(0x0b, asm);
+    } else if class == X_SSE {
+        need_ops(2, asm);
+        let pfx = arg >> 8;
+        enc(pfx, false, false, 0x0f00 | (arg & 255), 2, asm.x86[1].reg,
+            asm.x86[0], false, 0, 0, asm);
+    } else if class == X_SSEMOV {
+        need_ops(2, asm);
+        let pfx = arg >> 8;
+        if asm.x86[1].kind == K_MEM {
+            enc(pfx, false, false, 0x0f11, 2, asm.x86[0].reg, asm.x86[1],
+                false, 0, 0, asm);
+        } else {
+            enc(pfx, false, false, 0x0f10, 2, asm.x86[1].reg, asm.x86[0],
+                false, 0, 0, asm);
+        }
+    } else if class == X_CVTSI2 {
+        need_ops(2, asm);
+        let pfx = arg >> 8;
+        let wide = asm.x86[0].kind == K_REG && asm.x86[0].size == 8
+            || text_is(b - 1, b, b"q", asm);
+        enc(pfx, false, wide, 0x0f2a, 2, asm.x86[1].reg, asm.x86[0], false,
+            0, 0, asm);
+    } else if class == X_CVTT2SI {
+        need_ops(2, asm);
+        let pfx = arg >> 8;
+        enc(pfx, false, asm.x86[1].size == 8, 0x0f2c, 2, asm.x86[1].reg,
+            asm.x86[0], false, 0, 0, asm);
+    } else if class == X_MOVD {
+        need_ops(2, asm);
+        movd(asm);
+    } else if class == X_SSEI {
+        need_ops(3, asm);
+        let pfx = arg >> 8;
+        enc(pfx, false, false, 0x0f00 | (arg & 255), 2, asm.x86[2].reg,
+            asm.x86[1], false, asm.x86[0].imm, 1, asm);
+    } else if class == X_VMOV {
+        // (load 6F, store 7F; between registers the store form when only
+        // the source is r8-r15, which keeps the short prefix, as LLVM does)
+        need_ops(2, asm);
+        let l = asm.x86[0].size == 32 || asm.x86[1].size == 32;
+        if asm.x86[1].kind == K_MEM
+            || (asm.x86[0].kind == K_REG && asm.x86[0].reg >= 8
+                && asm.x86[1].reg < 8) {
+            vex(arg, 0x0f, false, l, 0x7f, asm.x86[0].reg, 0, asm.x86[1],
+                0, 0, asm);
+        } else {
+            vex(arg, 0x0f, false, l, 0x6f, asm.x86[1].reg, 0, asm.x86[0],
+                0, 0, asm);
+        }
+    } else if class == X_VZEROUPPER {
+        out8(0xc5, asm);
+        out8(0xf8, asm);
+        out8(0x77, asm);
+    } else if class == X_SSESHIFT && asm.x86[0].kind != K_IMM {
+        need_ops(2, asm);
+        enc(0x66, false, false, 0x0f00 | (arg >> 24), 2, asm.x86[1].reg,
+            asm.x86[0], false, 0, 0, asm);
+    } else if class == X_SSESHIFT {
+        need_ops(2, asm);
+        enc(0x66, false, false, 0x0f00 | (arg & 255), 2, (arg >> 16) & 255,
+            asm.x86[1], false, asm.x86[0].imm, 1, asm);
+    } else {
+        asm_error("unknown instruction", asm);
     }
 }
 
 // `*%reg` as a register r/m operand.
-fn reg_operand(k: i64) -> XOp {
-    let mut op = unsafe { (*get_xops().add(k as usize)) };
+fn reg_operand(k: i64, asm: &mut Asm<Comp>) -> XOp {
+    let mut op = asm.x86[k as usize];
     op.kind = K_REG;
     op
-}
-
-// (0.28.0) XOPS's accessors: every use of it is one of them.
-fn get_xops() -> *mut XOp {
-    // UNSAFE: the assembler's state, a process-wide static mut that the
-    // main thread and the assembler thread use in turn; Rust has no safe
-    // access to a static mut
-    // SAFETY: one thread at a time uses it: the main thread before
-    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
-    // it in compile_program) and after asm_thread_finish's pthread_join,
-    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
-    // pthread_create and pthread_join order the hand-overs; no worker
-    // reaches it, the -O0 main thread's code generation between start and
-    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
-    // the loop around them) touches none of it, and at -O1+ there is no
-    // assembler thread (only the main thread assembles, in join_task's
-    // asm_flush); accessed through the accessor's raw pointer, no reference
-    // kept
-    unsafe { XOPS }
-}
-
-fn set_xops(v: *mut XOp) {
-    // UNSAFE: the assembler's state, a process-wide static mut that the
-    // main thread and the assembler thread use in turn; Rust has no safe
-    // access to a static mut
-    // SAFETY: one thread at a time uses it: the main thread before
-    // asm_thread_start (assembler_begin, from asm_stream_begin, runs before
-    // it in compile_program) and after asm_thread_finish's pthread_join,
-    // the assembler thread (asm_thread_main -> assemble_bytes) in between;
-    // pthread_create and pthread_join order the hand-overs; no worker
-    // reaches it, the -O0 main thread's code generation between start and
-    // finish (gen_places_function, gen_atomic_function, asm_hand_over and
-    // the loop around them) touches none of it, and at -O1+ there is no
-    // assembler thread (only the main thread assembles, in join_task's
-    // asm_flush); accessed through the accessor's raw pointer, no reference
-    // kept
-    unsafe {
-        XOPS = v;
-    }
-}
-
-// (0.28.0) REGS's accessors: every use of it is one of them.
-fn get_regs() -> NameMap {
-    // UNSAFE: the x86 encoder's register map, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: written only by init_x86 and reg_def (called only by
-    // init_x86), from assembler_begin on the main thread, before
-    // asm_thread_start's pthread_create or after asm_thread_finish's join;
-    // the assembler thread only reads it (parse_xreg)
-    unsafe { REGS }
-}
-
-fn set_regs(v: NameMap) {
-    // UNSAFE: the x86 encoder's register map, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: written only by init_x86 and reg_def (called only by
-    // init_x86), from assembler_begin on the main thread, before
-    // asm_thread_start's pthread_create or after asm_thread_finish's join;
-    // the assembler thread only reads it (parse_xreg)
-    unsafe {
-        REGS = v;
-    }
-}
-
-// (0.28.0) XMN's accessors: every use of it is one of them.
-fn get_xmn() -> NameMap {
-    // UNSAFE: the x86 encoder's mnemonic map, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: written only by mn, called only from init_x86 and sse (itself
-    // called only by init_x86), from assembler_begin on the main thread
-    // before the assembler thread starts or after it is joined; the
-    // assembler thread only reads it
-    unsafe { XMN }
-}
-
-fn set_xmn(v: NameMap) {
-    // UNSAFE: the x86 encoder's mnemonic map, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: written only by mn, called only from init_x86 and sse (itself
-    // called only by init_x86), from assembler_begin on the main thread
-    // before the assembler thread starts or after it is joined; the
-    // assembler thread only reads it
-    unsafe {
-        XMN = v;
-    }
 }

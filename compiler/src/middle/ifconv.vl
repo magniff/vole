@@ -12,15 +12,14 @@
 // vector select on a mask; instcombine makes `k ? t + x : t` into `t + (k
 // ? x : 0)`), and the loop has no branch to mispredict. A condition the
 // same in every iteration is left to unswitching.
-use crate::base::{IntVec, free};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::types::{TY_BOOL, is_float, is_integer};
 use crate::middle::ctx::FnCtx;
 use crate::middle::fold::combine_select;
 use crate::middle::ir::{
-    Op, Term, get_irfuncs, ir_append, ir_arg, ir_enter, ir_make, ir_operand, ir_operand_count,
-    ir_set_arg, ir_unlink, ir_val,
+    Op, Term, fn_block, fn_block_count, ir_append, ir_arg, ir_enter, ir_make, ir_operand,
+    ir_operand_count, ir_set_arg, ir_unlink, ir_val,
 };
 use crate::middle::ir::cfg::pred_index;
 use crate::middle::loops::{
@@ -35,226 +34,211 @@ const IFCONV_COST: i64 = 4;
 
 // The cost of arm block b (its instructions that are not constants), or -1
 // when it holds one that may not run unconditionally.
-fn arm_cost(cx: &mut FnCtx, b: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut cost: i64 = 0;
-        let mut v = (*cx.blocks.add(b as usize)).first;
-        while v != 0 {
-            let op = (*cx.insts.add(v as usize)).op;
-            if op == Op::Const {
-                v = (*cx.insts.add(v as usize)).next;
-                continue;
-            }
-            if !(op.is_pure() || op == Op::Sel) || op == Op::Div || op == Op::Rem
-                || is_float((*cx.insts.add(v as usize)).ty)
-                || (op == Op::Conv && is_float((*cx.insts.add(v as usize)).imm2))
-                || (op == Op::Cmp && is_float((*cx.insts.add(v as usize)).imm2))
-                || crate::middle::licm::op_guarded(cx, v, pcx) {
-                return -1;
-            }
-            cost += 1;
-            v = (*cx.insts.add(v as usize)).next;
+fn arm_cost(cx: &mut FnCtx<Comp>, b: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut cost: i64 = 0;
+    let mut v = (cx.blocks[b as usize]).first;
+    while v != 0 {
+        let op = (cx.insts[v as usize]).op;
+        if op == Op::Const {
+            v = (cx.insts[v as usize]).next;
+            continue;
         }
-        cost
+        if !(op.is_pure() || op == Op::Sel) || op == Op::Div || op == Op::Rem
+            || is_float((cx.insts[v as usize]).ty)
+            || (op == Op::Conv && is_float((cx.insts[v as usize]).imm2))
+            || (op == Op::Cmp && is_float((cx.insts[v as usize]).imm2))
+            || crate::middle::licm::op_guarded(cx, v, pcx) {
+            return -1;
+        }
+        cost += 1;
+        v = (cx.insts[v as usize]).next;
     }
+    cost
 }
 
 // Whether block b is an arm of h: reached from h alone, jumping on.
-fn is_arm(cx: &mut FnCtx, b: i64, h: i64) -> bool {
-    unsafe {
-        (*cx.blocks.add(b as usize)).preds.count == 1
-            && (*(*cx.blocks.add(b as usize)).preds.data.add(0)) == h
-            && (*cx.blocks.add(b as usize)).term == Term::Jump
+fn is_arm(cx: &mut FnCtx<Comp>, b: i64, h: i64) -> bool {
+    (cx.blocks[b as usize]).preds.len() as i64 == 1
+        && ((cx.blocks[b as usize]).preds[0]) == h
+        && (cx.blocks[b as usize]).term == Term::Jump
+}
+
+fn move_up(cx: &mut FnCtx<Comp>, from: i64, to: i64) {
+    let mut v = (cx.blocks[from as usize]).first;
+    while v != 0 {
+        let next = (cx.insts[v as usize]).next;
+        ir_unlink(cx, v);
+        ir_append(cx, to, v);
+        v = next;
     }
 }
 
-fn move_up(cx: &mut FnCtx, from: i64, to: i64) {
-    unsafe {
-        let mut v = (*cx.blocks.add(from as usize)).first;
-        while v != 0 {
-            let next = (*cx.insts.add(v as usize)).next;
-            ir_unlink(cx, v);
-            ir_append(cx, to, v);
-            v = next;
-        }
-    }
-}
-
-fn drop_arm(cx: &mut FnCtx, b: i64) {
-    unsafe {
-        (*cx.blocks.add(b as usize)).removed = 1;
-        (*cx.blocks.add(b as usize)).term = Term::None;
-        (*cx.blocks.add(b as usize)).preds.count = 0;
-        (*cx.blocks.add(b as usize)).first = 0;
-        (*cx.blocks.add(b as usize)).last = 0;
-    }
+fn drop_arm(cx: &mut FnCtx<Comp>, b: i64) {
+    (cx.blocks[b as usize]).removed = 1;
+    (cx.blocks[b as usize]).term = Term::None;
+    (cx.blocks[b as usize]).preds.clear();
+    (cx.blocks[b as usize]).first = 0;
+    (cx.blocks[b as usize]).last = 0;
 }
 
 // Whether block b branches and is reached from one block (a link of a
 // chain fold_branch_chain may merge).
-fn chained(cx: &mut FnCtx, b: i64) -> bool {
-    unsafe {
-        (*cx.blocks.add(b as usize)).term == Term::Branch
-            && (*cx.blocks.add(b as usize)).preds.count == 1
-    }
+fn chained(cx: &mut FnCtx<Comp>, b: i64) -> bool {
+    (cx.blocks[b as usize]).term == Term::Branch
+        && (cx.blocks[b as usize]).preds.len() as i64 == 1
 }
 
 // Whether function fi has a branch to an arm (a block reached from it
 // alone, jumping on) or to a link of a chain: no loop analysis without
 // one.
-fn has_arm(cx: &mut FnCtx, fi: i64) -> bool {
-    unsafe {
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-            let h = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(h as usize)).removed == 0
-                && (*cx.blocks.add(h as usize)).term == Term::Branch
-                && (is_arm(cx, (*cx.blocks.add(h as usize)).s0, h)
-                    || is_arm(cx, (*cx.blocks.add(h as usize)).s1, h)
-                    || chained(cx, (*cx.blocks.add(h as usize)).s0)
-                    || chained(cx, (*cx.blocks.add(h as usize)).s1)) {
-                return true;
-            }
+fn has_arm(cx: &mut FnCtx<Comp>, fi: i64) -> bool {
+    for i in 0..fn_block_count(cx, fi) {
+        let h = (fn_block(cx, fi, i));
+        if (cx.blocks[h as usize]).removed == 0
+            && (cx.blocks[h as usize]).term == Term::Branch
+            && (is_arm(cx, (cx.blocks[h as usize]).s0, h)
+                || is_arm(cx, (cx.blocks[h as usize]).s1, h)
+                || chained(cx, (cx.blocks[h as usize]).s0)
+                || chained(cx, (cx.blocks[h as usize]).s1)) {
+            return true;
         }
-        false
     }
+    false
 }
 
 // Whether phi (of block join, in loop l) is used by join's branch alone
 // within the loop.
-fn only_branched_on(cx: &mut FnCtx, l: i64, phi: i64, join: i64) -> bool {
-    unsafe {
-        if (*cx.blocks.add(join as usize)).term != Term::Branch
-            || ir_val(cx, (*cx.blocks.add(join as usize)).cond) != phi {
-            return false;
-        }
-        for i in 0..loop_size(cx, l) {
-            let b = loop_block(cx, l, i);
-            let mut v = (*cx.blocks.add(b as usize)).first;
-            while v != 0 {
-                for k in 0..ir_operand_count(cx, v) {
-                    let o = ir_operand(cx, v, k);
-                    if o != 0 && ir_val(cx, o) == phi {
-                        return false;
-                    }
-                }
-                v = (*cx.insts.add(v as usize)).next;
-            }
-        }
-        true
+fn only_branched_on(cx: &mut FnCtx<Comp>, l: i64, phi: i64, join: i64) -> bool {
+    if (cx.blocks[join as usize]).term != Term::Branch
+        || ir_val(cx, (cx.blocks[join as usize]).cond) != phi {
+        return false;
     }
+    for i in 0..loop_size(cx, l) {
+        let b = loop_block(cx, l, i);
+        let mut v = (cx.blocks[b as usize]).first;
+        while v != 0 {
+            for k in 0..ir_operand_count(cx, v) {
+                let o = ir_operand(cx, v, k);
+                if o != 0 && ir_val(cx, o) == phi {
+                    return false;
+                }
+            }
+            v = (cx.insts[v as usize]).next;
+        }
+    }
+    true
 }
 
 // If-converts the branch ending block h of loop l; returns whether it did.
-fn convert(cx: &mut FnCtx, l: i64, h: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let t = (*cx.blocks.add(h as usize)).s0;
-        let e = (*cx.blocks.add(h as usize)).s1;
-        if t == e || t == h || e == h {
-            return false;
-        }
-        let mut join: i64 = 0;
-        let mut arm_t: i64 = 0;
-        let mut arm_e: i64 = 0;
-        if is_arm(cx, t, h) && is_arm(cx, e, h)
-            && (*cx.blocks.add(t as usize)).s0 == (*cx.blocks.add(e as usize)).s0 {
-            join = (*cx.blocks.add(t as usize)).s0;
-            arm_t = t;
-            arm_e = e;
-        } else if is_arm(cx, t, h) && (*cx.blocks.add(t as usize)).s0 == e {
-            join = e;
-            arm_t = t;
-        } else if is_arm(cx, e, h) && (*cx.blocks.add(e as usize)).s0 == t {
-            join = t;
-            arm_e = e;
-        } else {
-            return false;
-        }
-        if join == h || join == loop_header(cx, l) || !loop_contains(cx, l, join)
-            || (join == t && arm_t != 0) || (join == e && arm_e != 0) {
-            return false;
-        }
-        let cost_t: i64 = if arm_t != 0 { arm_cost(cx, arm_t, pcx) } else { 0 };
-        let cost_e: i64 = if arm_e != 0 { arm_cost(cx, arm_e, pcx) } else { 0 };
-        if cost_t < 0 || cost_e < 0 || cost_t + cost_e > IFCONV_COST {
-            return false;
-        }
-        let index_t = pred_index(cx, join, if arm_t != 0 { arm_t } else { h });
-        let index_e = pred_index(cx, join, if arm_e != 0 { arm_e } else { h });
-        if index_t < 0 || index_e < 0 {
-            return false;
-        }
-        let mut selects: i64 = 0;
-        let mut phi = (*cx.blocks.add(join as usize)).first;
-        while phi != 0 && (*cx.insts.add(phi as usize)).op == Op::Phi {
-            let ir_arg_v2 = ir_arg(cx, phi, index_t);
-            let ir_val_v = ir_val(cx, ir_arg_v2);
-            let ir_arg_v3 = ir_arg(cx, phi, index_e);
-            let ir_val_v1 = ir_val(cx, ir_arg_v3);
-            if ir_val_v != ir_val_v1 {
-                if !is_integer((*cx.insts.add(phi as usize)).ty)
-                    && (*cx.insts.add(phi as usize)).ty != TY_BOOL {
-                    return false;
-                }
-                // (0.16) A bool only branched on (`a && b` as a condition)
-                // stays two branches: predictable ones cost less than the
-                // bools made and and-ed.
-                if (*cx.insts.add(phi as usize)).ty == TY_BOOL
-                    && only_branched_on(cx, l, phi, join) {
-                    return false;
-                }
-                selects += 1;
-            }
-            phi = (*cx.insts.add(phi as usize)).next;
-        }
-        if selects == 0 || selects > 3 {
-            return false;
-        }
-        let cond = (*cx.blocks.add(h as usize)).cond;
-        if arm_t != 0 {
-            move_up(cx, arm_t, h);
-        }
-        if arm_e != 0 {
-            move_up(cx, arm_e, h);
-        }
-        phi = (*cx.blocks.add(join as usize)).first;
-        while phi != 0 && (*cx.insts.add(phi as usize)).op == Op::Phi {
-            let ir_arg_v = ir_arg(cx, phi, index_t);
-            let value_t = ir_val(cx, ir_arg_v);
-            let ir_arg_v1 = ir_arg(cx, phi, index_e);
-            let value_e = ir_val(cx, ir_arg_v1);
-            let mut picked = value_t;
-            if value_t != value_e {
-                picked = ir_make(cx, Op::Sel, (*cx.insts.add(phi as usize)).ty, cond, value_t, 0,
-                    pcx);
-                (*cx.insts.add(picked as usize)).c = value_e;
-                ir_append(cx, h, picked);
-                // (k ? t + x : t is t + (k ? x : 0) at once: a reduction the
-                // vectorizer takes)
-                combine_select(cx, picked, pcx);
-            }
-            ir_set_arg(cx, phi, index_t, picked);
-            ir_set_arg(cx, phi, index_e, picked);
-            phi = (*cx.insts.add(phi as usize)).next;
-        }
-        // h jumps to the meeting block, once.
-        let removed_index = if arm_e != 0 { index_e } else { index_t };
-        let kept = if arm_e != 0 { arm_t } else { arm_e };
-        (*cx.blocks.add(h as usize)).term = Term::Jump;
-        (*cx.blocks.add(h as usize)).cond = 0;
-        (*cx.blocks.add(h as usize)).s0 = join;
-        (*cx.blocks.add(h as usize)).s1 = 0;
-        remove_pred_at(cx, join, removed_index);
-        if kept != 0 {
-            (*(*cx.blocks.add(join as usize)).preds.data.add(pred_index(cx, join, kept) as usize)) = h;
-        }
-        if arm_t != 0 {
-            drop_arm(cx, arm_t);
-        }
-        if arm_e != 0 {
-            drop_arm(cx, arm_e);
-        }
-        true
+fn convert(cx: &mut FnCtx<Comp>, l: i64, h: i64, pcx: &Ctx<Comp>) -> bool {
+    let t = (cx.blocks[h as usize]).s0;
+    let e = (cx.blocks[h as usize]).s1;
+    if t == e || t == h || e == h {
+        return false;
     }
+    let mut join: i64 = 0;
+    let mut arm_t: i64 = 0;
+    let mut arm_e: i64 = 0;
+    if is_arm(cx, t, h) && is_arm(cx, e, h)
+        && (cx.blocks[t as usize]).s0 == (cx.blocks[e as usize]).s0 {
+        join = (cx.blocks[t as usize]).s0;
+        arm_t = t;
+        arm_e = e;
+    } else if is_arm(cx, t, h) && (cx.blocks[t as usize]).s0 == e {
+        join = e;
+        arm_t = t;
+    } else if is_arm(cx, e, h) && (cx.blocks[e as usize]).s0 == t {
+        join = t;
+        arm_e = e;
+    } else {
+        return false;
+    }
+    if join == h || join == loop_header(cx, l) || !loop_contains(cx, l, join)
+        || (join == t && arm_t != 0) || (join == e && arm_e != 0) {
+        return false;
+    }
+    let cost_t: i64 = if arm_t != 0 { arm_cost(cx, arm_t, pcx) } else { 0 };
+    let cost_e: i64 = if arm_e != 0 { arm_cost(cx, arm_e, pcx) } else { 0 };
+    if cost_t < 0 || cost_e < 0 || cost_t + cost_e > IFCONV_COST {
+        return false;
+    }
+    let index_t = pred_index(cx, join, if arm_t != 0 { arm_t } else { h });
+    let index_e = pred_index(cx, join, if arm_e != 0 { arm_e } else { h });
+    if index_t < 0 || index_e < 0 {
+        return false;
+    }
+    let mut selects: i64 = 0;
+    let mut phi = (cx.blocks[join as usize]).first;
+    while phi != 0 && (cx.insts[phi as usize]).op == Op::Phi {
+        let ir_arg_v2 = ir_arg(cx, phi, index_t);
+        let ir_val_v = ir_val(cx, ir_arg_v2);
+        let ir_arg_v3 = ir_arg(cx, phi, index_e);
+        let ir_val_v1 = ir_val(cx, ir_arg_v3);
+        if ir_val_v != ir_val_v1 {
+            if !is_integer((cx.insts[phi as usize]).ty)
+                && (cx.insts[phi as usize]).ty != TY_BOOL {
+                return false;
+            }
+            // (0.16) A bool only branched on (`a && b` as a condition)
+            // stays two branches: predictable ones cost less than the
+            // bools made and and-ed.
+            if (cx.insts[phi as usize]).ty == TY_BOOL
+                && only_branched_on(cx, l, phi, join) {
+                return false;
+            }
+            selects += 1;
+        }
+        phi = (cx.insts[phi as usize]).next;
+    }
+    if selects == 0 || selects > 3 {
+        return false;
+    }
+    let cond = (cx.blocks[h as usize]).cond;
+    if arm_t != 0 {
+        move_up(cx, arm_t, h);
+    }
+    if arm_e != 0 {
+        move_up(cx, arm_e, h);
+    }
+    phi = (cx.blocks[join as usize]).first;
+    while phi != 0 && (cx.insts[phi as usize]).op == Op::Phi {
+        let ir_arg_v = ir_arg(cx, phi, index_t);
+        let value_t = ir_val(cx, ir_arg_v);
+        let ir_arg_v1 = ir_arg(cx, phi, index_e);
+        let value_e = ir_val(cx, ir_arg_v1);
+        let mut picked = value_t;
+        if value_t != value_e {
+            picked = ir_make(cx, Op::Sel, (cx.insts[phi as usize]).ty, cond, value_t, 0,
+                pcx);
+            (cx.insts[picked as usize]).c = value_e;
+            ir_append(cx, h, picked);
+            // (k ? t + x : t is t + (k ? x : 0) at once: a reduction the
+            // vectorizer takes)
+            combine_select(cx, picked, pcx);
+        }
+        ir_set_arg(cx, phi, index_t, picked);
+        ir_set_arg(cx, phi, index_e, picked);
+        phi = (cx.insts[phi as usize]).next;
+    }
+    // h jumps to the meeting block, once.
+    let removed_index = if arm_e != 0 { index_e } else { index_t };
+    let kept = if arm_e != 0 { arm_t } else { arm_e };
+    (cx.blocks[h as usize]).term = Term::Jump;
+    (cx.blocks[h as usize]).cond = 0;
+    (cx.blocks[h as usize]).s0 = join;
+    (cx.blocks[h as usize]).s1 = 0;
+    remove_pred_at(cx, join, removed_index);
+    if kept != 0 {
+        { let at_ix = pred_index(cx, join, kept) as usize;
+            cx.blocks[join as usize].preds[at_ix] = h; }
+    }
+    if arm_t != 0 {
+        drop_arm(cx, arm_t);
+    }
+    if arm_e != 0 {
+        drop_arm(cx, arm_e);
+    }
+    true
 }
 
 // (0.16) Branches to a common destination, merged (LLVM's
@@ -265,154 +249,146 @@ fn convert(cx: &mut FnCtx, l: i64, h: i64, pcx: &Ctx<Comp>) -> bool {
 // comparator's `<` and `<=` (lexicographic over fields) and the chains of
 // `&&` and `||` are one branch then, which mispredicts at most once. T's
 // phis must take the same value from h and B. Returns whether it merged.
-fn fold_branch_chain(cx: &mut FnCtx, l: i64, h: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        for side in 0..2 {
-            let b = if side == 0 { (*cx.blocks.add(h as usize)).s0 }
-                else { (*cx.blocks.add(h as usize)).s1 };
-            let t = if side == 0 { (*cx.blocks.add(h as usize)).s1 }
-                else { (*cx.blocks.add(h as usize)).s0 };
-            if b == h || b == t || (*cx.blocks.add(b as usize)).term != Term::Branch
-                || (*cx.blocks.add(b as usize)).preds.count != 1
-                || !loop_contains(cx, l, b) {
-                continue;
-            }
-            let b_to_t = (*cx.blocks.add(b as usize)).s0 == t;
-            if !b_to_t && (*cx.blocks.add(b as usize)).s1 != t {
-                continue;
-            }
-            let f = if b_to_t { (*cx.blocks.add(b as usize)).s1 }
-                else { (*cx.blocks.add(b as usize)).s0 };
-            if f == t || f == h || f == b || pred_index(cx, f, h) >= 0 {
-                continue;
-            }
-            let cost = arm_cost(cx, b, pcx);
-            if cost < 0 || cost > 2 * IFCONV_COST {
-                continue;
-            }
-            let from_h = pred_index(cx, t, h);
-            let from_b = pred_index(cx, t, b);
-            let mut same = from_h >= 0 && from_b >= 0;
-            let mut phi = (*cx.blocks.add(t as usize)).first;
-            while same && phi != 0 && (*cx.insts.add(phi as usize)).op == Op::Phi {
-                let ir_arg_v = ir_arg(cx, phi, from_h);
-                let ir_val_v = ir_val(cx, ir_arg_v);
-                let ir_arg_v1 = ir_arg(cx, phi, from_b);
-                let ir_val_v1 = ir_val(cx, ir_arg_v1);
-                if ir_val_v != ir_val_v1 {
-                    same = false;
-                }
-                phi = (*cx.insts.add(phi as usize)).next;
-            }
-            if !same {
-                continue;
-            }
-            // h's condition for T, B's for T, then their or.
-            let mut c1 = ir_val(cx, (*cx.blocks.add(h as usize)).cond);
-            if side == 0 {
-                c1 = ir_make(cx, Op::Not, TY_BOOL, c1, 0, 0, pcx);
-                ir_append(cx, h, c1);
-            }
-            move_up(cx, b, h);
-            let mut c2 = ir_val(cx, (*cx.blocks.add(b as usize)).cond);
-            if !b_to_t {
-                c2 = ir_make(cx, Op::Not, TY_BOOL, c2, 0, 0, pcx);
-                ir_append(cx, h, c2);
-            }
-            let c = ir_make(cx, Op::Or, TY_BOOL, c1, c2, 0, pcx);
-            ir_append(cx, h, c);
-            (*cx.blocks.add(h as usize)).cond = c;
-            (*cx.blocks.add(h as usize)).s0 = t;
-            (*cx.blocks.add(h as usize)).s1 = f;
-            // T loses B, F has h for B.
-            remove_pred_at(cx, t, from_b);
-            (*(*cx.blocks.add(f as usize)).preds.data.add(pred_index(cx, f, b) as usize)) = h;
-            drop_arm(cx, b);
-            return true;
+fn fold_branch_chain(cx: &mut FnCtx<Comp>, l: i64, h: i64, pcx: &Ctx<Comp>) -> bool {
+    for side in 0..2 {
+        let b = if side == 0 { (cx.blocks[h as usize]).s0 }
+            else { (cx.blocks[h as usize]).s1 };
+        let t = if side == 0 { (cx.blocks[h as usize]).s1 }
+            else { (cx.blocks[h as usize]).s0 };
+        if b == h || b == t || (cx.blocks[b as usize]).term != Term::Branch
+            || (cx.blocks[b as usize]).preds.len() as i64 != 1
+            || !loop_contains(cx, l, b) {
+            continue;
         }
-        false
+        let b_to_t = (cx.blocks[b as usize]).s0 == t;
+        if !b_to_t && (cx.blocks[b as usize]).s1 != t {
+            continue;
+        }
+        let f = if b_to_t { (cx.blocks[b as usize]).s1 }
+            else { (cx.blocks[b as usize]).s0 };
+        if f == t || f == h || f == b || pred_index(cx, f, h) >= 0 {
+            continue;
+        }
+        let cost = arm_cost(cx, b, pcx);
+        if cost < 0 || cost > 2 * IFCONV_COST {
+            continue;
+        }
+        let from_h = pred_index(cx, t, h);
+        let from_b = pred_index(cx, t, b);
+        let mut same = from_h >= 0 && from_b >= 0;
+        let mut phi = (cx.blocks[t as usize]).first;
+        while same && phi != 0 && (cx.insts[phi as usize]).op == Op::Phi {
+            let ir_arg_v = ir_arg(cx, phi, from_h);
+            let ir_val_v = ir_val(cx, ir_arg_v);
+            let ir_arg_v1 = ir_arg(cx, phi, from_b);
+            let ir_val_v1 = ir_val(cx, ir_arg_v1);
+            if ir_val_v != ir_val_v1 {
+                same = false;
+            }
+            phi = (cx.insts[phi as usize]).next;
+        }
+        if !same {
+            continue;
+        }
+        // h's condition for T, B's for T, then their or.
+        let mut c1 = ir_val(cx, (cx.blocks[h as usize]).cond);
+        if side == 0 {
+            c1 = ir_make(cx, Op::Not, TY_BOOL, c1, 0, 0, pcx);
+            ir_append(cx, h, c1);
+        }
+        move_up(cx, b, h);
+        let mut c2 = ir_val(cx, (cx.blocks[b as usize]).cond);
+        if !b_to_t {
+            c2 = ir_make(cx, Op::Not, TY_BOOL, c2, 0, 0, pcx);
+            ir_append(cx, h, c2);
+        }
+        let c = ir_make(cx, Op::Or, TY_BOOL, c1, c2, 0, pcx);
+        ir_append(cx, h, c);
+        (cx.blocks[h as usize]).cond = c;
+        (cx.blocks[h as usize]).s0 = t;
+        (cx.blocks[h as usize]).s1 = f;
+        // T loses B, F has h for B.
+        remove_pred_at(cx, t, from_b);
+        { let at_ix = pred_index(cx, f, b) as usize; cx.blocks[f as usize].preds[at_ix] = h; }
+        drop_arm(cx, b);
+        return true;
     }
+    false
 }
 
 // Whether block b holds phis only.
-fn only_phis(cx: &mut FnCtx, b: i64) -> bool {
-    unsafe {
-        let mut v = (*cx.blocks.add(b as usize)).first;
-        while v != 0 {
-            if (*cx.insts.add(v as usize)).op != Op::Phi {
-                return false;
-            }
-            v = (*cx.insts.add(v as usize)).next;
+fn only_phis(cx: &mut FnCtx<Comp>, b: i64) -> bool {
+    let mut v = (cx.blocks[b as usize]).first;
+    while v != 0 {
+        if (cx.insts[v as usize]).op != Op::Phi {
+            return false;
         }
-        true
+        v = (cx.insts[v as usize]).next;
     }
+    true
 }
 
 // If-converts the small branches of fi's innermost loops; returns whether
 // any was.
-pub fn if_convert_loops(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        if !pcx.ifconv || !has_arm(cx, fi) {
-            return false;
-        }
-        ir_enter(cx, fi, pcx);
-        analyze_loops(cx, fi);
-        let mut heads = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut owner = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut merged = false;
-        for l in 0..loop_count(cx) {
-            if !is_innermost(cx, l) {
-                continue;
-            }
-            for i in 0..loop_size(cx, l) {
-                let b = loop_block(cx, l, i);
-                // (0.16) A block of phis only, jumping to a block whose phis
-                // take them (an inner `if` meeting before the outer one):
-                // merged into it, so that the outer branch is a diamond.
-                if (*cx.blocks.add(b as usize)).removed == 0
-                    && (*cx.blocks.add(b as usize)).term == Term::Jump
-                    && (*cx.blocks.add(b as usize)).first != 0
-                    && (*cx.insts.add((*cx.blocks.add(b as usize)).first as usize)).op == Op::Phi
-                    && loop_contains(cx, l, (*cx.blocks.add(b as usize)).s0)
-                    && (*cx.blocks.add(b as usize)).s0 != loop_header(cx, l) && only_phis(cx, b)
-                    && merge_phi_block(cx, fi, b, (*cx.blocks.add(b as usize)).s0) {
-                    merged = true;
-                }
-            }
-        }
-        if merged {
-            // (the blocks changed: the loops again)
-            analyze_loops(cx, fi);
-        }
-        for l in 0..loop_count(cx) {
-            if !is_innermost(cx, l) {
-                continue;
-            }
-            for i in 0..loop_size(cx, l) {
-                let b = loop_block(cx, l, i);
-                if (*cx.blocks.add(b as usize)).removed == 0
-                    && (*cx.blocks.add(b as usize)).term == Term::Branch
-                    && ! {
-                    let at_arg2 = ir_val(cx, (*cx.blocks.add(b as usize)).cond);
-                    invariant_in(cx, l, at_arg2)
-                } {
-                    heads.push(b);
-                    owner.push(l);
-                }
-            }
-        }
-        let mut changed = merged;
-        for i in 0..heads.count {
-            let b = (*heads.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed == 0
-                && (*cx.blocks.add(b as usize)).term == Term::Branch
-                && (convert(cx, (*owner.data.add(i as usize)), b, pcx)
-                    || fold_branch_chain(cx, (*owner.data.add(i as usize)), b, pcx)) {
-                changed = true;
-            }
-        }
-        free(heads.data as *mut u8);
-        free(owner.data as *mut u8);
-        changed
+pub fn if_convert_loops(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
+    if !pcx.ifconv || !has_arm(cx, fi) {
+        return false;
     }
+    ir_enter(cx, fi, pcx);
+    analyze_loops(cx, fi);
+    let mut heads: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut owner: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut merged = false;
+    for l in 0..loop_count(cx) {
+        if !is_innermost(cx, l) {
+            continue;
+        }
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            // (0.16) A block of phis only, jumping to a block whose phis
+            // take them (an inner `if` meeting before the outer one):
+            // merged into it, so that the outer branch is a diamond.
+            if (cx.blocks[b as usize]).removed == 0
+                && (cx.blocks[b as usize]).term == Term::Jump
+                && (cx.blocks[b as usize]).first != 0
+                && (cx.insts[(cx.blocks[b as usize]).first as usize]).op == Op::Phi
+                && loop_contains(cx, l, (cx.blocks[b as usize]).s0)
+                && (cx.blocks[b as usize]).s0 != loop_header(cx, l) && only_phis(cx, b)
+                && merge_phi_block(cx, fi, b, (cx.blocks[b as usize]).s0) {
+                merged = true;
+            }
+        }
+    }
+    if merged {
+        // (the blocks changed: the loops again)
+        analyze_loops(cx, fi);
+    }
+    for l in 0..loop_count(cx) {
+        if !is_innermost(cx, l) {
+            continue;
+        }
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            if (cx.blocks[b as usize]).removed == 0
+                && (cx.blocks[b as usize]).term == Term::Branch
+                && ! {
+                let at_arg2 = ir_val(cx, (cx.blocks[b as usize]).cond);
+                invariant_in(cx, l, at_arg2)
+            } {
+                heads.push(b);
+                owner.push(l);
+            }
+        }
+    }
+    let mut changed = merged;
+    for i in 0..heads.len() as i64 {
+        let b = (heads[i as usize]);
+        if (cx.blocks[b as usize]).removed == 0
+            && (cx.blocks[b as usize]).term == Term::Branch
+            && (convert(cx, (owner[i as usize]), b, pcx)
+                || fold_branch_chain(cx, (owner[i as usize]), b, pcx)) {
+            changed = true;
+        }
+    }
+    changed
 }

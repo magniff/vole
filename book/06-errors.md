@@ -32,7 +32,7 @@ fn main(gpa: Gpa) {
     let line = "port = 8080";
     println("{:?} {:?}", line.find("="), line.find("#"));
 
-    let mut defaults: HashMap<&str, i64, Gpa> = HashMap::new_in(gpa);
+    let mut defaults: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     defaults.insert("port", 80);
     defaults.insert("workers", 4);
     let port = defaults.get("port").copied().unwrap_or(0);

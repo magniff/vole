@@ -9,7 +9,7 @@
 $ unsafe --no-std
 unsafe0253/main.vl:7	extern	crate::extern	ffi	justified	3 C functions
 unsafe0253/main.vl:23	block	crate::main	alloc	justified	c-call(malloc)
-unsafe0253/main.vl:24	block	crate::main	raw-pointer	missing both	other x4, deref x3, unsafe-call(*i64::add) x3
+unsafe0253/main.vl:24	block	crate::main	raw-pointer	missing both	other x4, deref x3, unsafe-call(*mut i64::add) x3
 unsafe0253/main.vl:31	block	crate::main	ffi	missing UNSAFE:	c-call(abs)
 unsafe0253/main.vl:35	block	crate::main	raw-pointer	justified	unsafe-call(raw::first)
 unsafe0253/main.vl:38	block	crate::main	raw-pointer	justified	unsafe-call(raw::sum)
@@ -17,19 +17,19 @@ unsafe0253/main.vl:40	block	crate::main	other	justified	union-field
 unsafe0253/main.vl:44	block	crate::main	other	missing UNSAFE:	none (unneeded)
 unsafe0253/main.vl:47	block	crate::main	other	missing both	none (unneeded)
 unsafe0253/main.vl:48	block	crate::main	alloc	missing both	c-call(free)
-unsafe0253/raw.vl:5	unsafe fn	crate::raw::sum	raw-pointer	justified	deref, unsafe-call(*i64::add)
+unsafe0253/raw.vl:5	unsafe fn	crate::raw::sum	raw-pointer	justified	deref, unsafe-call(*const i64::add)
 unsafe0253/raw.vl:13	unsafe fn	crate::raw::first	raw-pointer	missing both	deref
 unsafe0253/raw.vl:19	block	crate::raw::peek	raw-pointer	missing both	deref
 sites: 13 (10 blocks, 2 unsafe fns, 1 extern blocks); unjustified: 7; unneeded: 2
 try: volec fix --only unneeded-unsafe
 ## A FILE's sites; the unjustified ones.
 $ unsafe unsafe0253/raw.vl
-unsafe0253/raw.vl:5	unsafe fn	crate::raw::sum	raw-pointer	justified	deref, unsafe-call(*i64::add)
+unsafe0253/raw.vl:5	unsafe fn	crate::raw::sum	raw-pointer	justified	deref, unsafe-call(*const i64::add)
 unsafe0253/raw.vl:13	unsafe fn	crate::raw::first	raw-pointer	missing both	deref
 unsafe0253/raw.vl:19	block	crate::raw::peek	raw-pointer	missing both	deref
 sites: 3 (1 blocks, 2 unsafe fns, 0 extern blocks); unjustified: 2; unneeded: 0
 $ unsafe --no-std --unjustified
-unsafe0253/main.vl:24	block	crate::main	raw-pointer	missing both	other x4, deref x3, unsafe-call(*i64::add) x3
+unsafe0253/main.vl:24	block	crate::main	raw-pointer	missing both	other x4, deref x3, unsafe-call(*mut i64::add) x3
 unsafe0253/main.vl:31	block	crate::main	ffi	missing UNSAFE:	c-call(abs)
 unsafe0253/main.vl:44	block	crate::main	other	missing UNSAFE:	none (unneeded)
 unsafe0253/main.vl:47	block	crate::main	other	missing both	none (unneeded)
@@ -63,6 +63,6 @@ missing UNSAFE:	2	2
 try: volec fix --only unneeded-unsafe
 ## One object a site.
 $ unsafe unsafe0253/raw.vl --json
-{"file":"unsafe0253/raw.vl","line":5,"kind":"unsafe fn","item":"crate::raw::sum","class":"raw-pointer","unsafe_comment":true,"safety_comment":true,"justified":true,"checked":true,"ops":"deref, unsafe-call(*i64::add)"}
+{"file":"unsafe0253/raw.vl","line":5,"kind":"unsafe fn","item":"crate::raw::sum","class":"raw-pointer","unsafe_comment":true,"safety_comment":true,"justified":true,"checked":true,"ops":"deref, unsafe-call(*const i64::add)"}
 {"file":"unsafe0253/raw.vl","line":13,"kind":"unsafe fn","item":"crate::raw::first","class":"raw-pointer","unsafe_comment":false,"safety_comment":false,"justified":false,"checked":true,"ops":"deref"}
 {"file":"unsafe0253/raw.vl","line":19,"kind":"block","item":"crate::raw::peek","class":"raw-pointer","unsafe_comment":false,"safety_comment":false,"justified":false,"checked":true,"ops":"deref"}

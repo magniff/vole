@@ -23,6 +23,15 @@
 #   -s SEED       the seed binary (`vole build -O`)
 #   -r RUNS       runs per measurement (default 5)
 #   -t TARGET     the target (default: the host)
+#
+# (0.29) A run that fails ends with one line that says which program and
+# why, `bench: PROGRAM VARIANT: ...` (a program that does not build with
+# the compiler measured, or stops: its exit status or signal and the last
+# line it wrote to stderr, a panic's message; an output that differs; a
+# ratio above its bound), or, for anything else, `bench: failed (exit N)
+# while ...`: bootstrap/gate.sh's bench row shows that line. In 0.28.0 a
+# program that panicked ended the run in the middle of its row, and the
+# gate's row was empty.
 
 set -eu
 LC_ALL=C
@@ -41,7 +50,7 @@ while [ $# -gt 0 ]; do
         -s) SEED=$2; shift 2 ;;
         -r) RUNS=$2; shift 2 ;;
         -t) TARGET=$2; shift 2 ;;
-        *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -59,8 +68,30 @@ case "$TARGET" in
 esac
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-bench.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
+# (0.29) the last line of a failed run: fail's, or what was being done
+SAID=0
+STAGE="starting"
+fail() {
+    echo
+    echo "bench: $*"
+    SAID=1
+    exit 1
+}
+trap 'rc=$?; [ $rc -eq 0 ] || [ $SAID -eq 1 ] || { echo; echo "bench: failed (exit $rc) while $STAGE"; }; rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
+# Times command $5 as timer does (RUNS INPUT OUTPUT command), printing
+# the milliseconds. When the program stops: false, and $WORK/why says
+# which ($1) and how, the last line it wrote to stderr (a panic's
+# message) and timer's (its exit status or signal); the caller, not in a
+# `$(...)`, fails the run with it: `ms=$(timed ...) || fail "$(cat "$WORK/why")"`.
+timed() { # <what> <runs> <input> <output> <command>
+    td_what=$1
+    shift
+    "$WORK/timer" "$@" 2>"$WORK/timed.err" && return 0
+    echo "$td_what: the program failed: $(sed "s|$WORK/||g" "$WORK/timed.err" | grep -v '^$' | tail -2 | tr '\n' ' ' | sed 's/ $//')" >"$WORK/why"
+    return 1
+}
+STAGE="building bench/timer.c"
 # shellcheck disable=SC2086
 "$CC" -O2 -o "$WORK/timer" "$ROOT/bench/timer.c"
 dd if=/dev/zero of="$WORK/md5.in" bs=1048576 count=8 2>/dev/null
@@ -81,10 +112,7 @@ build() {
             # shellcheck disable=SC2086
             "$CC" $ARCH -o "$3" "$3.o" -lm
             return ;;
-        # (0.28.0) a release that still has editions (0.27) is told the
-        # one the programs are in: they no longer say it themselves
-        # shellcheck disable=SC2086
-        previous) "$PREVIOUS" $PREVIOUS_EDITION --target "$TARGET" "$1" -o "$3.s" >/dev/null 2>&1 || return 1 ;;
+        previous) "$PREVIOUS" --target "$TARGET" "$1" -o "$3.s" >/dev/null 2>&1 || return 1 ;;
         seed)
             # The seed knows only 0.2's declarations of C functions.
             awk -f "$ROOT/tests/seed-compat.awk" "$1" >"$3.vl"
@@ -95,10 +123,6 @@ build() {
     "$CC" $ARCH -o "$3" "$3.s" -lm
 }
 
-PREVIOUS_EDITION=""
-if [ -n "$PREVIOUS" ]; then
-    case "$("$PREVIOUS" --version 2>/dev/null)" in *" 0.27."*) PREVIOUS_EDITION="--edition rust" ;; esac
-fi
 VARIANTS="O0 O1 O2"
 [ -n "$PREVIOUS" ] && VARIANTS="previous $VARIANTS"
 [ -n "$SEED" ] && VARIANTS="$VARIANTS seed"
@@ -116,12 +140,18 @@ for source in "$ROOT"/bench/*.vl "$ROOT/examples/md5/main.vl"; do
     reference=""
     row=""
     for v in $VARIANTS; do
+        STAGE="building $name $v"
         if ! build "$source" "$v" "$WORK/$name.$v"; then
+            # (0.29) the compiler measured builds every program; the
+            # previous release and the seed may not know its language
+            case "$v" in
+                O0|O1|O2) fail "$name $v: does not build: $(grep -m1 -i 'error' "$WORK/$name.$v.out" 2>/dev/null || echo "the link failed")" ;;
+            esac
             printf " %9s" "-"
             row="$row -"
             continue
         fi
-        ms=$("$WORK/timer" "$RUNS" "$input" "$WORK/$name.$v.out" "$WORK/$name.$v")
+        ms=$(timed "$name $v" "$RUNS" "$input" "$WORK/$name.$v.out" "$WORK/$name.$v") || fail "$(cat "$WORK/why")"
         printf " %9s" "$ms"
         row="$row $ms"
         if [ "$v" = O2 ]; then
@@ -137,15 +167,17 @@ for source in "$ROOT"/bench/*.vl "$ROOT/examples/md5/main.vl"; do
         if [ -z "$reference" ]; then
             reference="$WORK/$name.$v.out"
         elif ! cmp -s "$reference" "$WORK/$name.$v.out"; then
-            echo; echo "bench: $name: the $v output differs" >&2; exit 1
+            fail "$name $v: the output differs from $(basename "$reference" .out | sed "s/^$name\.//")'s"
         fi
     done
     c="$ROOT/bench/$name.c"
     if [ -f "$c" ]; then
         # shellcheck disable=SC2086
+        STAGE="building bench/$name.c with $CC -O2"
         "$CC" $ARCH -O2 -o "$WORK/$name.c.bin" "$c" -lm
-        ms=$("$WORK/timer" "$RUNS" "$input" "$WORK/$name.c.out" "$WORK/$name.c.bin")
-        cmp -s "$reference" "$WORK/$name.c.out" || { echo; echo "bench: $name: the C output differs" >&2; exit 1; }
+        ms=$(timed "$name cc -O2" "$RUNS" "$input" "$WORK/$name.c.out" "$WORK/$name.c.bin") || fail "$(cat "$WORK/why")"
+        cmp -s "$reference" "$WORK/$name.c.out" || fail "$name cc -O2: the C program's output differs"
+        STAGE="the table"
         printf " %9s\n" "$ms"
         echo "$row $ms" >>"$WORK/times"
     else
@@ -154,6 +186,7 @@ for source in "$ROOT"/bench/*.vl "$ROOT/examples/md5/main.vl"; do
 done
 
 # The geometric means of the ratios to cc -O2 (a time of 0 counts as 1 ms).
+STAGE="the geometric means"
 printf "%-10s" "geomean"
 awk -v n="$(echo $VARIANTS | wc -w)" '
     { c = $NF < 1 ? 1 : $NF
@@ -170,13 +203,14 @@ awk -v n="$(echo $VARIANTS | wc -w)" '
 # made by hand with Buf's push_int (bench/fmtints.vl).
 # usage: ratio NAME MS OTHER OTHER_MS WHAT
 ratio() {
+    STAGE="the ratio $1/$3"
     a_ms=$2
     b_ms=$4
     round=0
     while [ $round -lt "$RUNS" ]; do
-        ms=$("$WORK/timer" 1 "$WORK/empty" "$WORK/$1.round.out" "$WORK/$1.O2")
+        ms=$(timed "$1 O2" 1 "$WORK/empty" "$WORK/$1.round.out" "$WORK/$1.O2") || fail "$(cat "$WORK/why")"
         [ "$ms" -lt "$a_ms" ] && a_ms=$ms
-        ms=$("$WORK/timer" 1 "$WORK/empty" "$WORK/$3.round.out" "$WORK/$3.O2")
+        ms=$(timed "$3 O2" 1 "$WORK/empty" "$WORK/$3.round.out" "$WORK/$3.O2") || fail "$(cat "$WORK/why")"
         [ "$ms" -lt "$b_ms" ] && b_ms=$ms
         round=$((round + 1))
     done
@@ -185,8 +219,7 @@ ratio() {
     r=$(awk -v a="$a_ms" -v b="$b_ms" 'BEGIN { if (b < 1) b = 1; if (a < 1) a = 1; printf "%.3f", a / b }')
     printf "%-10s %9s\n" "$1/$3" "$r"
     if awk -v r="$r" 'BEGIN { exit !(r > 1.05) }'; then
-        echo "bench: $1/$3 is $r, above 1.05: $5 are not zero cost" >&2
-        exit 1
+        fail "$1/$3 is $r, above 1.05: $5 are not zero cost"
     fi
 }
 if [ -n "${CHAIN_MS:-}" ] && [ -n "${LOOP_MS:-}" ]; then

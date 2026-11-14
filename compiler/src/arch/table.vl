@@ -4,6 +4,8 @@
 // do not know themselves. compiler/arch/README.md gives the formats; a
 // malformed line is an internal error (the tables are the compiler's).
 
+use std::sync::atomic::{Atomic, Ordering};
+
 use crate::arch::{
     ARCH_AARCH64, ARCH_PORTABLE, ARCH_X86_64, FEAT_DETECT, FEAT_HAS, FIELD_COUNT, FORM_BITS,
     FORM_CAST, FORM_FEAT, FORM_HINT, FORM_INTR, FORM_INTR_MEM, FORM_LOAD, FORM_LOAD_DUP, FORM_STORE,
@@ -13,37 +15,31 @@ use crate::arch::{
 };
 use crate::arch::features::feature_bit_in;
 use crate::arch::tables::{insn_a64_source, insn_x86_source, intrinsics_source};
-use crate::back::objfile::{NameMap, name_get, name_put};
-use crate::base::{IntVec, buf_freeze, buf_new, die, get_bufs, grow, intern};
+use crate::base::{buf_done, buf_new, die, intern};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::get_x86;
+use crate::front::lexer::find_byte;
 use crate::middle::ir::{BITS_LEADING, BITS_ONES, BITS_TRAILING, Cond, Op};
 
 const PARAM_WIDTH: i64 = 5;
 
-extern "C" {
-    fn memchr(s: *mut u8, c: i32, n: u64) -> *mut u8;
-}
-
 pub fn param_entry(p: i64, k: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (*pcx.params.data.add((p * PARAM_WIDTH + k) as usize)) }
+    (pcx.params[(p * PARAM_WIDTH + k) as usize])
 }
 
 // The type text of parameter p (an index as IntrInfo.params + k).
 pub fn param_type_text(p: i64, pcx: &Ctx<Comp>) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(
-        (*get_bufs().add(pcx.table_buf as usize)).data.add((param_entry(p, 1, pcx)) as usize),
-        (param_entry(p, 2, pcx) - (param_entry(p, 1, pcx))) as usize) }
+    &buf_done(pcx.table_buf)[
+        (param_entry(p, 1, pcx)) as usize..param_entry(p, 2, pcx) as usize]
 }
 
 fn byte(i: i64, pcx: &Ctx<Comp>) -> u8 {
-    unsafe { (*pcx.table_text.add(i as usize)) }
+    pcx.table_text[i as usize]
 }
 
 fn text(a: i64, b: i64, pcx: &Ctx<Comp>) -> &'static [u8] {
-    unsafe { std::slice::from_raw_parts(
-        (*get_bufs().add(pcx.table_buf as usize)).data.add((a) as usize), (b - (a)) as usize) }
+    &buf_done(pcx.table_buf)[a as usize..b as usize]
 }
 
 fn is(a: i64, b: i64, word: &[u8], pcx: &Ctx<Comp>) -> bool {
@@ -62,16 +58,16 @@ fn starts(a: i64, b: i64, word: &[u8], pcx: &Ctx<Comp>) -> bool {
     b - a >= word.len() as i64 && is(a, a + word.len() as i64, word, pcx)
 }
 
-fn bad(what: *mut u8) -> ! {
+fn bad(what: *const u8) -> ! {
     die(what);
 }
 
 // An integer at [a, b), decimal (with a sign) or 0x hexadecimal.
 fn number(a: i64, b: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { number_in(a, b, pcx) }
+    number_in(a, b, pcx)
 }
 
-unsafe fn number_in(a: i64, b: i64, pcx: &Ctx<Comp>) -> i64 {
+fn number_in(a: i64, b: i64, pcx: &Ctx<Comp>) -> i64 {
     let mut i = a;
     let mut negative = false;
     if i < b && byte(i, pcx) == b'-' {
@@ -119,75 +115,70 @@ fn trim_end(a: i64, b: i64, pcx: &Ctx<Comp>) -> i64 {
 }
 
 // Splits the line [a, b) at " | " into FIELDS (want fields); false when it
-// has another count. (0.25: the '|'s found by memchr)
+// has another count. (0.25: the '|'s found by find_byte)
 fn split_fields(a: i64, b: i64, want: i64, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        let t = pcx.table_text;
-        let mut start = a;
-        let mut n: i64 = 0;
-        while true {
-            // (the next " | " from start, else b)
-            let mut sep = b;
-            let mut q = start + 1;
-            while q + 1 < b {
-                let bar = memchr(t.add(q as usize), b'|' as i32, (b - 1 - q) as u64);
-                if bar == 0 as *mut u8 {
-                    break;
-                }
-                q += bar as i64 - (t.add(q as usize)) as i64;
-                if (*t.add((q - 1) as usize)) == b' ' && (*t.add((q + 1) as usize)) == b' ' {
-                    sep = q - 1;
-                    break;
-                }
-                q += 1;
+    let t = pcx.table_text;
+    let mut start = a;
+    let mut n: i64 = 0;
+    loop {
+        // (the next " | " from start, else b)
+        let mut sep = b;
+        let mut q = start + 1;
+        while q + 1 < b {
+            match find_byte(&t[q as usize..(b - 1) as usize], b'|') {
+                Some(at) => q += at as i64,
+                None => break,
             }
-            pcx.table_fields.push(trim_start(start, sep, pcx));
-            pcx.table_fields.push(trim_end(start, sep, pcx));
-            n += 1;
-            if sep == b {
+            if t[(q - 1) as usize] == b' ' && t[(q + 1) as usize] == b' ' {
+                sep = q - 1;
                 break;
             }
-            start = sep + 3;
+            q += 1;
         }
-        n == want
+        pcx.table_fields.push(trim_start(start, sep, pcx));
+        pcx.table_fields.push(trim_end(start, sep, pcx));
+        n += 1;
+        if sep == b {
+            break;
+        }
+        start = sep + 3;
     }
+    n == want
 }
 
 // The table, parsed on the first call.
 pub fn load_table(pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if pcx.table_buf >= 0 {
-            return;
+    if pcx.table_buf >= 0 {
+        return;
+    }
+    pcx.table_buf = buf_new();
+    intrinsics_source(pcx.table_buf);
+    // (0.27.7: written once, here, then frozen: its bytes are never moved
+    // or written again, so table_text and the readers' views stay valid)
+    let t = buf_done(pcx.table_buf);
+    pcx.table_text = t;
+    init_name_table(pcx);
+    let len = t.len() as i64;
+    let mut arch = ARCH_PORTABLE;
+    let mut a: i64 = 0;
+    while a < len {
+        // (the end of the line, by find_byte)
+        let b = match find_byte(&t[a as usize..], b'\n') {
+            Some(at) => a + at as i64,
+            None => len,
+        };
+        if byte(a, pcx) == b'=' {
+            arch = if is(a + 2, b, b"aarch64", pcx) { ARCH_AARCH64 }
+                else if is(a + 2, b, b"x86_64", pcx) { ARCH_X86_64 } else { ARCH_PORTABLE };
+        } else {
+            parse_intrinsic(a, b, arch, pcx);
         }
-        pcx.table_buf = buf_new();
-        intrinsics_source(pcx.table_buf);
-        // (0.27.7: written once, here; its bytes are then never moved or
-        // written, so table_text and the readers' views stay valid)
-        buf_freeze(pcx.table_buf);
-        init_name_table(pcx);
-        let len = (*get_bufs().add(pcx.table_buf as usize)).len;
-        let t = (*get_bufs().add(pcx.table_buf as usize)).data;
-        pcx.table_text = t;
-        let mut arch = ARCH_PORTABLE;
-        let mut a: i64 = 0;
-        while a < len {
-            // (the end of the line, by memchr)
-            let nl = memchr(t.add(a as usize), b'\n' as i32, (len - a) as u64);
-            let b = if nl == 0 as *mut u8 { len }
-                else { a + (nl as i64 - (t.add(a as usize)) as i64) };
-            if byte(a, pcx) == b'=' {
-                arch = if is(a + 2, b, b"aarch64", pcx) { ARCH_AARCH64 }
-                    else if is(a + 2, b, b"x86_64", pcx) { ARCH_X86_64 } else { ARCH_PORTABLE };
-            } else {
-                parse_intrinsic(a, b, arch, pcx);
-            }
-            a = b + 1;
-        }
-        crate::arch::template::reserve_slot_names(pcx);
-        for id in 0..pcx.intr_count {
-            if (*pcx.intrs.add(id as usize)).form == FORM_INTR_MEM {
-                link_parts(id, pcx);
-            }
+        a = b + 1;
+    }
+    crate::arch::template::reserve_slot_names(pcx);
+    for id in 0..pcx.intrs.len() as i64 {
+        if (pcx.intrs[id as usize]).form == FORM_INTR_MEM {
+            link_parts(id, pcx);
         }
     }
 }
@@ -198,312 +189,297 @@ pub fn load_table(pcx: &mut Ctx<Comp>) {
 // Their ids in part1 and part2 (made while the table is parsed: no symbol
 // is made later).
 fn link_parts(id: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let name = intr_text(id, F_NAME, pcx);
-        let load = name.len() > 6 && name[0..6] == b"vld2q_";
-        let store = name.len() > 6 && name[0..6] == b"vst2q_";
-        if !load && !store {
-            bad(c"internal error: arch table: an intr.mem intrinsic lowering does not know");
+    let name = intr_text(id, F_NAME, pcx);
+    let load = name.len() > 6 && name[0..6] == b"vld2q_";
+    let store = name.len() > 6 && name[0..6] == b"vst2q_";
+    if !load && !store {
+        bad(c"internal error: arch table: an intr.mem intrinsic lowering does not know");
+    }
+    let mut tmp: [u8; 48] = [0; 48];
+    let rest = name.len() as i64 - 6;
+    if rest > 40 {
+        bad(c"internal error: arch table: a name too long");
+    }
+    for k in 0..2 {
+        let head = if load { "vuzp" } else { "vzip" };
+        for j in 0..4 {
+            tmp[j as usize] = head[j as usize];
         }
-        let mut tmp: [u8; 48] = [0; 48];
-        let rest = name.len() as i64 - 6;
-        if rest > 40 {
-            bad(c"internal error: arch table: a name too long");
+        tmp[4] = if k == 0 { b'1' } else { b'2' };
+        tmp[5] = b'q';
+        tmp[6] = b'_';
+        for j in 0..rest {
+            tmp[(7 + j) as usize] = name[(6 + j) as usize];
         }
-        for k in 0..2 {
-            let head = if load { "vuzp" } else { "vzip" };
-            for j in 0..4 {
-                tmp[j as usize] = head[j as usize];
-            }
-            tmp[4] = if k == 0 { b'1' } else { b'2' };
-            tmp[5] = b'q';
-            tmp[6] = b'_';
-            for j in 0..rest {
-                tmp[(7 + j) as usize] = name[(6 + j) as usize];
-            }
-            let part = (*pcx.intr_by_name.add(intern(&tmp[0..(7 + rest) as usize], pcx) as usize)) - 1;
-            if part < 0 {
-                bad(c"internal error: arch table: an intr.mem intrinsic without its permutes");
-            }
-            if k == 0 {
-                (*pcx.intrs.add(id as usize)).part1 = part;
-            } else {
-                (*pcx.intrs.add(id as usize)).part2 = part;
-            }
+        let part = ({
+            let at_ix = intern(&tmp[0..(7 + rest) as usize], pcx) as usize;
+            pcx.intr_by_name[at_ix]
+        }) - 1;
+        if part < 0 {
+            bad(c"internal error: arch table: an intr.mem intrinsic without its permutes");
+        }
+        if k == 0 {
+            (pcx.intrs[id as usize]).part1 = part;
+        } else {
+            (pcx.intrs[id as usize]).part2 = part;
         }
     }
 }
 
 fn field_start(base: i64, f: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (*pcx.table_fields.data.add((base + 2 * f) as usize)) }
+    (pcx.table_fields[(base + 2 * f) as usize])
 }
 
 fn field_end(base: i64, f: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (*pcx.table_fields.data.add((base + 2 * f + 1) as usize)) }
+    (pcx.table_fields[(base + 2 * f + 1) as usize])
 }
 
 fn parse_intrinsic(a: i64, b: i64, arch: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let base = pcx.table_fields.count;
-        if !split_fields(a, b, FIELD_COUNT, pcx) {
-            bad(c"internal error: arch table: a line without its 11 columns");
-        }
-        let id = pcx.intr_count;
-        pcx.intrs = grow(pcx.intrs, pcx.intr_count, &mut pcx.intr_cap);
-        pcx.intr_count += 1;
-        let name = intern(text(field_start(base, F_NAME, pcx), field_end(base, F_NAME, pcx), pcx),
-            pcx);
-        (*pcx.intrs.add(id as usize)) = IntrInfo {
-            name, arch, features: 0, form: 0, form_arg: 0, work: 0,
-            params: pcx.params.count / PARAM_WIDTH,
-            nparams: 0, ret_start: 0, ret_end: 0, consts: 0, flags: 0, mem: MEM_NONE, mem_param: -1,
-            mem_bytes: 0, fields: base, part1: -1, part2: -1,
-        };
-        if (*pcx.intr_by_name.add(name as usize)) != 0 {
-            bad(c"internal error: arch table: an intrinsic named twice");
-        }
-        (*pcx.intr_by_name.add(name as usize)) = id + 1;
-        parse_features(id, field_start(base, F_FEATURES, pcx), field_end(base, F_FEATURES, pcx),
-            arch, pcx);
-        parse_signature(id, field_start(base, F_SIGNATURE, pcx), field_end(base, F_SIGNATURE, pcx),
-            pcx);
-        parse_form(id, field_start(base, F_FORM, pcx), field_end(base, F_FORM, pcx), pcx);
-        parse_flags(id, field_start(base, F_FLAGS, pcx), field_end(base, F_FLAGS, pcx), pcx);
-        parse_memory(id, field_start(base, F_MEMORY, pcx), field_end(base, F_MEMORY, pcx), pcx);
+    let base = pcx.table_fields.len() as i64;
+    if !split_fields(a, b, FIELD_COUNT, pcx) {
+        bad(c"internal error: arch table: a line without its 11 columns");
     }
+    let id = pcx.intrs.len() as i64;
+    let name = intern(text(field_start(base, F_NAME, pcx), field_end(base, F_NAME, pcx), pcx),
+        pcx);
+    pcx.intrs.push(IntrInfo {
+        name, arch, features: 0, form: 0, form_arg: 0, work: 0,
+        params: pcx.params.len() as i64 / PARAM_WIDTH,
+        nparams: 0, ret_start: 0, ret_end: 0, consts: 0, flags: 0, mem: MEM_NONE, mem_param: -1,
+        mem_bytes: 0, fields: base, part1: -1, part2: -1,
+    });
+    if (pcx.intr_by_name[name as usize]) != 0 {
+        bad(c"internal error: arch table: an intrinsic named twice");
+    }
+    (pcx.intr_by_name[name as usize]) = id + 1;
+    parse_features(id, field_start(base, F_FEATURES, pcx), field_end(base, F_FEATURES, pcx),
+        arch, pcx);
+    parse_signature(id, field_start(base, F_SIGNATURE, pcx), field_end(base, F_SIGNATURE, pcx),
+        pcx);
+    parse_form(id, field_start(base, F_FORM, pcx), field_end(base, F_FORM, pcx), pcx);
+    parse_flags(id, field_start(base, F_FLAGS, pcx), field_end(base, F_FLAGS, pcx), pcx);
+    parse_memory(id, field_start(base, F_MEMORY, pcx), field_end(base, F_MEMORY, pcx), pcx);
 }
 
 // `neon`, `crc`, `sse4.2`, comma-separated; `-`: none.
 fn parse_features(id: i64, a: i64, b: i64, arch: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if is(a, b, b"-", pcx) {
-            return;
+    if is(a, b, b"-", pcx) {
+        return;
+    }
+    let mut i = a;
+    while i < b {
+        let mut j = i;
+        while j < b && byte(j, pcx) != b',' {
+            j += 1;
         }
-        let mut i = a;
-        while i < b {
-            let mut j = i;
-            while j < b && byte(j, pcx) != b',' {
-                j += 1;
-            }
-            let bit = feature_bit_in(text(trim_start(i, j, pcx), trim_end(i, j, pcx), pcx), arch);
-            if bit < 0 {
-                bad(c"internal error: arch table: an unknown feature");
-            }
-            (*pcx.intrs.add(id as usize)).features |= 1 << bit as u64;
-            i = j + 1;
+        let bit = feature_bit_in(text(trim_start(i, j, pcx), trim_end(i, j, pcx), pcx), arch);
+        if bit < 0 {
+            bad(c"internal error: arch table: an unknown feature");
         }
+        (pcx.intrs[id as usize]).features |= 1 << bit as u64;
+        i = j + 1;
     }
 }
 
 // `(a: T, n: const LO..=HI) -> R` or `(s: [u8], i: i64, v: T)`.
 fn parse_signature(id: i64, a: i64, b: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if a >= b || byte(a, pcx) != b'(' {
-            bad(c"internal error: arch table: a signature without '('");
-        }
-        let mut close = a;
-        while close < b && byte(close, pcx) != b')' {
-            close += 1;
-        }
-        if close >= b {
-            bad(c"internal error: arch table: a signature without ')'");
-        }
-        let mut i = a + 1;
-        let mut k: i64 = 0;
-        while i < close {
-            let mut j = i;
-            let mut depth: i64 = 0;
-            while j < close && !(byte(j, pcx) == b',' && depth == 0) {
-                if byte(j, pcx) == b'[' || byte(j, pcx) == b'(' {
-                    depth += 1;
-                } else if byte(j, pcx) == b']' || byte(j, pcx) == b')' {
-                    depth -= 1;
-                }
-                j += 1;
+    if a >= b || byte(a, pcx) != b'(' {
+        bad(c"internal error: arch table: a signature without '('");
+    }
+    let mut close = a;
+    while close < b && byte(close, pcx) != b')' {
+        close += 1;
+    }
+    if close >= b {
+        bad(c"internal error: arch table: a signature without ')'");
+    }
+    let mut i = a + 1;
+    let mut k: i64 = 0;
+    while i < close {
+        let mut j = i;
+        let mut depth: i64 = 0;
+        while j < close && !(byte(j, pcx) == b',' && depth == 0) {
+            if byte(j, pcx) == b'[' || byte(j, pcx) == b'(' {
+                depth += 1;
+            } else if byte(j, pcx) == b']' || byte(j, pcx) == b')' {
+                depth -= 1;
             }
-            let s = trim_start(i, j, pcx);
-            let e = trim_end(i, j, pcx);
-            let mut colon = s;
-            while colon < e && byte(colon, pcx) != b':' {
-                colon += 1;
-            }
-            if colon >= e {
-                bad(c"internal error: arch table: a parameter without its type");
-            }
-            let ts = trim_start(colon + 1, e, pcx);
-            let param = intern(text(s, colon, pcx), pcx);
-            pcx.params.push(param);
-            if starts(ts, e, b"const ", pcx) {
-                // `const LO..=HI`
-                let r = trim_start(ts + 6, e, pcx);
-                let mut dots = r;
-                while dots + 2 < e && !(byte(dots, pcx) == b'.' && byte(dots + 1, pcx) == b'.') {
-                    dots += 1;
-                }
-                if dots + 2 >= e || byte(dots + 2, pcx) != b'=' {
-                    bad(c"internal error: arch table: an immediate without LO..=HI");
-                }
-                pcx.params.push(ts);
-                pcx.params.push(ts);
-                pcx.params.push(number(r, dots, pcx));
-                pcx.params.push(number(dots + 3, e, pcx));
-                (*pcx.intrs.add(id as usize)).consts |= 1 << k as u64;
-            } else {
-                pcx.params.push(ts);
-                pcx.params.push(e);
-                pcx.params.push(1);
-                pcx.params.push(0);
-            }
-            k += 1;
-            i = j + 1;
+            j += 1;
         }
-        (*pcx.intrs.add(id as usize)).nparams = k;
-        let r = trim_start(close + 1, b, pcx);
-        if starts(r, b, b"->", pcx) {
-            (*pcx.intrs.add(id as usize)).ret_start = trim_start(r + 2, b, pcx);
-            (*pcx.intrs.add(id as usize)).ret_end = b;
+        let s = trim_start(i, j, pcx);
+        let e = trim_end(i, j, pcx);
+        let mut colon = s;
+        while colon < e && byte(colon, pcx) != b':' {
+            colon += 1;
+        }
+        if colon >= e {
+            bad(c"internal error: arch table: a parameter without its type");
+        }
+        let ts = trim_start(colon + 1, e, pcx);
+        let param = intern(text(s, colon, pcx), pcx);
+        pcx.params.push(param);
+        if starts(ts, e, b"const ", pcx) {
+            // `const LO..=HI`
+            let r = trim_start(ts + 6, e, pcx);
+            let mut dots = r;
+            while dots + 2 < e && !(byte(dots, pcx) == b'.' && byte(dots + 1, pcx) == b'.') {
+                dots += 1;
+            }
+            if dots + 2 >= e || byte(dots + 2, pcx) != b'=' {
+                bad(c"internal error: arch table: an immediate without LO..=HI");
+            }
+            pcx.params.push(ts);
+            pcx.params.push(ts);
+            pcx.params.push(number(r, dots, pcx));
+            pcx.params.push(number(dots + 3, e, pcx));
+            (pcx.intrs[id as usize]).consts |= 1 << k as u64;
         } else {
-            (*pcx.intrs.add(id as usize)).ret_start = b;
-            (*pcx.intrs.add(id as usize)).ret_end = b;
+            pcx.params.push(ts);
+            pcx.params.push(e);
+            pcx.params.push(1);
+            pcx.params.push(0);
         }
+        k += 1;
+        i = j + 1;
+    }
+    (pcx.intrs[id as usize]).nparams = k;
+    let r = trim_start(close + 1, b, pcx);
+    if starts(r, b, b"->", pcx) {
+        (pcx.intrs[id as usize]).ret_start = trim_start(r + 2, b, pcx);
+        (pcx.intrs[id as usize]).ret_end = b;
+    } else {
+        (pcx.intrs[id as usize]).ret_start = b;
+        (pcx.intrs[id as usize]).ret_end = b;
     }
 }
 
 // `intr`, `load`, `vbin.add`, `vcmp.eq:v16i8`, `bits.ones`, `feat.has` ...
 fn parse_form(id: i64, a: i64, b: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let mut e = a;
-        while e < b && byte(e, pcx) != b':' {
-            e += 1;
-        }
-        if e < b {
-            (*pcx.intrs.add(id as usize)).work = intern(text(e + 1, b, pcx), pcx);
-        }
-        let mut dot = a;
-        while dot < e && byte(dot, pcx) != b'.' {
-            dot += 1;
-        }
-        let arg_start = if dot < e { dot + 1 } else { e };
-        let mut form: i64 = 0;
-        let mut arg: i64 = 0;
-        if is(a, e, b"intr", pcx) { form = FORM_INTR; }
-        else if is(a, e, b"intr.mem", pcx) { form = FORM_INTR_MEM; }
-        else if is(a, e, b"load", pcx) { form = FORM_LOAD; }
-        else if is(a, e, b"store", pcx) { form = FORM_STORE; }
-        else if is(a, e, b"cast", pcx) { form = FORM_CAST; }
-        else if is(a, e, b"vsplat", pcx) { form = FORM_VSPLAT; }
-        else if is(a, e, b"vext", pcx) { form = FORM_VEXT; }
-        else if is(a, e, b"hint", pcx) { form = FORM_HINT; }
-        else if is(a, e, b"vneg", pcx) { form = FORM_VNEG; }
-        else if is(a, e, b"vins", pcx) { form = FORM_VINS; }
-        else if is(a, e, b"vsel", pcx) { form = FORM_VSEL; }
-        else if is(a, e, b"vsum", pcx) { form = FORM_VSUM; }
-        else if is(a, e, b"load.dup", pcx) { form = FORM_LOAD_DUP; }
-        else if is(a, dot, b"vbin", pcx) {
-            form = FORM_VBIN;
-            arg = if is(arg_start, e, b"add", pcx) { Op::Add as i64 }
-                else if is(arg_start, e, b"sub", pcx) { Op::Sub as i64 }
-                else if is(arg_start, e, b"mul", pcx) { Op::Mul as i64 }
-                else if is(arg_start, e, b"and", pcx) { Op::And as i64 }
-                else if is(arg_start, e, b"or", pcx) { Op::Or as i64 }
-                else if is(arg_start, e, b"xor", pcx) { Op::Xor as i64 }
-                else if is(arg_start, e, b"div", pcx) { Op::Div as i64 }
-                else { bad(c"internal error: arch table: an unknown vbin") };
-        } else if is(a, dot, b"vcmp", pcx) {
-            form = FORM_VCMP;
-            arg = if is(arg_start, e, b"eq", pcx) { Cond::Eq as i64 }
-                else if is(arg_start, e, b"gt", pcx) { Cond::Gt as i64 }
-                else if is(arg_start, e, b"ge", pcx) { Cond::Ge as i64 }
-                else if is(arg_start, e, b"lt", pcx) { Cond::Lt as i64 }
-                else if is(arg_start, e, b"le", pcx) { Cond::Le as i64 }
-                else { bad(c"internal error: arch table: an unknown vcmp") };
-        } else if is(a, dot, b"bits", pcx) {
-            form = FORM_BITS;
-            arg = if is(arg_start, e, b"ones", pcx) { BITS_ONES }
-                else if is(arg_start, e, b"leading", pcx) { BITS_LEADING }
-                else if is(arg_start, e, b"trailing", pcx) { BITS_TRAILING }
-                else { bad(c"internal error: arch table: an unknown bits count") };
-        } else if is(a, dot, b"feat", pcx) {
-            form = FORM_FEAT;
-            arg = if is(arg_start, e, b"has", pcx) { FEAT_HAS }
-                else if is(arg_start, e, b"detect", pcx) { FEAT_DETECT }
-                else { bad(c"internal error: arch table: an unknown feat") };
-        } else {
-            bad(c"internal error: arch table: an unknown IR form");
-        }
-        (*pcx.intrs.add(id as usize)).form = form;
-        (*pcx.intrs.add(id as usize)).form_arg = arg;
+    let mut e = a;
+    while e < b && byte(e, pcx) != b':' {
+        e += 1;
     }
+    if e < b {
+        (pcx.intrs[id as usize]).work = intern(text(e + 1, b, pcx), pcx);
+    }
+    let mut dot = a;
+    while dot < e && byte(dot, pcx) != b'.' {
+        dot += 1;
+    }
+    let arg_start = if dot < e { dot + 1 } else { e };
+    let mut form: i64 = 0;
+    let mut arg: i64 = 0;
+    if is(a, e, b"intr", pcx) { form = FORM_INTR; }
+    else if is(a, e, b"intr.mem", pcx) { form = FORM_INTR_MEM; }
+    else if is(a, e, b"load", pcx) { form = FORM_LOAD; }
+    else if is(a, e, b"store", pcx) { form = FORM_STORE; }
+    else if is(a, e, b"cast", pcx) { form = FORM_CAST; }
+    else if is(a, e, b"vsplat", pcx) { form = FORM_VSPLAT; }
+    else if is(a, e, b"vext", pcx) { form = FORM_VEXT; }
+    else if is(a, e, b"hint", pcx) { form = FORM_HINT; }
+    else if is(a, e, b"vneg", pcx) { form = FORM_VNEG; }
+    else if is(a, e, b"vins", pcx) { form = FORM_VINS; }
+    else if is(a, e, b"vsel", pcx) { form = FORM_VSEL; }
+    else if is(a, e, b"vsum", pcx) { form = FORM_VSUM; }
+    else if is(a, e, b"load.dup", pcx) { form = FORM_LOAD_DUP; }
+    else if is(a, dot, b"vbin", pcx) {
+        form = FORM_VBIN;
+        arg = if is(arg_start, e, b"add", pcx) { Op::Add as i64 }
+            else if is(arg_start, e, b"sub", pcx) { Op::Sub as i64 }
+            else if is(arg_start, e, b"mul", pcx) { Op::Mul as i64 }
+            else if is(arg_start, e, b"and", pcx) { Op::And as i64 }
+            else if is(arg_start, e, b"or", pcx) { Op::Or as i64 }
+            else if is(arg_start, e, b"xor", pcx) { Op::Xor as i64 }
+            else if is(arg_start, e, b"div", pcx) { Op::Div as i64 }
+            else { bad(c"internal error: arch table: an unknown vbin") };
+    } else if is(a, dot, b"vcmp", pcx) {
+        form = FORM_VCMP;
+        arg = if is(arg_start, e, b"eq", pcx) { Cond::Eq as i64 }
+            else if is(arg_start, e, b"gt", pcx) { Cond::Gt as i64 }
+            else if is(arg_start, e, b"ge", pcx) { Cond::Ge as i64 }
+            else if is(arg_start, e, b"lt", pcx) { Cond::Lt as i64 }
+            else if is(arg_start, e, b"le", pcx) { Cond::Le as i64 }
+            else { bad(c"internal error: arch table: an unknown vcmp") };
+    } else if is(a, dot, b"bits", pcx) {
+        form = FORM_BITS;
+        arg = if is(arg_start, e, b"ones", pcx) { BITS_ONES }
+            else if is(arg_start, e, b"leading", pcx) { BITS_LEADING }
+            else if is(arg_start, e, b"trailing", pcx) { BITS_TRAILING }
+            else { bad(c"internal error: arch table: an unknown bits count") };
+    } else if is(a, dot, b"feat", pcx) {
+        form = FORM_FEAT;
+        arg = if is(arg_start, e, b"has", pcx) { FEAT_HAS }
+            else if is(arg_start, e, b"detect", pcx) { FEAT_DETECT }
+            else { bad(c"internal error: arch table: an unknown feat") };
+    } else {
+        bad(c"internal error: arch table: an unknown IR form");
+    }
+    (pcx.intrs[id as usize]).form = form;
+    (pcx.intrs[id as usize]).form_arg = arg;
 }
 
 // The index of parameter `name` of intrinsic id, or -1.
 fn param_index(id: i64, a: i64, b: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let name = intern(text(a, b, pcx), pcx);
-        for k in 0..(*pcx.intrs.add(id as usize)).nparams {
-            if param_entry((*pcx.intrs.add(id as usize)).params + k, 0, pcx) == name {
-                return k;
-            }
+    let name = intern(text(a, b, pcx), pcx);
+    for k in 0..(pcx.intrs[id as usize]).nparams {
+        if param_entry((pcx.intrs[id as usize]).params + k, 0, pcx) == name {
+            return k;
         }
-        -1
     }
+    -1
 }
 
 // `pure commutative tied=a`, space-separated; `-`: none.
 fn parse_flags(id: i64, a: i64, b: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let mut i = a;
-        while i < b {
-            let mut j = i;
-            while j < b && byte(j, pcx) != b' ' {
-                j += 1;
-            }
-            if is(i, j, b"pure", pcx) {
-                (*pcx.intrs.add(id as usize)).flags |= IF_PURE;
-            } else if is(i, j, b"commutative", pcx) {
-                (*pcx.intrs.add(id as usize)).flags |= IF_COMMUTATIVE;
-            } else if starts(i, j, b"tied=", pcx) {
-                let k = param_index(id, i + 5, j, pcx);
-                if k < 0 {
-                    bad(c"internal error: arch table: tied to an unknown parameter");
-                }
-                (*pcx.intrs.add(id as usize)).flags |= (k + 1) << IF_TIED_SHIFT as u64;
-            } else if !is(i, j, b"-", pcx) {
-                bad(c"internal error: arch table: an unknown flag");
-            }
-            i = trim_start(j, b, pcx);
+    let mut i = a;
+    while i < b {
+        let mut j = i;
+        while j < b && byte(j, pcx) != b' ' {
+            j += 1;
         }
+        if is(i, j, b"pure", pcx) {
+            (pcx.intrs[id as usize]).flags |= IF_PURE;
+        } else if is(i, j, b"commutative", pcx) {
+            (pcx.intrs[id as usize]).flags |= IF_COMMUTATIVE;
+        } else if starts(i, j, b"tied=", pcx) {
+            let k = param_index(id, i + 5, j, pcx);
+            if k < 0 {
+                bad(c"internal error: arch table: tied to an unknown parameter");
+            }
+            (pcx.intrs[id as usize]).flags |= (k + 1) << IF_TIED_SHIFT as u64;
+        } else if !is(i, j, b"-", pcx) {
+            bad(c"internal error: arch table: an unknown flag");
+        }
+        i = trim_start(j, b, pcx);
     }
 }
 
 // `none`, `raw`, `load(s, 16)`, `store(s, 16)`.
 fn parse_memory(id: i64, a: i64, b: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if is(a, b, b"none", pcx) || is(a, b, b"-", pcx) {
-            return;
-        }
-        if is(a, b, b"raw", pcx) {
-            (*pcx.intrs.add(id as usize)).mem = MEM_RAW;
-            return;
-        }
-        let load = starts(a, b, b"load(", pcx);
-        if !load && !starts(a, b, b"store(", pcx) {
-            bad(c"internal error: arch table: an unknown memory column");
-        }
-        let open = if load { a + 5 } else { a + 6 };
-        let mut comma = open;
-        while comma < b && byte(comma, pcx) != b',' {
-            comma += 1;
-        }
-        let k = param_index(id, open, comma, pcx);
-        if k < 0 || comma >= b || byte(b - 1, pcx) != b')' {
-            bad(c"internal error: arch table: a memory column without its slice");
-        }
-        (*pcx.intrs.add(id as usize)).mem = if load { MEM_LOAD } else { MEM_STORE };
-        (*pcx.intrs.add(id as usize)).mem_param = k;
-        (*pcx.intrs.add(id as usize)).mem_bytes = number(trim_start(comma + 1, b - 1, pcx), b - 1,
-            pcx);
+    if is(a, b, b"none", pcx) || is(a, b, b"-", pcx) {
+        return;
     }
+    if is(a, b, b"raw", pcx) {
+        (pcx.intrs[id as usize]).mem = MEM_RAW;
+        return;
+    }
+    let load = starts(a, b, b"load(", pcx);
+    if !load && !starts(a, b, b"store(", pcx) {
+        bad(c"internal error: arch table: an unknown memory column");
+    }
+    let open = if load { a + 5 } else { a + 6 };
+    let mut comma = open;
+    while comma < b && byte(comma, pcx) != b',' {
+        comma += 1;
+    }
+    let k = param_index(id, open, comma, pcx);
+    if k < 0 || comma >= b || byte(b - 1, pcx) != b')' {
+        bad(c"internal error: arch table: a memory column without its slice");
+    }
+    (pcx.intrs[id as usize]).mem = if load { MEM_LOAD } else { MEM_STORE };
+    (pcx.intrs[id as usize]).mem_param = k;
+    (pcx.intrs[id as usize]).mem_bytes = number(trim_start(comma + 1, b - 1, pcx), b - 1,
+        pcx);
 }
 
 // ---- The instruction tables ----
@@ -515,120 +491,164 @@ fn parse_memory(id: i64, a: i64, b: i64, pcx: &mut Ctx<Comp>) {
 // (INSN_WIDTH each). Loaded by the front end (load_insns, from
 // virtual.vl) when a program names std::arch; read-only after.
 
-static mut INSN_BUF: i64 = -1;
-static mut INSN_BY_NAME: NameMap = NameMap {
-    ptrs: 0 as *mut i64, lens: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0,
-};
-static mut INSN_FIELDS: IntVec = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-// (0.27.8) The tables' text, a view of INSN_BUF's bytes taken when they
-// are loaded (by the front end, before the assembler's thread starts):
-// insn_text reads it, not BUFS, which the main thread grows meanwhile
-// (gen0's messages at -O0, buf_new); the bytes never change or move after.
-static mut INSN_TEXT: &[u8] = b"";
 const INSN_WIDTH: i64 = 12;
 
-fn insn_byte(i: i64) -> u8 {
-    unsafe { (*(*get_bufs().add(get_insn_buf() as usize)).data.add(i as usize)) }
+// The loaded tables: their text (a frozen buffer's bytes), each line's
+// fields (INSN_WIDTH entries: a start and an end in the text, a field)
+// and, sorted by mnemonic, the first line of each. Made once by
+// load_insns and never changed or freed after.
+struct InsnTable {
+    text: &'static [u8], fields: &'static [i64], by_name: &'static [i64],
+}
+
+// The address of the loaded tables, null before load_insns. An atomic:
+// the front end stores it (Release) before code generation starts any
+// thread, and the assembler, on a thread of its own at -O0, loads it
+// (Acquire).
+static INSNS: Atomic<*mut InsnTable> = Atomic::new(0 as *mut InsnTable);
+
+// The loaded tables, or None before load_insns (no program named
+// std::arch).
+fn insns() -> Option<&'static InsnTable> {
+    let table = INSNS.load(Ordering::Acquire);
+    if table == 0 as *mut InsnTable {
+        return None;
+    }
+    // UNSAFE: the tables are published as an address (an atomic holds no
+    // reference), read here through it
+    // SAFETY: a non-null INSNS is the address load_insns stored, of an
+    // InsnTable in a block of its own that `leak` gave the process's life;
+    // it was filled before the address was stored (Release, loaded with
+    // Acquire) and nothing writes or frees it after, so a shared
+    // reference for 'static is true
+    Some(unsafe { &*table })
+}
+
+// The mnemonic of instruction line k of a table's fields.
+fn insn_mnemonic(text: &'static [u8], fields: &[i64], k: i64) -> &'static [u8] {
+    let at = (k * INSN_WIDTH) as usize;
+    &text[fields[at] as usize..fields[at + 1] as usize]
 }
 
 pub fn load_insns() {
-    unsafe {
-        if get_insn_buf() >= 0 {
-            return;
-        }
-        // (the target's table only: the two architectures share mnemonics,
-        // crc32b among them; set_target runs before the modules load)
-        set_insn_buf(buf_new());
-        if get_x86() {
-            insn_x86_source(get_insn_buf());
-        } else {
-            insn_a64_source(get_insn_buf());
-        }
-        let len = (*get_bufs().add(get_insn_buf() as usize)).len;
-        let mut a: i64 = 0;
-        while a < len {
-            let mut b = a;
-            while b < len && insn_byte(b) != b'\n' {
-                b += 1;
-            }
-            let base = get_insn_fields().count;
-            let mut start = a;
-            let mut n: i64 = 0;
-            let mut i = a;
-            while i <= b && n < INSN_WIDTH / 2 {
-                let at_sep = i + 2 < b && insn_byte(i) == b' ' && insn_byte(i + 1) == b'|'
-                    && insn_byte(i + 2) == b' ';
-                if i == b || at_sep {
-                    let mut s = start;
-                    while s < i && insn_byte(s) == b' ' {
-                        s += 1;
-                    }
-                    let mut e = i;
-                    while e > s && insn_byte(e - 1) == b' ' {
-                        e -= 1;
-                    }
-                    { let mut insn_fields_copy = get_insn_fields(); insn_fields_copy.push(s);
-                        set_insn_fields(insn_fields_copy); }
-                    { let mut insn_fields_copy = get_insn_fields(); insn_fields_copy.push(e);
-                        set_insn_fields(insn_fields_copy); }
-                    n += 1;
-                    if i == b {
-                        break;
-                    }
-                    i += 3;
-                    start = i;
-                    continue;
-                }
-                i += 1;
-            }
-            while n < INSN_WIDTH / 2 {
-                { let mut insn_fields_copy = get_insn_fields(); insn_fields_copy.push(b);
-                    set_insn_fields(insn_fields_copy); }
-                { let mut insn_fields_copy = get_insn_fields(); insn_fields_copy.push(b);
-                    set_insn_fields(insn_fields_copy); }
-                n += 1;
-            }
-            // (a mnemonic of several lines: its first, the encoder tries the
-            // next ones)
-            let mn = std::slice::from_raw_parts(
-                (*get_bufs().add(get_insn_buf() as usize)).data.add(
-                    ((*get_insn_fields().data.add(base as usize))) as usize),
-                ((*get_insn_fields().data.add((base + 1) as usize)) - (
-                    (*get_insn_fields().data.add(base as usize)))) as usize);
-            if name_get(get_insn_by_name(), mn) == 0 {
-                { let mut insn_by_name_copy = get_insn_by_name();
-                    name_put(&mut insn_by_name_copy, mn, base / INSN_WIDTH + 1);
-                    set_insn_by_name(insn_by_name_copy); }
-            }
-            a = b + 1;
-        }
-        set_insn_text(
-            std::slice::from_raw_parts(
-                (*get_bufs().add(get_insn_buf() as usize)).data.add((0) as usize),
-                (len - (0)) as usize));
+    if insns().is_some() {
+        return;
     }
+    // (the target's table only: the two architectures share mnemonics,
+    // crc32b among them; set_target runs before the modules load)
+    let buf = buf_new();
+    if get_x86() {
+        insn_x86_source(buf);
+    } else {
+        insn_a64_source(buf);
+    }
+    // (0.29: written once, here, then frozen: the table's text is a view
+    // of it for the process)
+    let text = buf_done(buf);
+    let len = text.len() as i64;
+    let mut fields: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut a: i64 = 0;
+    while a < len {
+        let mut b = a;
+        while b < len && text[b as usize] != b'\n' {
+            b += 1;
+        }
+        let mut start = a;
+        let mut n: i64 = 0;
+        let mut i = a;
+        while i <= b && n < INSN_WIDTH / 2 {
+            let at_sep = i + 2 < b && text[i as usize] == b' ' && text[(i + 1) as usize] == b'|'
+                && text[(i + 2) as usize] == b' ';
+            if i == b || at_sep {
+                let mut s = start;
+                while s < i && text[s as usize] == b' ' {
+                    s += 1;
+                }
+                let mut e = i;
+                while e > s && text[(e - 1) as usize] == b' ' {
+                    e -= 1;
+                }
+                fields.push(s);
+                fields.push(e);
+                n += 1;
+                if i == b {
+                    break;
+                }
+                i += 3;
+                start = i;
+                continue;
+            }
+            i += 1;
+        }
+        while n < INSN_WIDTH / 2 {
+            fields.push(b);
+            fields.push(b);
+            n += 1;
+        }
+        a = b + 1;
+    }
+    // (a mnemonic of several lines: its first, the encoder tries the next
+    // ones; the sort keeps equal mnemonics in the lines' order)
+    let lines = fields.len() as i64 / INSN_WIDTH;
+    let mut order: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for k in 0..lines {
+        order.push(k);
+    }
+    order.sort_by(|x, y| {
+        insn_mnemonic(text, &fields, *x).cmp(insn_mnemonic(text, &fields, *y)).then(x.cmp(y))
+    });
+    let mut by_name: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..order.len() {
+        if i == 0
+            || insn_mnemonic(text, &fields, order[i])
+            != insn_mnemonic(text, &fields, order[i - 1]) {
+            by_name.push(order[i]);
+        }
+    }
+    let fields: &'static [i64] = fields.leak();
+    let by_name: &'static [i64] = by_name.leak();
+    let table: &'static mut InsnTable =
+        Box::leak(Box::new_in(InsnTable { text, fields, by_name }, Comp {}));
+    INSNS.store(table as *mut InsnTable, Ordering::Release);
 }
 
 // The line of mnemonic `name` in the instruction tables, or -1 (also
 // before the front end loaded them: no program named std::arch).
 pub fn insn_named(name: &[u8]) -> i64 {
-    if get_insn_buf() < 0 {
-        return -1;
+    let t = match insns() {
+        Some(t) => t,
+        None => return -1,
+    };
+    let mut lo: usize = 0;
+    let mut hi = t.by_name.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let have = insn_mnemonic(t.text, t.fields, t.by_name[mid]);
+        if have == name {
+            return t.by_name[mid];
+        }
+        if have < name {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
-    name_get(get_insn_by_name(), name) - 1
+    -1
 }
 
 // Field f of instruction line k, as text.
 pub fn insn_text(k: i64, f: i64) -> &'static [u8] {
-    unsafe {
-        // (past the last line: no mnemonic, which ends a run of lines)
-        if k < 0 || (k + 1) * INSN_WIDTH > get_insn_fields().count {
-            return b"";
-        }
-        let s = (*get_insn_fields().data.add((k * INSN_WIDTH + 2 * f) as usize));
-        let e = (*get_insn_fields().data.add((k * INSN_WIDTH + 2 * f + 1) as usize));
-        &get_insn_text()[s as usize..e as usize]
+    let t = match insns() {
+        Some(t) => t,
+        None => return b"",
+    };
+    // (past the last line: no mnemonic, which ends a run of lines)
+    if k < 0 || (k + 1) * INSN_WIDTH > t.fields.len() as i64 {
+        return b"";
     }
+    let s = t.fields[(k * INSN_WIDTH + 2 * f) as usize];
+    let e = t.fields[(k * INSN_WIDTH + 2 * f + 1) as usize];
+    &t.text[s as usize..e as usize]
 }
 
 // Field f of instruction line k as a hexadecimal number (`0x2e202c00`,
@@ -652,112 +672,4 @@ pub fn insn_hex(k: i64, f: i64) -> i64 {
         i += 1;
     }
     v
-}
-
-// (0.28.0) INSN_BUF's accessors: every use of it is one of them.
-fn get_insn_buf() -> i64 {
-    // UNSAFE: the instruction tables' buffer id, a process-wide static mut
-    // the assembler thread reads; Rust has no safe access to a static mut
-    // SAFETY: written only by load_insns (once: it returns when INSN_BUF >=
-    // 0), on the main thread in the front end (build -> load_modules ->
-    // load_arch_modules) or in volec assemble, both before code generation
-    // starts any thread (pool_start, asm_thread_start come later in
-    // compile_program); every later access is a read. (The value is safe;
-    // reading the buffer it names through base::BUFS is not: see BUFS's
-    // race row)
-    unsafe { INSN_BUF }
-}
-
-fn set_insn_buf(v: i64) {
-    // UNSAFE: the instruction tables' buffer id, a process-wide static mut
-    // the assembler thread reads; Rust has no safe access to a static mut
-    // SAFETY: written only by load_insns (once: it returns when INSN_BUF >=
-    // 0), on the main thread in the front end (build -> load_modules ->
-    // load_arch_modules) or in volec assemble, both before code generation
-    // starts any thread (pool_start, asm_thread_start come later in
-    // compile_program); every later access is a read. (The value is safe;
-    // reading the buffer it names through base::BUFS is not: see BUFS's
-    // race row)
-    unsafe {
-        INSN_BUF = v;
-    }
-}
-
-// (0.28.0) INSN_BY_NAME's accessors: every use of it is one of them.
-fn get_insn_by_name() -> NameMap {
-    // UNSAFE: the instruction tables' name map, a process-wide static mut
-    // the assembler reads; Rust has no safe access to a static mut
-    // SAFETY: filled only by load_insns, once, on the main thread in the
-    // front end before any code generation thread starts (pthread_create
-    // orders it before the assembler thread's reads); read-only afterwards
-    unsafe { INSN_BY_NAME }
-}
-
-fn set_insn_by_name(v: NameMap) {
-    // UNSAFE: the instruction tables' name map, a process-wide static mut
-    // the assembler reads; Rust has no safe access to a static mut
-    // SAFETY: filled only by load_insns, once, on the main thread in the
-    // front end before any code generation thread starts (pthread_create
-    // orders it before the assembler thread's reads); read-only afterwards
-    unsafe {
-        INSN_BY_NAME = v;
-    }
-}
-
-// (0.28.0) INSN_FIELDS's accessors: every use of it is one of them.
-fn get_insn_fields() -> IntVec {
-    // UNSAFE: the instruction tables' field offsets, a process-wide static
-    // mut the assembler reads; Rust has no safe access to a static mut
-    // SAFETY: pushed only by load_insns, once, on the main thread in the
-    // front end before any code generation thread starts; read-only
-    // afterwards (insn_text); the IntVec never grows again, so its data
-    // never moves under a reader
-    unsafe { INSN_FIELDS }
-}
-
-fn set_insn_fields(v: IntVec) {
-    // UNSAFE: the instruction tables' field offsets, a process-wide static
-    // mut the assembler reads; Rust has no safe access to a static mut
-    // SAFETY: pushed only by load_insns, once, on the main thread in the
-    // front end before any code generation thread starts; read-only
-    // afterwards (insn_text); the IntVec never grows again, so its data
-    // never moves under a reader
-    unsafe {
-        INSN_FIELDS = v;
-    }
-}
-
-// (0.28.0) INSN_TEXT's accessors: every use of it is one of them.
-fn get_insn_text() -> &'static [u8] {
-    // UNSAFE: the instruction tables' text, a view the assembler reads
-    // through a process-wide static mut; Rust has no safe access to a
-    // static mut
-    // SAFETY: written only by load_insns (once: it returns when INSN_BUF >=
-    // 0), on the main thread in the front end (build -> load_modules ->
-    // load_arch_modules) or in volec assemble, before code generation
-    // starts any thread (pthread_create orders it before the assembler
-    // thread's reads); read-only afterwards (insn_text); the bytes it views
-    // are INSN_BUF's buffer's data block, which nothing writes after
-    // load_insns (INSN_BUF's only other uses are insn_byte during the load
-    // and insn_named's test), and growing BUFS moves the Buf records, not
-    // the data block, so the view stays valid for the process
-    unsafe { INSN_TEXT }
-}
-
-fn set_insn_text(v: &'static [u8]) {
-    // UNSAFE: the instruction tables' text, a view the assembler reads
-    // through a process-wide static mut; Rust has no safe access to a
-    // static mut
-    // SAFETY: written only by load_insns (once: it returns when INSN_BUF >=
-    // 0), on the main thread in the front end (build -> load_modules ->
-    // load_arch_modules) or in volec assemble, before code generation
-    // starts any thread (pthread_create orders it before the assembler
-    // thread's reads); read-only afterwards (insn_text); the bytes it views
-    // are INSN_BUF's buffer's data block, which nothing writes after
-    // load_insns (INSN_BUF's only other uses are insn_byte during the load
-    // and insn_named's test), and growing BUFS moves the Buf records, not
-    // the data block, so the view stays valid for the process
-    unsafe {
-        INSN_TEXT = v;
-    }
 }

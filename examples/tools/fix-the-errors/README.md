@@ -221,7 +221,7 @@ $ volec check && echo no errors
 no errors
 grades.vl:3:1: warning[unsafe.unjustified] extern block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe grades.vl
 grades.vl:39:17: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe grades.vl
-ok: 0 errors, 2 warnings in main.vl
+ok: 0 errors, 2 warnings in main.vl (3 files, 0 shaders)
 $ volec main.vl -o gradebook && ./gradebook
 Ada     95 A  swing  6, with honours
 Brook   75 C  swing 21

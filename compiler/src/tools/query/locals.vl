@@ -8,7 +8,7 @@
 // (the tools' cache keeps no nodes): run_query_inner reads it so for a
 // FILE:LINE:COL, and a cached `FN::local` is asked again (ask_in_full).
 
-use crate::base::{IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd};
+use crate::base::{STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::modules::{file_of_pos, module_at};
@@ -24,10 +24,16 @@ use crate::tools::refactor_mod::local::{
     ident_at_column, load_decls, local_at, locals_named, use_decl,
 };
 
+// UNSAFE: C's getenv, setenv and execvp: the query runs itself again with
+// the whole program.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
-    fn getenv(name: *mut u8) -> *mut u8;
-    fn setenv(name: *mut u8, value: *mut u8, overwrite: i32) -> i32;
-    fn execvp(file: *mut u8, args: *mut *mut u8) -> i32;
+    fn getenv(name: *const u8) -> *mut u8;
+    fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32;
+    fn execvp(file: *const u8, args: *const *const u8) -> i32;
 }
 
 // Whether text ends in `:LINE:COL` (a FILE:LINE:COL).
@@ -43,6 +49,9 @@ pub fn has_column(text: &[u8]) -> bool {
 
 // Whether the query was run again in full (by ask_in_full).
 pub fn full_requested() -> bool {
+    // UNSAFE: getenv is C's; the variable's first byte is read.
+    // SAFETY: the name is a literal; v is checked not null before its first
+    // byte is read.
     unsafe {
         let v = getenv(c"VOLE_QUERY_FULL");
         v != 0 as *mut u8 && (*v.add(0)) == b'1'
@@ -52,174 +61,173 @@ pub fn full_requested() -> bool {
 // Runs this command again, reading the program in full (never returns
 // when it can run).
 fn ask_in_full(tcx: &Tcx<Comp>) {
+    // UNSAFE: setenv and execvp are C's.
+    // SAFETY: the names are literals; the argv is a list of the command's
+    // words (C strings) and a null (exec_words), alive for the call; its
+    // first word is the program as this one was run.
     unsafe {
         if !tcx.query_running || full_requested() {
             return;
         }
         setenv(c"VOLE_QUERY_FULL", c"1", 1);
         let words = crate::tools::query::roots::command_words(tcx);
-        execvp(words.get(0) as *mut u8, crate::tools::proc::exec_words(words));
+        execvp(words[0 as usize] as *mut u8,
+            crate::tools::proc::exec_words(words.as_slice()).as_ptr() as *const *const u8);
     }
 }
 
 // Whether `FN::x` could name a local: no definition has that path, and
 // its first segments name a function.
 fn may_be_local(name: &[u8], tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let mut i = name.len() as i64;
-        while i >= 2 && !(name[(i - 1) as usize] == b':' && name[(i - 2) as usize] == b':') {
-            i -= 1;
-        }
-        if i < 3 || i >= name.len() as i64 {
-            return false;
-        }
-        let mut whole = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        find_defs(name, false, &mut whole, tcx, pcx);
-        if whole.count > 0 {
-            return false;
-        }
-        let mut fns = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        find_defs(&name[0..(i - 2) as usize], false, &mut fns, tcx, pcx);
-        for k in 0..fns.count {
-            let kind = pcx.defs[(*fns.data.add(k as usize)) as usize].kind;
-            if kind == K_FN || kind == K_METHOD || kind == K_IMPL_METHOD || kind == K_TRAIT_FN {
-                return true;
-            }
-        }
-        false
+    let mut i = name.len() as i64;
+    while i >= 2 && !(name[(i - 1) as usize] == b':' && name[(i - 2) as usize] == b':') {
+        i -= 1;
     }
+    if i < 3 || i >= name.len() as i64 {
+        return false;
+    }
+    let mut whole: Vec<i64, Comp> = Vec::new_in(Comp {});
+    find_defs(name, false, &mut whole, tcx, pcx);
+    if whole.len() as i64 > 0 {
+        return false;
+    }
+    let mut fns: Vec<i64, Comp> = Vec::new_in(Comp {});
+    find_defs(&name[0..(i - 2) as usize], false, &mut fns, tcx, pcx);
+    for k in 0..fns.len() as i64 {
+        let kind = pcx.defs[(fns[k as usize]) as usize].kind;
+        if kind == K_FN || kind == K_METHOD || kind == K_IMPL_METHOD || kind == K_TRAIT_FN {
+            return true;
+        }
+    }
+    false
 }
 
 // `query refs NAME` when NAME is a local: the status; -1 when it is not
 // one (refs goes on with the definitions).
 pub fn local_refs(name: &[u8], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        if tcx.restored {
-            if may_be_local(name, tcx, pcx) {
-                ask_in_full(tcx);
-            }
-            return -1;
+    if tcx.restored {
+        if may_be_local(name, tcx, pcx) {
+            ask_in_full(tcx);
         }
-        load_decls(pcx);
-        let mut decls = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let at = ident_at_column(name, pcx);
-        if at >= 0 {
-            let d = local_at(at, pcx);
-            if d < 0 {
-                return -1;
-            }
-            decls.push(d);
-        } else if !locals_named(name, &mut decls, tcx, pcx) || decls.count == 0 {
-            return -1;
-        }
-        let mut written = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
-        changed_places(&mut written, pcx);
-        // The declarations and the uses: position, kind (0 def, 1 read, 2
-        // write), once per position.
-        let mut pos = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut kind = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut seen = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
-        let mut by_decl = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
-        for k in 0..decls.count {
-            let d = (*decls.data.add(k as usize));
-            by_decl.put(d + 1, 1);
-            seen.put(d + 1, 1);
-            pos.push(d);
-            kind.push(0);
-        }
-        for n in 1..pcx.nodes.len() as i64 {
-            let d = use_decl(n, pcx);
-            if d < 0 || by_decl.get(d + 1) == 0 {
-                continue;
-            }
-            let p = pcx.nodes[n as usize].start;
-            if seen.get(p + 1) != 0 {
-                continue;
-            }
-            // (a use as written: its name at the node's start)
-            let t = token_at(p, pcx);
-            let dt = token_at(d, pcx);
-            if (pcx.toks[t as usize].value != pcx.toks[dt as usize].value
-                || pcx.toks[t as usize].start != p)
-                && !(t > 0 && in_literal(t - 1, p, dt, pcx)) {
-                continue;
-            }
-            seen.put(p + 1, 1);
-            pos.push(p);
-            kind.push(if written.get(p + 1) == 1 { 2 } else { 1 });
-        }
-        // (by position)
-        let v = pos.data;
-        let w = kind.data;
-        for a in 1..pos.count {
-            let mut j = a;
-            while j > 0 && (*v.add(j as usize)) < (*v.add((j - 1) as usize)) {
-                let x = (*v.add(j as usize));
-                (*v.add(j as usize)) = (*v.add((j - 1) as usize));
-                (*v.add((j - 1) as usize)) = x;
-                let y = (*w.add(j as usize));
-                (*w.add(j as usize)) = (*w.add((j - 1) as usize));
-                (*w.add((j - 1) as usize)) = y;
-                j -= 1;
-            }
-        }
-        let mut sel = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for i in 0..pos.count {
-            let k = if (*kind.data.add(i as usize)) == 0 { c"def" }
-                else if (*kind.data.add(i as usize)) == 1 { c"read" } else { c"write" };
-            if tcx.opt_kind != 0 as *mut u8 && !kind_listed(k, tcx.opt_kind) {
-                continue;
-            }
-            if !ref_in((*pos.data.add(i as usize)), pcx) {
-                continue;
-            }
-            sel.push(i);
-        }
-        let out = buf_new();
-        if tcx.opt_count {
-            buf_int(out, sel.count);
-            buf_byte(out, b'\n');
-            buf_write_fd(out, STDOUT);
-            return 0;
-        }
-        if sel.count == 0 {
-            let d = diag(c"note", c"query.empty", tcx);
-            buf_str(d, c"0 refs\n");
-            return 0;
-        }
-        let mut cur: i64 = -1;
-        for s in 0..sel.count {
-            let i = (*sel.data.add(s as usize));
-            let p = (*pos.data.add(i as usize));
-            let f = file_of_pos(p, pcx);
-            if f != cur {
-                buf_str(out, c"# ");
-                buf_bytes(out, file_text(f, pcx));
-                buf_byte(out, b'\n');
-                cur = f;
-            }
-            buf_int(out, line_of(p, pcx));
-            buf_byte(out, b':');
-            buf_int(out, p - line_start(p, pcx) + 1);
-            buf_byte(out, b'\t');
-            buf_str(out,
-                if (*kind.data.add(i as usize)) == 0 { c"def" }
-                else if (*kind.data.add(i as usize)) == 1 { c"read" } else { c"write" });
-            if (*kind.data.add(i as usize)) != 0 {
-                buf_byte(out, b'\t');
-                let e = enclosing(p, tcx, pcx);
-                put_short(out,
-                    if e >= 0 { pcx.defs[e as usize].fqn }
-                    else { mod_fqn(module_at(p, pcx), tcx, pcx) },
-                    pcx);
-            }
-            buf_byte(out, b'\t');
-            put_line(out, p, pcx);
-            buf_byte(out, b'\n');
-        }
-        buf_write_fd(out, STDOUT);
-        0
+        return -1;
     }
+    load_decls(pcx);
+    let mut decls: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let at = ident_at_column(name, pcx);
+    if at >= 0 {
+        let d = local_at(at, pcx);
+        if d < 0 {
+            return -1;
+        }
+        decls.push(d);
+    } else if !locals_named(name, &mut decls, tcx, pcx) || decls.len() as i64 == 0 {
+        return -1;
+    }
+    let mut written = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+    changed_places(&mut written, pcx);
+    // The declarations and the uses: position, kind (0 def, 1 read, 2
+    // write), once per position.
+    let mut pos: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut kind: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut seen = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+    let mut by_decl = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+    for k in 0..decls.len() as i64 {
+        let d = (decls[k as usize]);
+        by_decl.put(d + 1, 1);
+        seen.put(d + 1, 1);
+        pos.push(d);
+        kind.push(0);
+    }
+    for n in 1..pcx.nodes.len() as i64 {
+        let d = use_decl(n, pcx);
+        if d < 0 || by_decl.get(d + 1) == 0 {
+            continue;
+        }
+        let p = pcx.nodes[n as usize].start;
+        if seen.get(p + 1) != 0 {
+            continue;
+        }
+        // (a use as written: its name at the node's start)
+        let t = token_at(p, pcx);
+        let dt = token_at(d, pcx);
+        if (pcx.toks[t as usize].value != pcx.toks[dt as usize].value
+            || pcx.toks[t as usize].start != p)
+            && !(t > 0 && in_literal(t - 1, p, dt, pcx)) {
+            continue;
+        }
+        seen.put(p + 1, 1);
+        pos.push(p);
+        kind.push(if written.get(p + 1) == 1 { 2 } else { 1 });
+    }
+    // (by position)
+    for a in 1..pos.len() as i64 {
+        let mut j = a;
+        while j > 0 && (pos[j as usize]) < (pos[(j - 1) as usize]) {
+            let x = (pos[j as usize]);
+            (pos[j as usize]) = (pos[(j - 1) as usize]);
+            (pos[(j - 1) as usize]) = x;
+            let y = (kind[j as usize]);
+            (kind[j as usize]) = (kind[(j - 1) as usize]);
+            (kind[(j - 1) as usize]) = y;
+            j -= 1;
+        }
+    }
+    let mut sel: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..pos.len() as i64 {
+        let k = if (kind[i as usize]) == 0 { c"def" }
+            else if (kind[i as usize]) == 1 { c"read" } else { c"write" };
+        if tcx.opt_kind != 0 as *mut u8 && !kind_listed(k, tcx.opt_kind) {
+            continue;
+        }
+        if !ref_in((pos[i as usize]), pcx) {
+            continue;
+        }
+        sel.push(i);
+    }
+    let out = buf_new();
+    if tcx.opt_count {
+        buf_int(out, sel.len() as i64);
+        buf_byte(out, b'\n');
+        buf_write_fd(out, STDOUT);
+        return 0;
+    }
+    if sel.len() as i64 == 0 {
+        let d = diag(c"note", c"query.empty", tcx);
+        buf_str(d, c"0 refs\n");
+        return 0;
+    }
+    let mut cur: i64 = -1;
+    for s in 0..sel.len() as i64 {
+        let i = (sel[s as usize]);
+        let p = (pos[i as usize]);
+        let f = file_of_pos(p, pcx);
+        if f != cur {
+            buf_str(out, c"# ");
+            buf_bytes(out, file_text(f, pcx));
+            buf_byte(out, b'\n');
+            cur = f;
+        }
+        buf_int(out, line_of(p, pcx));
+        buf_byte(out, b':');
+        buf_int(out, p - line_start(p, pcx) + 1);
+        buf_byte(out, b'\t');
+        buf_str(out,
+            if (kind[i as usize]) == 0 { c"def" }
+            else if (kind[i as usize]) == 1 { c"read" } else { c"write" });
+        if (kind[i as usize]) != 0 {
+            buf_byte(out, b'\t');
+            let e = enclosing(p, tcx, pcx);
+            put_short(out,
+                if e >= 0 { pcx.defs[e as usize].fqn }
+                else { mod_fqn(module_at(p, pcx), tcx, pcx) },
+                pcx);
+        }
+        buf_byte(out, b'\t');
+        put_line(out, p, pcx);
+        buf_byte(out, b'\n');
+    }
+    buf_write_fd(out, STDOUT);
+    0
 }
 
 // (0.26.2) Whether the use at p is a name in a format literal's text
@@ -227,9 +235,7 @@ pub fn local_refs(name: &[u8], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 
 // holding it), `{x}`, `{:w$}`: the declaration's name (token dt) written
 // there.
 fn in_literal(t: i64, p: i64, dt: i64, pcx: &Ctx<Comp>) -> bool {
-    // UNSAFE: TOKS is the lexer's token table, a raw pointer (front/lexer).
-    // SAFETY: t and dt are token_at's results for positions of the program, below TOK_COUNT.
-    let (tok, d) = unsafe { (pcx.toks[t as usize], pcx.toks[dt as usize]) };
+    let (tok, d) = (pcx.toks[t as usize], pcx.toks[dt as usize]);
     if tok.kind != crate::front::lexer::Tok::Str || p <= tok.start || p >= tok.end {
         return false;
     }

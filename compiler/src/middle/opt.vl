@@ -6,12 +6,16 @@
 
 use crate::back::codecache::cc_begin;
 use crate::back::regalloc::prepare::layout_order;
-use crate::base::{IntVec, alloc_array, die, free};
+use crate::base::{die, sized_table};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::timer::{
-    T_ATTRS, T_GLOBAL_DCE, T_HEAP, T_INLINE, T_IPCP, T_LICM, T_LOOPS, T_PROMOTE, T_SCALAR, T_SLP,
-    T_TRE, timer_add, timer_now,
+    P_ADCE, P_CONST_SLOTS, P_COPY_ELISION, P_DCE, P_ENTRY_FACTS, P_FN_SIZE, P_GVN, P_HEAP_TO_STACK,
+    P_IF_CONVERT, P_INSTCOMBINE, P_LICM, P_LOOP_EXITS, P_LOOP_ROTATE, P_LOOP_SETUP,
+    P_LOOP_TRANSFORM, P_PROMOTE, P_PURE_CALLS, P_RANGES, P_REDUCE_UNSWITCH, P_RESOLVE, P_SCCP,
+    P_SIMPLIFY_CFG, P_SROA, P_TAIL_RECURSION, P_THREAD_TAGS, P_TRIVIAL_PHIS, P_UNROLL_RUNTIME,
+    P_VECTORIZE, T_ATTRS, T_GLOBAL_DCE, T_HEAP, T_INLINE, T_IPCP, T_LICM, T_LOOPS, T_PROMOTE,
+    T_SCALAR, T_SLP, T_TRE, pass_done, timer_add, timer_now,
 };
 use crate::front::modules::{module_of, within_std};
 use crate::gen0::gen::fn_is_global;
@@ -26,14 +30,14 @@ use crate::middle::gvn::run_gvn;
 use crate::middle::gvn_calls::repeated_pure_calls;
 use crate::middle::ifconv::if_convert_loops;
 use crate::middle::inline::{
-    compute_sccs, count_call_sites, forget_fn_caches, func_size, get_fn_size, init_fn_caches,
-    inline_rounds, inlined_everywhere, ir_callee, optimize_with_leaves, set_fn_size,
+    compute_sccs, count_call_sites, forget_fn_caches, func_size, init_fn_caches, inline_log_end,
+    inline_log_start, inline_rounds, inlined_everywhere, ir_callee, optimize_with_leaves,
     simplify_inlining_leaves, start_inlining_budget,
 };
 use crate::middle::ipo::{has_effect, heap_to_stack, init_attrs, print_attrs, propagate_constants};
 use crate::middle::ir::{
-    Op, Term, get_irfuncs, ir_append, ir_arg, ir_enter, ir_operand, ir_operand_count, ir_replace,
-    ir_resolve_operands, ir_shrink, ir_unlink, ir_val,
+    Op, Term, fn_block, fn_block_count, fn_entry, ir_append, ir_arg, ir_enter, ir_operand,
+    ir_operand_count, ir_release, ir_replace, ir_resolve_operands, ir_shrink, ir_unlink, ir_val,
 };
 use crate::middle::ir::cfg::{
     copy_terminator, is_succ, pred_index, redirect_succ, succ, succ_count, switch_target,
@@ -44,7 +48,7 @@ use crate::middle::loops::{rotate_loops, seal_all};
 use crate::middle::lower::ssa::ssa_undef;
 use crate::middle::lsr::reduce_and_unswitch;
 use crate::middle::parallel::{
-    cleanup_all, optimize_components, parallel_begin, phase_time, simplify_all,
+    P_CLEANUP, P_SLP, cleanup_all, optimize_components, parallel_begin, phase_time, simplify_all,
 };
 use crate::middle::promote::promote_loop_memory;
 use crate::middle::range::fold_by_ranges;
@@ -58,21 +62,19 @@ use crate::middle::vectorize::unroll::unroll_runtime_loops;
 
 // Resolves every operand of every instruction of function `fi` (after
 // replacements).
-pub fn resolve_all(cx: &mut FnCtx, fi: i64) {
-    unsafe {
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed != 0 {
-                continue;
-            }
-            let mut v = (*cx.blocks.add(b as usize)).first;
-            while v != 0 {
-                ir_resolve_operands(cx, v);
-                v = (*cx.insts.add(v as usize)).next;
-            }
-            if (*cx.blocks.add(b as usize)).cond != 0 {
-                (*cx.blocks.add(b as usize)).cond = ir_val(cx, (*cx.blocks.add(b as usize)).cond);
-            }
+pub fn resolve_all(cx: &mut FnCtx<Comp>, fi: i64) {
+    for i in 0..fn_block_count(cx, fi) {
+        let b = (fn_block(cx, fi, i));
+        if (cx.blocks[b as usize]).removed != 0 {
+            continue;
+        }
+        let mut v = (cx.blocks[b as usize]).first;
+        while v != 0 {
+            ir_resolve_operands(cx, v);
+            v = (cx.insts[v as usize]).next;
+        }
+        if (cx.blocks[b as usize]).cond != 0 {
+            (cx.blocks[b as usize]).cond = ir_val(cx, (cx.blocks[b as usize]).cond);
         }
     }
 }
@@ -81,27 +83,20 @@ pub fn resolve_all(cx: &mut FnCtx, fi: i64) {
 
 // Removes predecessor `pred` (at index `index`) from block `b`, with the
 // matching phi operands.
-pub fn remove_pred_at(cx: &mut FnCtx, b: i64, index: i64) {
-    unsafe {
-        let preds = &(*cx.blocks.add(b as usize)).preds as *mut IntVec;
-        for i in index..(*preds).count - 1 {
-            (*(*preds).data.add(i as usize)) = (*(*preds).data.add((i + 1) as usize));
+pub fn remove_pred_at(cx: &mut FnCtx<Comp>, b: i64, index: i64) {
+    cx.blocks[b as usize].preds.remove(index as usize);
+    let mut phi = (cx.blocks[b as usize]).first;
+    while phi != 0 && (cx.insts[phi as usize]).op == Op::Phi {
+        let base = (cx.insts[phi as usize]).args;
+        for i in index..(cx.insts[phi as usize]).nargs - 1 {
+            (cx.args[(base + i) as usize]) = (cx.args[(base + i + 1) as usize]);
         }
-        (*preds).count -= 1;
-        let mut phi = (*cx.blocks.add(b as usize)).first;
-        while phi != 0 && (*cx.insts.add(phi as usize)).op == Op::Phi {
-            let base = (*cx.insts.add(phi as usize)).args;
-            for i in index..(*cx.insts.add(phi as usize)).nargs - 1 {
-                (*cx.args.data.add((base + i) as usize)) = (
-                    *cx.args.data.add((base + i + 1) as usize));
-            }
-            (*cx.insts.add(phi as usize)).nargs -= 1;
-            phi = (*cx.insts.add(phi as usize)).next;
-        }
+        (cx.insts[phi as usize]).nargs -= 1;
+        phi = (cx.insts[phi as usize]).next;
     }
 }
 
-pub fn remove_pred(cx: &mut FnCtx, b: i64, pred: i64) {
+pub fn remove_pred(cx: &mut FnCtx<Comp>, b: i64, pred: i64) {
     let index = pred_index(cx, b, pred);
     if index >= 0 {
         remove_pred_at(cx, b, index);
@@ -110,63 +105,57 @@ pub fn remove_pred(cx: &mut FnCtx, b: i64, pred: i64) {
 
 // Appends predecessor `pred` to block `b`; each phi gets `pred_operand`'s
 // operand for it (the phi's operand for predecessor `like`).
-pub fn add_pred_like(cx: &mut FnCtx, b: i64, pred: i64, like: i64) {
-    unsafe {
-        let like_index = pred_index(cx, b, like);
-        (*cx.blocks.add(b as usize)).preds.push(pred);
-        let mut phi = (*cx.blocks.add(b as usize)).first;
-        while phi != 0 && (*cx.insts.add(phi as usize)).op == Op::Phi {
-            let n = (*cx.insts.add(phi as usize)).nargs;
-            let start = cx.args.count;
-            for i in 0..n {
-                cx.args.push(
-                    (*cx.args.data.add(((*cx.insts.add(phi as usize)).args + i) as usize)));
-                cx.argty.push(0);
-            }
+pub fn add_pred_like(cx: &mut FnCtx<Comp>, b: i64, pred: i64, like: i64) {
+    let like_index = pred_index(cx, b, like);
+    (cx.blocks[b as usize]).preds.push(pred);
+    let mut phi = (cx.blocks[b as usize]).first;
+    while phi != 0 && (cx.insts[phi as usize]).op == Op::Phi {
+        let n = (cx.insts[phi as usize]).nargs;
+        let start = cx.args.len() as i64;
+        for i in 0..n {
             cx.args.push(
-                (*cx.args.data.add(((*cx.insts.add(phi as usize)).args + like_index) as usize)));
+                (cx.args[((cx.insts[phi as usize]).args + i) as usize]));
             cx.argty.push(0);
-            (*cx.insts.add(phi as usize)).args = start;
-            (*cx.insts.add(phi as usize)).nargs = n + 1;
-            phi = (*cx.insts.add(phi as usize)).next;
         }
+        cx.args.push(
+            (cx.args[((cx.insts[phi as usize]).args + like_index) as usize]));
+        cx.argty.push(0);
+        (cx.insts[phi as usize]).args = start;
+        (cx.insts[phi as usize]).nargs = n + 1;
+        phi = (cx.insts[phi as usize]).next;
     }
 }
 
 // Removes block `b` from the function: from its successors' predecessor
 // lists, and its instructions from their blocks.
-pub fn remove_block(cx: &mut FnCtx, b: i64) {
-    unsafe {
-        for i in 0..succ_count(cx, b) {
-            let succ_v = succ(cx, b, i);
-            remove_pred(cx, succ_v, b);
-        }
-        (*cx.blocks.add(b as usize)).removed = 1;
-        (*cx.blocks.add(b as usize)).term = Term::None;
-        let mut v = (*cx.blocks.add(b as usize)).first;
-        while v != 0 {
-            let next = (*cx.insts.add(v as usize)).next;
-            (*cx.insts.add(v as usize)).block = 0;
-            (*cx.insts.add(v as usize)).prev = 0;
-            (*cx.insts.add(v as usize)).next = 0;
-            v = next;
-        }
-        (*cx.blocks.add(b as usize)).first = 0;
-        (*cx.blocks.add(b as usize)).last = 0;
+pub fn remove_block(cx: &mut FnCtx<Comp>, b: i64) {
+    for i in 0..succ_count(cx, b) {
+        let succ_v = succ(cx, b, i);
+        remove_pred(cx, succ_v, b);
     }
+    (cx.blocks[b as usize]).removed = 1;
+    (cx.blocks[b as usize]).term = Term::None;
+    let mut v = (cx.blocks[b as usize]).first;
+    while v != 0 {
+        let next = (cx.insts[v as usize]).next;
+        (cx.insts[v as usize]).block = 0;
+        (cx.insts[v as usize]).prev = 0;
+        (cx.insts[v as usize]).next = 0;
+        v = next;
+    }
+    (cx.blocks[b as usize]).first = 0;
+    (cx.blocks[b as usize]).last = 0;
 }
 
 // Removes the blocks the entry does not reach. Returns whether any was.
-pub fn remove_unreachable(cx: &mut FnCtx, fi: i64) -> bool {
+pub fn remove_unreachable(cx: &mut FnCtx<Comp>, fi: i64) -> bool {
     layout_order(cx, fi);
     let mut changed = false;
-    unsafe {
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed == 0 && (*cx.blocks.add(b as usize)).order < 0 {
-                remove_block(cx, b);
-                changed = true;
-            }
+    for i in 0..fn_block_count(cx, fi) {
+        let b = (fn_block(cx, fi, i));
+        if (cx.blocks[b as usize]).removed == 0 && (cx.blocks[b as usize]).order < 0 {
+            remove_block(cx, b);
+            changed = true;
         }
     }
     changed
@@ -174,45 +163,43 @@ pub fn remove_unreachable(cx: &mut FnCtx, fi: i64) -> bool {
 
 // Replaces phis whose operands are one value (or the phi itself) by that
 // value, until none is left.
-pub fn remove_trivial_phis(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
+pub fn remove_trivial_phis(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     let mut any = false;
     let mut changed = true;
     while changed {
         changed = false;
-        unsafe {
-            for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-                let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-                if (*cx.blocks.add(b as usize)).removed != 0 {
-                    continue;
-                }
-                let mut phi = (*cx.blocks.add(b as usize)).first;
-                while phi != 0 && (*cx.insts.add(phi as usize)).op == Op::Phi {
-                    let next = (*cx.insts.add(phi as usize)).next;
-                    let mut same: i64 = 0;
-                    let mut trivial = true;
-                    for k in 0..(*cx.insts.add(phi as usize)).nargs {
-                        let ir_arg_v = ir_arg(cx, phi, k);
-                        let operand = ir_val(cx, ir_arg_v);
-                        if operand == same || operand == phi {
-                            continue;
-                        }
-                        if same != 0 {
-                            trivial = false;
-                            break;
-                        }
-                        same = operand;
+        for i in 0..fn_block_count(cx, fi) {
+            let b = (fn_block(cx, fi, i));
+            if (cx.blocks[b as usize]).removed != 0 {
+                continue;
+            }
+            let mut phi = (cx.blocks[b as usize]).first;
+            while phi != 0 && (cx.insts[phi as usize]).op == Op::Phi {
+                let next = (cx.insts[phi as usize]).next;
+                let mut same: i64 = 0;
+                let mut trivial = true;
+                for k in 0..(cx.insts[phi as usize]).nargs {
+                    let ir_arg_v = ir_arg(cx, phi, k);
+                    let operand = ir_val(cx, ir_arg_v);
+                    if operand == same || operand == phi {
+                        continue;
                     }
-                    if trivial {
-                        if same == 0 {
-                            ir_enter(cx, fi, pcx);
-                            same = ssa_undef(cx, (*cx.insts.add(phi as usize)).ty, pcx);
-                        }
-                        ir_replace(cx, phi, same);
-                        changed = true;
-                        any = true;
+                    if same != 0 {
+                        trivial = false;
+                        break;
                     }
-                    phi = next;
+                    same = operand;
                 }
+                if trivial {
+                    if same == 0 {
+                        ir_enter(cx, fi, pcx);
+                        same = ssa_undef(cx, (cx.insts[phi as usize]).ty, pcx);
+                    }
+                    ir_replace(cx, phi, same);
+                    changed = true;
+                    any = true;
+                }
+                phi = next;
             }
         }
     }
@@ -224,69 +211,65 @@ pub fn remove_trivial_phis(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
 
 // ---- Dominators ----
 
-fn intersect(cx: &mut FnCtx, b1: i64, b2: i64) -> i64 {
-    unsafe {
-        let mut x = b1;
-        let mut y = b2;
-        let mut steps: i64 = 0;
-        while x != y {
-            steps += 1;
-            if steps > 100000000 {
-                die(c"internal error: dominators do not converge");
-            }
-            while (*cx.blocks.add(x as usize)).order > (*cx.blocks.add(y as usize)).order {
-                x = (*cx.blocks.add(x as usize)).idom;
-            }
-            while (*cx.blocks.add(y as usize)).order > (*cx.blocks.add(x as usize)).order {
-                y = (*cx.blocks.add(y as usize)).idom;
-            }
+fn intersect(cx: &mut FnCtx<Comp>, b1: i64, b2: i64) -> i64 {
+    let mut x = b1;
+    let mut y = b2;
+    let mut steps: i64 = 0;
+    while x != y {
+        steps += 1;
+        if steps > 100000000 {
+            die(c"internal error: dominators do not converge");
         }
-        x
+        while (cx.blocks[x as usize]).order > (cx.blocks[y as usize]).order {
+            x = (cx.blocks[x as usize]).idom;
+        }
+        while (cx.blocks[y as usize]).order > (cx.blocks[x as usize]).order {
+            y = (cx.blocks[y as usize]).idom;
+        }
     }
+    x
 }
 
 // BLOCKS[b].idom for every reachable block (the entry is its own); also
 // lays out the blocks (BLOCKS[b].order, ORDER) in reverse post-order.
-pub fn compute_dominators(cx: &mut FnCtx, fi: i64) {
-    unsafe {
-        layout_order(cx, fi);
-        for i in 0..cx.order.count {
-            { let at_ix = (*cx.order.data.add(i as usize)) as usize;
-                (*cx.blocks.add(at_ix)).idom = 0 };
-        }
-        let entry = (*get_irfuncs().add(fi as usize)).entry;
-        (*cx.blocks.add(entry as usize)).idom = entry;
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for i in 1..cx.order.count {
-                let b = (*cx.order.data.add(i as usize));
-                let mut new_idom: i64 = 0;
-                for k in 0..(*cx.blocks.add(b as usize)).preds.count {
-                    let p = (*(*cx.blocks.add(b as usize)).preds.data.add(k as usize));
-                    if (*cx.blocks.add(p as usize)).order < 0
-                        || (*cx.blocks.add(p as usize)).idom == 0 {
-                        continue;
-                    }
-                    new_idom = if new_idom == 0 { p } else { intersect(cx, p, new_idom) };
+pub fn compute_dominators(cx: &mut FnCtx<Comp>, fi: i64) {
+    layout_order(cx, fi);
+    for i in 0..cx.order.len() as i64 {
+        { let at_ix = (cx.order[i as usize]) as usize;
+            (cx.blocks[at_ix]).idom = 0 };
+    }
+    let entry = fn_entry(cx, fi);
+    (cx.blocks[entry as usize]).idom = entry;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 1..cx.order.len() as i64 {
+            let b = (cx.order[i as usize]);
+            let mut new_idom: i64 = 0;
+            for k in 0..(cx.blocks[b as usize]).preds.len() as i64 {
+                let p = ((cx.blocks[b as usize]).preds[k as usize]);
+                if (cx.blocks[p as usize]).order < 0
+                    || (cx.blocks[p as usize]).idom == 0 {
+                    continue;
                 }
-                if new_idom != (*cx.blocks.add(b as usize)).idom {
-                    (*cx.blocks.add(b as usize)).idom = new_idom;
-                    changed = true;
-                }
+                new_idom = if new_idom == 0 { p } else { intersect(cx, p, new_idom) };
+            }
+            if new_idom != (cx.blocks[b as usize]).idom {
+                (cx.blocks[b as usize]).idom = new_idom;
+                changed = true;
             }
         }
     }
 }
 
 // Whether block a dominates block b (both reachable).
-pub fn dominates(cx: &mut FnCtx, a: i64, b: i64) -> bool {
+pub fn dominates(cx: &mut FnCtx<Comp>, a: i64, b: i64) -> bool {
     let mut x = b;
     loop {
         if x == a {
             return true;
         }
-        let up = unsafe { (*cx.blocks.add(x as usize)).idom };
+        let up = (cx.blocks[x as usize]).idom;
         if up == x || up == 0 {
             return false;
         }
@@ -298,518 +281,535 @@ pub fn dominates(cx: &mut FnCtx, a: i64, b: i64) -> bool {
 
 // Whether blocks x and y (two of them) hold nothing and jump to one block,
 // whose phis take the same value from both.
-fn same_forward(cx: &mut FnCtx, x: i64, y: i64) -> bool {
-    unsafe {
-        if x == y || (*cx.blocks.add(x as usize)).first != 0
-            || (*cx.blocks.add(y as usize)).first != 0
-            || (*cx.blocks.add(x as usize)).term != Term::Jump
-            || (*cx.blocks.add(y as usize)).term != Term::Jump
-            || (*cx.blocks.add(x as usize)).s0 != (*cx.blocks.add(y as usize)).s0
-            || (*cx.blocks.add(x as usize)).preds.count != 1
-            || (*cx.blocks.add(y as usize)).preds.count != 1 {
+fn same_forward(cx: &mut FnCtx<Comp>, x: i64, y: i64) -> bool {
+    if x == y || (cx.blocks[x as usize]).first != 0
+        || (cx.blocks[y as usize]).first != 0
+        || (cx.blocks[x as usize]).term != Term::Jump
+        || (cx.blocks[y as usize]).term != Term::Jump
+        || (cx.blocks[x as usize]).s0 != (cx.blocks[y as usize]).s0
+        || (cx.blocks[x as usize]).preds.len() as i64 != 1
+        || (cx.blocks[y as usize]).preds.len() as i64 != 1 {
+        return false;
+    }
+    let t = (cx.blocks[x as usize]).s0;
+    let ix = pred_index(cx, t, x);
+    let iy = pred_index(cx, t, y);
+    let mut phi = (cx.blocks[t as usize]).first;
+    while phi != 0 && (cx.insts[phi as usize]).op == Op::Phi {
+        let ir_arg_v = ir_arg(cx, phi, ix);
+        let ir_val_v = ir_val(cx, ir_arg_v);
+        let ir_arg_v1 = ir_arg(cx, phi, iy);
+        let ir_val_v1 = ir_val(cx, ir_arg_v1);
+        if ir_val_v != ir_val_v1 {
             return false;
         }
-        let t = (*cx.blocks.add(x as usize)).s0;
-        let ix = pred_index(cx, t, x);
-        let iy = pred_index(cx, t, y);
-        let mut phi = (*cx.blocks.add(t as usize)).first;
-        while phi != 0 && (*cx.insts.add(phi as usize)).op == Op::Phi {
-            let ir_arg_v = ir_arg(cx, phi, ix);
-            let ir_val_v = ir_val(cx, ir_arg_v);
-            let ir_arg_v1 = ir_arg(cx, phi, iy);
-            let ir_val_v1 = ir_val(cx, ir_arg_v1);
-            if ir_val_v != ir_val_v1 {
-                return false;
-            }
-            phi = (*cx.insts.add(phi as usize)).next;
-        }
-        true
+        phi = (cx.insts[phi as usize]).next;
     }
+    true
 }
 
 // Merges blocks into their only predecessor when it has no other
 // successor, and threads jumps through empty blocks. Returns whether
 // anything changed.
-pub fn simplify_cfg(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let mut changed = false;
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed != 0 {
-                continue;
-            }
-            // A branch with both edges to one block is a jump.
-            if (*cx.blocks.add(b as usize)).term == Term::Branch
-                && (*cx.blocks.add(b as usize)).s0 == (*cx.blocks.add(b as usize)).s1 {
-                let s = (*cx.blocks.add(b as usize)).s0;
-                remove_pred(cx, s, b);
-                (*cx.blocks.add(b as usize)).term = Term::Jump;
-                (*cx.blocks.add(b as usize)).cond = 0;
-                (*cx.blocks.add(b as usize)).s1 = 0;
-                changed = true;
-            }
-            // A branch on a constant is a jump.
-            if (*cx.blocks.add(b as usize)).term == Term::Branch
-                && (*cx.insts.add((*cx.blocks.add(b as usize)).cond as usize)).op == Op::Const {
-                let taken = if (*cx.insts.add((*cx.blocks.add(b as usize)).cond as usize)).imm
-                    != 0 { (*cx.blocks.add(b as usize)).s0 }
-                    else { (*cx.blocks.add(b as usize)).s1 };
-                let dropped = if taken
-                    == (*cx.blocks.add(b as usize)).s0 { (*cx.blocks.add(b as usize)).s1 }
-                    else { (*cx.blocks.add(b as usize)).s0 };
-                remove_pred(cx, dropped, b);
-                (*cx.blocks.add(b as usize)).term = Term::Jump;
-                (*cx.blocks.add(b as usize)).cond = 0;
-                (*cx.blocks.add(b as usize)).s0 = taken;
-                (*cx.blocks.add(b as usize)).s1 = 0;
-                changed = true;
-            }
-            // (0.14) So is a branch to two empty blocks that go on to one
-            // block, where its phis take the same value from both (what a
-            // threaded comparison of -1, 0 and 1 leaves).
-            if (*cx.blocks.add(b as usize)).term == Term::Branch
-                && same_forward(cx, (*cx.blocks.add(b as usize)).s0,
-                    (*cx.blocks.add(b as usize)).s1) {
-                let dropped = (*cx.blocks.add(b as usize)).s1;
-                remove_pred(cx, dropped, b);
-                (*cx.blocks.add(b as usize)).term = Term::Jump;
-                (*cx.blocks.add(b as usize)).cond = 0;
-                (*cx.blocks.add(b as usize)).s1 = 0;
-                changed = true;
-            }
-            // So is a switch on a constant, or with one successor.
-            if (*cx.blocks.add(b as usize)).term == Term::Switch
-                && ((*cx.insts.add((*cx.blocks.add(b as usize)).cond as usize)).op == Op::Const
-                    || (*cx.blocks.add(b as usize)).nsucc == 1) {
-                let taken = if (*cx.blocks.add(b as usize)).nsucc
-                    == 1 { (*cx.blocks.add(b as usize)).s0 }
-                    else {
-                        switch_target(cx, b,
-                            (*cx.insts.add((*cx.blocks.add(b as usize)).cond as usize)).imm)
-                    };
-                switch_to_jump(cx, b, taken);
-                changed = true;
-            }
+pub fn simplify_cfg(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
+    let mut changed = false;
+    for i in 0..fn_block_count(cx, fi) {
+        let b = (fn_block(cx, fi, i));
+        if (cx.blocks[b as usize]).removed != 0 {
+            continue;
         }
-        if changed {
-            remove_unreachable(cx, fi);
+        // A branch with both edges to one block is a jump.
+        if (cx.blocks[b as usize]).term == Term::Branch
+            && (cx.blocks[b as usize]).s0 == (cx.blocks[b as usize]).s1 {
+            let s = (cx.blocks[b as usize]).s0;
+            remove_pred(cx, s, b);
+            (cx.blocks[b as usize]).term = Term::Jump;
+            (cx.blocks[b as usize]).cond = 0;
+            (cx.blocks[b as usize]).s1 = 0;
+            changed = true;
         }
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed != 0 {
-                continue;
-            }
-            if merge_into_pred(cx, fi, b) || thread_jump(cx, fi, b) {
-                changed = true;
-            }
+        // A branch on a constant is a jump.
+        if (cx.blocks[b as usize]).term == Term::Branch
+            && (cx.insts[(cx.blocks[b as usize]).cond as usize]).op == Op::Const {
+            let taken = if (cx.insts[(cx.blocks[b as usize]).cond as usize]).imm
+                != 0 { (cx.blocks[b as usize]).s0 }
+                else { (cx.blocks[b as usize]).s1 };
+            let dropped = if taken
+                == (cx.blocks[b as usize]).s0 { (cx.blocks[b as usize]).s1 }
+                else { (cx.blocks[b as usize]).s0 };
+            remove_pred(cx, dropped, b);
+            (cx.blocks[b as usize]).term = Term::Jump;
+            (cx.blocks[b as usize]).cond = 0;
+            (cx.blocks[b as usize]).s0 = taken;
+            (cx.blocks[b as usize]).s1 = 0;
+            changed = true;
         }
-        if changed {
-            resolve_all(cx, fi);
-            remove_trivial_phis(cx, fi, pcx);
+        // (0.14) So is a branch to two empty blocks that go on to one
+        // block, where its phis take the same value from both (what a
+        // threaded comparison of -1, 0 and 1 leaves).
+        if (cx.blocks[b as usize]).term == Term::Branch
+            && same_forward(cx, (cx.blocks[b as usize]).s0,
+                (cx.blocks[b as usize]).s1) {
+            let dropped = (cx.blocks[b as usize]).s1;
+            remove_pred(cx, dropped, b);
+            (cx.blocks[b as usize]).term = Term::Jump;
+            (cx.blocks[b as usize]).cond = 0;
+            (cx.blocks[b as usize]).s1 = 0;
+            changed = true;
         }
-        changed
+        // So is a switch on a constant, or with one successor.
+        if (cx.blocks[b as usize]).term == Term::Switch
+            && ((cx.insts[(cx.blocks[b as usize]).cond as usize]).op == Op::Const
+                || (cx.blocks[b as usize]).nsucc == 1) {
+            let taken = if (cx.blocks[b as usize]).nsucc
+                == 1 { (cx.blocks[b as usize]).s0 }
+                else {
+                    switch_target(cx, b,
+                        (cx.insts[(cx.blocks[b as usize]).cond as usize]).imm)
+                };
+            switch_to_jump(cx, b, taken);
+            changed = true;
+        }
     }
+    if changed {
+        remove_unreachable(cx, fi);
+    }
+    for i in 0..fn_block_count(cx, fi) {
+        let b = (fn_block(cx, fi, i));
+        if (cx.blocks[b as usize]).removed != 0 {
+            continue;
+        }
+        if merge_into_pred(cx, fi, b) || thread_jump(cx, fi, b) {
+            changed = true;
+        }
+    }
+    if changed {
+        resolve_all(cx, fi);
+        remove_trivial_phis(cx, fi, pcx);
+    }
+    changed
 }
 
 // Turns switch b into a jump to `taken` (one of its successors).
-pub fn switch_to_jump(cx: &mut FnCtx, b: i64, taken: i64) {
-    unsafe {
-        for i in 0..(*cx.blocks.add(b as usize)).nsucc {
-            let s = succ(cx, b, i);
-            if s != taken {
-                remove_pred(cx, s, b);
-            }
+pub fn switch_to_jump(cx: &mut FnCtx<Comp>, b: i64, taken: i64) {
+    for i in 0..(cx.blocks[b as usize]).nsucc {
+        let s = succ(cx, b, i);
+        if s != taken {
+            remove_pred(cx, s, b);
         }
-        (*cx.blocks.add(b as usize)).term = Term::Jump;
-        (*cx.blocks.add(b as usize)).cond = 0;
-        (*cx.blocks.add(b as usize)).s0 = taken;
-        (*cx.blocks.add(b as usize)).s1 = 0;
     }
+    (cx.blocks[b as usize]).term = Term::Jump;
+    (cx.blocks[b as usize]).cond = 0;
+    (cx.blocks[b as usize]).s0 = taken;
+    (cx.blocks[b as usize]).s1 = 0;
 }
 
 // Block b has one predecessor p, which jumps to it: move b's instructions
 // to the end of p.
-fn merge_into_pred(cx: &mut FnCtx, fi: i64, b: i64) -> bool {
-    unsafe {
-        if (*cx.blocks.add(b as usize)).preds.count != 1
-            || b == (*get_irfuncs().add(fi as usize)).entry {
-            return false;
-        }
-        let p = (*(*cx.blocks.add(b as usize)).preds.data.add(0));
-        if p == b || (*cx.blocks.add(p as usize)).term != Term::Jump {
-            return false;
-        }
-        // Phis of a block with one predecessor are that operand.
-        let mut v = (*cx.blocks.add(b as usize)).first;
-        while v != 0 && (*cx.insts.add(v as usize)).op == Op::Phi {
-            let next = (*cx.insts.add(v as usize)).next;
-            let ir_arg_v = ir_arg(cx, v, 0);
-            let ir_val_v = ir_val(cx, ir_arg_v);
-            ir_replace(cx, v, ir_val_v);
-            v = next;
-        }
-        v = (*cx.blocks.add(b as usize)).first;
-        while v != 0 {
-            let next = (*cx.insts.add(v as usize)).next;
-            ir_unlink(cx, v);
-            ir_append(cx, p, v);
-            v = next;
-        }
-        copy_terminator(cx, p, b);
-        for i in 0..succ_count(cx, b) {
-            let s = succ(cx, b, i);
-            let index = pred_index(cx, s, b);
-            (*(*cx.blocks.add(s as usize)).preds.data.add(index as usize)) = p;
-        }
-        (*cx.blocks.add(b as usize)).term = Term::None;
-        (*cx.blocks.add(b as usize)).removed = 1;
-        (*cx.blocks.add(b as usize)).preds.count = 0;
-        true
+fn merge_into_pred(cx: &mut FnCtx<Comp>, fi: i64, b: i64) -> bool {
+    if (cx.blocks[b as usize]).preds.len() as i64 != 1
+        || b == fn_entry(cx, fi) {
+        return false;
     }
+    let p = ((cx.blocks[b as usize]).preds[0]);
+    if p == b || (cx.blocks[p as usize]).term != Term::Jump {
+        return false;
+    }
+    // Phis of a block with one predecessor are that operand.
+    let mut v = (cx.blocks[b as usize]).first;
+    while v != 0 && (cx.insts[v as usize]).op == Op::Phi {
+        let next = (cx.insts[v as usize]).next;
+        let ir_arg_v = ir_arg(cx, v, 0);
+        let ir_val_v = ir_val(cx, ir_arg_v);
+        ir_replace(cx, v, ir_val_v);
+        v = next;
+    }
+    v = (cx.blocks[b as usize]).first;
+    while v != 0 {
+        let next = (cx.insts[v as usize]).next;
+        ir_unlink(cx, v);
+        ir_append(cx, p, v);
+        v = next;
+    }
+    copy_terminator(cx, p, b);
+    for i in 0..succ_count(cx, b) {
+        let s = succ(cx, b, i);
+        let index = pred_index(cx, s, b);
+        ((cx.blocks[s as usize]).preds[index as usize]) = p;
+    }
+    (cx.blocks[b as usize]).term = Term::None;
+    (cx.blocks[b as usize]).removed = 1;
+    (cx.blocks[b as usize]).preds.clear();
+    true
 }
 
 // Block b is empty (no instructions) and jumps to s: its predecessors can
 // go to s directly, when s has no phis.
-fn thread_jump(cx: &mut FnCtx, fi: i64, b: i64) -> bool {
-    unsafe {
-        if (*cx.blocks.add(b as usize)).first != 0
-            || (*cx.blocks.add(b as usize)).term != Term::Jump
-            || b == (*get_irfuncs().add(fi as usize)).entry {
-            return false;
-        }
-        let s = (*cx.blocks.add(b as usize)).s0;
-        if s == b {
-            return false;
-        }
-        let first = (*cx.blocks.add(s as usize)).first;
-        if first != 0 && (*cx.insts.add(first as usize)).op == Op::Phi {
-            return false;
-        }
-        if (*cx.blocks.add(b as usize)).preds.count == 0 {
-            return false;
-        }
-        for i in 0..(*cx.blocks.add(b as usize)).preds.count {
-            let p = (*(*cx.blocks.add(b as usize)).preds.data.add(i as usize));
-            if (*cx.blocks.add(p as usize)).term == Term::Switch && is_succ(cx, p, s) {
-                return false;
-            }
-        }
-        for i in 0..(*cx.blocks.add(b as usize)).preds.count {
-            let p = (*(*cx.blocks.add(b as usize)).preds.data.add(i as usize));
-            redirect_succ(cx, p, b, s);
-            (*cx.blocks.add(s as usize)).preds.push(p);
-        }
-        remove_pred(cx, s, b);
-        (*cx.blocks.add(b as usize)).term = Term::None;
-        (*cx.blocks.add(b as usize)).removed = 1;
-        (*cx.blocks.add(b as usize)).preds.count = 0;
-        true
+fn thread_jump(cx: &mut FnCtx<Comp>, fi: i64, b: i64) -> bool {
+    if (cx.blocks[b as usize]).first != 0
+        || (cx.blocks[b as usize]).term != Term::Jump
+        || b == fn_entry(cx, fi) {
+        return false;
     }
+    let s = (cx.blocks[b as usize]).s0;
+    if s == b {
+        return false;
+    }
+    let first = (cx.blocks[s as usize]).first;
+    if first != 0 && (cx.insts[first as usize]).op == Op::Phi {
+        return false;
+    }
+    if (cx.blocks[b as usize]).preds.len() as i64 == 0 {
+        return false;
+    }
+    for i in 0..(cx.blocks[b as usize]).preds.len() as i64 {
+        let p = ((cx.blocks[b as usize]).preds[i as usize]);
+        if (cx.blocks[p as usize]).term == Term::Switch && is_succ(cx, p, s) {
+            return false;
+        }
+    }
+    for i in 0..(cx.blocks[b as usize]).preds.len() as i64 {
+        let p = ((cx.blocks[b as usize]).preds[i as usize]);
+        redirect_succ(cx, p, b, s);
+        (cx.blocks[s as usize]).preds.push(p);
+    }
+    remove_pred(cx, s, b);
+    (cx.blocks[b as usize]).term = Term::None;
+    (cx.blocks[b as usize]).removed = 1;
+    (cx.blocks[b as usize]).preds.clear();
+    true
 }
 
 // ---- Dead code elimination ----
 
 // Removes the instructions whose values are not used, transitively (mark
 // and sweep from the instructions with side effects and the terminators).
-pub fn eliminate_dead_code(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let mut work = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed != 0 {
-                continue;
-            }
-            let mut v = (*cx.blocks.add(b as usize)).first;
-            while v != 0 {
-                (*cx.insts.add(v as usize)).mark = 0;
-                v = (*cx.insts.add(v as usize)).next;
-            }
+pub fn eliminate_dead_code(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
+    let mut work: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..fn_block_count(cx, fi) {
+        let b = (fn_block(cx, fi, i));
+        if (cx.blocks[b as usize]).removed != 0 {
+            continue;
         }
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed != 0 {
-                continue;
-            }
-            let mut v = (*cx.blocks.add(b as usize)).first;
-            while v != 0 {
-                if has_effect(cx, v, pcx) {
-                    mark_live(cx, v, &mut work);
-                }
-                v = (*cx.insts.add(v as usize)).next;
-            }
-            if (*cx.blocks.add(b as usize)).cond != 0 {
-                mark_live(cx, (*cx.blocks.add(b as usize)).cond, &mut work);
-            }
+        let mut v = (cx.blocks[b as usize]).first;
+        while v != 0 {
+            (cx.insts[v as usize]).mark = 0;
+            v = (cx.insts[v as usize]).next;
         }
-        while work.count > 0 {
-            let v = work.pop();
-            for k in 0..ir_operand_count(cx, v) {
-                let operand = ir_operand(cx, v, k);
-                if operand != 0 {
-                    mark_live(cx, operand, &mut work);
-                }
-            }
-        }
-        free(work.data as *mut u8);
-        let mut changed = false;
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed != 0 {
-                continue;
-            }
-            let mut v = (*cx.blocks.add(b as usize)).first;
-            while v != 0 {
-                let next = (*cx.insts.add(v as usize)).next;
-                if (*cx.insts.add(v as usize)).mark == 0 {
-                    ir_unlink(cx, v);
-                    changed = true;
-                }
-                v = next;
-            }
-        }
-        changed
     }
+    for i in 0..fn_block_count(cx, fi) {
+        let b = (fn_block(cx, fi, i));
+        if (cx.blocks[b as usize]).removed != 0 {
+            continue;
+        }
+        let mut v = (cx.blocks[b as usize]).first;
+        while v != 0 {
+            if has_effect(cx, v, pcx) {
+                mark_live(cx, v, &mut work);
+            }
+            v = (cx.insts[v as usize]).next;
+        }
+        if (cx.blocks[b as usize]).cond != 0 {
+            mark_live(cx, (cx.blocks[b as usize]).cond, &mut work);
+        }
+    }
+    while work.len() as i64 > 0 {
+        let v = work.pop().unwrap();
+        for k in 0..ir_operand_count(cx, v) {
+            let operand = ir_operand(cx, v, k);
+            if operand != 0 {
+                mark_live(cx, operand, &mut work);
+            }
+        }
+    }
+    let mut changed = false;
+    for i in 0..fn_block_count(cx, fi) {
+        let b = (fn_block(cx, fi, i));
+        if (cx.blocks[b as usize]).removed != 0 {
+            continue;
+        }
+        let mut v = (cx.blocks[b as usize]).first;
+        while v != 0 {
+            let next = (cx.insts[v as usize]).next;
+            if (cx.insts[v as usize]).mark == 0 {
+                ir_unlink(cx, v);
+                changed = true;
+            }
+            v = next;
+        }
+    }
+    changed
 }
 
-fn mark_live(cx: &mut FnCtx, v: i64, work: &mut IntVec) {
-    unsafe {
-        if (*cx.insts.add(v as usize)).mark == 0 {
-            (*cx.insts.add(v as usize)).mark = 1;
-            work.push(v);
-        }
+fn mark_live(cx: &mut FnCtx<Comp>, v: i64, work: &mut Vec<i64, Comp>) {
+    if (cx.insts[v as usize]).mark == 0 {
+        (cx.insts[v as usize]).mark = 1;
+        work.push(v);
     }
 }
 
 // ---- The pipeline ----
 
 // Cleanup that every IR function gets before code generation.
-pub fn cleanup_function(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
+pub fn cleanup_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     resolve_all(cx, fi);
     remove_unreachable(cx, fi);
     remove_trivial_phis(cx, fi, pcx);
     resolve_all(cx, fi);
+    pass_done(P_CLEANUP, pcx);
     verify_func(cx, fi, c"lowering, inlining and cleanup", pcx);
 }
 
 // (0.17) The -O1 pipeline of one function (PER_FUNCTION), after the
 // program's leaves (simplify_inlining_leaves): the small leaves' calls
 // inlined, the scalar pipeline.
-pub fn optimize_function(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
+pub fn optimize_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     optimize_with_leaves(cx, fi, pcx);
 }
 
 // After inlining into fi: the cleanup and the scalar pipeline.
-pub fn optimize_after_inlining(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
+pub fn optimize_after_inlining(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     cleanup_function(cx, fi, pcx);
     simplify_function(cx, fi, pcx);
 }
 
 // The scalar pipeline (-O1), twice: constants, peepholes, control flow,
-// value numbering, dead code.
-pub fn simplify_function(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
+// value numbering, dead code. (0.29: pass_done after each, for
+// --time-passes=passes.)
+pub fn simplify_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     for round in 0..2 {
         sccp(cx, fi, pcx);
+        pass_done(P_SCCP, pcx);
         verify_func(cx, fi, c"sccp", pcx);
         instcombine(cx, fi, pcx);
+        pass_done(P_INSTCOMBINE, pcx);
         verify_func(cx, fi, c"instcombine", pcx);
-        if round == 0 && elide_copies(cx, fi, pcx) {
-            verify_func(cx, fi, c"copy elision", pcx);
-        }
-        if round == 0 && run_sroa(cx, fi, pcx) {
-            verify_func(cx, fi, c"sroa", pcx);
-        }
-        if round == 0 && promote_constant_slots(cx, fi, pcx) {
-            verify_func(cx, fi, c"constant slots", pcx);
+        if round == 0 {
+            let elided = elide_copies(cx, fi, pcx);
+            pass_done(P_COPY_ELISION, pcx);
+            if elided {
+                verify_func(cx, fi, c"copy elision", pcx);
+            }
+            let replaced = run_sroa(cx, fi, pcx);
+            pass_done(P_SROA, pcx);
+            if replaced {
+                verify_func(cx, fi, c"sroa", pcx);
+            }
+            let promoted = promote_constant_slots(cx, fi, pcx);
+            pass_done(P_CONST_SLOTS, pcx);
+            if promoted {
+                verify_func(cx, fi, c"constant slots", pcx);
+            }
         }
         simplify_cfg(cx, fi, pcx);
+        pass_done(P_SIMPLIFY_CFG, pcx);
         verify_func(cx, fi, c"simplify_cfg", pcx);
         run_gvn(cx, fi, pcx);
+        pass_done(P_GVN, pcx);
         verify_func(cx, fi, c"gvn", pcx);
         eliminate_dead_code(cx, fi, pcx);
+        pass_done(P_DCE, pcx);
         verify_func(cx, fi, c"dead code elimination", pcx);
         simplify_cfg(cx, fi, pcx);
+        pass_done(P_SIMPLIFY_CFG, pcx);
         verify_func(cx, fi, c"simplify_cfg", pcx);
-        if round == 0 && thread_tags(cx, fi, pcx) {
-            verify_func(cx, fi, c"threading on tags", pcx);
+        if round == 0 {
+            let threaded = thread_tags(cx, fi, pcx);
+            pass_done(P_THREAD_TAGS, pcx);
+            if threaded {
+                verify_func(cx, fi, c"threading on tags", pcx);
+            }
         }
     }
     remove_trivial_phis(cx, fi, pcx);
+    pass_done(P_TRIVIAL_PHIS, pcx);
 }
 
-pub fn optimize_program(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        pcx.fn_live = alloc_array::<i64>(pcx.irfunc_count + 1);
-        for fi in 0..pcx.irfunc_count {
-            (*pcx.fn_live.add(fi as usize)) = 1;
-        }
-        // (0.18.1) No entry facts in a function an indirect call may enter.
-        strip_taken(cx, pcx);
-        drop_unreachable_std(cx, pcx);
-        // (0.18.1) The code cache (back::codecache).
-        cc_begin(pcx);
-        // (0.18.1) The tasks' threads (middle::parallel), and each function's
-        // cleanup on them.
-        parallel_begin(cx, pcx);
-        cleanup_all(cx, pcx);
-        phase_time(c"cleanup", pcx);
-        if pcx.opt_level == 0 {
-            return;
-        }
-        let mut t = timer_now(pcx);
-        // (0.17) -O1: small leaf functions inlined (inline.vl)
-        if pcx.opt_level == 1 {
-            simplify_inlining_leaves(cx, pcx);
-            timer_add(T_SCALAR, t, pcx);
-            phase_time(c"small leaves", pcx);
-            return;
-        }
-        simplify_all(cx, pcx);
+pub fn optimize_program(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
+    sized_table(&mut pcx.fn_live, pcx.irfunc_count + 1, 0);
+    for fi in 0..pcx.irfunc_count {
+        (pcx.fn_live[fi as usize]) = 1;
+    }
+    // (0.18.1) No entry facts in a function an indirect call may enter.
+    strip_taken(cx, pcx);
+    drop_unreachable_std(cx, pcx);
+    // (0.18.1) The code cache (back::codecache).
+    // (its count of the program's instructions reads every function's
+    // stored IR)
+    ir_release(cx, pcx);
+    cc_begin(pcx);
+    // (0.18.1) The tasks' threads (middle::parallel), and each function's
+    // cleanup on them.
+    parallel_begin(cx, pcx);
+    cleanup_all(cx, pcx);
+    phase_time(c"cleanup", pcx);
+    if pcx.opt_level == 0 {
+        return;
+    }
+    let mut t = timer_now(pcx);
+    // (0.17) -O1: small leaf functions inlined (inline.vl)
+    if pcx.opt_level == 1 {
+        simplify_inlining_leaves(cx, pcx);
         timer_add(T_SCALAR, t, pcx);
-        phase_time(c"scalar pipeline", pcx);
-        if pcx.opt_level < 2 {
-            return;
-        }
-        t = timer_now(pcx);
-        // -O2: interprocedural constants, then bottom-up over the call graph's
-        // components: tail recursion, inlining, the loop passes, scalar
-        // promotion and loop-invariant code motion, and each component's
-        // attributes (docs/optimizer.md, 0.6).
-        pcx.fn_scc = alloc_array::<i64>(pcx.irfunc_count + 1);
-        set_fn_size(alloc_array::<i64>(pcx.irfunc_count + 1));
-        pcx.fn_calls = alloc_array::<i64>(pcx.irfunc_count + 1);
-        pcx.fn_address = alloc_array::<i64>(pcx.irfunc_count + 1);
-        init_fn_caches(pcx);
-        init_attrs(pcx);
-        count_call_sites(cx, pcx);
-        // The functions whose address the program takes stay in it, even when
-        // every call through the address is made direct (see
-        // remove_dead_functions).
-        pcx.fn_taken = alloc_array::<i64>(pcx.irfunc_count + 1);
-        set_deferred(alloc_array::<i64>(pcx.irfunc_count + 1));
+        phase_time(c"small leaves", pcx);
+        return;
+    }
+    simplify_all(cx, pcx);
+    timer_add(T_SCALAR, t, pcx);
+    phase_time(c"scalar pipeline", pcx);
+    if pcx.opt_level < 2 {
+        return;
+    }
+    t = timer_now(pcx);
+    // -O2: interprocedural constants, then bottom-up over the call graph's
+    // components: tail recursion, inlining, the loop passes, scalar
+    // promotion and loop-invariant code motion, and each component's
+    // attributes (docs/optimizer.md, 0.6).
+    sized_table(&mut pcx.fn_scc, pcx.irfunc_count + 1, 0);
+    pcx.fn_size.reset(pcx.irfunc_count + 1, 0);
+    sized_table(&mut pcx.fn_calls, pcx.irfunc_count + 1, 0);
+    sized_table(&mut pcx.fn_address, pcx.irfunc_count + 1, 0);
+    init_fn_caches(pcx);
+    init_attrs(pcx);
+    count_call_sites(cx, pcx);
+    // The functions whose address the program takes stay in it, even when
+    // every call through the address is made direct (see
+    // remove_dead_functions).
+    sized_table(&mut pcx.fn_taken, pcx.irfunc_count + 1, 0);
+    pcx.opt_deferred.reset(pcx.irfunc_count + 1, 0);
+    for fi in 0..pcx.irfunc_count {
+        (pcx.fn_taken[fi as usize]) = (pcx.fn_address[fi as usize]);
+    }
+    compute_sccs(cx, pcx);
+    propagate_constants(cx, pcx);
+    for fi in 0..pcx.irfunc_count {
+        ir_enter(cx, fi, pcx);
+        pcx.fn_size.set(fi, func_size(cx, fi));
+    }
+    start_inlining_budget(pcx);
+    inline_log_start(pcx);
+    timer_add(T_IPCP, t, pcx);
+    phase_time(c"interprocedural constants, components", pcx);
+    // (0.18.1: each component once the components it calls are done,
+    // middle::parallel; one thread takes them in SCC_ORDER, as 0.17 did)
+    optimize_components(cx, pcx);
+    inline_log_end(pcx);
+    phase_time(c"components, bottom up", pcx);
+    t = timer_now(pcx);
+    remove_dead_functions(cx, pcx);
+    timer_add(T_GLOBAL_DCE, t, pcx);
+    phase_time(c"dead functions", pcx);
+    // The functions whose loop passes waited for their callers, and that
+    // are still called somewhere, then SLP (finish_function): when each
+    // is emitted (0.18.1), or here for the IR printers.
+    if pcx.emit_ir || pcx.emit_mir {
         for fi in 0..pcx.irfunc_count {
-            (*pcx.fn_taken.add(fi as usize)) = (*pcx.fn_address.add(fi as usize));
+            deferred_loops(cx, fi, pcx);
         }
-        compute_sccs(cx, pcx);
-        propagate_constants(cx, pcx);
         for fi in 0..pcx.irfunc_count {
-            ir_enter(cx, fi, pcx);
-            (*get_fn_size().add(fi as usize)) = func_size(cx, fi);
+            slp_function(cx, fi, pcx);
         }
-        start_inlining_budget(pcx);
-        timer_add(T_IPCP, t, pcx);
-        phase_time(c"interprocedural constants, components", pcx);
-        // (0.18.1: each component once the components it calls are done,
-        // middle::parallel; one thread takes them in SCC_ORDER, as 0.17 did)
-        optimize_components(cx, pcx);
-        phase_time(c"components, bottom up", pcx);
-        t = timer_now(pcx);
-        remove_dead_functions(cx, pcx);
-        timer_add(T_GLOBAL_DCE, t, pcx);
-        phase_time(c"dead functions", pcx);
-        // The functions whose loop passes waited for their callers, and that
-        // are still called somewhere, then SLP (finish_function): when each
-        // is emitted (0.18.1), or here for the IR printers.
-        if pcx.emit_ir || pcx.emit_mir {
-            for fi in 0..pcx.irfunc_count {
-                deferred_loops(cx, fi, pcx);
-            }
-            for fi in 0..pcx.irfunc_count {
-                slp_function(cx, fi, pcx);
-            }
-        }
-        if pcx.print_attrs {
-            print_attrs(pcx);
-        }
+    }
+    if pcx.print_attrs {
+        print_attrs(pcx);
     }
 }
 
 // (0.18.1) The bottom-up pipeline of function fi, of its component's task
 // (middle::parallel): tail recursion, inlining, heap to stack, the loop
 // passes (or not yet, DEFERRED), its size.
-pub fn optimize_component_function(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        ir_enter(cx, fi, pcx);
-        let mut t = timer_now(pcx);
-        if eliminate_tail_recursion(cx, fi, pcx) {
-            cleanup_function(cx, fi, pcx);
-            simplify_function(cx, fi, pcx);
-        }
-        timer_add(T_TRE, t, pcx);
-        t = timer_now(pcx);
-        inline_rounds(cx, fi, pcx);
-        // (0.18.1) the checks of its requires, inlined at its entry, as facts
-        entry_assumes(cx, fi, pcx);
-        timer_add(T_INLINE, t, pcx);
-        t = timer_now(pcx);
-        if heap_to_stack(cx, fi, pcx) {
-            simplify_function(cx, fi, pcx);
-        } else if repeated_pure_calls(cx, fi, pcx) {
+pub fn optimize_component_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
+    ir_enter(cx, fi, pcx);
+    let mut t = timer_now(pcx);
+    let tail = eliminate_tail_recursion(cx, fi, pcx);
+    pass_done(P_TAIL_RECURSION, pcx);
+    if tail {
+        cleanup_function(cx, fi, pcx);
+        simplify_function(cx, fi, pcx);
+    }
+    timer_add(T_TRE, t, pcx);
+    t = timer_now(pcx);
+    inline_rounds(cx, fi, pcx);
+    // (0.18.1) the checks of its requires, inlined at its entry, as facts
+    entry_assumes(cx, fi, pcx);
+    pass_done(P_ENTRY_FACTS, pcx);
+    timer_add(T_INLINE, t, pcx);
+    t = timer_now(pcx);
+    let on_stack = heap_to_stack(cx, fi, pcx);
+    pass_done(P_HEAP_TO_STACK, pcx);
+    if on_stack {
+        simplify_function(cx, fi, pcx);
+    } else {
+        let repeated = repeated_pure_calls(cx, fi, pcx);
+        pass_done(P_PURE_CALLS, pcx);
+        if repeated {
             // (0.16: merged now that the callees' attributes are known)
             run_gvn(cx, fi, pcx);
+            pass_done(P_GVN, pcx);
             eliminate_dead_code(cx, fi, pcx);
+            pass_done(P_DCE, pcx);
         }
-        timer_add(T_HEAP, t, pcx);
-        if inlined_everywhere(fi, pcx) {
-            (*get_deferred().add(fi as usize)) = 1;
-        } else {
-            loop_pipeline(cx, fi, pcx);
-        }
-        t = timer_now(pcx);
-        (*get_fn_size().add(fi as usize)) = func_size(cx, fi);
-        ir_shrink(cx);
-        // (asked before, through a call made direct, it is asked again)
-        forget_fn_caches(fi);
-        timer_add(T_ATTRS, t, pcx);
     }
+    timer_add(T_HEAP, t, pcx);
+    if inlined_everywhere(fi, pcx) {
+        pcx.opt_deferred.set(fi, 1);
+    } else {
+        loop_pipeline(cx, fi, pcx);
+    }
+    t = timer_now(pcx);
+    pcx.fn_size.set(fi, func_size(cx, fi));
+    ir_shrink(cx);
+    // (asked before, through a call made direct, it is asked again)
+    forget_fn_caches(fi, pcx);
+    pass_done(P_FN_SIZE, pcx);
+    timer_add(T_ATTRS, t, pcx);
 }
 
 // (0.18.1) -O2: function fi's loop passes, when they waited for its
 // callers (DEFERRED) and it is still called.
-pub fn deferred_loops(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        if (*get_deferred().add(fi as usize)) != 0 && (*pcx.fn_live.add(fi as usize)) != 0 {
-            ir_enter(cx, fi, pcx);
-            loop_pipeline(cx, fi, pcx);
-        }
+pub fn deferred_loops(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
+    if (pcx.opt_deferred.get(fi)) != 0 && (pcx.fn_live[fi as usize]) != 0 {
+        ir_enter(cx, fi, pcx);
+        loop_pipeline(cx, fi, pcx);
     }
 }
 
 // (0.18.1) -O2: function fi's SLP vectorization (0.11: last, on the code
 // as it will be emitted: stores packed earlier would hide their values
 // from the loads of the functions they are inlined into).
-pub fn slp_function(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        let t = timer_now(pcx);
-        // (0.18.1) the facts of entry_assumes gone before the code is made
-        if (*pcx.fn_live.add(fi as usize)) != 0 {
-            ir_enter(cx, fi, pcx);
-            drop_assumes(cx, fi, pcx);
-        }
-        if (*pcx.fn_live.add(fi as usize)) != 0 && slp_vectorize(cx, fi, pcx) {
-            ir_enter(cx, fi, pcx);
-            resolve_all(cx, fi);
-            eliminate_dead_code(cx, fi, pcx);
-            verify_func(cx, fi, c"SLP vectorization", pcx);
-        }
-        timer_add(T_SLP, t, pcx);
+pub fn slp_function(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
+    let t = timer_now(pcx);
+    // (0.18.1) the facts of entry_assumes gone before the code is made
+    if (pcx.fn_live[fi as usize]) != 0 {
+        ir_enter(cx, fi, pcx);
+        drop_assumes(cx, fi, pcx);
     }
+    let packed = (pcx.fn_live[fi as usize]) != 0 && slp_vectorize(cx, fi, pcx);
+    pass_done(P_SLP, pcx);
+    if packed {
+        ir_enter(cx, fi, pcx);
+        resolve_all(cx, fi);
+        eliminate_dead_code(cx, fi, pcx);
+        pass_done(P_DCE, pcx);
+        verify_func(cx, fi, c"SLP vectorization", pcx);
+    }
+    timer_add(T_SLP, t, pcx);
 }
-
-// Functions whose loop passes wait until inlining is done (see
-// inlined_everywhere).
-static mut DEFERRED: *mut i64 = 0 as *mut i64;
 
 // The loop passes, LICM and scalar promotion of function fi, each followed
 // by the scalar pipeline when it changed something.
-fn loop_pipeline(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
+fn loop_pipeline(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     let mut t = timer_now(pcx);
     if optimize_loops(cx, fi, pcx) {
         simplify_function(cx, fi, pcx);
     }
     timer_add(T_LOOPS, t, pcx);
     t = timer_now(pcx);
-    if run_licm(cx, fi, pcx) {
+    let moved = run_licm(cx, fi, pcx);
+    pass_done(P_LICM, pcx);
+    if moved {
         resolve_all(cx, fi);
+        pass_done(P_RESOLVE, pcx);
         verify_func(cx, fi, c"licm", pcx);
         simplify_function(cx, fi, pcx);
     }
@@ -817,7 +817,9 @@ fn loop_pipeline(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
     // After LICM: the addresses of slots and statics are out of the
     // loops by then.
     t = timer_now(pcx);
-    if promote_loop_memory(cx, fi, pcx) {
+    let promoted = promote_loop_memory(cx, fi, pcx);
+    pass_done(P_PROMOTE, pcx);
+    if promoted {
         simplify_function(cx, fi, pcx);
     }
     timer_add(T_PROMOTE, t, pcx);
@@ -825,27 +827,37 @@ fn loop_pipeline(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
 
 // -O2's loop passes (loops.vl and the files after it), before LICM.
 // Returns whether anything changed.
-fn optimize_loops(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
+fn optimize_loops(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     ir_enter(cx, fi, pcx);
     resolve_all(cx, fi);
     seal_all(cx, fi);
+    pass_done(P_LOOP_SETUP, pcx);
     simplify_cfg(cx, fi, pcx);
+    pass_done(P_SIMPLIFY_CFG, pcx);
     // Between the passes a light cleanup only; the scalar pipeline runs
     // once after them (in optimize_program).
     let mut changed = false;
-    if count_loop_exits(cx, fi, pcx) {
+    let counted = count_loop_exits(cx, fi, pcx);
+    pass_done(P_LOOP_EXITS, pcx);
+    if counted {
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
-    if rotate_loops(cx, fi, pcx) {
+    let rotated = rotate_loops(cx, fi, pcx);
+    pass_done(P_LOOP_ROTATE, pcx);
+    if rotated {
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
-    if transform_loops(cx, fi, pcx) {
+    let transformed = transform_loops(cx, fi, pcx);
+    pass_done(P_LOOP_TRANSFORM, pcx);
+    if transformed {
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
-    if fold_by_ranges(cx, fi, pcx) {
+    let folded = fold_by_ranges(cx, fi, pcx);
+    pass_done(P_RANGES, pcx);
+    if folded {
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
@@ -855,7 +867,12 @@ fn optimize_loops(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
     // were converted may be a diamond itself then, the tree of an
     // inlined comparator's `<`)
     let mut rounds: i64 = 0;
-    while rounds < 4 && if_convert_loops(cx, fi, pcx) {
+    while rounds < 4 {
+        let converted = if_convert_loops(cx, fi, pcx);
+        pass_done(P_IF_CONVERT, pcx);
+        if !converted {
+            break;
+        }
         changed = true;
         light_cleanup(cx, fi, pcx);
         rounds += 1;
@@ -863,6 +880,7 @@ fn optimize_loops(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
     // (0.10: after the checks the ranges remove, before strength
     // reduction rewrites the addresses)
     let vectorized = vectorize_loops(cx, fi, pcx);
+    pass_done(P_VECTORIZE, pcx);
     if vectorized {
         changed = true;
         light_cleanup(cx, fi, pcx);
@@ -875,36 +893,49 @@ fn optimize_loops(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
         // (and the LCSSA phis of the loops it left)
         resolve_all(cx, fi);
         remove_trivial_phis(cx, fi, pcx);
+        pass_done(P_LOOP_TRANSFORM, pcx);
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
     // (0.11: the loops the vectorizer left, in its frame; the loop forest
     // it found is current when it changed nothing)
-    if unroll_runtime_loops(cx, fi, !vectorized && !unrolled && pcx.vectorize, pcx) {
+    let unrolled_runtime =
+        unroll_runtime_loops(cx, fi, !vectorized && !unrolled && pcx.vectorize, pcx);
+    pass_done(P_UNROLL_RUNTIME, pcx);
+    if unrolled_runtime {
         changed = true;
         light_cleanup(cx, fi, pcx);
     }
-    if reduce_and_unswitch(cx, fi, pcx) {
+    let reduced = reduce_and_unswitch(cx, fi, pcx);
+    pass_done(P_REDUCE_UNSWITCH, pcx);
+    if reduced {
         changed = true;
     }
-    if aggressive_dce(cx, fi, pcx) {
+    let removed = aggressive_dce(cx, fi, pcx);
+    pass_done(P_ADCE, pcx);
+    if removed {
         changed = true;
         verify_func(cx, fi, c"aggressive dead code elimination", pcx);
     }
     if changed {
         resolve_all(cx, fi);
+        pass_done(P_RESOLVE, pcx);
         verify_func(cx, fi, c"loop passes", pcx);
     }
     changed
 }
 
 // Unused values and trivial control flow, between the loop passes.
-fn light_cleanup(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
+fn light_cleanup(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
     resolve_all(cx, fi);
+    pass_done(P_RESOLVE, pcx);
     eliminate_dead_code(cx, fi, pcx);
+    pass_done(P_DCE, pcx);
     simplify_cfg(cx, fi, pcx);
+    pass_done(P_SIMPLIFY_CFG, pcx);
     remove_trivial_phis(cx, fi, pcx);
     seal_all(cx, fi);
+    pass_done(P_TRIVIAL_PHIS, pcx);
     verify_func(cx, fi, c"cleanup", pcx);
 }
 
@@ -914,20 +945,18 @@ fn light_cleanup(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) {
 // kept even when every call through it was made direct and inlined: a
 // function used as a value is part of what the program is (and of what
 // the tests look at).
-fn remove_dead_functions(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let mut changed = true;
-        while changed {
-            changed = false;
-            count_call_sites(cx, pcx);
-            for fi in 0..pcx.irfunc_count {
-                if (*pcx.fn_live.add(fi as usize)) != 0 && (*pcx.fn_calls.add(fi as usize)) == 0
-                    && (*pcx.fn_address.add(fi as usize)) == 0
-                    && (*pcx.fn_taken.add(fi as usize)) == 0
-                    && !fn_is_global((*get_irfuncs().add(fi as usize)).f, pcx) {
-                    (*pcx.fn_live.add(fi as usize)) = 0;
-                    changed = true;
-                }
+fn remove_dead_functions(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        count_call_sites(cx, pcx);
+        for fi in 0..pcx.irfunc_count {
+            if (pcx.fn_live[fi as usize]) != 0 && (pcx.fn_calls[fi as usize]) == 0
+                && (pcx.fn_address[fi as usize]) == 0
+                && (pcx.fn_taken[fi as usize]) == 0
+                && !fn_is_global(pcx.ir_fn[fi as usize], pcx) {
+                (pcx.fn_live[fi as usize]) = 0;
+                changed = true;
             }
         }
     }
@@ -939,76 +968,47 @@ fn remove_dead_functions(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
 // compiling a small program. The roots are every function not from std
 // (a program's own unused functions stay, as before); a std function is
 // reachable when a reachable function calls it or takes its address.
-fn drop_unreachable_std(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if pcx.std_module < 0 {
-            return;
-        }
-        let reach = alloc_array::<i64>(pcx.irfunc_count + 1);
-        let mut work = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for fi in 0..pcx.irfunc_count {
-            (*reach.add(fi as usize)) = 0;
-            let f = (*get_irfuncs().add(fi as usize)).f;
-            if fn_is_global(f, pcx) || !within_std(module_of(pcx.fns[f as usize].node, pcx), pcx) {
-                (*reach.add(fi as usize)) = 1;
-                work.push(fi);
-            }
-        }
-        while work.count > 0 {
-            work.count -= 1;
-            let fi = (*work.data.add(work.count as usize));
-            ir_enter(cx, fi, pcx);
-            for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-                let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-                if (*cx.blocks.add(b as usize)).removed != 0 {
-                    continue;
-                }
-                let mut v = (*cx.blocks.add(b as usize)).first;
-                while v != 0 {
-                    let mut g = ir_callee(cx, v, pcx);
-                    if (*cx.insts.add(v as usize)).op == Op::FAddr
-                        && (*pcx.fn_ir.add((*cx.insts.add(v as usize)).imm as usize)) != 0 {
-                        g = (*pcx.fn_ir.add((*cx.insts.add(v as usize)).imm as usize)) - 1;
-                    }
-                    if g >= 0 && (*reach.add(g as usize)) == 0 {
-                        (*reach.add(g as usize)) = 1;
-                        work.push(g);
-                    }
-                    v = (*cx.insts.add(v as usize)).next;
-                }
-            }
-        }
-        for fi in 0..pcx.irfunc_count {
-            if (*reach.add(fi as usize)) == 0 {
-                (*pcx.fn_live.add(fi as usize)) = 0;
-            }
-        }
-        free(work.data as *mut u8);
-        free(reach as *mut u8);
+fn drop_unreachable_std(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
+    if pcx.std_module < 0 {
+        return;
     }
-}
-
-// (0.28.0) DEFERRED's accessors: every use of it is one of them.
-pub fn get_deferred() -> *mut i64 {
-    // UNSAFE: the per-function deferred-loops flag, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: allocated by optimize_program on the main thread; entry fi
-    // written only by fi's component task (optimize_component_function,
-    // get_facts) and read by fi's own emission task (deferred_loops) in a
-    // later phase and by fi's own codecache records (own_fp, put_facts);
-    // one task per function per phase, phases ordered by MUTEX
-    unsafe { DEFERRED }
-}
-
-pub fn set_deferred(v: *mut i64) {
-    // UNSAFE: the per-function deferred-loops flag, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: allocated by optimize_program on the main thread; entry fi
-    // written only by fi's component task (optimize_component_function,
-    // get_facts) and read by fi's own emission task (deferred_loops) in a
-    // later phase and by fi's own codecache records (own_fp, put_facts);
-    // one task per function per phase, phases ordered by MUTEX
-    unsafe {
-        DEFERRED = v;
+    let mut reach: Vec<i64, Comp> = Vec::new_in(Comp {});
+    reach.resize((pcx.irfunc_count + 1) as usize, 0);
+    let mut work: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for fi in 0..pcx.irfunc_count {
+        (reach[fi as usize]) = 0;
+        let f = pcx.ir_fn[fi as usize];
+        if fn_is_global(f, pcx) || !within_std(module_of(pcx.fns[f as usize].node, pcx), pcx) {
+            (reach[fi as usize]) = 1;
+            work.push(fi);
+        }
+    }
+    while work.len() as i64 > 0 {
+        let fi = work.pop().unwrap();
+        ir_enter(cx, fi, pcx);
+        for i in 0..fn_block_count(cx, fi) {
+            let b = (fn_block(cx, fi, i));
+            if (cx.blocks[b as usize]).removed != 0 {
+                continue;
+            }
+            let mut v = (cx.blocks[b as usize]).first;
+            while v != 0 {
+                let mut g = ir_callee(cx, v, pcx);
+                if (cx.insts[v as usize]).op == Op::FAddr
+                    && (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) != 0 {
+                    g = (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) - 1;
+                }
+                if g >= 0 && (reach[g as usize]) == 0 {
+                    (reach[g as usize]) = 1;
+                    work.push(g);
+                }
+                v = (cx.insts[v as usize]).next;
+            }
+        }
+    }
+    for fi in 0..pcx.irfunc_count {
+        if (reach[fi as usize]) == 0 {
+            (pcx.fn_live[fi as usize]) = 0;
+        }
     }
 }

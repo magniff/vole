@@ -1,7 +1,8 @@
 ## 0.25.4: `volec fix --only unneeded-unsafe` (tests/refactor/unneeded0254/):
 ## the unsafe blocks `query unsafe` calls `none (unneeded)` taken away, the
-## code in them kept and in its scope; those it cannot open safely left
-## and counted. The program prints what it printed.
+## code in them kept and in its scope; (0.29) one it cannot open safely
+## (it declares, and code follows) made a plain block, and one it leaves
+## named with the reason. The program prints what it printed.
 % "$COMPILER" main.vl -o a >/dev/null 2>&1 && ./a
 33 21
 $ query unsafe main.vl
@@ -24,7 +25,7 @@ main.vl:74	block	crate::count	raw-pointer	justified	other
 sites: 16 (15 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 13; unneeded: 12
 try: volec fix --only unneeded-unsafe
 $ fix --only unneeded-unsafe --diff
-fixed 9 unneeded unsafe blocks, 2 left as they are (query unsafe lists them)	main.vl	+12 -20 lines
+fixed 10 unneeded unsafe blocks, 1 left as it is (query unsafe lists it)	main.vl	+13 -21 lines
 --- a/main.vl
 +++ b/main.vl
 @@ -11,5 +11,3 @@
@@ -50,6 +51,9 @@ fixed 9 unneeded unsafe blocks, 2 left as they are (query unsafe lists them)	mai
 -    unsafe { bump(d); }
 +    let d = 2 * (c + x);
 +    bump(d);
+@@ -31 +27 @@
+-    unsafe {
++    {
 @@ -37 +33 @@
 -    unsafe { if x > 0 { d } else { n } }
 +    if x > 0 { d } else { n }
@@ -66,25 +70,25 @@ fixed 9 unneeded unsafe blocks, 2 left as they are (query unsafe lists them)	mai
 -        println("{s} {}", count());
 -    }
 +    println("{s} {}", count());
+note fix.unneeded-left: main.vl:48: unsafe block left: it is inside a block taken away in this run: run it again
 $ fix --only unneeded-unsafe
-fixed 1 unneeded unsafe block, 1 left as it is (query unsafe lists it)	main.vl	+1 -3 lines
+fixed 1 unneeded unsafe block	main.vl	+1 -3 lines
 $ fix --only unneeded-unsafe
 note fix.none: nothing to fix
 % "$COMPILER" main.vl -o b >/dev/null 2>&1 && ./b
 33 21
 $ query unsafe main.vl
 main.vl:5	extern	crate::extern	ffi	missing both	1 C function
-main.vl:27	block	crate::two	other	missing both	none (unneeded)
 main.vl:32	block	crate::two	ffi	missing both	c-call(strlen)
 main.vl:39	block	crate::three	other	justified	none (unneeded)
 main.vl:56	block	crate::bump	raw-pointer	justified	other
 main.vl:64	block	crate::count	raw-pointer	justified	other
-sites: 6 (5 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 3; unneeded: 2
-try: volec fix --only unneeded-unsafe
+sites: 5 (4 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 2; unneeded: 1
+try: volec fix --only unneeded-justified
 ## (0.25.5) `--only unneeded-justified`: the justified one too, with the
 ## comments above it (they say why a block no longer needed was).
 $ fix --only unneeded-justified --diff
-fixed 1 unneeded unsafe block, 1 left as it is (query unsafe lists it)	main.vl	+1 -5 lines
+fixed 1 unneeded unsafe block	main.vl	+1 -5 lines
 --- a/main.vl
 +++ b/main.vl
 @@ -37,5 +37 @@
@@ -98,9 +102,7 @@ fixed 1 unneeded unsafe block, 1 left as it is (query unsafe lists it)	main.vl	+
 33 21
 $ query unsafe main.vl
 main.vl:5	extern	crate::extern	ffi	missing both	1 C function
-main.vl:27	block	crate::two	other	missing both	none (unneeded)
 main.vl:32	block	crate::two	ffi	missing both	c-call(strlen)
 main.vl:52	block	crate::bump	raw-pointer	justified	other
 main.vl:60	block	crate::count	raw-pointer	justified	other
-sites: 5 (4 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 3; unneeded: 1
-try: volec fix --only unneeded-unsafe
+sites: 4 (3 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 2; unneeded: 0

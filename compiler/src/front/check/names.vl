@@ -4,8 +4,8 @@
 // scope, or the `use` that would bring it).
 
 use crate::base::{
-    IntVec, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, free, get_bufs, get_src, intern,
-    sym_text,
+    buf_append, buf_byte, buf_bytes, buf_copy, buf_done, buf_eq, buf_len, buf_new, buf_str,
+    buf_truncate, c_starts, get_src, intern, intern_buf, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -14,7 +14,7 @@ use crate::base::diag::{
     err_help, err_help_fmt, err_help_sym, err_pos, err_str, err_sym, err_try, err_try_fmt,
 };
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{CONV_NEW, FN_UNSAFE, NodeKind, new_node};
+use crate::front::ast::{FN_UNSAFE, NodeKind};
 use crate::front::ast::NodeKind::{CStr, Path, Str};
 use crate::front::check::{Res, lookup_local, name_error};
 use crate::front::check::synth_mode::synth_expr;
@@ -24,7 +24,6 @@ use crate::front::closures::note_local_use;
 use crate::front::distinct::is_view_distinct;
 use crate::front::generics::{TPL_NONE, env_lookup, instance_of, targ_count_error, template_of_key};
 use crate::front::generics::instantiate::{fn_instance, push_written_targs};
-use crate::front::lexer::Tok;
 use crate::front::modules::{item_key_if_known, module_count, within_std};
 use crate::front::modules::lookup::{
     B_ITEM, B_MODULE, B_PRIVATE, B_TVARIANT, B_VARIANT, access_error, binding, binding_kind,
@@ -32,191 +31,183 @@ use crate::front::modules::lookup::{
     note_c_use,
 };
 use crate::front::parser::items::ITEM_PUBLIC;
-use crate::front::stdsrc_rust::std2_source;
+use crate::front::stdsrc::std_source;
 use crate::front::threadlocal::note_static_use;
 use crate::front::types::{
-    TyKind, buf_type, enum_type, err_type, fn_param, get_enums, is_pointer, item_node_of, make_type,
+    TyKind, buf_type, enum_type, err_type, fn_param, is_pointer, item_node_of, make_type,
 };
 use crate::tools::fix::note_missing_use;
 
 pub fn synth_name(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let name = pcx.nodes[n as usize].a;
-        let resolved = (pcx.nodes[n as usize].p & NODE_RESOLVED) != 0;
-        if !resolved {
-            match lookup_local(name, pcx) {
-                Option::Some(local) => {
-                    if pcx.nodes[n as usize].g != 0 {
-                        name_error(pcx.nodes[n as usize].start, c"'", name,
-                            c"' is a variable, not a generic function", pcx);
-                    }
-                    pcx.nodes[n as usize].res = Res::Local;
-                    pcx.nodes[n as usize].y = local;
-                    note_local_use(n, local, pcx);
-                    // RULE: F18.5 (a use of an open local)
-                    if pcx.open_lets.count > 0 {
-                        crate::front::check::literals::open_use(n, local, pcx);
-                    }
-                    if pcx.locals[local as usize].access
-                        && (pcx.nodes[n as usize].p & CONV_NEW) == 0 {
-                        // (0.20) an access is used as the value it designates:
-                        // `x` is `*x` (`&x`: `&*x`, a reborrow), conventions.md D12
-                        return access_use(n, pcx);
-                    }
-                    return pcx.locals[local as usize].ty;
+    let name = pcx.nodes[n as usize].a;
+    let resolved = (pcx.nodes[n as usize].p & NODE_RESOLVED) != 0;
+    if !resolved {
+        match lookup_local(name, pcx) {
+            Option::Some(local) => {
+                if pcx.nodes[n as usize].g != 0 {
+                    name_error(pcx.nodes[n as usize].start, c"'", name,
+                        c"' is a variable, not a generic function", pcx);
                 }
-                Option::None => {}
-            }
-        }
-        // RULE: F15.3 (the rust edition: an `#[array_builtin(N)]` item's N is
-        // the instance's length, a `usize` constant)
-        if !resolved {
-            let len = crate::front::generics::instantiate::length_of(
-                crate::front::generics::env_lookup(name, pcx), pcx);
-            if len >= 0 {
-                pcx.nodes[n as usize].kind = NodeKind::Int;
-                pcx.nodes[n as usize].a = len;
-                pcx.nodes[n as usize].b = crate::front::lexer::SUF_USIZE;
-                return crate::front::check::synth_mode::synth_expr(n, pcx);
-            }
-        }
-        // RULE: F5.4 (the rust edition: `Self` of a unit struct is its value)
-        if !resolved && name == pcx.self_type_sym
-            && crate::front::check::rust::unit_struct_value(n, crate::front::check::rust::SELF_KEY,
-                pcx) {
-            return crate::front::check::synth_mode::synth_expr(n, pcx);
-        }
-        let b = if resolved { binding(B_ITEM, name) }
-            else { lookup_item(pcx.cur_mod, name, pcx.cur_mod, pcx) };
-        if !resolved {
-            note_c_use(pcx.nodes[n as usize].start, name, b, pcx);
-        }
-        let kind = binding_kind(b);
-        if kind == B_PRIVATE {
-            access_error(b, pcx.nodes[n as usize].start, name, pcx);
-        }
-        if kind == B_VARIANT {
-            // A variant brought into scope by `use E::...;`: `E::V`.
-            let v = binding_value(b);
-            pcx.nodes[n as usize].kind = Path;
-            pcx.nodes[n as usize].a = pcx.variants[v as usize].name;
-            pcx.nodes[n as usize].b = pcx.variants[v as usize].name;
-            pcx.nodes[n as usize].y = enum_type(pcx.variants[v as usize].enum_id, pcx);
-            return synth_expr(n, pcx);
-        }
-        if kind == B_TVARIANT {
-            // A variant of a generic enum (0.6): its type arguments inferred
-            // (`y` < 0: the template; see path_target).
-            pcx.nodes[n as usize].kind = Path;
-            pcx.nodes[n as usize].b = name;
-            pcx.nodes[n as usize].y = -binding_value(b) - 1;
-            return synth_expr(n, pcx);
-        }
-        if kind == B_MODULE {
-            name_error(pcx.nodes[n as usize].start, c"'", name, c"' is a module, not a value", pcx);
-        }
-        if kind != B_ITEM {
-            // (0.26.3: `format(x)`: `format_in(x, gpa)`)
-            if !pcx.check_unchecked && binding_kind(lookup_item(pcx.cur_mod,
-                crate::front::check::alloc_rules::in_name(name, pcx), pcx.cur_mod,
-                pcx)) == B_ITEM {
-                crate::front::check::alloc_rules::no_in_error(n, name, sym_text(name, pcx), pcx);
-            }
-            if pcx.check_unchecked {
-                // (a binding of what was not parsed: the rest goes on)
-                return pcx.ty_error;
-            }
-            unknown_name_error(pcx.nodes[n as usize].start, c"undefined variable '", name, pcx);
-        }
-        let key = binding_value(b);
-        if (*pcx.sym_const.add(key as usize)) != 0 {
-            let c = (*pcx.sym_const.add(key as usize)) - 1;
-            let init = pcx.nodes[pcx.consts[c as usize].node as usize].c;
-            if pcx.nodes[init as usize].kind == CStr && is_pointer(pcx.consts[c as usize].ty, pcx) {
-                // A C string constant: the literal itself.
-                pcx.nodes[n as usize].kind = CStr;
-                pcx.nodes[n as usize].a = pcx.nodes[init as usize].a;
-                return pcx.consts[c as usize].ty;
-            }
-            if pcx.nodes[init as usize].kind == Str
-                && (pcx.consts[c as usize].ty == pcx.ty_string
-                    || is_view_distinct(pcx.consts[c as usize].ty, pcx)) {
-                // A string constant (0.14; a `str` one, 0.25.4): the literal
-                // itself. (A `str` constant read as a `Res::Const` was lowered
-                // as an integer, `ir_const(0)`: a null slice, a crash.)
-                pcx.nodes[n as usize].kind = Str;
-                pcx.nodes[n as usize].a = pcx.nodes[init as usize].a;
-                pcx.nodes[n as usize].b = pcx.nodes[init as usize].b;
-                return pcx.consts[c as usize].ty;
-            }
-            // RULE: F34.2 (a constant made at each use)
-            if pcx.consts[c as usize].state >= 3 {
-                return inline_const(n, c, pcx);
-            }
-            pcx.nodes[n as usize].res = Res::Const;
-            pcx.nodes[n as usize].y = c;
-            return pcx.consts[pcx.nodes[n as usize].y as usize].ty;
-        }
-        if (*pcx.sym_static.add(key as usize)) != 0 {
-            pcx.nodes[n as usize].res = Res::Static;
-            pcx.nodes[n as usize].y = (*pcx.sym_static.add(key as usize)) - 1;
-            // The code generators find statics by their symbol.
-            pcx.nodes[n as usize].a = pcx.nodes[
-                pcx.statics[pcx.nodes[n as usize].y as usize].node as usize].a;
-            // (0.21: a thread-local brings std's __tls_addr)
-            note_static_use(pcx.nodes[n as usize].y, n, pcx);
-            // RULE: F19.6 (0.27.3: a `static mut`, read or written, is
-            // unsafe in the rust edition, rustc E0133)
-            if pcx.statics[pcx.nodes[n as usize].y as usize].mutable {
-                crate::front::check::unsafety::unsafe_op(n,
-                    crate::front::check::unsafety::U_STATIC_MUT,
-                    c"use of a mutable static is unsafe (rustc E0133)", pcx);
-            }
-            return pcx.statics[pcx.nodes[n as usize].y as usize].ty;
-        }
-        if (*pcx.sym_fn.add(key as usize)) != 0 {
-            let mut f = (*pcx.sym_fn.add(key as usize)) - 1;
-            if pcx.fns[f as usize].variadic {
-                name_error(pcx.nodes[n as usize].start, c"variadic function '", name,
-                    c"' cannot be used as a value", pcx);
-            }
-            if pcx.fns[f as usize].generic > 0 {
-                // `max::<i64>` as a value: the arguments must be written.
-                if pcx.nodes[n as usize].g == 0 {
-                    name_error(pcx.nodes[n as usize].start, c"generic function '", name,
-                        c"' needs its type arguments to be used as a value ('f::<T>')", pcx);
+                pcx.nodes[n as usize].res = Res::Local;
+                pcx.nodes[n as usize].y = local;
+                note_local_use(n, local, pcx);
+                // RULE: F18.5 (a use of an open local)
+                if pcx.open_lets.len() as i64 > 0 {
+                    crate::front::check::literals::open_use(n, local, pcx);
                 }
-                if pcx.nodes[pcx.nodes[n as usize].g as usize].count
-                    != pcx.fns[f as usize].generic {
-                    targ_count_error(pcx.nodes[n as usize].start, c"function",
-                        pcx.fns[f as usize].display, pcx.fns[f as usize].generic,
-                        pcx.nodes[pcx.nodes[n as usize].g as usize].count, pcx);
-                }
-                let mark = pcx.tscratch.count;
-                push_written_targs(pcx.nodes[n as usize].g, pcx);
-                f = fn_instance(f, mark, n, pcx);
-            } else if pcx.nodes[n as usize].g != 0 {
-                name_error(pcx.nodes[n as usize].start, c"function '", name, c"' is not generic",
-                    pcx);
+                return pcx.locals[local as usize].ty;
             }
-            pcx.nodes[n as usize].res = Res::Fn;
-            pcx.nodes[n as usize].y = f;
-            ensure_checked(f, n, pcx);
-            // (RULE: F19.3: in the rust edition the value's type is an
-            // `unsafe fn` type, whose calls need `unsafe`)
-            return fn_value_type(f, n, pcx);
+            Option::None => {}
         }
-        // RULE: F7.3 (the rust edition: a unit struct is a value)
-        if (*pcx.sym_struct.add(key as usize)) != 0
-            && crate::front::check::rust::unit_struct_value(n, key, pcx) {
-            return crate::front::check::synth_mode::synth_expr(n, pcx);
-        }
-        if (*pcx.sym_struct.add(key as usize)) != 0 || (*pcx.sym_enum.add(key as usize)) != 0
-            || (*pcx.sym_alias.add(key as usize)) != 0 {
-            name_error(pcx.nodes[n as usize].start, c"'", name, c"' is a type, not a value", pcx);
-        }
-        unknown_name_error(pcx.nodes[n as usize].start, c"undefined variable '", name, pcx)
     }
+    // RULE: F15.3 (the rust edition: an `#[array_builtin(N)]` item's N is
+    // the instance's length, a `usize` constant)
+    if !resolved {
+        let len = crate::front::generics::instantiate::length_of(
+            crate::front::generics::env_lookup(name, pcx), pcx);
+        if len >= 0 {
+            pcx.nodes[n as usize].kind = NodeKind::Int;
+            pcx.nodes[n as usize].a = len;
+            pcx.nodes[n as usize].b = crate::front::lexer::SUF_USIZE;
+            return crate::front::check::synth_mode::synth_expr(n, pcx);
+        }
+    }
+    // RULE: F5.4 (the rust edition: `Self` of a unit struct is its value)
+    if !resolved && name == pcx.self_type_sym
+        && crate::front::check::rust::unit_struct_value(n, crate::front::check::rust::SELF_KEY,
+            pcx) {
+        return crate::front::check::synth_mode::synth_expr(n, pcx);
+    }
+    let b = if resolved { binding(B_ITEM, name) }
+        else { lookup_item(pcx.cur_mod, name, pcx.cur_mod, pcx) };
+    if !resolved {
+        note_c_use(pcx.nodes[n as usize].start, name, b, pcx);
+    }
+    let kind = binding_kind(b);
+    if kind == B_PRIVATE {
+        access_error(b, pcx.nodes[n as usize].start, name, pcx);
+    }
+    if kind == B_VARIANT {
+        // A variant brought into scope by `use E::...;`: `E::V`.
+        let v = binding_value(b);
+        pcx.nodes[n as usize].kind = Path;
+        pcx.nodes[n as usize].a = pcx.variants[v as usize].name;
+        pcx.nodes[n as usize].b = pcx.variants[v as usize].name;
+        pcx.nodes[n as usize].y = enum_type(pcx.variants[v as usize].enum_id, pcx);
+        return synth_expr(n, pcx);
+    }
+    if kind == B_TVARIANT {
+        // A variant of a generic enum (0.6): its type arguments inferred
+        // (`y` < 0: the template; see path_target).
+        pcx.nodes[n as usize].kind = Path;
+        pcx.nodes[n as usize].b = name;
+        pcx.nodes[n as usize].y = -binding_value(b) - 1;
+        return synth_expr(n, pcx);
+    }
+    if kind == B_MODULE {
+        name_error(pcx.nodes[n as usize].start, c"'", name, c"' is a module, not a value", pcx);
+    }
+    if kind != B_ITEM {
+        // (0.26.3: `format(x)`: `format_in(x, gpa)`)
+        if !pcx.check_unchecked && binding_kind(lookup_item(pcx.cur_mod,
+            crate::front::check::alloc_rules::in_name(name, pcx), pcx.cur_mod,
+            pcx)) == B_ITEM {
+            crate::front::check::alloc_rules::no_in_error(n, name, sym_text(name, pcx), pcx);
+        }
+        if pcx.check_unchecked {
+            // (a binding of what was not parsed: the rest goes on)
+            return pcx.ty_error;
+        }
+        unknown_name_error(pcx.nodes[n as usize].start, c"undefined variable '", name, pcx);
+    }
+    let key = binding_value(b);
+    if (pcx.sym_const[key as usize]) != 0 {
+        let c = (pcx.sym_const[key as usize]) - 1;
+        let init = pcx.nodes[pcx.consts[c as usize].node as usize].c;
+        if pcx.nodes[init as usize].kind == CStr && is_pointer(pcx.consts[c as usize].ty, pcx) {
+            // A C string constant: the literal itself.
+            pcx.nodes[n as usize].kind = CStr;
+            pcx.nodes[n as usize].a = pcx.nodes[init as usize].a;
+            return pcx.consts[c as usize].ty;
+        }
+        if pcx.nodes[init as usize].kind == Str
+            && (pcx.consts[c as usize].ty == pcx.ty_string
+                || is_view_distinct(pcx.consts[c as usize].ty, pcx)) {
+            // A string constant (0.14; a `str` one, 0.25.4): the literal
+            // itself. (A `str` constant read as a `Res::Const` was lowered
+            // as an integer, `ir_const(0)`: a null slice, a crash.)
+            pcx.nodes[n as usize].kind = Str;
+            pcx.nodes[n as usize].a = pcx.nodes[init as usize].a;
+            pcx.nodes[n as usize].b = pcx.nodes[init as usize].b;
+            return pcx.consts[c as usize].ty;
+        }
+        // RULE: F34.2 (a constant made at each use)
+        if pcx.consts[c as usize].state >= 3 {
+            return inline_const(n, c, pcx);
+        }
+        pcx.nodes[n as usize].res = Res::Const;
+        pcx.nodes[n as usize].y = c;
+        return pcx.consts[pcx.nodes[n as usize].y as usize].ty;
+    }
+    if (pcx.sym_static[key as usize]) != 0 {
+        pcx.nodes[n as usize].res = Res::Static;
+        pcx.nodes[n as usize].y = (pcx.sym_static[key as usize]) - 1;
+        // The code generators find statics by their symbol.
+        pcx.nodes[n as usize].a = pcx.nodes[
+            pcx.statics[pcx.nodes[n as usize].y as usize].node as usize].a;
+        // (0.21: a thread-local brings std's __tls_addr)
+        note_static_use(pcx.nodes[n as usize].y, n, pcx);
+        // RULE: F19.6 (0.27.3: a `static mut`, read or written, is
+        // unsafe in the rust edition, rustc E0133)
+        if pcx.statics[pcx.nodes[n as usize].y as usize].mutable {
+            crate::front::check::unsafety::unsafe_op(n,
+                crate::front::check::unsafety::U_STATIC_MUT,
+                c"use of a mutable static is unsafe (rustc E0133)", pcx);
+        }
+        return pcx.statics[pcx.nodes[n as usize].y as usize].ty;
+    }
+    if (pcx.sym_fn[key as usize]) != 0 {
+        let mut f = (pcx.sym_fn[key as usize]) - 1;
+        if pcx.fns[f as usize].variadic {
+            name_error(pcx.nodes[n as usize].start, c"variadic function '", name,
+                c"' cannot be used as a value", pcx);
+        }
+        if pcx.fns[f as usize].generic > 0 {
+            // `max::<i64>` as a value: the arguments must be written.
+            if pcx.nodes[n as usize].g == 0 {
+                name_error(pcx.nodes[n as usize].start, c"generic function '", name,
+                    c"' needs its type arguments to be used as a value ('f::<T>')", pcx);
+            }
+            if pcx.nodes[pcx.nodes[n as usize].g as usize].count
+                != pcx.fns[f as usize].generic {
+                targ_count_error(pcx.nodes[n as usize].start, c"function",
+                    pcx.fns[f as usize].display, pcx.fns[f as usize].generic,
+                    pcx.nodes[pcx.nodes[n as usize].g as usize].count, pcx);
+            }
+            let mark = pcx.tscratch.len() as i64;
+            push_written_targs(pcx.nodes[n as usize].g, pcx);
+            f = fn_instance(f, mark, n, pcx);
+        } else if pcx.nodes[n as usize].g != 0 {
+            name_error(pcx.nodes[n as usize].start, c"function '", name, c"' is not generic",
+                pcx);
+        }
+        pcx.nodes[n as usize].res = Res::Fn;
+        pcx.nodes[n as usize].y = f;
+        ensure_checked(f, n, pcx);
+        // (RULE: F19.3: in the rust edition the value's type is an
+        // `unsafe fn` type, whose calls need `unsafe`)
+        return fn_value_type(f, n, pcx);
+    }
+    // RULE: F7.3 (the rust edition: a unit struct is a value)
+    if (pcx.sym_struct[key as usize]) != 0
+        && crate::front::check::rust::unit_struct_value(n, key, pcx) {
+        return crate::front::check::synth_mode::synth_expr(n, pcx);
+    }
+    if (pcx.sym_struct[key as usize]) != 0 || (pcx.sym_enum[key as usize]) != 0
+        || (pcx.sym_alias[key as usize]) != 0 {
+        name_error(pcx.nodes[n as usize].start, c"'", name, c"' is a type, not a value", pcx);
+    }
+    unknown_name_error(pcx.nodes[n as usize].start, c"undefined variable '", name, pcx)
 }
 
 // RULE: F34.2 Ident n names constant c, made at each use (a rust-edition
@@ -237,7 +228,7 @@ fn inline_const(n: i64, c: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // (resolved as at the constant: none of the use's locals, nor its
     // type parameters)
     let saved_floor = pcx.env_floor;
-    pcx.env_floor = pcx.env.count;
+    pcx.env_floor = pcx.env.len() as i64;
     let saved_env = crate::front::generics::env_enter(0, 0, 0, pcx);
     let e = crate::front::generics::instantiate::clone_node(pcx.nodes[item as usize].c, pcx);
     crate::front::check::check_mode::check_expr(e, ty, pcx);
@@ -256,24 +247,6 @@ fn inline_const(n: i64, c: i64, pcx: &mut Ctx<Comp>) -> i64 {
     ty
 }
 
-// (0.20) Ident n, a use of an access local (front/check: Local.access),
-// becomes `*n`: the place it designates. (The Ident inside is flagged
-// CONV_NEW, so that it is the reference.)
-fn access_use(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let inner = new_node(NodeKind::Ident, pcx.nodes[n as usize].start, pcx.nodes[n as usize].end,
-        pcx);
-    pcx.nodes[inner as usize] = pcx.nodes[n as usize];
-    pcx.nodes[inner as usize].p |= CONV_NEW;
-    pcx.nodes[n as usize].kind = NodeKind::Unary;
-    pcx.nodes[n as usize].op = Tok::Star;
-    pcx.nodes[n as usize].a = 0;
-    pcx.nodes[n as usize].b = inner;
-    pcx.nodes[n as usize].count = 0;
-    pcx.nodes[n as usize].list = 0;
-    pcx.nodes[n as usize].p = pcx.nodes[n as usize].p & NODE_RESOLVED;
-    synth_expr(n, pcx)
-}
-
 // An Ident whose `a` is already a key (a path resolved to an item).
 pub const NODE_RESOLVED: i64 = 2;
 
@@ -281,27 +254,25 @@ pub const NODE_RESOLVED: i64 = 2;
 // a value of type `ty`, or 0 when `name` is no variant: a generic enum's
 // variant (0.6) takes the instance `ty`.
 pub fn used_variant_enum(name: i64, ty: i64, p: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let b = lookup_quiet(pcx.cur_mod, name, pcx.cur_mod, pcx);
-        if binding_kind(b) == B_VARIANT {
-            return enum_type(pcx.variants[binding_value(b) as usize].enum_id, pcx);
-        }
-        if binding_kind(b) != B_TVARIANT {
-            return 0;
-        }
-        let e = binding_value(b);
-        if !instance_of(ty, -e - 1, pcx) {
-            err_begin(pcx.nodes[p as usize].start, pcx);
-            err_str(c"expected '", pcx);
-            err_type(ty, pcx);
-            err_str(c"', got a pattern of '", pcx);
-            err_sym((*get_enums().add(e as usize)).name, pcx);
-            err_str(c"'", pcx);
-            pattern_enum_help(ty, sym_text((*get_enums().add(e as usize)).name, pcx), pcx);
-            err_end(pcx);
-        }
-        ty
+    let b = lookup_quiet(pcx.cur_mod, name, pcx.cur_mod, pcx);
+    if binding_kind(b) == B_VARIANT {
+        return enum_type(pcx.variants[binding_value(b) as usize].enum_id, pcx);
     }
+    if binding_kind(b) != B_TVARIANT {
+        return 0;
+    }
+    let e = binding_value(b);
+    if !instance_of(ty, -e - 1, pcx) {
+        err_begin(pcx.nodes[p as usize].start, pcx);
+        err_str(c"expected '", pcx);
+        err_type(ty, pcx);
+        err_str(c"', got a pattern of '", pcx);
+        err_sym((pcx.enums[e as usize]).name, pcx);
+        err_str(c"'", pcx);
+        pattern_enum_help(ty, sym_text((pcx.enums[e as usize]).name, pcx), pcx);
+        err_end(pcx);
+    }
+    ty
 }
 
 // (0.25.2.2, eval 0.25.2.1: windtunnel) The help of a pattern of Option
@@ -310,7 +281,7 @@ pub fn used_variant_enum(name: i64, ty: i64, p: i64, pcx: &mut Ctx<Comp>) -> i64
 pub fn pattern_enum_help(ty: i64, pat: &[u8], pcx: &Ctx<Comp>) {
     let b = buf_new();
     buf_type(b, ty, pcx);
-    let v = buf_slice(b);
+    let v = buf_copy(b);
     if v.len() > 7 && v[0..7] == b"Result<" && pat == b"Option" {
         err_help(
             c"the value is a Result: its patterns are `Ok(x)` and `Err(e)`; `.ok()` makes it an Option (`match r.ok() { Some(x) => ..., None => ... }`), `.unwrap_or(d)` gives the value or d", pcx);
@@ -323,46 +294,42 @@ pub fn pattern_enum_help(ty: i64, pat: &[u8], pcx: &Ctx<Comp>) {
 // Whether `name` is a constant in the current scope (its index + 1, or 0).
 pub fn scope_const(name: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let b = lookup_quiet(pcx.cur_mod, name, pcx.cur_mod, pcx);
-    if binding_kind(b) == B_ITEM { unsafe { (*pcx.sym_const.add(binding_value(b) as usize)) } }
+    if binding_kind(b) == B_ITEM { (pcx.sym_const[binding_value(b) as usize]) }
     else { 0 }
 }
 
 // An unknown name; when a C header left it out, why.
-pub fn unknown_name_error(pos: i64, before: *mut u8, name: i64, pcx: &mut Ctx<Comp>) -> ! {
-    unsafe {
-        if sym_text(name, pcx) == b"char" {
-            // (0.27.0: Rust's `char`, the rust edition's from 0.27.2)
-            crate::front::rust::later(pos, pos + 4, "char", "0.27.2", pcx);
-            crate::base::diag::err_jump(pcx);
-        }
-        err_begin(pos, pcx);
-        err_str(before, pcx);
-        err_sym(name, pcx);
-        err_str(c"'", pcx);
-        err_failed_name(name, pcx);
-        let reason = c_import_skip_reason(name, pcx);
-        if reason != 0 as *mut u8 {
-            err_help(c"'", pcx);
-            err_help_sym(name, pcx);
-            err_help(c"' was not imported from the C headers: ", pcx);
-            err_help(reason, pcx);
-        }
-        else if (*before.add(0)) == b'u' && (*before.add(2)) == b'd'
-            && sym_text(name, pcx) == b"gpa" {
-            // (0.25.2.1: the allocator is a parameter, a test's too)
-            let cur = pcx.cur_fn;
-            crate::front::ambient::gpa_param_help(if cur >= 0 { pcx.fns[cur as usize].node }
-                else { -1 },
-                if cur >= 0 { sym_text(pcx.fns[cur as usize].display, pcx) } else { b"" }, pcx);
-        }
-        else if (*before.add(0)) == b'u' && (*before.add(1)) == b'n'
-            && ((*before.add(2)) == b'd' || (*before.add(2)) == b'k') {
-            // (`undefined variable '`, `unknown type '`, `unknown struct '`)
-            suggest_name(name, (*before.add(2)) == b'd',
-                pos == pcx.callee_pos || (*before.add(2)) == b'k', pcx);
-        }
-        err_end(pcx)
+pub fn unknown_name_error(pos: i64, before: *const u8, name: i64, pcx: &mut Ctx<Comp>) -> ! {
+    if sym_text(name, pcx) == b"char" {
+        // (0.27.0: Rust's `char`, the rust edition's from 0.27.2)
+        crate::front::rust::later(pos, pos + 4, "char", "0.27.2", pcx);
+        crate::base::diag::err_jump(pcx);
     }
+    err_begin(pos, pcx);
+    err_str(before, pcx);
+    err_sym(name, pcx);
+    err_str(c"'", pcx);
+    err_failed_name(name, pcx);
+    let reason = c_import_skip_reason(name, pcx);
+    if reason != 0 as *mut u8 {
+        err_help(c"'", pcx);
+        err_help_sym(name, pcx);
+        err_help(c"' was not imported from the C headers: ", pcx);
+        err_help(reason, pcx);
+    }
+    else if c_starts(before, b"und") && sym_text(name, pcx) == b"gpa" {
+        // (0.25.2.1: the allocator is a parameter, a test's too)
+        let cur = pcx.cur_fn;
+        crate::front::ambient::gpa_param_help(if cur >= 0 { pcx.fns[cur as usize].node }
+            else { -1 },
+            if cur >= 0 { sym_text(pcx.fns[cur as usize].display, pcx) } else { b"" }, pcx);
+    }
+    else if c_starts(before, b"und") || c_starts(before, b"unk") {
+        // (`undefined variable '`, `unknown type '`, `unknown struct '`)
+        suggest_name(name, c_starts(before, b"und"),
+            pos == pcx.callee_pos || c_starts(before, b"unk"), pcx);
+    }
+    err_end(pcx)
 }
 
 // ---- Suggestions for unknown names (0.11) ----
@@ -406,19 +373,19 @@ pub fn help_std_elsewhere(target: i64, name: i64, in_use: bool, std_module: i64,
         if t.len() > 0 && t[0] >= b'a' && t[0] <= b'z' && t != b"str" {
             buf_str(w, c"(...)");
         }
-        let written = buf_slice(w);
+        let written = buf_copy(w);
         if in_use {
             err_help_fmt(
-                { let t = str::from_utf8(t).unwrap(); { let written = str::from_utf8(written).unwrap(); format_args("'{t}' is in the prelude: every module has it without a `use` or a path; delete this line and write `{written}`") } }, pcx);
+                { let t = str::from_utf8(t).unwrap(); { let written = str::from_utf8(&written).unwrap(); format_args("'{t}' is in the prelude: every module has it without a `use` or a path; delete this line and write `{written}`") } }, pcx);
         } else {
             err_help_fmt({
                 let t = str::from_utf8(t).unwrap();
-                { let written = str::from_utf8(written).unwrap();
+                { let written = str::from_utf8(&written).unwrap();
                     format_args("'{t}' is in the prelude: write `{written}`, with no path") }
             },
                 pcx);
         }
-        err_try_fmt(str::from_utf8(written).unwrap(), pcx);
+        err_try_fmt(str::from_utf8(&written).unwrap(), pcx);
         return true;
     }
     if target != std_module && std_module >= 0
@@ -438,17 +405,17 @@ pub fn help_std_elsewhere(target: i64, name: i64, in_use: bool, std_module: i64,
     if at != 0 {
         err_help_fmt({
             let t = str::from_utf8(t).unwrap();
-            format_args("'{t}' is in {}", str::from_utf8(buf_slice(at)).unwrap())
+            format_args("'{t}' is in {}", str::from_utf8(buf_done(at)).unwrap())
         }, pcx);
         if in_use {
             err_try_fmt({
                 let t = str::from_utf8(t).unwrap();
-                format_args("use {}::{t};", str::from_utf8(buf_slice(at)).unwrap())
+                format_args("use {}::{t};", str::from_utf8(buf_done(at)).unwrap())
             }, pcx);
         } else {
             err_try_fmt({
                 let t = str::from_utf8(t).unwrap();
-                format_args("{}::{t}", str::from_utf8(buf_slice(at)).unwrap())
+                format_args("{}::{t}", str::from_utf8(buf_done(at)).unwrap())
             }, pcx);
         }
         return true;
@@ -480,100 +447,98 @@ fn has_part(t: &[u8], part: &[u8]) -> bool {
 // in std (`did you mean 'x'?`), what std reads input with, or where std's
 // API is listed.
 fn suggest_name(name: i64, value: bool, hint_std: bool, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        // (0.18.1: and `Reverse(x)`, a value, as a type)
-        if (!value || sym_text(name, pcx) == b"Reverse") && rust_type_help(name, pcx) {
-            return;
+    // (0.18.1: and `Reverse(x)`, a value, as a type)
+    if (!value || sym_text(name, pcx) == b"Reverse") && rust_type_help(name, pcx) {
+        return;
+    }
+    // (0.25.2.1: a function std has under another name)
+    let syn = std_synonym_help(sym_text(name, pcx));
+    if value && syn.len() > 0 {
+        err_help_fmt(str::from_utf8(syn).unwrap(), pcx);
+        return;
+    }
+    let mut path = import_path_for(name, value, pcx);
+    if path == 0 && pcx.import_paths != 0 {
+        // (0.25.3) several modules have it, none named in the file: each
+        err_help(c"'", pcx);
+        err_help_sym(name, pcx);
+        err_help(c"' is in several modules: add ", pcx);
+        buf_append(pcx.err_help, pcx.import_paths);
+        return;
+    }
+    if path == 0 && pcx.std_module < 0 && std_has(name, value, pcx) {
+        path = buf_new();
+        buf_str(path, c"std");
+    }
+    if path != 0 {
+        note_missing_use(pcx.cur_mod, intern_buf(path, pcx), name, pcx);
+        err_help(c"add `use ", pcx);
+        buf_append(pcx.err_help, path);
+        err_help(c"::", pcx);
+        err_help_sym(name, pcx);
+        err_help(c";`", pcx);
+        // (0.18: `fix --suggested` adds it, as `fix --only imports`)
+        err_fixable(pcx);
+        return;
+    }
+    let mut tie = false;
+    let near = nearest_name(name, value, &mut tie, pcx);
+    if near >= 0 {
+        err_help(c"did you mean '", pcx);
+        err_help_sym(near, pcx);
+        err_help(c"'?", pcx);
+        if !tie {
+            err_fix_word(err_pos(pcx), sym_text(name, pcx), sym_text(near, pcx), pcx);
         }
-        // (0.25.2.1: a function std has under another name)
-        let syn = std_synonym_help(sym_text(name, pcx));
-        if value && syn.len() > 0 {
-            err_help_fmt(str::from_utf8(syn).unwrap(), pcx);
-            return;
+        return;
+    }
+    if value && rust_input_help(name, pcx) {
+        return;
+    }
+    let mut in_std = near_to(name);
+    std_names(pcx);
+    for i in 0..pcx.std_names.len() as i64 / 2 {
+        if ((pcx.std_names[(2 * i + 1) as usize]) != 0) == value {
+            in_std.offer((pcx.std_names[(2 * i) as usize]), pcx);
         }
-        let mut path = import_path_for(name, value, pcx);
-        if path == 0 && pcx.import_paths != 0 {
-            // (0.25.3) several modules have it, none named in the file: each
-            err_help(c"'", pcx);
-            err_help_sym(name, pcx);
-            err_help(c"' is in several modules: add ", pcx);
-            buf_bytes(pcx.err_help, buf_slice(pcx.import_paths));
-            return;
+    }
+    if in_std.best >= 0 && is_prelude_name(in_std.best, pcx) {
+        // (0.17) a name of the prelude: no `use`
+        err_help(c"did you mean '", pcx);
+        err_help_sym(in_std.best, pcx);
+        err_help(c"'?", pcx);
+        if !in_std.tie {
+            err_fix_word(err_pos(pcx), sym_text(name, pcx), sym_text(in_std.best, pcx), pcx);
         }
-        if path == 0 && pcx.std_module < 0 && std_has(name, value, pcx) {
-            path = buf_new();
-            buf_str(path, c"std");
+        return;
+    }
+    if in_std.best >= 0 {
+        err_help(c"did you mean 'std::", pcx);
+        err_help_sym(in_std.best, pcx);
+        err_help(c"'? (`use std::", pcx);
+        err_help_sym(in_std.best, pcx);
+        err_help(c";`)", pcx);
+        if !in_std.tie {
+            let b = buf_new();
+            buf_str(b, c"std::");
+            buf_bytes(b, sym_text(in_std.best, pcx));
+            err_fix_word(err_pos(pcx), sym_text(name, pcx), &buf_copy(b), pcx);
         }
-        if path != 0 {
-            note_missing_use(pcx.cur_mod, intern(buf_slice(path), pcx), name, pcx);
-            err_help(c"add `use ", pcx);
-            buf_bytes(pcx.err_help, buf_slice(path));
-            err_help(c"::", pcx);
-            err_help_sym(name, pcx);
-            err_help(c";`", pcx);
-            // (0.18: `fix --suggested` adds it, as `fix --only imports`)
-            err_fixable(pcx);
-            return;
-        }
-        let mut tie = false;
-        let near = nearest_name(name, value, &mut tie, pcx);
-        if near >= 0 {
-            err_help(c"did you mean '", pcx);
-            err_help_sym(near, pcx);
-            err_help(c"'?", pcx);
-            if !tie {
-                err_fix_word(err_pos(pcx), sym_text(name, pcx), sym_text(near, pcx), pcx);
-            }
-            return;
-        }
-        if value && rust_input_help(name, pcx) {
-            return;
-        }
-        let mut in_std = near_to(name);
-        std_names(pcx);
-        for i in 0..pcx.std_names.count / 2 {
-            if ((*pcx.std_names.data.add((2 * i + 1) as usize)) != 0) == value {
-                in_std.offer((*pcx.std_names.data.add((2 * i) as usize)), pcx);
-            }
-        }
-        if in_std.best >= 0 && is_prelude_name(in_std.best, pcx) {
-            // (0.17) a name of the prelude: no `use`
-            err_help(c"did you mean '", pcx);
-            err_help_sym(in_std.best, pcx);
-            err_help(c"'?", pcx);
-            if !in_std.tie {
-                err_fix_word(err_pos(pcx), sym_text(name, pcx), sym_text(in_std.best, pcx), pcx);
-            }
-            return;
-        }
-        if in_std.best >= 0 {
-            err_help(c"did you mean 'std::", pcx);
-            err_help_sym(in_std.best, pcx);
-            err_help(c"'? (`use std::", pcx);
-            err_help_sym(in_std.best, pcx);
-            err_help(c";`)", pcx);
-            if !in_std.tie {
-                let b = buf_new();
-                buf_str(b, c"std::");
-                buf_bytes(b, sym_text(in_std.best, pcx));
-                err_fix_word(err_pos(pcx), sym_text(name, pcx), buf_slice(b), pcx);
-            }
-            return;
-        }
-        if hint_std && !crate::front::modules::within_std(pcx.cur_mod, pcx)
-            && sym_text(name, pcx).len() > 2 {
-            err_help(c"std's names: `volec guide std`", pcx);
-        }
+        return;
+    }
+    if hint_std && !crate::front::modules::within_std(pcx.cur_mod, pcx)
+        && sym_text(name, pcx).len() > 2 {
+        err_help(c"std's names: `volec guide std`", pcx);
     }
 }
 
 fn std_names(pcx: &mut Ctx<Comp>) {
-    if pcx.std_names.count > 0 {
+    if pcx.std_names.len() as i64 > 0 {
         return;
     }
     let src = buf_new();
-    std2_source(src);
-    let text = buf_slice(src);
+    std_source(src);
+    let text = buf_copy(src);
     let mut start: i64 = 0;
     while start < text.len() as i64 {
         let mut end = start;
@@ -634,16 +599,14 @@ fn is_ident_byte(x: u8) -> bool {
 
 // Whether std has a public value (or type) `name`.
 pub fn std_has(name: i64, value: bool, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        std_names(pcx);
-        for i in 0..pcx.std_names.count / 2 {
-            if (*pcx.std_names.data.add((2 * i) as usize)) == name
-                && ((*pcx.std_names.data.add((2 * i + 1) as usize)) != 0) == value {
-                return true;
-            }
+    std_names(pcx);
+    for i in 0..pcx.std_names.len() as i64 / 2 {
+        if (pcx.std_names[(2 * i) as usize]) == name
+            && ((pcx.std_names[(2 * i + 1) as usize]) != 0) == value {
+            return true;
         }
-        false
     }
+    false
 }
 
 // The help of an unknown function a Rust or Python programmer reads input
@@ -683,7 +646,7 @@ fn rust_type_help(name: i64, pcx: &mut Ctx<Comp>) -> bool {
         err_try(c"u8", pcx);
         rust_type_fix(text, b"u8", pcx);
     } else if text == b"usize" || text == b"isize" {
-        err_help(c"`i64`: lengths and indices are i64 (`s.len`, `v.len()`)", pcx);
+        err_help(c"`i64`: lengths and indices are i64 (`s.len()`, `v.len()`)", pcx);
         err_try(c"i64", pcx);
         rust_type_fix(text, b"i64", pcx);
     } else if text == b"Reverse" {
@@ -723,31 +686,27 @@ fn rust_type_fix(old: &[u8], new: &[u8], pcx: &mut Ctx<Comp>) {
 // Whether key `key` (an item's) is a value (a function, constant or
 // static) or, for !value, a type.
 fn key_is(key: i64, value: bool, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        if value {
-            (*pcx.sym_fn.add(key as usize)) != 0 || (*pcx.sym_const.add(key as usize)) != 0
-                || (*pcx.sym_static.add(key as usize)) != 0
-        } else {
-            (*pcx.sym_struct.add(key as usize)) != 0 || (*pcx.sym_enum.add(key as usize)) != 0
-                || (*pcx.sym_alias.add(key as usize)) != 0 || template_of_key(key, pcx) != TPL_NONE
-        }
+    if value {
+        (pcx.sym_fn[key as usize]) != 0 || (pcx.sym_const[key as usize]) != 0
+            || (pcx.sym_static[key as usize]) != 0
+    } else {
+        (pcx.sym_struct[key as usize]) != 0 || (pcx.sym_enum[key as usize]) != 0
+            || (pcx.sym_alias[key as usize]) != 0 || template_of_key(key, pcx) != TPL_NONE
     }
 }
 
 // Whether `name` is a value (or a type) where the checker is.
 fn name_in_scope(name: i64, value: bool, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        if value {
-            match lookup_local(name, pcx) {
-                Option::Some(_) => { return true; }
-                Option::None => {}
-            }
-        } else if env_lookup(name, pcx) != 0 || (*pcx.sym_primitive.add(name as usize)) != 0 {
-            return true;
+    if value {
+        match lookup_local(name, pcx) {
+            Option::Some(_) => { return true; }
+            Option::None => {}
         }
-        let b = lookup_quiet(pcx.cur_mod, name, pcx.cur_mod, pcx);
-        binding_kind(b) == B_ITEM && key_is(binding_value(b), value, pcx)
+    } else if env_lookup(name, pcx) != 0 || (pcx.sym_primitive[name as usize]) != 0 {
+        return true;
     }
+    let b = lookup_quiet(pcx.cur_mod, name, pcx.cur_mod, pcx);
+    binding_kind(b) == B_ITEM && key_is(binding_value(b), value, pcx)
 }
 
 // The name in scope nearest to `name` (see name_distance), or -1.
@@ -800,66 +759,61 @@ pub fn near_to(want: i64) -> Near {
 // `_` word, one inside the other, or an edit distance of at most half its
 // length), closest first; how many.
 pub fn help_closest_names(want: i64, max: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let w = sym_text(want, pcx);
-        let mut score = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for i in 0..pcx.near_all.count {
-            let c = sym_text((*pcx.near_all.data.add(i as usize)), pcx);
-            let d = edit_distance(w, c);
-            let mut p: i64 = 0;
-            while p < w.len() as i64 && p < c.len() as i64 && w[p as usize] == c[p as usize] {
-                p += 1;
-            }
-            let inside = c.len() >= w.len()
-                && (0i64..c.len() as i64 - w.len() as i64 + 1).any(
-                    |k| &c[k as usize..(k + w.len() as i64) as usize] == w)
-                || w.len() >= c.len() && c.len() >= 3
-                && (0i64..w.len() as i64 - c.len() as i64 + 1).any(
-                    |k| &w[k as usize..(k + c.len() as i64) as usize] == c);
-            // (0.25.2.1: only related names, however few: `x.sqrt()` on an
-            // f64 offered `fmt`, `fmt_debug`; `query items T` lists them all)
-            let related = p >= 3 || inside || d * 2 <= w.len() as i64 || shares_word(w, c);
-            score.push(if related { d * 4 - p * 3 - (if inside { 8 } else { 0 }) }
-                else { i64::MAX });
+    let w = sym_text(want, pcx);
+    let mut score: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..pcx.near_all.len() as i64 {
+        let c = sym_text((pcx.near_all[i as usize]), pcx);
+        let d = edit_distance(w, c);
+        let mut p: i64 = 0;
+        while p < w.len() as i64 && p < c.len() as i64 && w[p as usize] == c[p as usize] {
+            p += 1;
         }
-        let mut shown: i64 = 0;
-        while shown < max {
-            let mut best: i64 = -1;
-            for i in 0..pcx.near_all.count {
-                if (*score.data.add(i as usize)) != i64::MAX
-                    && (best < 0 || (*score.data.add(i as usize)) < (*score.data.add(best as usize))
-                        || (*score.data.add(i as usize)) == (*score.data.add(best as usize))
-                        && sym_text((*pcx.near_all.data.add(i as usize)), pcx).len()
-                        < sym_text((*pcx.near_all.data.add(best as usize)), pcx).len()) {
-                    best = i;
-                }
-            }
-            if best < 0 {
-                break;
-            }
-            if shown > 0 {
-                err_help(c", ", pcx);
-            }
-            err_help(c"'", pcx);
-            err_help_sym((*pcx.near_all.data.add(best as usize)), pcx);
-            err_help(c"'", pcx);
-            (*score.data.add(best as usize)) = i64::MAX;
-            shown += 1;
-        }
-        free(score.data as *mut u8);
-        shown
+        let inside = c.len() >= w.len()
+            && (0i64..c.len() as i64 - w.len() as i64 + 1).any(
+                |k| &c[k as usize..(k + w.len() as i64) as usize] == w)
+            || w.len() >= c.len() && c.len() >= 3
+            && (0i64..w.len() as i64 - c.len() as i64 + 1).any(
+                |k| &w[k as usize..(k + c.len() as i64) as usize] == c);
+        // (0.25.2.1: only related names, however few: `x.sqrt()` on an
+        // f64 offered `fmt`, `fmt_debug`; `query items T` lists them all)
+        let related = p >= 3 || inside || d * 2 <= w.len() as i64 || shares_word(w, c);
+        score.push(if related { d * 4 - p * 3 - (if inside { 8 } else { 0 }) }
+            else { i64::MAX });
     }
+    let mut shown: i64 = 0;
+    while shown < max {
+        let mut best: i64 = -1;
+        for i in 0..pcx.near_all.len() as i64 {
+            if (score[i as usize]) != i64::MAX
+                && (best < 0 || (score[i as usize]) < (score[best as usize])
+                    || (score[i as usize]) == (score[best as usize])
+                    && sym_text((pcx.near_all[i as usize]), pcx).len()
+                    < sym_text((pcx.near_all[best as usize]), pcx).len()) {
+                best = i;
+            }
+        }
+        if best < 0 {
+            break;
+        }
+        if shown > 0 {
+            err_help(c", ", pcx);
+        }
+        err_help(c"'", pcx);
+        err_help_sym((pcx.near_all[best as usize]), pcx);
+        err_help(c"'", pcx);
+        (score[best as usize]) = i64::MAX;
+        shown += 1;
+    }
+    shown
 }
 
 // (0.17) `prefix` and the names of NEAR_ALL nearest to `want` as the help
 // (help_closest_names); no help when none is near.
-pub fn help_nearest(prefix: *mut u8, want: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        let mark = (*get_bufs().add(pcx.err_help as usize)).len;
-        err_help(prefix, pcx);
-        if help_closest_names(want, 4, pcx) == 0 {
-            (*get_bufs().add(pcx.err_help as usize)).len = mark;
-        }
+pub fn help_nearest(prefix: *const u8, want: i64, pcx: &Ctx<Comp>) {
+    let mark = buf_len(pcx.err_help);
+    err_help(prefix, pcx);
+    if help_closest_names(want, 4, pcx) == 0 {
+        buf_truncate(pcx.err_help, mark);
     }
 }
 
@@ -918,16 +872,14 @@ impl Near {
     // Offers candidate `cand`.
     pub fn offer(&mut self, cand: i64, pcx: &mut Ctx<Comp>) {
         if pcx.near_collect && cand >= 0 && cand != self.want {
-            unsafe {
-                let mut seen = false;
-                for i in 0..pcx.near_all.count {
-                    if (*pcx.near_all.data.add(i as usize)) == cand {
-                        seen = true;
-                    }
+            let mut seen = false;
+            for i in 0..pcx.near_all.len() as i64 {
+                if (pcx.near_all[i as usize]) == cand {
+                    seen = true;
                 }
-                if !seen {
-                    pcx.near_all.push(cand);
-                }
+            }
+            if !seen {
+                pcx.near_all.push(cand);
             }
         }
         if self.close(cand, pcx) {
@@ -938,16 +890,14 @@ impl Near {
     // The error's help, `did you mean 'x'?`, when there is a candidate and
     // no other help.
     pub fn help(self, pcx: &mut Ctx<Comp>) {
-        unsafe {
-            if self.best >= 0 && (*get_bufs().add(pcx.err_help as usize)).len == 0 {
-                err_help(c"did you mean '", pcx);
-                err_help_sym(self.best, pcx);
-                err_help(c"'?", pcx);
-                // (0.18) the only name that near: the fix renames it
-                if !self.tie {
-                    err_fix_word(err_pos(pcx), sym_text(self.want, pcx), sym_text(self.best, pcx),
-                        pcx);
-                }
+        if self.best >= 0 && buf_len(pcx.err_help) == 0 {
+            err_help(c"did you mean '", pcx);
+            err_help_sym(self.best, pcx);
+            err_help(c"'?", pcx);
+            // (0.18) the only name that near: the fix renames it
+            if !self.tie {
+                err_fix_word(err_pos(pcx), sym_text(self.want, pcx), sym_text(self.best, pcx),
+                    pcx);
             }
         }
     }
@@ -1084,7 +1034,7 @@ pub fn import_path_for(name: i64, value: bool, pcx: &mut Ctx<Comp>) -> i64 {
     if in_std {
         std_item_paths(paths, name, value, pcx);
     }
-    let all = buf_slice(paths);
+    let all = buf_copy(paths);
     let f = crate::front::modules::file_of_pos(err_pos(pcx), pcx);
     let file = if f
         >= 0 { &get_src()[
@@ -1117,7 +1067,7 @@ pub fn import_path_for(name: i64, value: bool, pcx: &mut Ctx<Comp>) -> i64 {
         let mentioned = buf_new();
         buf_bytes(mentioned, p);
         buf_str(mentioned, c"::");
-        if mentions(file, buf_slice(mentioned)) {
+        if mentions(file, &buf_copy(mentioned)) {
             named = p;
             named_count += 1;
         }
@@ -1140,12 +1090,12 @@ pub fn import_path_for(name: i64, value: bool, pcx: &mut Ctx<Comp>) -> i64 {
 fn add_path(paths: i64, p: &[u8]) {
     let have = buf_new();
     buf_str(have, c"\n");
-    buf_bytes(have, buf_slice(paths));
+    buf_append(have, paths);
     let line = buf_new();
     buf_str(line, c"\n");
     buf_bytes(line, p);
     buf_str(line, c"\n");
-    if !mentions(buf_slice(have), buf_slice(line)) {
+    if !mentions(&buf_copy(have), &buf_copy(line)) {
         buf_bytes(paths, p);
         buf_str(paths, c"\n");
     }
@@ -1207,7 +1157,7 @@ fn parent_reexports(text: &[u8], list: &[u8], file: &[u8], word: &[u8]) -> bool 
             break;
         }
         let name = &list[(s + 1) as usize..e as usize];
-        if name == buf_slice(own) || name == buf_slice(flat) {
+        if buf_eq(own, name) || buf_eq(flat, name) {
             from = off;
         }
     }
@@ -1225,7 +1175,7 @@ fn parent_reexports(text: &[u8], list: &[u8], file: &[u8], word: &[u8]) -> bool 
         }
         let line = &text[start as usize..end as usize];
         start = end + 1;
-        if line.len() < 9 || &line[0..8] != b"pub use " || !mentions(line, buf_slice(part)) {
+        if line.len() < 9 || &line[0..8] != b"pub use " || !mentions(line, &buf_copy(part)) {
             continue;
         }
         // (the name as a whole word of the line)
@@ -1248,11 +1198,11 @@ fn parent_reexports(text: &[u8], list: &[u8], file: &[u8], word: &[u8]) -> bool 
 // its files' list (`flat/` and std.vl: `std`), added to paths.
 fn std_item_paths(paths: i64, name: i64, value: bool, pcx: &Ctx<Comp>) {
     let src = buf_new();
-    std2_source(src);
+    std_source(src);
     let files = buf_new();
-    crate::front::stdsrc_rust::std2_files(files);
-    let text = buf_slice(src);
-    let list = buf_slice(files);
+    crate::front::stdsrc::std_files(files);
+    let text = buf_copy(src);
+    let list = buf_copy(files);
     let word = sym_text(name, pcx);
     let mut start: i64 = 0;
     while start < text.len() as i64 {
@@ -1324,8 +1274,8 @@ fn std_item_paths(paths: i64, name: i64, value: bool, pcx: &Ctx<Comp>) {
             }
         }
         // (the module above re-exports it: its path, `std::collections`)
-        if parent_reexports(text, list, file, word) {
-            let whole = buf_slice(path);
+        if parent_reexports(&text, &list, file, word) {
+            let whole = buf_copy(path);
             let mut cut = whole.len() as i64;
             for i in 0..whole.len() as i64 {
                 if whole[i as usize] == b':' {
@@ -1337,7 +1287,7 @@ fn std_item_paths(paths: i64, name: i64, value: bool, pcx: &Ctx<Comp>) {
                 continue;
             }
         }
-        add_path(paths, buf_slice(path));
+        add_path(paths, &buf_copy(path));
     }
 }
 
@@ -1369,7 +1319,7 @@ fn put_module_path(out: i64, m: i64, pcx: &Ctx<Comp>) {
 // position, an `unsafe fn` or a C function (an extern block's) is an
 // `unsafe fn` type (RULE: F19.3).
 pub fn fn_value_type(f: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let mark = pcx.tscratch.count;
+    let mark = pcx.tscratch.len() as i64;
     for i in 0..pcx.fns[f as usize].param_count {
         pcx.tscratch.push(fn_param(f, i, pcx));
     }

@@ -11,8 +11,8 @@ is Rust's, with the differences named here.
   `r#type` is the identifier `type` (C names that are keywords).
 - Keywords are Rust's (`let mut`, `move`, `ref`, `match`, `impl`,
   `where`, ...) plus `import` (a C header) and `union`. Reserved
-  (errors): `dyn`, `defer` (a guard with `Drop` does it), `@`. `var`,
-  `inout` and `sink` are plain names (not keywords).
+  (errors): `dyn`, `@`. `var`, `inout`, `sink` and `defer` are plain
+  names (there is no `defer` statement: a guard with `Drop` does it).
 - Integers: `42`, `1_000`, `0xff`, `0b1010`, with a type suffix `255u8`,
   `7i32`. Floats: `1.5`, `2e10`, `1.5f32`. `'a'`, `'\n'`, `'\u{e9}'` are
   `char`s; `b'A'` is a `u8`. Strings: `"a\tb\n\"q\"\\"`, `"\x41"`,
@@ -95,7 +95,7 @@ fn ignore(_: i64) {}                 // `_` ignores an argument
 fn bump(mut n: i64) -> i64 { n += 1; n }  // a mutable copy of the argument
 fn twice(v: &mut Vec<i64, Gpa>) { v.push(v.len() as i64); } // called as twice(&mut v)
 unsafe fn raw(p: *const i64) -> i64 { *p }  // callers need unsafe
-fn hi(m: &mut HashMap<i64, i64, Gpa>) { m.insert(1, 2); } // the `use` above
+fn hi(m: &mut HashMap<i64, i64, Gpa, FixedState>) { m.insert(1, 2); } // the `use`s above
 
 impl Point {
     fn len2(&self) -> i64 { self.x * self.x + self.y * self.y }
@@ -160,7 +160,7 @@ From loosest to tightest (all left-associative except where noted):
 | `+` `-` | |
 | `*` `/` `%` | |
 | `as` | `-x as i64` is `(-x) as i64`; `a * b as f64` is `a * (b as f64)` |
-| prefix `-` `!` `*` `&` `&mut` | `!` is bool's not and an integer's bitwise not (`~` too, vole's); `*r` reads through a reference or a raw pointer |
+| prefix `-` `!` `*` `&` `&mut` | `!` is bool's not and an integer's bitwise not (`~x` is an error); `*r` reads through a reference or a raw pointer |
 | `f()` `a[i]` `a[i..j]` `x.f` `x.0` `x.m()` `e?` | `*p.x` is `*(p.x)` |
 
 No `**` (power: `x.pow(n)`), no ternary (`if c { a } else { b }` is an

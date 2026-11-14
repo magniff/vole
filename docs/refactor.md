@@ -18,6 +18,7 @@ volec edit patch TARGET [--loose] < PAIRS   (0.12; see "Edits inside an item")
 volec edit patch TARGET --pairs FILE [--loose]   (0.13)
 volec edit patch [TARGET] --old A --new B --in NAME --old C --new D   (0.15: several targets)
 volec edit patch [TARGET] [--old A --new B]... --pairs FILE   (0.25.5: both; `@@ FILE` blocks)
+volec edit patch FILE --old A --new B   (0.29: FILE a shader's .wgsl of the program, checked; or a text file git tracks, exact match, not checked)
 volec edit patch FILE:LINE --old '' --new TEXT   (0.25.5: TEXT inserted above the line)
 volec edit apply [FILE]                     (0.15) several items' new text, one edit
 volec edit insert --in TARGET --after|--before ANCHOR [--loose] < TEXT
@@ -499,7 +500,7 @@ target is a std item is refused, `error edit.not-source: str::trim is in
 <std>, not in a file of the program`. Edit the file under
 `compiler/std/` (`query def` and `query show` name it and its line),
 `volec fmt` it, run `compiler/std/embed.sh` (the commit hook does too),
-which makes `compiler/src/front/stdsrc_rust.vl`, and rebuild. What follows
+which makes `compiler/src/front/stdsrc.vl`, and rebuild. What follows
 is the old std's, 0.17 to 0.27, and comes back with the files read as
 modules.
 
@@ -638,8 +639,8 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 | `unused` | imports whose name is written nowhere else in their file, removed (the name of a list with its separator; the item when all go; `use p::{a}` left with one name becomes `use p::a`). `pub use` is kept |
 | `pub` | `pub` on the items other modules use while they are private (`error ... is private`), and (0.26) on the fields of the program's structs they read, write or name in a literal (`field.private`, `field.literal-private`) |
 | `unsafe` | the unsafe operations outside unsafe code, wrapped in unsafe blocks (the outermost unit around each: a statement, `let p = unsafe { e };`, an expression); a function with several of them gets its whole body in one block, one level deeper, when its braces have lines of their own (0.12, the codebase's style; `--fix-unsafe` keeps 0.9's units) |
-| `unneeded-unsafe` | (0.25.4, asked for only) the unsafe blocks with nothing unsafe inside (`query unsafe`'s `none (unneeded)`) taken away, their code kept: a block on lines of its own becomes its lines, one level less indented; one on a line its code, in parentheses where the operators around it could bind otherwise (`2 * unsafe { a + b }` is `2 * (a + b)`); a statement in the middle of a block gets the `;` it ends with. A block is opened only when it is its block's last statement or declares nothing (`let`, `var`, `inout`, `defer`) at its own level, so names keep their scope and values their drops; left, and counted in the summary: one that declares and is not last, one with a string or comment over several lines, one spread over lines in another shape (`let x = unsafe {`), one whose comments say `UNSAFE:` or `SAFETY:`, and one inside another taken away in the same run (the next run takes it). The edit is checked as every fix is (docs/design/modernize-0254.md, step 1: 938 blocks of compiler/src, the corpus byte-identical by `same-output`) |
-| `unneeded-justified` | (0.25.5, asked for only) the same, and the unneeded blocks whose comments say `UNSAFE:` or `SAFETY:` too, with those comments: the `//` lines right above the block's line, from the first that says one of them down (a block that is no longer needed has no reason left). Left: one whose line holds another `unsafe` (the comments may be its too), one whose comments are not right above its line |
+| `unneeded-unsafe` | (0.25.4, asked for only) the unsafe blocks with nothing unsafe inside (`query unsafe`'s `none (unneeded)`) taken away, their code kept: a block on lines of its own becomes its lines, one level less indented; one on a line its code, in parentheses where the operators around it could bind otherwise (`2 * unsafe { a + b }` is `2 * (a + b)`); a statement in the middle of a block gets the `;` it ends with. A block is opened only when it is its block's last statement or declares nothing (`let`, `var`, `inout`, `defer`) at its own level, so names keep their scope and values their drops. (0.29) A block written over several lines where an expression stands (a function's whole body, a `let`'s value, an `if` or `while` condition, an operand) becomes its code too, and the edit engine lays the statement's lines out as `volec fmt` would; a block that declares is also opened when only a lone name or literal follows it in its block (nothing runs between the two ends); any other block that declares, one holding statements where an expression stands, and one on lines of its own with a string or comment over several lines loses the word `unsafe` alone (a plain `{ }` block, the same scope). Left, counted in the summary and each named with its reason (`note fix.unneeded-left: FILE:LINE: unsafe block left: WHY`): an expression holding a string or comment over several lines or ending in a `//` comment, one of a generated file, and one inside another taken away in the same run (the next run takes it); one whose comments say `UNSAFE:` or `SAFETY:` is not this fix's. The edit is checked as every fix is (docs/design/modernize-0254.md, step 1: 938 blocks of compiler/src, the corpus byte-identical by `same-output`) |
+| `unneeded-justified` | (0.25.5, asked for only) the same, and the unneeded blocks whose comments say `UNSAFE:` or `SAFETY:` too, with those comments: the `//` lines right above the block's line or (0.29) above the first line of its statement, from the first that says one of them down (a block that is no longer needed has no reason left); two blocks of a statement lose their comments once. Left, with the reason: one whose statement holds another `unsafe` that stays (the comments are its too), one whose comments are not on the lines above its statement |
 | `obsolete-attr` | (0.26.0, asked for only) the obsolete attributes deleted: `#[sealed]` (`warning attr.obsolete`; every struct's fields are private from 0.26), its line when it is alone on it |
 
 | `tidy-imports` | (0.12) the `use` lines in the codebase's style: the paths of a module's child modules written as most of its `use` lines that could be written either way write them (0.14: relative, `use a::x;`, or from `crate`, `use crate::m::a::x;`; a tie, as the first), the `use` items of a module with one path (and one `pub`) merged where the first is, their names sorted (byte order) and each once, `use p::a;` for one, `use p::{a, b};` when the line fits in 100 columns, else wrapped four spaces in, a line per name imported under another name (`use p::a as b;`); a `use` with a comment on its lines, or sharing a line, is left as it is, and one with a comment right above it is not merged into another |
@@ -814,7 +815,7 @@ instances of a generic function (`instances→N→grow<i64> grow<Buf>
 
 `volec lint --max-lines N [ROOT]`: one error per file over N lines,
 largest first, each with the deps of its module. A generated file (one
-starting `// Generated by`, as `front/stdsrc_rust.vl` and the guide's
+starting `// Generated by`, as `front/stdsrc.vl` and the guide's
 `text/`) is not counted: its size is its generator's (0.14).
 
 ```

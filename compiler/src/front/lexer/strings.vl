@@ -4,8 +4,8 @@
 // literals and their escapes; STRS, the strings' table.
 
 use crate::base::{
-    alloc_zeroed, buf_byte, buf_bytes, buf_clear, buf_done, buf_new, elem_at, get_bufs, get_src,
-    grow, memcpy,
+    buf_at, buf_byte, buf_bytes, buf_clear, buf_copy, buf_done, buf_len, buf_new, buf_truncate,
+    get_src,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -13,29 +13,25 @@ use crate::base::diag::{
     err_begin, err_end, err_fix, err_fmt, err_help, err_str, err_try_fmt, error_at,
 };
 use crate::front::lexer::{
-    Tok, at_end, get_str_cap, get_str_count, get_strs, lex_token, peek_at, push_token, set_str_cap,
-    set_str_count, set_strs, skip_whitespace_and_comments,
+    Tok, at_end, lex_token, peek_at, push_token, skip_whitespace_and_comments,
 };
 use crate::front::lexer::Tok::{CStr, Char, Str};
 use crate::front::lexer::blocks::{at_ftext_block, ftext_line, in_ftext_block, open_ftext_block};
 
 // ---- Strings and characters ----
 
-pub fn add_string(bytes: &[u8]) -> i64 {
-    unsafe {
-        set_strs({
-            let mut str_cap_copy = get_str_cap();
-            let r_copy = grow(get_strs(), get_str_count(), &mut str_cap_copy);
-            set_str_cap(str_cap_copy); r_copy
-        });
-        let n = bytes.len() as i64;
-        let copy = alloc_zeroed(n + 1);
-        memcpy(copy, bytes.ptr, n as u64);
-        *elem_at(get_strs(), get_str_count()) = std::slice::from_raw_parts(copy.add((0) as usize),
-            (n - (0)) as usize);
-        set_str_count(get_str_count() + (1));
-        get_str_count() - 1
-    }
+pub fn add_string(bytes: &[u8], pcx: &Ctx<Comp>) -> i64 {
+    // (the string's own copy and a NUL after it, never freed: `leak`
+    // gives it the process's life, which is what 'static says)
+    let mut copy: Vec<u8, Comp> = Vec::new_in(Comp {});
+    copy.reserve(bytes.len() + 1);
+    copy.extend_from_slice(bytes);
+    copy.push(0);
+    let kept: &'static [u8] = copy.leak();
+    let mut table = pcx.strs.write().unwrap();
+    table.texts.push(&kept[..bytes.len()]);
+    table.aligns.push(0);
+    table.texts.len() as i64 - 1
 }
 
 // After a backslash in a string: a line continuation (0.9) is skipped
@@ -56,46 +52,37 @@ fn line_continuation(pcx: &mut Ctx<Comp>) -> bool {
 
 // `"..."` or `c"..."` starting at `start`.
 pub fn lex_string(start: i64, is_c: bool, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        pcx.lex_pos += if is_c { 2 } else { 1 };
-        buf_clear(pcx.lex_scratch);
-        loop {
-            plain_run(false, pcx);
-            if at_end(pcx) {
-                error_at(start, c"unterminated string literal", pcx);
-            }
-            let c = peek_at(0, pcx);
-            pcx.lex_pos += 1;
-            if c == b'"' {
-                break;
-            }
-            if c == b'\n' {
-                error_at(pcx.lex_pos - 1, c"newline in string literal", pcx);
-            }
-            if c == b'\\' && line_continuation(pcx) {
-                continue;
-            }
-            if c == b'\\' {
-                lex_escape(pcx.lex_scratch, in_char: false, pcx: pcx);
-            } else {
-                buf_byte(pcx.lex_scratch, c);
-            }
+    pcx.lex_pos += if is_c { 2 } else { 1 };
+    buf_clear(pcx.lex_scratch);
+    loop {
+        plain_run(false, pcx);
+        if at_end(pcx) {
+            error_at(start, c"unterminated string literal", pcx);
         }
-        let bytes = (*get_bufs().add(pcx.lex_scratch as usize)).data;
-        let n = (*get_bufs().add(pcx.lex_scratch as usize)).len;
-        if is_c {
-            for i in 0..n {
-                if (*bytes.add(i as usize)) == 0 {
-                    error_at(start, c"C string literal contains a NUL byte", pcx);
-                }
-            }
+        let c = peek_at(0, pcx);
+        pcx.lex_pos += 1;
+        if c == b'"' {
+            break;
         }
-        let id = add_string(std::slice::from_raw_parts(bytes.add((0) as usize),
-            (n - (0)) as usize));
-        // (0.27.3: `b"..."`, the rust edition's byte string, suffix 2. RULE: F23.2)
-        push_token(if is_c { CStr } else { Str }, start, id as u64,
-            if !is_c && crate::base::get_src()[start as usize] == b'b' { 2 } else { 0 }, pcx);
+        if c == b'\n' {
+            error_at(pcx.lex_pos - 1, c"newline in string literal", pcx);
+        }
+        if c == b'\\' && line_continuation(pcx) {
+            continue;
+        }
+        if c == b'\\' {
+            lex_escape(pcx.lex_scratch, in_char: false, pcx: pcx);
+        } else {
+            buf_byte(pcx.lex_scratch, c);
+        }
     }
+    if is_c && buf_copy(pcx.lex_scratch).contains(&0) {
+        error_at(start, c"C string literal contains a NUL byte", pcx);
+    }
+    let id = add_string(&buf_copy(pcx.lex_scratch), pcx);
+    // (0.27.3: `b"..."`, the rust edition's byte string, suffix 2. RULE: F23.2)
+    push_token(if is_c { CStr } else { Str }, start, id as u64,
+        if !is_c && crate::base::get_src()[start as usize] == b'b' { 2 } else { 0 }, pcx);
 }
 
 // `f"..."` starting at `start` (0.15): FHead, then for each hole its
@@ -103,83 +90,77 @@ pub fn lex_string(start: i64, is_c: bool, pcx: &mut Ctx<Comp>) {
 // `}` that closes it, or at a `:` outside brackets, which starts its spec
 // (the bytes up to the `}`).
 pub fn lex_fstring(start: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        pcx.lex_pos += 2;
-        let mut more = false;
-        if at_ftext_block(start, pcx) {
-            // (0.25.4) `f"""`: a text block with holes (lexer/blocks)
-            buf_clear(pcx.lex_scratch);
-            if !open_ftext_block(start, pcx) {
-                more = lex_fstring_text(start, pcx);
-            }
-        } else {
+    pcx.lex_pos += 2;
+    let mut more = false;
+    if at_ftext_block(start, pcx) {
+        // (0.25.4) `f"""`: a text block with holes (lexer/blocks)
+        buf_clear(pcx.lex_scratch);
+        if !open_ftext_block(start, pcx) {
             more = lex_fstring_text(start, pcx);
         }
-        let head = add_string(
-            std::slice::from_raw_parts(
-                (*get_bufs().add(pcx.lex_scratch as usize)).data.add((0) as usize),
-                ((*get_bufs().add(pcx.lex_scratch as usize)).len - (0)) as usize));
-        push_token(Tok::FHead, start, head as u64, if more { 0 } else { 1 }, pcx);
-        while more {
-            let hole = pcx.lex_pos;
-            let first = pcx.toks.len() as i64;
-            // (braces end the hole; any bracket protects a `:`; a string
-            // literal in a hole is a token of it)
-            let mut braces: i64 = 0;
-            let mut depth: i64 = 0;
-            loop {
-                skip_whitespace_and_comments(pcx);
-                if at_end(pcx) {
-                    error_at(start, c"unterminated f-string", pcx);
-                }
-                let c = peek_at(0, pcx);
-                if braces == 0 && c == b'}' || depth == 0 && c == b':' && peek_at(1, pcx) != b':' {
-                    break;
-                }
-                if c == b'f' && peek_at(1, pcx) == b'"' {
-                    error_at(pcx.lex_pos,
-                        c"f-strings cannot be nested: compute the inner one in a 'let' first",
-                        pcx);
-                }
-                if c == b'{' {
-                    braces += 1;
-                } else if c == b'}' {
-                    braces -= 1;
-                }
-                if c == b'(' || c == b'[' || c == b'{' {
-                    depth += 1;
-                } else if (c == b')' || c == b']' || c == b'}') && depth > 0 {
-                    depth -= 1;
-                }
-                lex_token(pcx);
+    } else {
+        more = lex_fstring_text(start, pcx);
+    }
+    let head = add_string(
+        &buf_copy(pcx.lex_scratch), pcx);
+    push_token(Tok::FHead, start, head as u64, if more { 0 } else { 1 }, pcx);
+    while more {
+        let hole = pcx.lex_pos;
+        let first = pcx.toks.len() as i64;
+        // (braces end the hole; any bracket protects a `:`; a string
+        // literal in a hole is a token of it)
+        let mut braces: i64 = 0;
+        let mut depth: i64 = 0;
+        loop {
+            skip_whitespace_and_comments(pcx);
+            if at_end(pcx) {
+                error_at(start, c"unterminated f-string", pcx);
             }
-            if pcx.toks.len() as i64 == first {
-                error_at(hole - 1,
-                    c"an f-string hole needs an expression, as in '{x}'; write '{{' for a brace",
+            let c = peek_at(0, pcx);
+            if braces == 0 && c == b'}' || depth == 0 && c == b':' && peek_at(1, pcx) != b':' {
+                break;
+            }
+            if c == b'f' && peek_at(1, pcx) == b'"' {
+                error_at(pcx.lex_pos,
+                    c"f-strings cannot be nested: compute the inner one in a 'let' first",
                     pcx);
             }
-            let piece = pcx.lex_pos;
-            let mut spec: i64 = -1;
-            if peek_at(0, pcx) == b':' {
-                pcx.lex_pos += 1;
-                let from = pcx.lex_pos;
-                while !at_end(pcx) && peek_at(0, pcx) != b'}' && peek_at(0, pcx) != b'"'
-                    && peek_at(0, pcx) != b'\n' {
-                    pcx.lex_pos += 1;
-                }
-                if peek_at(0, pcx) != b'}' {
-                    error_at(piece, c"unterminated format spec: expected '}'", pcx);
-                }
-                spec = add_string(&get_src()[from as usize..pcx.lex_pos as usize]);
+            if c == b'{' {
+                braces += 1;
+            } else if c == b'}' {
+                braces -= 1;
             }
-            pcx.lex_pos += 1;
-            more = lex_fstring_text(start, pcx);
-            let text = add_string(
-                std::slice::from_raw_parts(
-                    (*get_bufs().add(pcx.lex_scratch as usize)).data.add((0) as usize),
-                    ((*get_bufs().add(pcx.lex_scratch as usize)).len - (0)) as usize));
-            push_token(if more { Tok::FMid } else { Tok::FTail }, piece, text as u64, spec, pcx);
+            if c == b'(' || c == b'[' || c == b'{' {
+                depth += 1;
+            } else if (c == b')' || c == b']' || c == b'}') && depth > 0 {
+                depth -= 1;
+            }
+            lex_token(pcx);
         }
+        if pcx.toks.len() as i64 == first {
+            error_at(hole - 1,
+                c"an f-string hole needs an expression, as in '{x}'; write '{{' for a brace",
+                pcx);
+        }
+        let piece = pcx.lex_pos;
+        let mut spec: i64 = -1;
+        if peek_at(0, pcx) == b':' {
+            pcx.lex_pos += 1;
+            let from = pcx.lex_pos;
+            while !at_end(pcx) && peek_at(0, pcx) != b'}' && peek_at(0, pcx) != b'"'
+                && peek_at(0, pcx) != b'\n' {
+                pcx.lex_pos += 1;
+            }
+            if peek_at(0, pcx) != b'}' {
+                error_at(piece, c"unterminated format spec: expected '}'", pcx);
+            }
+            spec = add_string(&get_src()[from as usize..pcx.lex_pos as usize], pcx);
+        }
+        pcx.lex_pos += 1;
+        more = lex_fstring_text(start, pcx);
+        let text = add_string(
+            &buf_copy(pcx.lex_scratch), pcx);
+        push_token(if more { Tok::FMid } else { Tok::FTail }, piece, text as u64, spec, pcx);
     }
 }
 
@@ -212,14 +193,9 @@ fn lex_fstring_text(start: i64, pcx: &mut Ctx<Comp>) -> bool {
         if c == b'\n' && in_ftext_block(pcx) {
             // (0.25.4) a line of an f-string text block ends: a CR
             // before it is not text, the next line's indentation is not
-            // UNSAFE: SRC and BUFS are the front end's tables, raw pointers (base).
-            // SAFETY: 2 <= LEX_POS and LEX_POS is within the file being lexed, inside
-            // SRC; LEX_SCRATCH is a buffer of BUFS, made before the lexer runs.
-            unsafe {
-                if pcx.lex_pos >= 2 && get_src()[(pcx.lex_pos - 2) as usize] == b'\r'
-                    && (*get_bufs().add(pcx.lex_scratch as usize)).len > 0 {
-                    (*get_bufs().add(pcx.lex_scratch as usize)).len -= 1;
-                }
+            if pcx.lex_pos >= 2 && get_src()[(pcx.lex_pos - 2) as usize] == b'\r'
+                && buf_len(pcx.lex_scratch) > 0 {
+                buf_truncate(pcx.lex_scratch, buf_len(pcx.lex_scratch) - 1);
             }
             if ftext_line(pcx.lex_pos, pcx) {
                 return false;
@@ -255,23 +231,20 @@ fn lex_fstring_text(start: i64, pcx: &mut Ctx<Comp>) -> bool {
 // themselves (not '"', '\\' or a newline; in an f-string, not '{' or '}'
 // either), appended to LEX_SCRATCH at once; LEX_POS after them.
 fn plain_run(braces: bool, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let src = get_src().ptr;
-        let end = pcx.lex_end;
-        let from = pcx.lex_pos;
-        let mut p = from;
-        while p < end {
-            let c = (*src.add(p as usize));
-            if c == b'"' || c == b'\\' || c == b'\n' || braces && (c == b'{' || c == b'}') {
-                break;
-            }
-            p += 1;
+    let src = get_src();
+    let end = pcx.lex_end;
+    let from = pcx.lex_pos;
+    let mut p = from;
+    while p < end {
+        let c = src[p as usize];
+        if c == b'"' || c == b'\\' || c == b'\n' || braces && (c == b'{' || c == b'}') {
+            break;
         }
-        if p > from {
-            buf_bytes(pcx.lex_scratch,
-                std::slice::from_raw_parts(src.add((from) as usize), (p - (from)) as usize));
-            pcx.lex_pos = p;
-        }
+        p += 1;
+    }
+    if p > from {
+        buf_bytes(pcx.lex_scratch, &src[from as usize..p as usize]);
+        pcx.lex_pos = p;
     }
 }
 
@@ -380,86 +353,87 @@ fn lex_unicode_escape(backslash_at: i64, in_char: bool, pcx: &mut Ctx<Comp>) -> 
 // the scalar, any one, and its token's suffix 1 (2: a byte literal); in
 // MVS a character is one byte (u8).
 pub fn lex_char(byte_at: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let start = if byte_at >= 0 { byte_at } else { pcx.lex_pos };
-        pcx.lex_pos += 1;
-        buf_clear(pcx.lex_scratch);
-        let c = peek_at(0, pcx);
-        if at_end(pcx) || c == b'\n' {
-            unterminated_char(start, pcx);
-        }
-        if c == b'\'' {
-            error_at(start, c"empty character literal", pcx);
-        }
-        // (0.27.0) a lifetime or a label in the rust edition: `'a` not
-        // followed by a quote (`'a'` is a character), front/rust
-        if byte_at < 0
-            && (c == b'_' || c >= b'a' && c <= b'z' || c >= b'A' && c <= b'Z')
-            && peek_at(1, pcx) != b'\'' {
-            let end = ident_end(start + 1, pcx);
-            pcx.lex_pos = end;
-            push_token(Tok::Lifetime, start,
-                crate::base::intern(&get_src()[(start + 1) as usize..end as usize], pcx) as u64, 0,
-                pcx);
-            return;
-        }
-        if c == b'\\' {
-            pcx.lex_pos += 1;
-            lex_escape(pcx.lex_scratch, in_char: true, pcx: pcx);
-        } else if c < 0x80 {
-            pcx.lex_pos += 1;
-            buf_byte(pcx.lex_scratch, c);
-        } else {
-            // The character's UTF-8 bytes: the lead byte and its continuations.
-            let mut end = pcx.lex_pos + 1;
-            while end < pcx.lex_end && (get_src()[end as usize] & 0xc0) == 0x80 {
-                end += 1;
-            }
-            if end < pcx.lex_end && get_src()[end as usize] == b'\'' {
-                // RULE: F1.2 (the rust edition's `char`: the scalar)
-                for k in pcx.lex_pos..end {
-                    buf_byte(pcx.lex_scratch, get_src()[k as usize]);
-                }
-                pcx.lex_pos = end;
-            } else {
-                err_begin(start, pcx);
-                err_fmt(format_args("character literal '{}",
-                    &str::from_utf8(get_src()[pcx.lex_pos as usize..end as usize]).unwrap()), pcx);
-                err_str(c"' is not ASCII (a character is one byte, u8)", pcx);
-                err_end(pcx);
-            }
-        }
-        if at_end(pcx) || peek_at(0, pcx) != b'\'' {
-            unterminated_char(start, pcx);
-        }
-        pcx.lex_pos += 1;
-        let len = (*get_bufs().add(pcx.lex_scratch as usize)).len;
-        let bytes = (*get_bufs().add(pcx.lex_scratch as usize)).data;
-        if byte_at >= 0 {
-            // RULE: F23.2 (`b'x'`: one byte, ASCII or `\xHH`)
-            let escape = get_src()[(byte_at + 2) as usize] == b'\\';
-            if len != 1 || (*bytes.add(0)) >= 0x80 && !escape
-                || escape && byte_at + 3 < pcx.lex_end
-                && get_src()[(byte_at + 3) as usize] == b'u' {
-                error_at(start, c"a byte literal is one ASCII character or a '\\xHH' escape",
-                    pcx);
-            }
-            push_token(Char, start, (*bytes.add(0)) as u64, 2, pcx);
-            return;
-        }
-        // (the scalar of the UTF-8 bytes)
-        let mut v = (*bytes.add(0)) as u64;
-        if len == 2 {
-            v = (v & 0x1f) << 6 | ((*bytes.add(1)) & 0x3f) as u64;
-        } else if len == 3 {
-            v = (v & 0x0f) << 12 | (((*bytes.add(1)) & 0x3f) as u64) << 6
-                | ((*bytes.add(2)) & 0x3f) as u64;
-        } else if len >= 4 {
-            v = (v & 0x07) << 18 | (((*bytes.add(1)) & 0x3f) as u64) << 12
-                | (((*bytes.add(2)) & 0x3f) as u64) << 6 | ((*bytes.add(3)) & 0x3f) as u64;
-        }
-        push_token(Char, start, v, 1, pcx);
+    let start = if byte_at >= 0 { byte_at } else { pcx.lex_pos };
+    pcx.lex_pos += 1;
+    buf_clear(pcx.lex_scratch);
+    let c = peek_at(0, pcx);
+    if at_end(pcx) || c == b'\n' {
+        unterminated_char(start, pcx);
     }
+    if c == b'\'' {
+        error_at(start, c"empty character literal", pcx);
+    }
+    // (0.27.0) a lifetime or a label in the rust edition: `'a` not
+    // followed by a quote (`'a'` is a character), front/rust
+    if byte_at < 0
+        && (c == b'_' || c >= b'a' && c <= b'z' || c >= b'A' && c <= b'Z')
+        && peek_at(1, pcx) != b'\'' {
+        let end = ident_end(start + 1, pcx);
+        pcx.lex_pos = end;
+        push_token(Tok::Lifetime, start,
+            crate::base::intern(&get_src()[(start + 1) as usize..end as usize], pcx) as u64, 0,
+            pcx);
+        return;
+    }
+    if c == b'\\' {
+        pcx.lex_pos += 1;
+        lex_escape(pcx.lex_scratch, in_char: true, pcx: pcx);
+    } else if c < 0x80 {
+        pcx.lex_pos += 1;
+        buf_byte(pcx.lex_scratch, c);
+    } else {
+        // The character's UTF-8 bytes: the lead byte and its continuations.
+        let mut end = pcx.lex_pos + 1;
+        while end < pcx.lex_end && (get_src()[end as usize] & 0xc0) == 0x80 {
+            end += 1;
+        }
+        if end < pcx.lex_end && get_src()[end as usize] == b'\'' {
+            // RULE: F1.2 (the rust edition's `char`: the scalar)
+            for k in pcx.lex_pos..end {
+                buf_byte(pcx.lex_scratch, get_src()[k as usize]);
+            }
+            pcx.lex_pos = end;
+        } else {
+            err_begin(start, pcx);
+            err_fmt(format_args("character literal '{}",
+                &str::from_utf8(get_src()[pcx.lex_pos as usize..end as usize]).unwrap()), pcx);
+            err_str(c"' is not ASCII (a character is one byte, u8)", pcx);
+            err_end(pcx);
+        }
+    }
+    if at_end(pcx) || peek_at(0, pcx) != b'\'' {
+        unterminated_char(start, pcx);
+    }
+    pcx.lex_pos += 1;
+    let len = buf_len(pcx.lex_scratch);
+    // (the literal's bytes, 0 where it has fewer: an error is reported)
+    let mut bytes: [u8; 4] = [0u8; 4];
+    for k in 0..len.min(4) {
+        bytes[k as usize] = buf_at(pcx.lex_scratch, k);
+    }
+    if byte_at >= 0 {
+        // RULE: F23.2 (`b'x'`: one byte, ASCII or `\xHH`)
+        let escape = get_src()[(byte_at + 2) as usize] == b'\\';
+        if len != 1 || bytes[0] >= 0x80 && !escape
+            || escape && byte_at + 3 < pcx.lex_end
+            && get_src()[(byte_at + 3) as usize] == b'u' {
+            error_at(start, c"a byte literal is one ASCII character or a '\\xHH' escape",
+                pcx);
+        }
+        push_token(Char, start, bytes[0] as u64, 2, pcx);
+        return;
+    }
+    // (the scalar of the UTF-8 bytes)
+    let mut v = bytes[0] as u64;
+    if len == 2 {
+        v = (v & 0x1f) << 6 | (bytes[1] & 0x3f) as u64;
+    } else if len == 3 {
+        v = (v & 0x0f) << 12 | ((bytes[1] & 0x3f) as u64) << 6 | (bytes[2] & 0x3f) as u64;
+    } else if len >= 4 {
+        v = (v & 0x07) << 18 | ((bytes[1] & 0x3f) as u64) << 12
+            | ((bytes[2] & 0x3f) as u64) << 6 | (bytes[3] & 0x3f) as u64;
+    }
+    push_token(Char, start, v, 1, pcx);
 }
 
 // (0.17) An unterminated character literal at `start`: a Rust label or

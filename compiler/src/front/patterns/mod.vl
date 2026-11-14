@@ -13,7 +13,7 @@ pub mod usefulness;
 // (0.27.2) the rust edition's struct patterns
 mod structs;
 
-use crate::base::{buf_fmt, buf_new, buf_slice, cstr, get_bufs, get_src, sym_text};
+use crate::base::{buf_copy, buf_fmt, buf_len, buf_new, c_eq, cstr, get_src, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{err_begin, err_end, err_fmt, err_help, err_help_fmt, err_str, err_try_fmt};
@@ -49,8 +49,8 @@ use crate::front::modules::lookup::{
 use crate::front::patterns::usefulness::check_arms;
 use crate::front::types::{
     REF_MUT, REF_SHARED, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, buf_type, enum_type, enum_variant,
-    err_type, find_variant, get_enums, is_fieldless_enum, is_float, is_integer, is_ref,
-    item_node_of, ref_to, type_elem, variant_field,
+    err_type, find_variant, is_fieldless_enum, is_float, is_integer, is_ref, item_node_of, ref_to,
+    type_elem, variant_field,
 };
 use crate::tools::query::command_line::qnote;
 
@@ -98,7 +98,7 @@ pub fn binds_ref(p: i64, pcx: &Ctx<Comp>) -> bool {
 }
 
 pub fn check_pattern(p: i64, ty: i64, pcx: &mut Ctx<Comp>) {
-    pcx.pattern_start = pcx.env.count;
+    pcx.pattern_start = pcx.env.len() as i64;
     let saved = pcx.bind_ref;
     pcx.bind_ref = 0;
     check_pat(p, ty, pcx);
@@ -106,254 +106,255 @@ pub fn check_pattern(p: i64, ty: i64, pcx: &mut Ctx<Comp>) {
 }
 
 fn check_pat(p: i64, ty: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        if (pcx.nodes[p as usize].p & crate::front::ast::PAT_AMP) != 0 {
-            // (0.27.0: `&p`; against a value, MVS std's copies, p itself)
-            pcx.nodes[p as usize].p &= ~crate::front::ast::PAT_AMP;
-            let saved = pcx.bind_ref;
-            pcx.bind_ref = 0;
-            let through = is_ref(ty, pcx);
-            check_pat(p, if through { pcx.types[ty as usize].a } else { ty }, pcx);
-            pcx.bind_ref = saved;
-            pcx.nodes[p as usize].p |= crate::front::ast::PAT_AMP;
-            if through {
-                pcx.nodes[p as usize].p |= PAT_DEREF;
-            }
-            return;
-        }
-        if derefs(p, ty, pcx) {
-            // (0.18.1) a pattern on a reference matches what it points to;
-            // its bindings are references into it, `&mut` only under
-            // `&mut` all the way down (lowering: PAT_DEREF, PAT_REF)
-            let saved = pcx.bind_ref;
-            pcx.bind_ref = if saved == REF_SHARED
-                || pcx.types[ty as usize].b == REF_SHARED { REF_SHARED }
-                else { REF_MUT };
-            check_pat(p, pcx.types[ty as usize].a, pcx);
-            pcx.bind_ref = saved;
+    if (pcx.nodes[p as usize].p & crate::front::ast::PAT_AMP) != 0 {
+        // (0.27.0: `&p`; against a value, MVS std's copies, p itself)
+        pcx.nodes[p as usize].p &= !crate::front::ast::PAT_AMP;
+        let saved = pcx.bind_ref;
+        pcx.bind_ref = 0;
+        let through = is_ref(ty, pcx);
+        check_pat(p, if through { pcx.types[ty as usize].a } else { ty }, pcx);
+        pcx.bind_ref = saved;
+        pcx.nodes[p as usize].p |= crate::front::ast::PAT_AMP;
+        if through {
             pcx.nodes[p as usize].p |= PAT_DEREF;
+        }
+        return;
+    }
+    if derefs(p, ty, pcx) {
+        // (0.18.1) a pattern on a reference matches what it points to;
+        // its bindings are references into it, `&mut` only under
+        // `&mut` all the way down (lowering: PAT_DEREF, PAT_REF)
+        let saved = pcx.bind_ref;
+        pcx.bind_ref = if saved == REF_SHARED
+            || pcx.types[ty as usize].b == REF_SHARED { REF_SHARED }
+            else { REF_MUT };
+        check_pat(p, pcx.types[ty as usize].a, pcx);
+        pcx.bind_ref = saved;
+        pcx.nodes[p as usize].p |= PAT_DEREF;
+        return;
+    }
+    // (a pattern checked again, a generic's instance: flags of its own)
+    pcx.nodes[p as usize].p &= !(PAT_DEREF | PAT_REF);
+    let kind = pcx.nodes[p as usize].kind;
+    // (0.18: a literal pattern of a distinct type matches its
+    // underlying type's values)
+    if (kind == PatLit || kind == PatRange) && is_distinct_type(ty, pcx) {
+        // RULE: F1.4 (a `char` pattern's literals are chars, read as
+        // their scalars here: check_mode's Char arm)
+        let saved = pcx.char_scalar;
+        pcx.char_scalar = pcx.char_type != 0 && ty == pcx.char_type;
+        check_pat(p, strip_distinct(ty, pcx), pcx);
+        pcx.char_scalar = saved;
+        return;
+    }
+    pcx.nodes[p as usize].ty = ty;
+    if kind == PatWild {
+        return;
+    }
+    if kind == PatBind && pcx.nodes[p as usize].b == 0
+        && scope_const(pcx.nodes[p as usize].a, pcx) == 0
+        && lookup_local(pcx.nodes[p as usize].a, pcx).is_none()
+        && used_variant_enum(pcx.nodes[p as usize].a, ty, p, pcx) != 0 {
+        // A variant brought into scope by `use` (0.4) or the prelude (0.6).
+        lookup_commit(pcx.nodes[p as usize].a, pcx.nodes[p as usize].start, pcx);
+        pcx.nodes[p as usize].y = used_variant_enum(pcx.nodes[p as usize].a, ty, p, pcx);
+        pcx.nodes[p as usize].kind = PatVariant;
+        pcx.nodes[p as usize].b = pcx.nodes[p as usize].a;
+        pcx.nodes[p as usize].c = 0;
+        check_pat(p, ty, pcx);
+        return;
+    }
+    if kind == PatVariant && pcx.nodes[p as usize].d == 1 {
+        // `V(p, ...)`: a variant by its own name, from `use`.
+        let t = used_variant_enum(pcx.nodes[p as usize].b, ty, p, pcx);
+        // RULE: F27.1 (the rust edition: `S { a, .. }`, `S(x)` of a struct)
+        if t == 0 && structs::struct_pattern(p, ty, pcx) {
             return;
         }
-        // (a pattern checked again, a generic's instance: flags of its own)
-        pcx.nodes[p as usize].p &= ~(PAT_DEREF | PAT_REF);
-        let kind = pcx.nodes[p as usize].kind;
-        // (0.18: a literal pattern of a distinct type matches its
-        // underlying type's values)
-        if (kind == PatLit || kind == PatRange) && is_distinct_type(ty, pcx) {
-            // RULE: F1.4 (a `char` pattern's literals are chars, read as
-            // their scalars here: check_mode's Char arm)
-            let saved = pcx.char_scalar;
-            pcx.char_scalar = pcx.char_type != 0 && ty == pcx.char_type;
-            check_pat(p, strip_distinct(ty, pcx), pcx);
-            pcx.char_scalar = saved;
-            return;
+        if t == 0 && (pcx.nodes[p as usize].p & PAT_FIELDS) != 0 {
+            // (0.17) `P { x, y }` of a struct
+            name_error(pcx.nodes[p as usize].start, c"'", pcx.nodes[p as usize].b,
+                c"' is not an enum variant: only variants are matched by field name ('E::V { a, .. }'); bind the struct and read its fields ('p => p.x')", pcx);
         }
-        pcx.nodes[p as usize].ty = ty;
-        if kind == PatWild {
-            return;
+        if t == 0 {
+            name_error(pcx.nodes[p as usize].start, c"unknown variant '",
+                pcx.nodes[p as usize].b,
+                c"' (write 'Enum::Variant', or bring it into scope with 'use Enum::Variant;')",
+                pcx);
         }
-        if kind == PatBind && pcx.nodes[p as usize].b == 0
-            && scope_const(pcx.nodes[p as usize].a, pcx) == 0
-            && lookup_local(pcx.nodes[p as usize].a, pcx).is_none()
-            && used_variant_enum(pcx.nodes[p as usize].a, ty, p, pcx) != 0 {
-            // A variant brought into scope by `use` (0.4) or the prelude (0.6).
-            lookup_commit(pcx.nodes[p as usize].a, pcx.nodes[p as usize].start, pcx);
-            pcx.nodes[p as usize].y = used_variant_enum(pcx.nodes[p as usize].a, ty, p, pcx);
-            pcx.nodes[p as usize].kind = PatVariant;
-            pcx.nodes[p as usize].b = pcx.nodes[p as usize].a;
-            pcx.nodes[p as usize].c = 0;
+        lookup_commit(pcx.nodes[p as usize].b, pcx.nodes[p as usize].start, pcx);
+        pcx.nodes[p as usize].y = t;
+        pcx.nodes[p as usize].d = 0;
+        check_pat(p, ty, pcx);
+        return;
+    }
+    if kind == PatRange && (pcx.nodes[pcx.nodes[p as usize].a as usize].kind == PatVariant
+        || pcx.nodes[pcx.nodes[p as usize].b as usize].kind == PatVariant) {
+        if pcx.types[ty as usize].kind != TyKind::Enum {
+            // (0.17) `i8::MIN..=-1`, `0..=i64::MAX`: constants' paths
+            pcx.nodes[p as usize].a = pattern_path(pcx.nodes[p as usize].a, pcx);
+            pcx.nodes[p as usize].b = pattern_path(pcx.nodes[p as usize].b, pcx);
             check_pat(p, ty, pcx);
             return;
         }
-        if kind == PatVariant && pcx.nodes[p as usize].d == 1 {
-            // `V(p, ...)`: a variant by its own name, from `use`.
-            let t = used_variant_enum(pcx.nodes[p as usize].b, ty, p, pcx);
-            // RULE: F27.1 (the rust edition: `S { a, .. }`, `S(x)` of a struct)
-            if t == 0 && structs::struct_pattern(p, ty, pcx) {
-                return;
-            }
-            if t == 0 && (pcx.nodes[p as usize].p & PAT_FIELDS) != 0 {
-                // (0.17) `P { x, y }` of a struct
-                name_error(pcx.nodes[p as usize].start, c"'", pcx.nodes[p as usize].b,
-                    c"' is not an enum variant: only variants are matched by field name ('E::V { a, .. }'); bind the struct and read its fields ('p => p.x')", pcx);
-            }
-            if t == 0 {
-                name_error(pcx.nodes[p as usize].start, c"unknown variant '",
-                    pcx.nodes[p as usize].b, c"' (write 'Enum::Variant', or bring it into scope with 'use Enum::Variant;')", pcx);
-            }
-            lookup_commit(pcx.nodes[p as usize].b, pcx.nodes[p as usize].start, pcx);
-            pcx.nodes[p as usize].y = t;
-            pcx.nodes[p as usize].d = 0;
-            check_pat(p, ty, pcx);
-            return;
+        if pcx.nodes[pcx.nodes[p as usize].a as usize].kind != PatVariant
+            || pcx.nodes[pcx.nodes[p as usize].b as usize].kind != PatVariant {
+            type_error(p, c"a variant range needs two variants of the same enum", pcx);
         }
-        if kind == PatRange && (pcx.nodes[pcx.nodes[p as usize].a as usize].kind == PatVariant
-            || pcx.nodes[pcx.nodes[p as usize].b as usize].kind == PatVariant) {
-            if pcx.types[ty as usize].kind != TyKind::Enum {
-                // (0.17) `i8::MIN..=-1`, `0..=i64::MAX`: constants' paths
-                pcx.nodes[p as usize].a = pattern_path(pcx.nodes[p as usize].a, pcx);
-                pcx.nodes[p as usize].b = pattern_path(pcx.nodes[p as usize].b, pcx);
-                check_pat(p, ty, pcx);
-                return;
+        variant_range(p, ty, pcx);
+        return;
+    }
+    if kind == PatBind && pcx.nodes[p as usize].b == 0
+        && scope_const(pcx.nodes[p as usize].a, pcx) != 0
+        && lookup_local(pcx.nodes[p as usize].a, pcx).is_none()
+        && is_fieldless_enum(const_type(scope_const(pcx.nodes[p as usize].a, pcx), pcx), pcx) {
+        // A constant of a fieldless enum: its variant's pattern.
+        note_pattern_pos(pcx.nodes[p as usize].start, pcx);
+        lookup_commit(pcx.nodes[p as usize].a, pcx.nodes[p as usize].start, pcx);
+        let c = scope_const(pcx.nodes[p as usize].a, pcx) - 1;
+        let e = pcx.types[pcx.consts[c as usize].ty as usize].a;
+        let value = const_value(c, pcx);
+        for i in 0..(pcx.enums[e as usize]).variant_count {
+            let v = enum_variant(e, i, pcx);
+            if wrap_int(pcx.variants[v as usize].discr, (pcx.enums[e as usize]).tag)
+                == value {
+                pcx.nodes[p as usize].kind = PatVariant;
+                pcx.nodes[p as usize].y = enum_type(e, pcx);
+                pcx.nodes[p as usize].b = pcx.variants[v as usize].name;
+                pcx.nodes[p as usize].c = 0;
             }
-            if pcx.nodes[pcx.nodes[p as usize].a as usize].kind != PatVariant
-                || pcx.nodes[pcx.nodes[p as usize].b as usize].kind != PatVariant {
-                type_error(p, c"a variant range needs two variants of the same enum", pcx);
-            }
-            variant_range(p, ty, pcx);
-            return;
         }
-        if kind == PatBind && pcx.nodes[p as usize].b == 0
-            && scope_const(pcx.nodes[p as usize].a, pcx) != 0
-            && lookup_local(pcx.nodes[p as usize].a, pcx).is_none()
-            && is_fieldless_enum(const_type(scope_const(pcx.nodes[p as usize].a, pcx), pcx), pcx) {
-            // A constant of a fieldless enum: its variant's pattern.
+        check_pat(p, ty, pcx);
+        return;
+    }
+    // RULE: F7.3 (the rust edition: `U` of a unit struct)
+    if kind == PatBind && pcx.nodes[p as usize].b == 0 && pcx.nodes[p as usize].c == 0
+        && lookup_local(pcx.nodes[p as usize].a, pcx).is_none()
+        && structs::unit_pattern(p, ty, pcx) {
+        return;
+    }
+    if kind == PatBind {
+        let name = pcx.nodes[p as usize].a;
+        if scope_const(name, pcx) != 0 && pcx.nodes[p as usize].b == 0
+            && lookup_local(name, pcx).is_none() {
+            // A constant's name: a literal pattern.
             note_pattern_pos(pcx.nodes[p as usize].start, pcx);
-            lookup_commit(pcx.nodes[p as usize].a, pcx.nodes[p as usize].start, pcx);
-            let c = scope_const(pcx.nodes[p as usize].a, pcx) - 1;
-            let e = pcx.types[pcx.consts[c as usize].ty as usize].a;
-            let value = const_value(c, pcx);
-            for i in 0..(*get_enums().add(e as usize)).variant_count {
-                let v = enum_variant(e, i);
-                if wrap_int(pcx.variants[v as usize].discr, (*get_enums().add(e as usize)).tag)
-                    == value {
-                    pcx.nodes[p as usize].kind = PatVariant;
-                    pcx.nodes[p as usize].y = enum_type(e, pcx);
-                    pcx.nodes[p as usize].b = pcx.variants[v as usize].name;
-                    pcx.nodes[p as usize].c = 0;
-                }
-            }
-            check_pat(p, ty, pcx);
-            return;
-        }
-        // RULE: F7.3 (the rust edition: `U` of a unit struct)
-        if kind == PatBind && pcx.nodes[p as usize].b == 0 && pcx.nodes[p as usize].c == 0
-            && lookup_local(pcx.nodes[p as usize].a, pcx).is_none()
-            && structs::unit_pattern(p, ty, pcx) {
-            return;
-        }
-        if kind == PatBind {
-            let name = pcx.nodes[p as usize].a;
-            if scope_const(name, pcx) != 0 && pcx.nodes[p as usize].b == 0
-                && lookup_local(name, pcx).is_none() {
-                // A constant's name: a literal pattern.
-                note_pattern_pos(pcx.nodes[p as usize].start, pcx);
-                let e = new_node(Ident, pcx.nodes[p as usize].start, pcx.nodes[p as usize].end,
-                    pcx);
-                pcx.nodes[e as usize].a = name;
-                pcx.nodes[p as usize].kind = PatLit;
-                pcx.nodes[p as usize].a = e;
-                check_pat(p, ty, pcx);
-                return;
-            }
-            let mut bty = ty;
-            // (0.27.0: `ref x`, `ref mut x`, the rust edition's: c is the mode)
-            let mode = if pcx.nodes[p as usize].c != 0 { pcx.nodes[p as usize].c }
-                else { pcx.bind_ref };
-            // (a slice is a view already: a copy, as `&[T]` is `[T]`)
-            if mode != 0
-                && !(pcx.types[ty as usize].kind == TyKind::Slice && pcx.types[ty as usize].b == 0) {
-                if pcx.nodes[p as usize].b != 0 {
-                    err_begin(pcx.nodes[p as usize].start, pcx);
-                    err_fmt(
-                        format_args("'var {}' in a pattern through an access: its bindings are accesses into the value", str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
-                    err_help(c"drop the 'var' (matched through an inout access, 'x = v' changes the field), or match a copy: 'match e.clone()'", pcx);
-                    err_end(pcx);
-                }
-                bty = ref_to(ty, mode, pcx);
-                // RULE: F20.6 (0.27.5: a `ref mut` binding uses the matched
-                // place mutably, check_match)
-                if mode == REF_MUT && pcx.nodes[p as usize].c != 0 {
-                    pcx.pat_ref_mut = true;
-                }
-                pcx.nodes[p as usize].p |= PAT_REF;
-                pcx.nodes[p as usize].ty = bty;
-            }
-            if pcx.or_mode {
-                pcx.nodes[p as usize].x = or_rebind(p, name, bty, pcx);
-                return;
-            }
-            for i in pcx.pattern_start..pcx.env.count {
-                if pcx.locals[(*pcx.env.data.add(i as usize)) as usize].name == name {
-                    name_error(pcx.nodes[p as usize].start, c"identifier '", name,
-                        c"' is bound more than once in the same pattern", pcx);
-                }
-            }
-            pcx.nodes[p as usize].x = define_local(name, bty,
-                pcx.nodes[p as usize].b != 0 && bty == ty, false, pcx);
-            // (0.20) a binding into a value matched through an access (`match
-            // &x`, `match e` of an access) is an access too, in a 0.20 file:
-            // used as the value it designates (conventions.md §5.3)
-            return;
-        }
-        if kind == PatOr {
-            check_or_pattern(p, ty, pcx);
-            return;
-        }
-        if kind == PatVariant && pcx.nodes[p as usize].c == 0 && pcx.nodes[p as usize].d == 0
-            && pcx.nodes[p as usize].y == 0
-            && is_integer(ty) {
-            // (0.17) `i64::MAX =>`: a constant's path
-            let e = pattern_path(p, pcx);
+            let e = new_node(Ident, pcx.nodes[p as usize].start, pcx.nodes[p as usize].end,
+                pcx);
+            pcx.nodes[e as usize].a = name;
             pcx.nodes[p as usize].kind = PatLit;
             pcx.nodes[p as usize].a = e;
             check_pat(p, ty, pcx);
             return;
         }
-        if ty == TY_NEVER {
-            for i in 0..pcx.nodes[p as usize].count {
-                check_pat(child(p, i, pcx), TY_NEVER, pcx);
+        let mut bty = ty;
+        // (0.27.0: `ref x`, `ref mut x`, the rust edition's: c is the mode)
+        let mode = if pcx.nodes[p as usize].c != 0 { pcx.nodes[p as usize].c }
+            else { pcx.bind_ref };
+        // (a slice is a view already: a copy, as `&[T]` is `[T]`)
+        if mode != 0
+            && !(pcx.types[ty as usize].kind == TyKind::Slice && pcx.types[ty as usize].b == 0) {
+            if pcx.nodes[p as usize].b != 0 {
+                err_begin(pcx.nodes[p as usize].start, pcx);
+                err_fmt(
+                    format_args("'var {}' in a pattern through an access: its bindings are accesses into the value", str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+                err_help(c"drop the 'var' (matched through an inout access, 'x = v' changes the field), or match a copy: 'match e.clone()'", pcx);
+                err_end(pcx);
             }
+            bty = ref_to(ty, mode, pcx);
+            // RULE: F20.6 (0.27.5: a `ref mut` binding uses the matched
+            // place mutably, check_match)
+            if mode == REF_MUT && pcx.nodes[p as usize].c != 0 {
+                pcx.pat_ref_mut = true;
+            }
+            pcx.nodes[p as usize].p |= PAT_REF;
+            pcx.nodes[p as usize].ty = bty;
+        }
+        if pcx.or_mode {
+            pcx.nodes[p as usize].x = or_rebind(p, name, bty, pcx);
             return;
         }
-        match kind {
-            PatTuple => {
-                let count = pcx.nodes[p as usize].count;
-                if ty == TY_UNIT && count == 0 {
-                    return;
-                }
-                if (pcx.nodes[p as usize].p & PAT_FIELDS) != 0
-                    && pcx.types[ty as usize].kind == TyKind::Struct
-                    && count == pcx.structs[pcx.types[ty as usize].a as usize].field_count {
-                    // (a struct pattern made already: a generic's instance)
-                    structs::check_parts(p, ty, pcx);
-                    return;
-                }
-                if pcx.types[ty as usize].kind != TyKind::Tuple
-                    || pcx.types[ty as usize].count != count {
-                    err_begin(pcx.nodes[p as usize].start, pcx);
-                    err_fmt(
-                        format_args(
-                            "a tuple pattern with {count} elements cannot bind a value of type '"), pcx);
-                    err_type(ty, pcx);
-                    err_str(c"'", pcx);
-                    err_end(pcx);
-                }
-                for i in 0..count {
-                    check_pat(child(p, i, pcx), type_elem(ty, i, pcx), pcx);
-                }
+        for i in pcx.pattern_start..pcx.env.len() as i64 {
+            if pcx.locals[(pcx.env[i as usize]) as usize].name == name {
+                name_error(pcx.nodes[p as usize].start, c"identifier '", name,
+                    c"' is bound more than once in the same pattern", pcx);
             }
-            PatLit => {
-                check_literal_type(p, ty, c"a literal pattern", pcx);
-                let e = pcx.nodes[p as usize].a;
-                check_const_expr(e, ty, pcx);
-                pcx.nodes[p as usize].x = const_eval(e, pcx);
-            }
-            PatRange => {
-                check_literal_type(p, ty, c"a range pattern", pcx);
-                if ty == TY_BOOL {
-                    type_error(p, c"range patterns need an integer type, not 'bool'", pcx);
-                }
-                check_const_expr(pcx.nodes[p as usize].a, ty, pcx);
-                check_const_expr(pcx.nodes[p as usize].b, ty, pcx);
-                pcx.nodes[p as usize].x = const_eval(pcx.nodes[p as usize].a, pcx);
-                pcx.nodes[p as usize].y = const_eval(pcx.nodes[p as usize].b, pcx);
-                if const_less(pcx.nodes[p as usize].y, pcx.nodes[p as usize].x, ty) {
-                    type_error(p, c"the range pattern is empty (its start is above its end)", pcx);
-                }
-            }
-            _ => check_variant_pattern(p, ty, pcx),
         }
+        pcx.nodes[p as usize].x = define_local(name, bty,
+            pcx.nodes[p as usize].b != 0 && bty == ty, false, pcx);
+        // (0.20) a binding into a value matched through an access (`match
+        // &x`, `match e` of an access) is an access too, in a 0.20 file:
+        // used as the value it designates (conventions.md §5.3)
+        return;
+    }
+    if kind == PatOr {
+        check_or_pattern(p, ty, pcx);
+        return;
+    }
+    if kind == PatVariant && pcx.nodes[p as usize].c == 0 && pcx.nodes[p as usize].d == 0
+        && pcx.nodes[p as usize].y == 0
+        && is_integer(ty) {
+        // (0.17) `i64::MAX =>`: a constant's path
+        let e = pattern_path(p, pcx);
+        pcx.nodes[p as usize].kind = PatLit;
+        pcx.nodes[p as usize].a = e;
+        check_pat(p, ty, pcx);
+        return;
+    }
+    if ty == TY_NEVER {
+        for i in 0..pcx.nodes[p as usize].count {
+            check_pat(child(p, i, pcx), TY_NEVER, pcx);
+        }
+        return;
+    }
+    match kind {
+        PatTuple => {
+            let count = pcx.nodes[p as usize].count;
+            if ty == TY_UNIT && count == 0 {
+                return;
+            }
+            if (pcx.nodes[p as usize].p & PAT_FIELDS) != 0
+                && pcx.types[ty as usize].kind == TyKind::Struct
+                && count == pcx.structs[pcx.types[ty as usize].a as usize].field_count {
+                // (a struct pattern made already: a generic's instance)
+                structs::check_parts(p, ty, pcx);
+                return;
+            }
+            if pcx.types[ty as usize].kind != TyKind::Tuple
+                || pcx.types[ty as usize].count != count {
+                err_begin(pcx.nodes[p as usize].start, pcx);
+                err_fmt(
+                    format_args(
+                        "a tuple pattern with {count} elements cannot bind a value of type '"),
+                    pcx);
+                err_type(ty, pcx);
+                err_str(c"'", pcx);
+                err_end(pcx);
+            }
+            for i in 0..count {
+                check_pat(child(p, i, pcx), type_elem(ty, i, pcx), pcx);
+            }
+        }
+        PatLit => {
+            check_literal_type(p, ty, c"a literal pattern", pcx);
+            let e = pcx.nodes[p as usize].a;
+            check_const_expr(e, ty, pcx);
+            pcx.nodes[p as usize].x = const_eval(e, pcx);
+        }
+        PatRange => {
+            check_literal_type(p, ty, c"a range pattern", pcx);
+            if ty == TY_BOOL {
+                type_error(p, c"range patterns need an integer type, not 'bool'", pcx);
+            }
+            check_const_expr(pcx.nodes[p as usize].a, ty, pcx);
+            check_const_expr(pcx.nodes[p as usize].b, ty, pcx);
+            pcx.nodes[p as usize].x = const_eval(pcx.nodes[p as usize].a, pcx);
+            pcx.nodes[p as usize].y = const_eval(pcx.nodes[p as usize].b, pcx);
+            if const_less(pcx.nodes[p as usize].y, pcx.nodes[p as usize].x, ty) {
+                type_error(p, c"the range pattern is empty (its start is above its end)", pcx);
+            }
+        }
+        _ => check_variant_pattern(p, ty, pcx),
     }
 }
 
@@ -426,17 +427,17 @@ fn pattern_path(b: i64, pcx: &mut Ctx<Comp>) -> i64 {
     n
 }
 
-fn check_literal_type(p: i64, ty: i64, what: *mut u8, pcx: &mut Ctx<Comp>) {
+fn check_literal_type(p: i64, ty: i64, what: *const u8, pcx: &mut Ctx<Comp>) {
     if is_float(ty) {
         err_begin(pcx.nodes[p as usize].start, pcx);
-        err_fmt(format_args("{} cannot match a float", str::from_utf8(cstr(what)).unwrap()), pcx);
+        err_fmt(format_args("{} cannot match a float", str::from_utf8(&cstr(what)).unwrap()), pcx);
         err_help(c"compare with '==' in a guard: 'x if x == 1.5 =>'", pcx);
         err_end(pcx);
     }
     if !(is_integer(ty) || ty == TY_BOOL) {
         err_begin(pcx.nodes[p as usize].start, pcx);
         err_fmt(format_args("{} cannot match a value of type '",
-            str::from_utf8(cstr(what)).unwrap()), pcx);
+            str::from_utf8(&cstr(what)).unwrap()), pcx);
         err_type(ty, pcx);
         err_str(c"'", pcx);
         err_end(pcx);
@@ -447,152 +448,149 @@ fn check_literal_type(p: i64, ty: i64, what: *mut u8, pcx: &mut Ctx<Comp>) {
 // path (h); a generic enum written without arguments stands for the
 // instance being matched.
 fn pattern_enum_type(p: i64, ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        if pcx.nodes[p as usize].y != 0 {
-            return pcx.nodes[p as usize].y;
-        }
-        let name = pcx.nodes[p as usize].a;
-        if pcx.nodes[p as usize].h == 0
-            && (env_lookup(name, pcx) != 0 || (*pcx.sym_primitive.add(name as usize)) != 0
-                || (name == pcx.self_type_sym && pcx.self_type != 0)) {
-            return resolve_named(name, pcx.nodes[p as usize].start, pcx);
-        }
-        let m = if pcx.nodes[p as usize].h
-            != 0 {
-            path_module(pcx.nodes[p as usize].h, pcx.nodes[pcx.nodes[p as usize].h as usize].count,
-                pcx)
-        }
-            else { pcx.cur_mod };
-        let b = lookup_name(m, name, pcx.cur_mod, pcx);
-        if pcx.nodes[p as usize].h == 0 {
-            note_c_use(pcx.nodes[p as usize].start, name, b, pcx);
-        }
-        if binding_kind(b) == B_PRIVATE {
-            access_error(b, pcx.nodes[p as usize].start, name, pcx);
-        }
-        if binding_kind(b) != B_ITEM {
-            unknown_name_error(pcx.nodes[p as usize].start, c"unknown type '", name, pcx);
-        }
-        let key = binding_value(b);
-        qnote(pcx.nodes[p as usize].start, name, item_node_of(key, pcx), 0, pcx);
-        let tpl = template_of_key(key, pcx);
-        if tpl != TPL_NONE {
-            if instance_of(ty, tpl, pcx) {
-                return ty;
-            }
-            err_begin(pcx.nodes[p as usize].start, pcx);
-            err_str(c"expected '", pcx);
-            err_type(ty, pcx);
-            err_fmt(format_args("', got a pattern of '{}'",
-                str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
-            crate::front::check::names::pattern_enum_help(ty, sym_text(name, pcx), pcx);
-            err_end(pcx);
-        }
-        resolve_key(key, name, pcx.nodes[p as usize].start, pcx)
+    if pcx.nodes[p as usize].y != 0 {
+        return pcx.nodes[p as usize].y;
     }
+    let name = pcx.nodes[p as usize].a;
+    if pcx.nodes[p as usize].h == 0
+        && (env_lookup(name, pcx) != 0 || (pcx.sym_primitive[name as usize]) != 0
+            || (name == pcx.self_type_sym && pcx.self_type != 0)) {
+        return resolve_named(name, pcx.nodes[p as usize].start, pcx);
+    }
+    let m = if pcx.nodes[p as usize].h
+        != 0 {
+        path_module(pcx.nodes[p as usize].h, pcx.nodes[pcx.nodes[p as usize].h as usize].count,
+            pcx)
+    }
+        else { pcx.cur_mod };
+    let b = lookup_name(m, name, pcx.cur_mod, pcx);
+    if pcx.nodes[p as usize].h == 0 {
+        note_c_use(pcx.nodes[p as usize].start, name, b, pcx);
+    }
+    if binding_kind(b) == B_PRIVATE {
+        access_error(b, pcx.nodes[p as usize].start, name, pcx);
+    }
+    if binding_kind(b) != B_ITEM {
+        unknown_name_error(pcx.nodes[p as usize].start, c"unknown type '", name, pcx);
+    }
+    let key = binding_value(b);
+    qnote(pcx.nodes[p as usize].start, name, item_node_of(key, pcx), 0, pcx);
+    let tpl = template_of_key(key, pcx);
+    if tpl != TPL_NONE {
+        if instance_of(ty, tpl, pcx) {
+            return ty;
+        }
+        err_begin(pcx.nodes[p as usize].start, pcx);
+        err_str(c"expected '", pcx);
+        err_type(ty, pcx);
+        err_fmt(format_args("', got a pattern of '{}'",
+            str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+        crate::front::check::names::pattern_enum_help(ty, sym_text(name, pcx), pcx);
+        err_end(pcx);
+    }
+    resolve_key(key, name, pcx.nodes[p as usize].start, pcx)
 }
 
 fn check_variant_pattern(p: i64, ty: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let t = pattern_enum_type(p, ty, pcx);
-        if pcx.types[t as usize].kind != TyKind::Enum {
-            err_begin(pcx.nodes[p as usize].start, pcx);
-            err_str(c"'", pcx);
-            err_type(t, pcx);
-            err_str(c"' is not an enum", pcx);
-            err_end(pcx);
+    let t = pattern_enum_type(p, ty, pcx);
+    if pcx.types[t as usize].kind != TyKind::Enum {
+        err_begin(pcx.nodes[p as usize].start, pcx);
+        err_str(c"'", pcx);
+        err_type(t, pcx);
+        err_str(c"' is not an enum", pcx);
+        err_end(pcx);
+    }
+    if t != ty {
+        mismatch_error(p, ty, t, pcx);
+    }
+    let v = find_variant(pcx.types[t as usize].a, pcx.nodes[p as usize].b, pcx);
+    if v < 0 {
+        err_begin(pcx.nodes[p as usize].start, pcx);
+        err_fmt(format_args("no variant '{}' in enum '",
+            str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()), pcx);
+        err_type(t, pcx);
+        err_str(c"'", pcx);
+        // (0.25.2.1: the nearest variants, `Left`: 'ArrowLeft')
+        pcx.near_all.clear();
+        pcx.near_collect = true;
+        let mut near = near_to(pcx.nodes[p as usize].b);
+        for i in 0..(pcx.enums[pcx.types[t as usize].a as usize]).variant_count {
+            near.offer(
+                pcx.variants[enum_variant(pcx.types[t as usize].a, i, pcx) as usize].name,
+                pcx);
         }
-        if t != ty {
-            mismatch_error(p, ty, t, pcx);
+        pcx.near_collect = false;
+        near.help(pcx);
+        if buf_len(pcx.err_help) == 0 {
+            help_nearest(c"its variants: ", pcx.nodes[p as usize].b, pcx);
         }
-        let v = find_variant(pcx.types[t as usize].a, pcx.nodes[p as usize].b, pcx);
-        if v < 0 {
-            err_begin(pcx.nodes[p as usize].start, pcx);
-            err_fmt(format_args("no variant '{}' in enum '",
-                str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()), pcx);
-            err_type(t, pcx);
-            err_str(c"'", pcx);
-            // (0.25.2.1: the nearest variants, `Left`: 'ArrowLeft')
-            pcx.near_all.count = 0;
-            pcx.near_collect = true;
-            let mut near = near_to(pcx.nodes[p as usize].b);
-            for i in 0..(*get_enums().add(pcx.types[t as usize].a as usize)).variant_count {
-                near.offer(pcx.variants[enum_variant(pcx.types[t as usize].a, i) as usize].name,
-                    pcx);
-            }
-            pcx.near_collect = false;
-            near.help(pcx);
-            if (*get_bufs().add(pcx.err_help as usize)).len == 0 {
-                help_nearest(c"its variants: ", pcx.nodes[p as usize].b, pcx);
-            }
-            err_end(pcx);
+        err_end(pcx);
+    }
+    // (0.17: struct-like variants)
+    if (pcx.nodes[p as usize].p & PAT_FIELDS) != 0 {
+        pattern_fields(p, v, t, pcx);
+    } else if (pcx.nodes[p as usize].p & PAT_PARENS) != 0 && has_named_fields(v, pcx) {
+        positional_error(p, v, t, true, pcx);
+    }
+    let count = pcx.variants[v as usize].field_count;
+    if pcx.nodes[p as usize].c == 0 && count > 0 && has_named_fields(v, pcx) {
+        err_begin(pcx.nodes[p as usize].start, pcx);
+        err_str(c"variant '", pcx);
+        err_type(t, pcx);
+        err_fmt(format_args("::{}' has {count}",
+            str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()), pcx);
+        err_str(if count == 1 { c" field" } else { c" fields" }, pcx);
+        err_help(c"match them by name, or leave them out with '..'", pcx);
+        let b = buf_new();
+        buf_type(b, t, pcx);
+        buf_fmt(b,
+            format_args("::{} {{ .. }}",
+                str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()));
+        err_try_fmt(str::from_utf8(&buf_copy(b)).unwrap(), pcx);
+        err_end(pcx);
+    }
+    if pcx.nodes[p as usize].c == 0 && count > 0 {
+        err_begin(pcx.nodes[p as usize].start, pcx);
+        err_str(c"variant '", pcx);
+        err_type(t, pcx);
+        err_fmt(format_args("::{}' has {count}",
+            str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()), pcx);
+        err_str(if count == 1 { c" field" } else { c" fields" }, pcx);
+        err_help(c"match them: '", pcx);
+        buf_type(pcx.err_help, t, pcx);
+        err_help_fmt(format_args("::{}(_",
+            str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()), pcx);
+        for _ in 1..count {
+            err_help(c", _", pcx);
         }
-        // (0.17: struct-like variants)
-        if (pcx.nodes[p as usize].p & PAT_FIELDS) != 0 {
-            pattern_fields(p, v, t, pcx);
-        } else if (pcx.nodes[p as usize].p & PAT_PARENS) != 0 && has_named_fields(v, pcx) {
-            positional_error(p, v, t, true, pcx);
-        }
-        let count = pcx.variants[v as usize].field_count;
-        if pcx.nodes[p as usize].c == 0 && count > 0 && has_named_fields(v, pcx) {
-            err_begin(pcx.nodes[p as usize].start, pcx);
-            err_str(c"variant '", pcx);
-            err_type(t, pcx);
-            err_fmt(format_args("::{}' has {count}",
-                str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()), pcx);
-            err_str(if count == 1 { c" field" } else { c" fields" }, pcx);
-            err_help(c"match them by name, or leave them out with '..'", pcx);
-            let b = buf_new();
-            buf_type(b, t, pcx);
-            buf_fmt(b,
-                format_args("::{} {{ .. }}",
-                    str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()));
-            err_try_fmt(str::from_utf8(buf_slice(b)).unwrap(), pcx);
-            err_end(pcx);
-        }
-        if pcx.nodes[p as usize].c == 0 && count > 0 {
-            err_begin(pcx.nodes[p as usize].start, pcx);
-            err_str(c"variant '", pcx);
-            err_type(t, pcx);
-            err_fmt(format_args("::{}' has {count}",
-                str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()), pcx);
-            err_str(if count == 1 { c" field" } else { c" fields" }, pcx);
-            err_help(c"match them: '", pcx);
-            buf_type(pcx.err_help, t, pcx);
-            err_help_fmt(format_args("::{}(_",
-                str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()), pcx);
-            for _ in 1..count {
-                err_help(c", _", pcx);
-            }
-            err_help(c")'", pcx);
-            err_end(pcx);
-        }
-        if pcx.nodes[p as usize].c != 0 && pcx.nodes[p as usize].count != count {
-            err_begin(pcx.nodes[p as usize].start, pcx);
-            err_str(c"variant '", pcx);
-            err_type(t, pcx);
-            err_fmt(format_args("::{}' has {count}",
-                str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()), pcx);
-            err_str(if count == 1 { c" field" } else { c" fields" }, pcx);
-            err_fmt(format_args(", the pattern has {}", pcx.nodes[p as usize].count), pcx);
-            err_end(pcx);
-        }
-        pcx.nodes[p as usize].x = v;
-        for i in 0..count {
-            check_pat(child(p, i, pcx), variant_field(v, i, pcx), pcx);
-        }
+        err_help(c")'", pcx);
+        err_end(pcx);
+    }
+    if pcx.nodes[p as usize].c != 0 && pcx.nodes[p as usize].count != count {
+        err_begin(pcx.nodes[p as usize].start, pcx);
+        err_str(c"variant '", pcx);
+        err_type(t, pcx);
+        err_fmt(format_args("::{}' has {count}",
+            str::from_utf8(sym_text(pcx.nodes[p as usize].b, pcx)).unwrap()), pcx);
+        err_str(if count == 1 { c" field" } else { c" fields" }, pcx);
+        err_fmt(format_args(", the pattern has {}", pcx.nodes[p as usize].count), pcx);
+        err_end(pcx);
+    }
+    pcx.nodes[p as usize].x = v;
+    for i in 0..count {
+        check_pat(child(p, i, pcx), variant_field(v, i, pcx), pcx);
     }
 }
 
 fn check_or_pattern(p: i64, ty: i64, pcx: &mut Ctx<Comp>) {
-    let first = pcx.env.count;
+    let first = pcx.env.len() as i64;
     check_pat(child(p, 0, pcx), ty, pcx);
     let saved_mode = pcx.or_mode;
     let saved_first = pcx.or_first;
     let saved_end = pcx.or_end;
     if !pcx.or_mode {
         pcx.or_first = first;
-        pcx.or_end = pcx.env.count;
+        pcx.or_end = pcx.env.len() as i64;
     }
     pcx.or_mode = true;
     let bound = binding_count(child(p, 0, pcx), pcx);
@@ -618,26 +616,24 @@ fn check_or_pattern(p: i64, ty: i64, pcx: &mut Ctx<Comp>) {
 
 // The local of the first alternative named `name`, for a later one.
 fn or_rebind(p: i64, name: i64, ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        for i in pcx.or_first..pcx.or_end {
-            let id = (*pcx.env.data.add(i as usize));
-            if pcx.locals[id as usize].name == name {
-                if pcx.locals[id as usize].ty != ty {
-                    err_begin(pcx.nodes[p as usize].start, pcx);
-                    err_fmt(format_args("variable '{}' has type '",
-                        str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
-                    err_type(pcx.locals[id as usize].ty, pcx);
-                    err_str(c"' in one alternative and '", pcx);
-                    err_type(ty, pcx);
-                    err_str(c"' in another", pcx);
-                    err_end(pcx);
-                }
-                return id;
+    for i in pcx.or_first..pcx.or_end {
+        let id = (pcx.env[i as usize]);
+        if pcx.locals[id as usize].name == name {
+            if pcx.locals[id as usize].ty != ty {
+                err_begin(pcx.nodes[p as usize].start, pcx);
+                err_fmt(format_args("variable '{}' has type '",
+                    str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+                err_type(pcx.locals[id as usize].ty, pcx);
+                err_str(c"' in one alternative and '", pcx);
+                err_type(ty, pcx);
+                err_str(c"' in another", pcx);
+                err_end(pcx);
             }
+            return id;
         }
-        name_error(pcx.nodes[p as usize].start, c"variable '", name,
-            c"' is not bound in every alternative of the or-pattern", pcx)
     }
+    name_error(pcx.nodes[p as usize].start, c"variable '", name,
+        c"' is not bound in every alternative of the or-pattern", pcx)
 }
 
 pub fn binding_count(p: i64, pcx: &Ctx<Comp>) -> i64 {
@@ -660,22 +656,20 @@ pub fn binding_count(p: i64, pcx: &Ctx<Comp>) -> i64 {
 // ---- Refutability ----
 
 pub fn is_irrefutable(p: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        match { pcx.nodes[p as usize].kind } {
-            PatWild | PatBind => true,
-            _ if pcx.nodes[p as usize].ty == TY_NEVER => true,
-            PatVariant if (
-                *get_enums().add(pcx.variants[pcx.nodes[p as usize].x as usize].enum_id as usize)).variant_count != 1 => false,
-            PatTuple | PatVariant => {
-                for i in 0..pcx.nodes[p as usize].count {
-                    if !is_irrefutable(child(p, i, pcx), pcx) {
-                        return false;
-                    }
+    match { pcx.nodes[p as usize].kind } {
+        PatWild | PatBind => true,
+        _ if pcx.nodes[p as usize].ty == TY_NEVER => true,
+        PatVariant if (
+            pcx.enums[pcx.variants[pcx.nodes[p as usize].x as usize].enum_id as usize]).variant_count != 1 => false,
+        PatTuple | PatVariant => {
+            for i in 0..pcx.nodes[p as usize].count {
+                if !is_irrefutable(child(p, i, pcx), pcx) {
+                    return false;
                 }
-                true
             }
-            _ => false,
+            true
         }
+        _ => false,
     }
 }
 
@@ -698,12 +692,12 @@ fn has_or_pattern(p: i64, pcx: &Ctx<Comp>) -> i64 {
 }
 
 // Patterns of `let` and `for` must match every value.
-pub fn check_irrefutable(p: i64, what: *mut u8, pcx: &mut Ctx<Comp>) {
+pub fn check_irrefutable(p: i64, what: *const u8, pcx: &mut Ctx<Comp>) {
     let or = has_or_pattern(p, pcx);
     if or != 0 {
         err_begin(pcx.nodes[or as usize].start, pcx);
         err_fmt(format_args("or-patterns are only allowed in match arms, not in '{}'",
-            str::from_utf8(cstr(what)).unwrap()),
+            str::from_utf8(&cstr(what)).unwrap()),
             pcx);
         err_end(pcx);
     }
@@ -711,10 +705,10 @@ pub fn check_irrefutable(p: i64, what: *mut u8, pcx: &mut Ctx<Comp>) {
         err_begin(pcx.nodes[p as usize].start, pcx);
         err_fmt(
             format_args("refutable pattern in '{}': it does not match every value of type '",
-                str::from_utf8(cstr(what)).unwrap()), pcx);
+                str::from_utf8(&cstr(what)).unwrap()), pcx);
         err_type(pcx.nodes[p as usize].ty, pcx);
         err_str(c"'", pcx);
-        if cstr(what) == b"let" {
+        if c_eq(what, b"let") {
             // (0.18.1) let-else
             err_help(
                 c"leave when it does not match: 'let PAT = e else { return ...; };' (or a 'match')", pcx);

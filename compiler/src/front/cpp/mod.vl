@@ -25,20 +25,25 @@ pub mod directives;
 pub mod expand;
 pub mod input;
 
-use crate::base::{
-    IntVec, buf_byte, buf_fmt, buf_new, buf_str, cstr, get_bufs, grow, intern_c, sym_name,
-};
+use crate::base::{buf_byte, buf_fmt, buf_new, buf_ptr, buf_str, cstr, intern_c, sym_name, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{err_end_text, error_at};
 use crate::front::cimport::ctx::CImportCx;
+use crate::front::lexer::strings::hex_value;
 
 use CK::{Char, Eof, Ident, Num, Punct, Str};
 
+// UNSAFE: C's number conversions, for the C preprocessor's and importer's constants: C's own
+// rules for a C literal (strtoull's bases, strtof's rounding, snprintf's %g) are what a
+// header's value means.
+// SAFETY: each declaration is the function's C prototype on the targets vole builds for (64-bit
+// macOS and Linux: int is i32, size_t u64, long and long long i64, a pointer 8 bytes); snprintf
+// is variadic and takes what its format names; what a call must hold (NUL-terminated input,
+// room in the output) is said at the call.
 pub extern "C" {
-    fn snprintf(buf: *mut u8, size: u64, format: *mut u8, ...) -> i32;
-    fn strtoull(s: *mut u8, end: *mut *mut u8, base: i32) -> u64;
-    fn strtof(s: *mut u8, end: *mut *mut u8) -> f32;
+    fn snprintf(buf: *mut u8, size: u64, format: *const u8, ...) -> i32;
+    fn strtof(s: *const u8, end: *mut *mut u8) -> f32;
 }
 
 // ---- Tokens ----
@@ -53,34 +58,91 @@ pub extern "C" {
 
 fn ctok_new(kind: CK, text: i64, file: i64, line: i64, space: bool, bol: bool,
     ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        pcx.ctoks = grow(pcx.ctoks, pcx.ctok_count, &mut ccx.ctok_cap);
-        let t = pcx.ctok_count;
-        (*pcx.ctoks.add(t as usize)) = CTok { kind, space, bol, text, file, line, hide: 0 };
-        pcx.ctok_count += 1;
-        t
-    }
+    let t = pcx.ctoks.len() as i64;
+    pcx.ctoks.push(CTok { kind, space, bol, text, file, line, hide: 0 });
+    t
 }
 
 pub fn ctok_copy(t: i64, ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let n = ctok_new((*pcx.ctoks.add(t as usize)).kind, (*pcx.ctoks.add(t as usize)).text,
-            (*pcx.ctoks.add(t as usize)).file, (*pcx.ctoks.add(t as usize)).line,
-            (*pcx.ctoks.add(t as usize)).space, bol: false, ccx: ccx, pcx: pcx);
-        (*pcx.ctoks.add(n as usize)).hide = (*pcx.ctoks.add(t as usize)).hide;
-        n
-    }
+    let n = ctok_new((pcx.ctoks[t as usize]).kind, (pcx.ctoks[t as usize]).text,
+        (pcx.ctoks[t as usize]).file, (pcx.ctoks[t as usize]).line,
+        (pcx.ctoks[t as usize]).space, bol: false, ccx: ccx, pcx: pcx);
+    (pcx.ctoks[n as usize]).hide = (pcx.ctoks[t as usize]).hide;
+    n
 }
 
 pub fn ctok_is(t: i64, sym: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        (*pcx.ctoks.add(t as usize)).text == sym && (*pcx.ctoks.add(t as usize)).kind != Str
-            && (*pcx.ctoks.add(t as usize)).kind != Char
-    }
+    (pcx.ctoks[t as usize]).text == sym && (pcx.ctoks[t as usize]).kind != Str
+        && (pcx.ctoks[t as usize]).kind != Char
 }
 
-pub fn ctok_text(t: i64, pcx: &Ctx<Comp>) -> *mut u8 {
-    unsafe { sym_name((*pcx.ctoks.add(t as usize)).text, pcx) }
+// The unsigned integer at the start of text in `base` (2, 8, 10 or 16; a
+// `0x` before a hex digit is skipped), as C's strtoull reads a literal:
+// its value (the largest u64 when it does not fit) and how many bytes
+// of text it is.
+pub fn c_ull(text: &[u8], base: u64) -> (u64, usize) {
+    let mut i: usize = 0;
+    if base == 16 && text.len() > 2 && text[0] == b'0' && (text[1] == b'x' || text[1] == b'X')
+        && hex_value(text[2]) >= 0 {
+        i = 2;
+    }
+    let mut value: u64 = 0;
+    let mut fits = true;
+    while i < text.len() {
+        let d = hex_value(text[i]);
+        if d < 0 || d as u64 >= base {
+            break;
+        }
+        if value > (0xffffffffffffffff - d as u64) / base {
+            fits = false;
+        } else {
+            value = value * base + d as u64;
+        }
+        i += 1;
+    }
+    (if fits { value } else { 0xffffffffffffffff }, i)
+}
+
+// The text of C token t.
+pub fn ctok_bytes(t: i64, pcx: &Ctx<Comp>) -> &'static [u8] {
+    sym_text((pcx.ctoks[t as usize]).text, pcx)
+}
+
+// The float C's strtof reads at the start of text, whose last byte is
+// the NUL that ends it (the rounding a C compiler gives an `f` literal).
+pub fn c_float(text: &[u8]) -> f32 {
+    assert(text.len() > 0 && text[text.len() - 1] == 0);
+    let mut end = 0 as *const u8;
+    // UNSAFE: C's strtof; a C call
+    // SAFETY: text's last byte is 0 (checked above) and strtof reads no
+    // further than the first NUL, so it reads text's bytes only; it writes
+    // `end`, a local, with a pointer into those bytes
+    unsafe { strtof(text.as_ptr(), &mut end) }
+}
+
+// `value` as C's `%.17g` writes it: the digits that read back as the
+// same double.
+pub fn c_g17(value: f64) -> Vec<u8, Comp> {
+    let mut digits: [u8; 64] = [0u8; 64];
+    // UNSAFE: C's snprintf, whose %.17g is the text a C constant's value
+    // is written with; a variadic C call
+    // SAFETY: the buffer is `digits`, 64 bytes, and 64 is the size given,
+    // so snprintf writes inside it and ends its text with a NUL (%.17g of
+    // a double is at most 24 bytes); the format takes one double, and one
+    // f64 is passed
+    unsafe { snprintf(digits.as_mut_ptr(), 64, c"%.17g", value); }
+    let mut out: Vec<u8, Comp> = Vec::new_in(Comp {});
+    for &d in digits.iter() {
+        if d == 0 {
+            break;
+        }
+        out.push(d);
+    }
+    out
+}
+
+pub fn ctok_text(t: i64, pcx: &Ctx<Comp>) -> *const u8 {
+    sym_name((pcx.ctoks[t as usize]).text, pcx)
 }
 
 // ---- Hide sets: linked lists of macro names, 0 the empty set ----
@@ -131,37 +193,35 @@ fn hs_inter(a: i64, b: i64, ccx: &mut CImportCx<Comp>) -> i64 {
 
 // ---- Errors in C code ----
 
-fn c_error(t: i64, message: *mut u8, pcx: &mut Ctx<Comp>) -> ! {
-    unsafe {
-        // An error in the list of imports: at the `import` item.
-        if t > 0 && (*pcx.ctoks.add(t as usize)).file == pcx.c_import_file
-            && (*pcx.ctoks.add(t as usize)).line - 1 < pcx.c_import_pos.count {
-            pcx.err_kind = c"C import";
-            error_at((*pcx.c_import_pos.data.add(((*pcx.ctoks.add(t as usize)).line - 1) as usize)),
-                message, pcx);
-        }
-        let out = buf_new();
-        buf_fmt(out, format_args("error[C import]: {}", str::from_utf8(cstr(message)).unwrap()));
-        if t > 0 && (*pcx.ctoks.add(t as usize)).file >= 0 {
-            buf_fmt(out,
-                format_args("\n --> {}: line {}",
-                    str::from_utf8(
-                        cstr(pcx.cfiles[(*pcx.ctoks.add(t as usize)).file as usize].path)).unwrap(),
-                    (*pcx.ctoks.add(t as usize)).line));
-        }
-        buf_byte(out, b'\n');
-        // (reported with the program's errors, at its first `import`)
-        err_end_text(if pcx.c_import_pos.count > 0 { (*pcx.c_import_pos.data.add(0)) } else { 0 },
-            out, pcx)
+fn c_error(t: i64, message: *const u8, pcx: &mut Ctx<Comp>) -> ! {
+    // An error in the list of imports: at the `import` item.
+    if t > 0 && (pcx.ctoks[t as usize]).file == pcx.c_import_file
+        && (pcx.ctoks[t as usize]).line - 1 < pcx.c_import_pos.len() as i64 {
+        pcx.err_kind = c"C import";
+        error_at((pcx.c_import_pos[((pcx.ctoks[t as usize]).line - 1) as usize]),
+            message, pcx);
     }
+    let out = buf_new();
+    buf_fmt(out, format_args("error[C import]: {}", str::from_utf8(&cstr(message)).unwrap()));
+    if t > 0 && (pcx.ctoks[t as usize]).file >= 0 {
+        buf_fmt(out,
+            format_args("\n --> {}: line {}",
+                str::from_utf8(
+                    &cstr(pcx.cfiles[(pcx.ctoks[t as usize]).file as usize].path)).unwrap(),
+                (pcx.ctoks[t as usize]).line));
+    }
+    buf_byte(out, b'\n');
+    // (reported with the program's errors, at its first `import`)
+    err_end_text(if pcx.c_import_pos.len() as i64 > 0 { (pcx.c_import_pos[0]) } else { 0 },
+        out, pcx)
 }
 
-fn c_error2(t: i64, message: *mut u8, detail: *mut u8, pcx: &mut Ctx<Comp>) -> ! {
+fn c_error2(t: i64, message: *const u8, detail: *const u8, pcx: &mut Ctx<Comp>) -> ! {
     let b = buf_new();
     buf_str(b, message);
     buf_str(b, detail);
     buf_byte(b, 0);
-    unsafe { c_error(t, (*get_bufs().add(b as usize)).data, pcx) }
+    c_error(t, buf_ptr(b), pcx)
 }
 
 // ---- Where the declarations are (0.25.2, for the language server) ----
@@ -190,12 +250,12 @@ pub fn origin_note(kind: i64, index: i64, tok: i64, first: i64, last: i64, repla
         return;
     }
     if o >= 0 {
-        pcx.c_origins.set(o * 3, tok);
-        pcx.c_origins.set(o * 3 + 1, first);
-        pcx.c_origins.set(o * 3 + 2, last);
+        pcx.c_origins[(o * 3) as usize] = tok;
+        pcx.c_origins[(o * 3 + 1) as usize] = first;
+        pcx.c_origins[(o * 3 + 2) as usize] = last;
         return;
     }
-    ccx.origin_of.put(key + 1, pcx.c_origins.count / 3 + 1);
+    ccx.origin_of.put(key + 1, pcx.c_origins.len() as i64 / 3 + 1);
     pcx.c_origins.push(tok);
     pcx.c_origins.push(first);
     pcx.c_origins.push(last);
@@ -209,13 +269,10 @@ pub fn origin_of(kind: i64, index: i64, ccx: &CImportCx<Comp>) -> i64 {
 // Token t's file (-1: none, or no such token), line, text (a symbol),
 // and whether a macro's expansion made it (its hide set is not empty).
 pub fn ctok_place(t: i64, pcx: &Ctx<Comp>) -> (i64, i64, i64, bool) {
-    if t < 0 || t >= pcx.ctok_count {
+    if t < 0 || t >= pcx.ctoks.len() as i64 {
         return (-1, 0, -1, false);
     }
-    // UNSAFE: the tokens are in CTOKS, a raw array the preprocessor grows.
-    // SAFETY: 0 <= t < CTOK_COUNT (checked above): a token ctok_new wrote
-    // whole; CTOKS is reallocated only by ctok_new, not during this read.
-    let tok = unsafe { (*pcx.ctoks.add(t as usize)) };
+    let tok = (pcx.ctoks[t as usize]);
     (tok.file, tok.line, tok.text, tok.hide != 0)
 }
 
@@ -228,16 +285,16 @@ pub fn ctok_line(t: i64, pcx: &Ctx<Comp>) -> i64 {
 // The places noted from origin `from` on that have no lines yet get the
 // lines of tokens toks[start..end] (a declaration's) in their name's file,
 // those not made by a macro's expansion.
-pub fn origin_lines(from: i64, toks: IntVec, start: i64, end: i64, pcx: &mut Ctx<Comp>) {
+pub fn origin_lines(from: i64, toks: &[i64], start: i64, end: i64, pcx: &mut Ctx<Comp>) {
     let mut o = from;
-    while o * 3 < pcx.c_origins.count {
-        let tok = pcx.c_origins.get(o * 3);
-        if tok >= 0 && pcx.c_origins.get(o * 3 + 1) == 0 {
+    while o * 3 < pcx.c_origins.len() as i64 {
+        let tok = pcx.c_origins[(o * 3) as usize];
+        if tok >= 0 && pcx.c_origins[(o * 3 + 1) as usize] == 0 {
             let (file, line, _, _) = ctok_place(tok, pcx);
             let mut first = line;
             let mut last = line;
             for k in start..end {
-                let (f, l, _, expanded) = ctok_place(toks.get(k), pcx);
+                let (f, l, _, expanded) = ctok_place(toks[k as usize], pcx);
                 if f == file && !expanded {
                     if l < first {
                         first = l;
@@ -247,8 +304,8 @@ pub fn origin_lines(from: i64, toks: IntVec, start: i64, end: i64, pcx: &mut Ctx
                     }
                 }
             }
-            pcx.c_origins.set(o * 3 + 1, first);
-            pcx.c_origins.set(o * 3 + 2, last);
+            pcx.c_origins[(o * 3 + 1) as usize] = first;
+            pcx.c_origins[(o * 3 + 2) as usize] = last;
         }
         o += 1;
     }
@@ -268,26 +325,24 @@ pub fn macro_of(sym: i64, ccx: &CImportCx<Comp>) -> i64 {
 }
 
 fn macro_param(m: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (*pcx.cints.data.add(((*pcx.macros.add(m as usize)).params + i) as usize)) }
+    (pcx.cints[((pcx.macros[m as usize]).params + i) as usize])
 }
 
 pub fn macro_tok(m: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe { (*pcx.cints.data.add(((*pcx.macros.add(m as usize)).body + i) as usize)) }
+    (pcx.cints[((pcx.macros[m as usize]).body + i) as usize])
 }
 
 // The index of `sym` among the parameters of macro m, or -1.
 fn macro_param_index(m: i64, sym: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if !(*pcx.macros.add(m as usize)).func {
-            return -1;
-        }
-        for i in 0..(*pcx.macros.add(m as usize)).param_count {
-            if macro_param(m, i, pcx) == sym {
-                return i;
-            }
-        }
-        -1
+    if !(pcx.macros[m as usize]).func {
+        return -1;
     }
+    for i in 0..(pcx.macros[m as usize]).param_count {
+        if macro_param(m, i, pcx) == sym {
+            return i;
+        }
+    }
+    -1
 }
 
 // ---- Well-known symbols ----
@@ -316,7 +371,7 @@ fn init_cpp_syms(ccx: &mut CImportCx<Comp>, pcx: &mut Ctx<Comp>) {
 // Builtins that `#if` answers (and `defined` says are defined): every
 // feature query is answered "no", so headers take their plainest path.
 fn is_query_builtin(sym: i64, pcx: &mut Ctx<Comp>) -> bool {
-    let names: [*mut u8; 14] = [c"__has_attribute", c"__has_cpp_attribute", c"__has_c_attribute",
+    let names: [*const u8; 14] = [c"__has_attribute", c"__has_cpp_attribute", c"__has_c_attribute",
         c"__has_builtin", c"__has_feature", c"__has_extension", c"__has_warning",
         c"__has_declspec_attribute", c"__building_module", c"__is_target_arch",
         c"__is_target_vendor", c"__is_target_os", c"__is_target_environment", c"__has_embed"];

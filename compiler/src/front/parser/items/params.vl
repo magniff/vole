@@ -2,14 +2,14 @@
 // defaults, a C function's `...` (split from items).
 
 use crate::base::{
-    buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, get_src, intern, intern_c, sym_text,
+    buf_append, buf_byte, buf_bytes, buf_copy, buf_fmt, buf_len, buf_new, get_src, intern_buf,
+    sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{err_begin, err_end, err_end_soft, err_help, err_jump, err_str, error_at};
 use crate::front::ast::{
-    CONV_INOUT, CONV_NEW, CONV_SINK, NODE_IMPLICIT, NODE_REF, NODE_REF_MUT, NodeKind, TY_OPAQUE,
-    child, list_begin, list_end, list_push, new_node,
+    NODE_IMPLICIT, NodeKind, TY_OPAQUE, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::conv::{conv_error, starts_type, word_at};
 use crate::front::lexer::Tok;
@@ -53,22 +53,12 @@ fn parse_param(pcx: &mut Ctx<Comp>) -> i64 {
     if at(Amp, pcx) {
         self_param_error(c"expected identifier, got '&'", pcx);
     }
-    // (0.20) the receivers `self`, `inout self`, `sink self`
-    // (conventions.md §4)
-    if at(Ident, pcx) && sym_text(pcx.toks[pcx.p as usize].value as i64, pcx) == b"self"
-        && (tok_kind(1, pcx) == Comma || tok_kind(1, pcx) == RParen) {
-        return self_receiver(start, 0, pcx);
-    }
-    // (0.25.3, eval 0.25.2.2) the mode before the name, `inout x: T`:
-    // read as `x: inout T` (its tokens put in that order), reported
-    // below with the exact edit
+    // (0.25.3, eval 0.25.2.2) `let` before the name, `let x: T`: read
+    // as `x: T`, reported below with the exact edit
     let mode_first = (at(Tok::Let, pcx))
         && tok_kind(1, pcx) == Ident && tok_kind(2, pcx) == Colon;
-    let mode_tok = pcx.toks[pcx.p as usize];
     if mode_first {
-        { let at_ix = pcx.p as usize; pcx.toks[at_ix] = pcx.toks[(pcx.p + 1) as usize] };
-        { let at_ix = (pcx.p + 1) as usize; pcx.toks[at_ix] = pcx.toks[(pcx.p + 2) as usize] };
-        { let at_ix = (pcx.p + 2) as usize; pcx.toks[at_ix] = mode_tok };
+        advance(pcx);
     }
     let mutable = eat(Mut, pcx);
     let n = new_node(NodeKind::Param, start, 0, pcx);
@@ -77,7 +67,6 @@ fn parse_param(pcx: &mut Ctx<Comp>) -> i64 {
         self_param_error(c"expected ':' after 'self'", pcx);
     }
     expect(Colon, pcx);
-    let mut is_sink = false;
     if word_at(pcx.p, b"set", pcx) && starts_type(tok_kind(1, pcx)) {
         conv_error(c"conv.set", cur_start(pcx), pcx.toks[pcx.p as usize].end,
             b"there is no 'set' parameter: a function returns what it makes",
@@ -87,15 +76,10 @@ fn parse_param(pcx: &mut Ctx<Comp>) -> i64 {
     pcx.param_type = true;
     pcx.nodes[n as usize].b = parse_type(pcx);
     pcx.param_type = false;
-    pcx.nodes[n as usize].c = (mutable || is_sink) as i64;
+    pcx.nodes[n as usize].c = mutable as i64;
     if mode_first {
-        mode_order_error(start, mode_tok, pcx.nodes[n as usize].a,
+        mode_order_error(start, pcx.nodes[n as usize].a,
             pcx.nodes[pcx.nodes[n as usize].b as usize].end, pcx);
-    }
-    if is_sink {
-        pcx.nodes[n as usize].p |= CONV_NEW | CONV_SINK;
-    } else {
-        mark_param_conv(n, pcx);
     }
     let before_eq = prev_end(pcx);
     let eq_at = pcx.toks[pcx.p as usize].start;
@@ -122,14 +106,10 @@ fn parse_param(pcx: &mut Ctx<Comp>) -> i64 {
     n
 }
 
-// (0.25.3, eval 0.25.2.2) `conv.mode_order`: a parameter's mode written
-// before its name (`inout x: i64`, Rust's `mut x` order), SRC[start..end):
-// the mode goes after the colon, `x: inout i64`; `let`, the default, is
-// left out.
-fn mode_order_error(start: i64, mode: crate::front::lexer::Token, name: i64, end: i64,
-    pcx: &mut Ctx<Comp>) {
-    let (text, word) = (&get_src()[start as usize..end as usize],
-        &get_src()[mode.start as usize..mode.end as usize]);
+// (0.25.3, eval 0.25.2.2) `conv.mode_order`: a parameter written with
+// `let` before its name (`let x: i64`), SRC[start..end): it is `x: i64`.
+fn mode_order_error(start: i64, name: i64, end: i64, pcx: &mut Ctx<Comp>) {
+    let text = &get_src()[start as usize..end as usize];
     let mut colon: i64 = 0;
     while colon < text.len() as i64 && text[colon as usize] != b':' {
         colon += 1;
@@ -142,70 +122,21 @@ fn mode_order_error(start: i64, mode: crate::front::lexer::Token, name: i64, end
     let new = buf_new();
     buf_bytes(new, crate::base::sym_text(name, pcx));
     buf_bytes(new, b": ");
-    if mode.kind != Tok::Let {
-        buf_bytes(new, word);
-        buf_bytes(new, b" ");
-    }
     buf_bytes(new, &text[t as usize..]);
     let msg = buf_new();
     buf_bytes(msg, b"a parameter is written '");
-    buf_bytes(msg, buf_slice(new));
+    buf_append(msg, new);
     buf_bytes(msg, b"', not '");
     buf_bytes(msg, text);
     buf_bytes(msg, b"'");
-    conv_error(c"conv.mode_order", start, end, buf_slice(msg),
-        if mode.kind == Tok::Let {
-            b"a parameter has no `let`: 'x: T' takes the value, 'x: &T' borrows it, 'x: &mut T' may change the caller's (called 'f(&mut v)')"
-        } else {
-            b"'x: T' takes the value, 'x: &T' borrows it, 'x: &mut T' may change the caller's (called 'f(&mut v)')"
-        }, buf_slice(new), pcx);
-}
-
-// (0.20) A Param written with a convention: its type node is an access
-// (`x: let T`, `x: inout T`, CONV_NEW on the TyPtr or TySlice the type
-// parser made), so the Param is flagged as such (front/conv: param_conv).
-pub fn mark_param_conv(n: i64, pcx: &mut Ctx<Comp>) {
-    let t = pcx.nodes[n as usize].b;
-    if t <= 0 || (pcx.nodes[t as usize].p & CONV_NEW) == 0 {
-        return;
-    }
-    pcx.nodes[n as usize].p |= CONV_NEW;
-    if (pcx.nodes[t as usize].p & NODE_REF_MUT) != 0 {
-        pcx.nodes[n as usize].p |= CONV_INOUT;
-    }
-}
-
-// (0.20) `self` (let), `inout self` (conv CONV_INOUT), `sink self`
-// (CONV_SINK), at `self`: a Param whose type is `let Self` (until T1, the
-// reference `&Self`), `inout Self` (`&mut Self`), or Self, mutable.
-fn self_receiver(start: i64, conv: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let n = new_node(NodeKind::Param, start, 0, pcx);
-    let name_start = cur_start(pcx);
-    pcx.nodes[n as usize].a = expect_ident(pcx);
-    let name = new_node(NodeKind::TyName, name_start, prev_end(pcx), pcx);
-    pcx.nodes[name as usize].a = intern_c(c"Self", pcx);
-    if conv == CONV_SINK {
-        pcx.nodes[n as usize].b = name;
-        pcx.nodes[n as usize].c = 1;
-        pcx.nodes[n as usize].p |= CONV_NEW | CONV_SINK;
-    } else {
-        let t = new_node(NodeKind::TyPtr, start, prev_end(pcx), pcx);
-        pcx.nodes[t as usize].a = name;
-        pcx.nodes[t as usize].p |= CONV_NEW | NODE_REF;
-        if conv == CONV_INOUT {
-            pcx.nodes[t as usize].p |= NODE_REF_MUT;
-            pcx.nodes[n as usize].p |= CONV_INOUT;
-        }
-        pcx.nodes[n as usize].b = t;
-        pcx.nodes[n as usize].p |= CONV_NEW;
-    }
-    pcx.nodes[n as usize].end = prev_end(pcx);
-    n
+    conv_error(c"conv.mode_order", start, end, &buf_copy(msg),
+        b"a parameter has no `let`: 'x: T' takes the value, 'x: &T' borrows it, 'x: &mut T' may change the caller's (called 'f(&mut v)')",
+        &buf_copy(new), pcx);
 }
 
 // `&self`, `&mut self`, `self` without a type (0.14): what vole writes.
 // (0.15) Rust's `fmt(&self, f: &mut Formatter)`: Display's and Debug's.
-fn self_param_error(message: *mut u8, pcx: &mut Ctx<Comp>) -> ! {
+fn self_param_error(message: *const u8, pcx: &mut Ctx<Comp>) -> ! {
     err_begin(cur_start(pcx), pcx);
     err_str(message, pcx);
     let mut formatter = false;
@@ -246,7 +177,7 @@ fn impl_bounds(pcx: &mut Ctx<Comp>) -> i64 {
 // RULE: D21.1, D21.4 (0.27.2.1) A function's result type after `->`: `impl
 // Tr + ..` at its top in a rust-edition file is the opaque result, a TyName
 // with TY_OPAQUE (a = its text, h = the bounds; front/opaque.vl); an `impl`
-// anywhere else in it is type.impl-position's (edition.later).
+// anywhere else in it is type.impl-position's (syntax.later).
 pub fn parse_fn_result(pcx: &mut Ctx<Comp>) -> i64 {
     if !eat(Tok::Arrow, pcx) {
         return 0;
@@ -300,24 +231,24 @@ fn impl_param_name(start: i64, end: i64, pcx: &mut Ctx<Comp>) -> i64 {
             blank = true;
             continue;
         }
-        if blank && buf_slice(b).len() > 0 {
+        if blank && (buf_len(b) as usize) > 0 {
             buf_bytes(b, b" ");
         }
         blank = false;
         buf_byte(b, c);
     }
-    let base = intern(buf_slice(b), pcx);
+    let base = intern_buf(b, pcx);
     let mut k: i64 = 1;
     loop {
         let mut sym = base;
         if k > 1 {
             let named = buf_new();
             buf_fmt(named, format_args("{} #{k}", str::from_utf8(sym_text(base, pcx)).unwrap()));
-            sym = intern(buf_slice(named), pcx);
+            sym = intern_buf(named, pcx);
         }
         let mut taken = false;
-        for i in pcx.impl_mark..pcx.impl_hidden.count {
-            if pcx.nodes[pcx.impl_hidden.get(i) as usize].a == sym {
+        for i in pcx.impl_mark..pcx.impl_hidden.len() as i64 {
+            if pcx.nodes[pcx.impl_hidden[i as usize] as usize].a == sym {
                 taken = true;
             }
         }
@@ -333,7 +264,7 @@ fn impl_param_name(start: i64, end: i64, pcx: &mut Ctx<Comp>) -> i64 {
 pub fn begin_impl_params(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let saved = pcx.impl_owner;
     pcx.impl_owner = n;
-    pcx.impl_mark = pcx.impl_hidden.count;
+    pcx.impl_mark = pcx.impl_hidden.len() as i64;
     saved
 }
 
@@ -341,11 +272,11 @@ pub fn begin_impl_params(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // generics.
 pub fn end_impl_params(n: i64, saved: i64, pcx: &mut Ctx<Comp>) {
     pcx.impl_owner = saved;
-    if pcx.impl_hidden.count == pcx.impl_mark {
+    if pcx.impl_hidden.len() as i64 == pcx.impl_mark {
         return;
     }
     let old = pcx.nodes[n as usize].g;
-    let first = pcx.impl_hidden.get(pcx.impl_mark);
+    let first = pcx.impl_hidden[pcx.impl_mark as usize];
     let g = new_node(NodeKind::Generics, if old != 0 { pcx.nodes[old as usize].start }
         else { pcx.nodes[first as usize].start },
         if old != 0 { pcx.nodes[old as usize].end } else { pcx.nodes[first as usize].end }, pcx);
@@ -356,11 +287,11 @@ pub fn end_impl_params(n: i64, saved: i64, pcx: &mut Ctx<Comp>) {
         }
         pcx.nodes[g as usize].a = pcx.nodes[old as usize].a;
     }
-    for i in pcx.impl_mark..pcx.impl_hidden.count {
-        list_push(pcx.impl_hidden.get(i), pcx);
+    for i in pcx.impl_mark..pcx.impl_hidden.len() as i64 {
+        list_push(pcx.impl_hidden[i as usize], pcx);
     }
     list_end(g, mark, pcx);
-    pcx.impl_hidden.count = pcx.impl_mark;
+    pcx.impl_hidden.truncate(pcx.impl_mark as usize);
     pcx.nodes[n as usize].g = g;
 }
 
@@ -383,9 +314,7 @@ pub fn at_where(pcx: &Ctx<Comp>) -> bool {
     if !at(Tok::Reserved, pcx) {
         return false;
     }
-    // UNSAFE: TOKS is the lexer's raw token array (no safe view of it in the parser)
-    // SAFETY: P is a token of the array: the parser stops at its Eof, which is last
-    let sym = unsafe { pcx.toks[pcx.p as usize].value } as i64;
+    let sym = (pcx.toks[pcx.p as usize].value) as i64;
     sym_text(sym, pcx) == b"where"
 }
 
@@ -393,7 +322,7 @@ pub fn at_where(pcx: &Ctx<Comp>) -> bool {
 // impl block are being parsed.
 pub fn reset_item_state(pcx: &mut Ctx<Comp>) {
     pcx.impl_owner = 0;
-    pcx.impl_hidden.count = 0;
+    pcx.impl_hidden.clear();
     pcx.where_outer = 0;
     pcx.param_type = false;
 }
@@ -436,8 +365,9 @@ pub fn parse_where(generics: i64, outer: i64, pcx: &mut Ctx<Comp>) {
                 break;
             }
         }
-        let had = pcx.scratch.count;
-        if crate::front::parser::rust::drop_sized(mark, start, pcx) && pcx.scratch.count == mark {
+        let had = pcx.scratch.len() as i64;
+        if crate::front::parser::rust::drop_sized(mark, start, pcx)
+            && pcx.scratch.len() as i64 == mark {
             // (0.27.0: `Self: Sized`, which says nothing)
             // RULE: F12.4 (0.27.6: but a trait function with it is not one
             // of an impl for an unsized Self)
@@ -465,7 +395,7 @@ pub fn parse_where(generics: i64, outer: i64, pcx: &mut Ctx<Comp>) {
                 owner: owner, subject: left, bounds: h,
             }, pcx);
         } else if param == 0 {
-            pcx.scratch.count = mark;
+            pcx.scratch.truncate(mark as usize);
             where_unsupported(start, left_end, prev_end(pcx), pcx);
         } else {
             join_bounds(param, mark, bstart, pcx);
@@ -513,7 +443,7 @@ fn where_param(left: i64, generics: i64, outer: i64, pcx: &Ctx<Comp>) -> i64 {
 
 // The bounds SCRATCH[mark..] after those `param` has (its h).
 fn join_bounds(param: i64, mark: i64, pos: i64, pcx: &mut Ctx<Comp>) {
-    let end = pcx.scratch.count;
+    let end = pcx.scratch.len() as i64;
     let old = pcx.nodes[param as usize].h;
     if old != 0 {
         for i in 0..pcx.nodes[old as usize].count {
@@ -521,13 +451,13 @@ fn join_bounds(param: i64, mark: i64, pos: i64, pcx: &mut Ctx<Comp>) {
         }
     }
     for i in mark..end {
-        list_push(pcx.scratch.get(i), pcx);
+        list_push(pcx.scratch[i as usize], pcx);
     }
-    let count = pcx.scratch.count - end;
+    let count = pcx.scratch.len() as i64 - end;
     for i in 0..count {
-        pcx.scratch.set(mark + i, pcx.scratch.get(end + i));
+        pcx.scratch[(mark + i) as usize] = pcx.scratch[(end + i) as usize];
     }
-    pcx.scratch.count = mark + count;
+    pcx.scratch.truncate((mark + count) as usize);
     let n = new_node(NodeKind::Generics, if old != 0 { pcx.nodes[old as usize].start } else { pos },
         0, pcx);
     list_end(n, mark, pcx);

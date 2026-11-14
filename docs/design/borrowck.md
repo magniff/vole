@@ -1429,7 +1429,7 @@ outside the holes named below.
 - R4 Closure bodies through a raw env (D10.4) and closure parameters
   not late-bound (D10.5). Reason: deferred to 0.27.2 with `Fn*`.
   *Closed in 0.27.2* (D19.4, D19.10, D20.3).
-- R5 `edition.lenient` leniencies of 0.19's meanings (a `&T` of a plain
+- R5 `type.ref-value` leniencies of 0.19's meanings (a `&T` of a plain
   value where `T` goes; a place where `&T` goes): closed by ir271 in
   0.27.1; after it, none.
 - R6 `fn` pointer types carry no late-bound regions (D3.3). Reason: no
@@ -1517,7 +1517,15 @@ outside the holes named below.
   drops `mk()`'s value before the block). MVS keeps them to the end of
   the statement. Still the statement's in both editions: a match arm's
   body and a lazy `&&`/`||`'s right operand, which Rust also ends at
-  their own evaluation.
+  their own evaluation. (0.29.0) An `if let`'s scrutinee is Rust 2024's
+  ("if let temporary scope"): its temporaries drop before the `else`
+  block, and at the end of the matching block; a let-else's before its
+  else block (every edition's rule). A borrow a scrutinee's guard holds
+  ends there: `if let Some(n) = lock(c).peek() { .. } else { c.n += 1; }`
+  is accepted (case `rust_b_iflet_else_temp_borrow`), and a value of
+  the matching block that borrows from a scrutinee temporary is
+  `borrowck.dropped_borrowed`, rustc 2024's E0716. A `match` keeps its
+  scrutinee's temporaries to the end of its statement.
 - L4 NLL only: problem case 3 (a conditional return of a borrow) is
   rejected as rustc's NLL does; the location-sensitive solve is
   0.27.4's. Also rustc's NLL limitations shared on purpose: one region
@@ -1635,7 +1643,7 @@ call).
 | 3 | `RO_CALL` per callee region, a per-call base | D3.2, D3.6 | ir271 M1 |
 | 4 | the variance table `var(S, i)` | D5.3 | ir271 M1 |
 | 5 | the regions dump (`--emit-places=regions`), §16 | — | ir271 M1 (format), bc271 M1 (content) |
-| 6 | `&&` token; `edition.lenient` closed (R5) | — | ir271 M1 |
+| 6 | `&&` token; `type.ref-value` closed (R5) | — | ir271 M1 |
 | 7 | `BK_RAW` mutability (`*const`/`*mut` distinct) | D2.2 | ir271 M2 |
 | 8 | captures as borrows; the closure call's env reborrow | D10.2-10.3 | ir271 M2 |
 | 9 | explicit reborrow `&'new mut (*Q)` for a `&mut` passed on; the verifier's "copy of an exclusive reference" | D3.6 | ir271 M2 |
@@ -2287,7 +2295,7 @@ instance: `front/opaque.vl`, a distinct type whose underlying type is the
 hidden type `H_f` once `f`'s body is checked. `slots(O_f) = slots(H_f)`;
 `needs_drop(O_f) = needs_drop(H_f)`; the code generators see `H_f`
 (distinct types are erased). A trait method's `-> impl Tr`, `Option<impl
-Tr>` and an `impl Tr` anywhere else are `edition.later: impl_trait_nested
+Tr>` and an `impl Tr` anywhere else are `syntax.later: impl_trait_nested
 (0.29)`.
 
 **D21.2 (the hidden type and the member choice).** `H_f` is the type of

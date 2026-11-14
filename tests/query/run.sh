@@ -216,15 +216,17 @@ n=$(printf '%s\n' "$out" | grep -c "^compiler/src/[a-z_0-9/]*\.vl${TAB}[0-9]*\$"
     && printf '%s\n' "$err" | head -1 | grep -q '^note query.truncated: [0-9]* refs in [0-9]* files$' \
     && [ "$(printf '%s\n' "$err" | grep -c '^try: .* query refs IntVec::push --')" = 3 ] && ok=1
 check self_refs_budget "$ok" "$(printf '%s\n' "$out" "$err" | tail -6)"
-out=$("$COMPILER" query refs IntVec::push --in compiler/src/base/mod.vl 2>&1)
+# (0.29: buf_reserve, which base/mod.vl still calls; IntVec::push has no
+# caller left there)
+out=$("$COMPILER" query refs base::buf_reserve --in compiler/src/base/mod.vl 2>&1)
 ok=0
 n=$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}call${TAB}base::[A-Za-z_:]*${TAB}")
 [ "$n" -ge 1 ] && printf '%s\n' "$out" | head -1 | grep -q '^# compiler/src/base/mod.vl$' \
-    && printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}def${TAB}pub fn push(" && ok=1
+    && printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}def${TAB}pub fn buf_reserve(" && ok=1
 check self_refs_in_file "$ok" "$(printf '%s\n' "$out" | head -5)"
-out=$("$COMPILER" query refs IntVec::push --in gvn --limit 5 2>&1)
+out=$("$COMPILER" query refs ir_val --in gvn --limit 5 2>&1)
 ok=0
-[ "$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}call${TAB}middle::gvn::")" = 5 ] \
+[ "$(printf '%s\n' "$out" | grep -cE "^[0-9]*:[0-9]*${TAB}(call|use)${TAB}middle::gvn")" = 5 ] \
     && printf '%s\n' "$out" | grep -q '^note query.truncated: showing 5 of [0-9]* refs$' && ok=1
 check self_refs_in_module_limit "$ok" "$out"
 n=$("$COMPILER" query refs IntVec::push --all 2>/dev/null | grep -c "^[0-9]*:[0-9]*${TAB}")
@@ -242,7 +244,7 @@ check self_def_variant "$ok" "$out"
 out=$("$COMPILER" query items gvn 2>&1)
 ok=0
 printf '%s\n' "$out" | head -1 | grep -q "^# crate::middle::gvn${TAB}compiler/src/middle/gvn.vl\$" \
-    && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}fn${TAB}pub fn run_gvn(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool\$" && ok=1
+    && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}fn${TAB}pub fn run_gvn(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool\$" && ok=1
 check self_items "$ok" "$(printf '%s\n' "$out" | head -5)"
 # More than 5 definitions for show: their paths, and an error.
 out=$("$COMPILER" query show .name 2>&1)
@@ -253,7 +255,7 @@ ok=0
     && printf '%s\n' "$out" | grep -q '^try: .* query show crate::[a-z_0-9:]*::[A-Za-z]*\.name$' && ok=1
 check self_show_ambiguous "$ok" "$out"
 # A long source line is cut at 100 bytes, with `…`.
-out=$("$COMPILER" query refs IntVec::push --in vectorize --all 2>&1 | awk -F "$TAB" 'length($3) > 100')
+out=$("$COMPILER" query refs ir_val --in vectorize --all 2>&1 | awk -F "$TAB" 'length($3) > 100')
 ok=0
 [ -z "$out" ] && ok=1
 check self_line_max "$ok" "$out"
@@ -313,11 +315,11 @@ check std_show_by_file "$ok" "$(printf '%s\n' "$out" | head -3)"
 out=$("$COMPILER" check --std-tree compiler/std 2>&1)
 rc=$?
 ok=0
-# (0.18.1: a clean check says so in one line; 0.25.3: but for one
-# unsafe.unjustified warning, the compiler's legacy unsafe, which
-# docs/unsafe-baseline.md counts)
-clean=$(printf '%s\n' "$out" | grep -v 'warning\[unsafe\.unjustified\]' | sed 's/^ok: 0 errors, 1 warning in /ok: 0 errors in /')
-[ $rc -eq 0 ] && [ "$clean" = "ok: 0 errors in compiler/src/main.vl" ] && ok=1
+# (0.18.1: a clean check says so in one line; 0.29: with no warning: the
+# compiler's source has no unsafe site without its comments)
+clean=$(printf '%s\n' "$out" | sed -e 's/ ([0-9]* files, 0 shaders)$//')
+# (0.29: the line ends with what was read, ` (N files, 0 shaders)`)
+[ $rc -eq 0 ] && [ "$clean" = "ok: 0 errors in compiler/src/main.vl" ] && printf '%s\n' "$out" | grep -q '^ok: .* in compiler/src/main.vl ([0-9]* files, 0 shaders)$' && ok=1
 check std_tree_checks "$ok" "$out"
 bad=""
 for kind in $("$COMPILER" query examples | cut -f1); do
@@ -341,7 +343,7 @@ check self_similar "$ok" "$(printf '%s\n' "$out" | grep '^// ' | head -8)"
 # static of a std submodule, which `query def` does not take back yet, a
 # 0.20.1 item; aarch64-linux's argv statics showed it; nor, 0.26.1, the
 # places IR's drop shims, `vole.$drop.T`: glue with no item of its own;
-# nor, 0.28.0, std2's methods of the integer types, `vole.Ty.max`: the
+# nor, 0.28.0, std's methods of the integer types, `vole.Ty.max`: the
 # compiler's `#[builtin_impls]` text, `<builtin>`, which the tools do not
 # index yet),
 # each given to `query def` (positions and modules to `show` and `items`).

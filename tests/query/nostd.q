@@ -12,7 +12,7 @@ $ show std::mem::swap
 // std::mem::swap	<std>:1392-1406
 // use std::mem::swap;
 // Exchanges the values of two places (MVS: two inout parameters).
-// std2: changed: takes &mut T twice
+// std: changed: takes &mut T twice
 #[effects(unsafe, T)]
 pub fn swap<T>(a: &mut T, b: &mut T) {
     // UNSAFE: raw moves (an assignment would drop the old value).
@@ -22,7 +22,10 @@ pub fn swap<T>(a: &mut T, b: &mut T) {
         let pa = a as *mut T;
         let pb = b as *mut T;
         let t = crate::ptr::read(pa as *const T);
-        crate::ptr::copy_nonoverlapping(pb as *const T, pa, 1);
+        // (0.29: a read and a write, not ptr::copy_nonoverlapping of one
+        // element, which is a call and its tests of the count in a build
+        // that does not inline: a sort's swaps at -O0)
+        crate::ptr::write(pa, crate::ptr::read(pb as *const T));
         crate::ptr::write(pb, t);
     }
 }

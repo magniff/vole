@@ -1,8 +1,9 @@
 // The diff of an edit, as --dry-run and `query diff` print it.
 
-use crate::base::{IntVec, buf_byte, buf_bytes, buf_int, buf_str, strlen};
+use crate::base::{buf_byte, buf_bytes, buf_int, buf_str, c_bytes};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
+use crate::front::modules::file_made;
 use crate::tools::ctx::Tcx;
 use crate::tools::proc::same_bytes;
 use crate::tools::query::c_slice;
@@ -17,7 +18,7 @@ use crate::tools::query::refs::file_text;
 // lines around each changed run are not printed).
 
 // The lines of text: their starts, and the end.
-fn split_lines(text: &[u8], out: &mut IntVec) {
+fn split_lines(text: &[u8], out: &mut Vec<i64, Comp>) {
     let mut i: i64 = 0;
     while i < text.len() as i64 {
         out.push(i);
@@ -30,23 +31,19 @@ fn split_lines(text: &[u8], out: &mut IntVec) {
 }
 
 // Line k of text (lines starting at starts), without its newline.
-fn line_text(text: &[u8], starts: IntVec, k: i64) -> &[u8] {
-    unsafe {
-        let a = (*starts.data.add(k as usize));
-        let mut b = (*starts.data.add((k + 1) as usize));
-        if b > a && b <= text.len() as i64 && text[(b - 1) as usize] == b'\n' {
-            b -= 1;
-        }
-        &text[a as usize..b as usize]
+fn line_text<'a>(text: &'a [u8], starts: &[i64], k: i64) -> &'a [u8] {
+    let a = (starts[k as usize]);
+    let mut b = (starts[(k + 1) as usize]);
+    if b > a && b <= text.len() as i64 && text[(b - 1) as usize] == b'\n' {
+        b -= 1;
     }
+    &text[a as usize..b as usize]
 }
 
 // Whether line k of text ends without a newline (the file's last).
-fn no_newline(text: &[u8], starts: IntVec, k: i64) -> bool {
-    unsafe {
-        let b = (*starts.data.add((k + 1) as usize));
-        b == text.len() as i64 && (b == 0 || text[(b - 1) as usize] != b'\n')
-    }
+fn no_newline(text: &[u8], starts: &[i64], k: i64) -> bool {
+    let b = (starts[(k + 1) as usize]);
+    b == text.len() as i64 && (b == 0 || text[(b - 1) as usize] != b'\n')
 }
 
 // The diff of old and new (the texts of one file), appended to out;
@@ -83,115 +80,124 @@ pub fn diff_moved(out: i64, from: &[u8], to: &[u8], old: &[u8], new: &[u8], tcx:
 
 // A path as printed (without a leading `./`).
 pub fn shown_path(path: *mut u8) -> &'static [u8] {
+    // UNSAFE: strlen is C's; the path is a C string, read and seen as a
+    // slice.
+    // SAFETY: path must be a C string that is never freed or written again
+    // (a file's path, a word of the command line, a buffer's block that is
+    // not freed); p[1] is read only when p[0] is '.', not the 0, and p moves
+    // past `./` only; the slice covers the bytes before the 0. The 'static
+    // is that promise of the caller's, not checked.
     unsafe {
         let mut p = path;
         while (*p.add(0)) == b'.' && (*p.add(1)) == b'/' {
             p = p.add(2);
         }
-        std::slice::from_raw_parts(p.add((0) as usize), (strlen(p) as i64 - (0)) as usize)
+        c_bytes(p)
     }
 }
 
 // The hunks of the diff of old and new (see diff_texts).
 fn diff_lines(out: i64, old: &[u8], new: &[u8], tcx: &mut Tcx<Comp>) {
-    unsafe {
-        let mut a = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut b = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        split_lines(old, &mut a);
-        split_lines(new, &mut b);
-        let na = a.count - 1;
-        let nb = b.count - 1;
-        // The common head and tail.
-        let mut head: i64 = 0;
-        while head < na && head < nb
-            && same_bytes(line_text(old, a, head), line_text(new, b, head))
-            && no_newline(old, a, head) == no_newline(new, b, head) {
-            head += 1;
-        }
-        let mut tail: i64 = 0;
-        while tail < na - head && tail < nb - head
-            && same_bytes(line_text(old, a, na - 1 - tail), line_text(new, b, nb - 1 - tail))
-            && no_newline(old, a, na - 1 - tail) == no_newline(new, b, nb - 1 - tail) {
-            tail += 1;
-        }
-        let m = na - head - tail;
-        let n = nb - head - tail;
-        // The middle: an LCS table when it is small; else, with as many
-        // lines on both sides (a rewrite of lines in place), line by line;
-        // else the lines in step, resynchronized after each change.
-        let mut ops = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        if m * n <= 4000000 {
-            lcs_ops(old, a, new, b, head, m, n, &mut ops);
-        } else if m == n {
-            let mut i: i64 = 0;
-            while i < m {
-                if same_bytes(line_text(old, a, head + i), line_text(new, b, head + i)) {
-                    ops.push(0);
-                    i += 1;
-                    continue;
-                }
-                let mut e = i;
-                while e < m
-                    && !same_bytes(line_text(old, a, head + e), line_text(new, b, head + e)) {
-                    e += 1;
-                }
-                for x in i..e {
-                    ops.push(-(head + x) - 1);
-                }
-                for x in i..e {
-                    ops.push(head + x + 1);
-                }
-                i = e;
-            }
-        } else {
-            resync_ops(old, a, new, b, head, m, n, &mut ops);
-        }
-        // ops: -(i + 1) removes old line i, (j + 1) adds new line j, 0
-        // keeps a line; hunks are the runs between kept lines.
-        let mut oi = head;
-        let mut nj = head;
-        let mut k: i64 = 0;
-        while k < ops.count {
-            if (*ops.data.add(k as usize)) == 0 {
-                oi += 1;
-                nj += 1;
-                k += 1;
+    let mut a: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut b: Vec<i64, Comp> = Vec::new_in(Comp {});
+    split_lines(old, &mut a);
+    split_lines(new, &mut b);
+    let na = a.len() as i64 - 1;
+    let nb = b.len() as i64 - 1;
+    // The common head and tail.
+    let mut head: i64 = 0;
+    while head < na && head < nb
+        && same_bytes(line_text(old, a.as_slice(), head), line_text(new, b.as_slice(), head))
+        && no_newline(old, a.as_slice(), head) == no_newline(new, b.as_slice(), head) {
+        head += 1;
+    }
+    let mut tail: i64 = 0;
+    while tail < na - head && tail < nb - head
+        && same_bytes(line_text(old, a.as_slice(), na - 1 - tail),
+            line_text(new, b.as_slice(), nb - 1 - tail))
+        && no_newline(old, a.as_slice(), na - 1 - tail)
+        == no_newline(new, b.as_slice(), nb - 1 - tail) {
+        tail += 1;
+    }
+    let m = na - head - tail;
+    let n = nb - head - tail;
+    // The middle: an LCS table when it is small; else, with as many
+    // lines on both sides (a rewrite of lines in place), line by line;
+    // else the lines in step, resynchronized after each change.
+    let mut ops: Vec<i64, Comp> = Vec::new_in(Comp {});
+    if m * n <= 4000000 {
+        lcs_ops(old, a.as_slice(), new, b.as_slice(), head, m, n, &mut ops);
+    } else if m == n {
+        let mut i: i64 = 0;
+        while i < m {
+            if same_bytes(line_text(old, a.as_slice(), head + i),
+                line_text(new, b.as_slice(), head + i)) {
+                ops.push(0);
+                i += 1;
                 continue;
             }
-            let mut end = k;
-            let mut dels: i64 = 0;
-            let mut adds: i64 = 0;
-            while end < ops.count && (*ops.data.add(end as usize)) != 0 {
-                if (*ops.data.add(end as usize)) < 0 { dels += 1; } else { adds += 1; }
-                end += 1;
+            let mut e = i;
+            while e < m
+                && !same_bytes(line_text(old, a.as_slice(), head + e),
+                    line_text(new, b.as_slice(), head + e)) {
+                e += 1;
             }
-            put_hunk_header(out, oi, dels, nj, adds, tcx);
-            for x in k..end {
-                if (*ops.data.add(x as usize)) < 0 {
-                    let i = -(*ops.data.add(x as usize)) - 1;
-                    buf_byte(out, b'-');
-                    buf_bytes(out, line_text(old, a, i));
-                    buf_byte(out, b'\n');
-                    if no_newline(old, a, i) {
-                        buf_str(out, c"\\ No newline at end of file\n");
-                    }
-                }
+            for x in i..e {
+                ops.push(-(head + x) - 1);
             }
-            for x in k..end {
-                if (*ops.data.add(x as usize)) > 0 {
-                    let j = (*ops.data.add(x as usize)) - 1;
-                    buf_byte(out, b'+');
-                    buf_bytes(out, line_text(new, b, j));
-                    buf_byte(out, b'\n');
-                    if no_newline(new, b, j) {
-                        buf_str(out, c"\\ No newline at end of file\n");
-                    }
-                }
+            for x in i..e {
+                ops.push(head + x + 1);
             }
-            oi += dels;
-            nj += adds;
-            k = end;
+            i = e;
         }
+    } else {
+        resync_ops(old, a.as_slice(), new, b.as_slice(), head, m, n, &mut ops);
+    }
+    // ops: -(i + 1) removes old line i, (j + 1) adds new line j, 0
+    // keeps a line; hunks are the runs between kept lines.
+    let mut oi = head;
+    let mut nj = head;
+    let mut k: i64 = 0;
+    while k < ops.len() as i64 {
+        if (ops[k as usize]) == 0 {
+            oi += 1;
+            nj += 1;
+            k += 1;
+            continue;
+        }
+        let mut end = k;
+        let mut dels: i64 = 0;
+        let mut adds: i64 = 0;
+        while end < ops.len() as i64 && (ops[end as usize]) != 0 {
+            if (ops[end as usize]) < 0 { dels += 1; } else { adds += 1; }
+            end += 1;
+        }
+        put_hunk_header(out, oi, dels, nj, adds, tcx);
+        for x in k..end {
+            if (ops[x as usize]) < 0 {
+                let i = -(ops[x as usize]) - 1;
+                buf_byte(out, b'-');
+                buf_bytes(out, line_text(old, a.as_slice(), i));
+                buf_byte(out, b'\n');
+                if no_newline(old, a.as_slice(), i) {
+                    buf_str(out, c"\\ No newline at end of file\n");
+                }
+            }
+        }
+        for x in k..end {
+            if (ops[x as usize]) > 0 {
+                let j = (ops[x as usize]) - 1;
+                buf_byte(out, b'+');
+                buf_bytes(out, line_text(new, b.as_slice(), j));
+                buf_byte(out, b'\n');
+                if no_newline(new, b.as_slice(), j) {
+                    buf_str(out, c"\\ No newline at end of file\n");
+                }
+            }
+        }
+        oi += dels;
+        nj += adds;
+        k = end;
     }
 }
 
@@ -220,13 +226,14 @@ fn put_range(out: i64, first: i64, count: i64) {
 // they are too many for lcs_ops (an edit of lines far apart in a large
 // file): equal lines are kept; after a difference, the nearest pair of
 // equal lines (the fewest lines skipped, at most 400) is where both go on.
-fn resync_ops(old: &[u8], a: IntVec, new: &[u8], b: IntVec, head: i64, m: i64, n: i64,
-    ops: &mut IntVec) {
+fn resync_ops(old: &[u8], a: &[i64], new: &[u8], b: &[i64], head: i64, m: i64, n: i64,
+    ops: &mut Vec<i64, Comp>) {
     let mut x: i64 = 0;
     let mut y: i64 = 0;
     while x < m || y < n {
         if x < m && y < n
-            && same_bytes(line_text(old, a, head + x), line_text(new, b, head + y)) {
+            && same_bytes(line_text(old, a, head + x),
+                line_text(new, b, head + y)) {
             ops.push(0);
             x += 1;
             y += 1;
@@ -265,50 +272,48 @@ fn resync_ops(old: &[u8], a: IntVec, new: &[u8], b: IntVec, head: i64, m: i64, n
 
 // The edit script of the m old lines and n new lines after `head`: a
 // longest common subsequence, as ops (see diff_texts).
-fn lcs_ops(old: &[u8], a: IntVec, new: &[u8], b: IntVec, head: i64, m: i64, n: i64,
-    ops: &mut IntVec) {
-    unsafe {
-        // len[i][j]: the LCS of old lines i.. and new lines j.. (of the middle).
-        let w = n + 1;
-        let len = crate::base::alloc_array::<i32>((m + 1) * w);
-        let mut i = m - 1;
-        while i >= 0 {
-            let mut j = n - 1;
-            while j >= 0 {
-                if same_bytes(line_text(old, a, head + i), line_text(new, b, head + j)) {
-                    (*len.add((i * w + j) as usize)) = (*len.add(((i + 1) * w + j + 1) as usize)) + 1;
-                }
-                else if (*len.add(((i + 1) * w + j) as usize))
-                    >= (*len.add((i * w + j + 1) as usize)) {
-                    (*len.add((i * w + j) as usize)) = (*len.add(((i + 1) * w + j) as usize));
-                } else {
-                    (*len.add((i * w + j) as usize)) = (*len.add((i * w + j + 1) as usize));
-                }
-                j -= 1;
+fn lcs_ops(old: &[u8], a: &[i64], new: &[u8], b: &[i64], head: i64, m: i64, n: i64,
+    ops: &mut Vec<i64, Comp>) {
+    // len[i][j]: the LCS of old lines i.. and new lines j.. (of the middle).
+    let w = n + 1;
+    let mut len: Vec<i32, Comp> = Vec::new_in(Comp {});
+    len.resize(((m + 1) * w) as usize, 0);
+    let mut i = m - 1;
+    while i >= 0 {
+        let mut j = n - 1;
+        while j >= 0 {
+            if same_bytes(line_text(old, a, head + i), line_text(new, b, head + j)) {
+                (len[(i * w + j) as usize]) = (len[((i + 1) * w + j + 1) as usize]) + 1;
             }
-            i -= 1;
-        }
-        let mut x: i64 = 0;
-        let mut y: i64 = 0;
-        while x < m || y < n {
-            if x < m && y < n
-                && same_bytes(line_text(old, a, head + x), line_text(new, b, head + y)) {
-                ops.push(0);
-                x += 1;
-                y += 1;
-            }
-            else if y >= n
-                || (x < m
-                    && (*len.add(((x + 1) * w + y) as usize))
-                    >= (*len.add((x * w + y + 1) as usize))) {
-                ops.push(-(head + x) - 1);
-                x += 1;
+            else if (len[((i + 1) * w + j) as usize])
+                >= (len[(i * w + j + 1) as usize]) {
+                (len[(i * w + j) as usize]) = (len[((i + 1) * w + j) as usize]);
             } else {
-                ops.push(head + y + 1);
-                y += 1;
+                (len[(i * w + j) as usize]) = (len[(i * w + j + 1) as usize]);
             }
+            j -= 1;
         }
-        crate::base::free(len as *mut u8);
+        i -= 1;
+    }
+    let mut x: i64 = 0;
+    let mut y: i64 = 0;
+    while x < m || y < n {
+        if x < m && y < n
+            && same_bytes(line_text(old, a, head + x), line_text(new, b, head + y)) {
+            ops.push(0);
+            x += 1;
+            y += 1;
+        }
+        else if y >= n
+            || (x < m
+                && (len[((x + 1) * w + y) as usize])
+                >= (len[(x * w + y + 1) as usize])) {
+            ops.push(-(head + x) - 1);
+            x += 1;
+        } else {
+            ops.push(head + y + 1);
+            y += 1;
+        }
     }
 }
 
@@ -324,24 +329,22 @@ fn plain_path(p: &[u8]) -> &[u8] {
 // The file of path: an index into FILES, -2 for a file the edit makes,
 // -1 for neither.
 pub fn file_by_path(path: &[u8], tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let p = plain_path(path);
-        for i in 0..tcx.ch_file.count {
-            let f = (*tcx.ch_file.data.add(i as usize));
-            if same_bytes(file_text(f, pcx), p) {
-                return f;
-            }
+    let p = plain_path(path);
+    for i in 0..tcx.ch_file.len() as i64 {
+        let f = (tcx.ch_file[i as usize]);
+        if same_bytes(file_text(f, pcx), p) {
+            return f;
         }
-        for i in 0..tcx.new_path.count {
-            if same_bytes(plain_path(c_slice((*tcx.new_path.data.add(i as usize)) as *mut u8)), p) {
-                return -2;
-            }
-        }
-        for f in 0..pcx.files.len() as i64 {
-            if (*pcx.files[f as usize].path.add(0)) != b'<' && same_bytes(file_text(f, pcx), p) {
-                return f;
-            }
-        }
-        -1
     }
+    for i in 0..tcx.new_path.len() as i64 {
+        if same_bytes(plain_path(&c_slice((tcx.new_path[i as usize]) as *mut u8)), p) {
+            return -2;
+        }
+    }
+    for f in 0..pcx.files.len() as i64 {
+        if !file_made(f, pcx) && same_bytes(file_text(f, pcx), p) {
+            return f;
+        }
+    }
+    -1
 }

@@ -9,7 +9,7 @@ use crate::back::codecache::{R_ATTRS, R_STATIC, cc_note};
 use crate::back::regalloc::intervals::calls_returns_twice;
 use crate::back::regalloc::prepare::layout_order;
 use crate::base::{
-    IntVec, STDERR, alloc_array, buf_byte, buf_int, buf_new, buf_str, buf_write_fd, free, intern_c,
+    STDERR, buf_byte, buf_int, buf_new, buf_str, buf_write_fd, find_sym, intern_c, sized_table,
     sym_name,
 };
 use crate::base::comp::Comp;
@@ -18,10 +18,16 @@ use crate::front::effects::{
     EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_PANIC,
     EFF_SYNC, EFF_THREAD, EFF_TLS, EFF_UNKNOWN, Effects, fn_effects,
 };
-use crate::front::effects::builtin::known_c_effects;
+use crate::front::effects::builtin::{
+    C_ALLOC, C_GLOBAL, C_IO, C_NONE, C_READS, c_class, c_symbol, known_c_effects,
+};
 use crate::front::types::{TY_BOOL, TY_U64, TY_U8, is_float, is_integer};
 use crate::gen0::gen::fn_is_global;
 use crate::gen0::target::rt_panic_sym;
+use crate::middle::callfacts::{
+    HW_ARGS, HW_ARG_SHIFT, HW_FAR, HW_KNOWN, HW_RESULT, HW_STATIC, mark_returning, no_writes,
+    note_writes, writes_bits, writes_hi, writes_lo,
+};
 use crate::middle::ctx::FnCtx;
 use crate::middle::fold::is_const;
 use crate::middle::gvn::{
@@ -29,8 +35,9 @@ use crate::middle::gvn::{
 };
 use crate::middle::inline::{ir_callee, param_operand};
 use crate::middle::ir::{
-    Op, Term, get_irfuncs, ir_append, ir_arg, ir_enter, ir_insert_before, ir_make, ir_new_slot,
-    ir_operand, ir_operand_count, ir_replace, ir_set_operand, ir_unlink, ir_val,
+    Op, Term, fn_block, fn_block_count, fn_entry, ir_append, ir_arg, ir_enter, ir_insert_before,
+    ir_make, ir_new_slot, ir_operand, ir_operand_count, ir_replace, ir_set_operand, ir_unlink,
+    ir_val,
 };
 use crate::middle::ir::Op::{
     Add, Call, CallC, CallI, Cmp, Const, Copy, FAddr, Load, Param, SAddr, Store,
@@ -65,56 +72,47 @@ const SPECULATE_COST: i64 = 64;
 const C_LIB_COST: i64 = 16;
 const ATTR_ALL: i64 = 63;
 
-// Per IR function: its attributes, and a bit per call operand that is a
-// pointer the function does not capture (nocapture: only dereferenced,
-// compared or passed to nocapture parameters). Valid when FN_ATTRS_DONE.
-static mut FN_ATTRS: *mut i64 = 0 as *mut i64;
-static mut FN_NOCAPTURE: *mut i64 = 0 as *mut i64;
-static mut FN_ATTRS_DONE: *mut i64 = 0 as *mut i64;
-
 pub fn init_attrs(pcx: &mut Ctx<Comp>) {
-    set_fn_attrs(alloc_array::<i64>(pcx.irfunc_count + 1));
-    set_fn_nocapture(alloc_array::<i64>(pcx.irfunc_count + 1));
-    set_fn_attrs_done(alloc_array::<i64>(pcx.irfunc_count + 1));
+    pcx.fn_attrs.reset(pcx.irfunc_count + 1, 0);
+    pcx.fn_nocapture.reset(pcx.irfunc_count + 1, 0);
+    pcx.fn_attrs_done.reset(pcx.irfunc_count + 1, 0);
     pcx.attrs_ready = true;
 }
 
 // What call v is known to do, as attribute bits (0: nothing known).
-pub fn call_attrs(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let op = (*cx.insts.add(v as usize)).op;
-        if op == Call {
-            let g = (*pcx.fn_ir.add((*cx.insts.add(v as usize)).imm as usize)) - 1;
-            if g < 0 {
-                // A C function (builtin.vl's table, or its declaration).
-                return front_attrs((*cx.insts.add(v as usize)).imm, pcx);
-            }
-            // (0.18.1: in the bottom-up phase, a callee whose component is
-            // below this one's: one being done on another thread is not)
-            // (0.27.8: FN_ATTRS_DONE[g] read only outside the phase, where
-            // fn_facts_ready reads `done`: in it, another component of this
-            // level may be writing it, infer_component_attrs)
-            if pcx.attrs_ready
-                && fn_facts_ready(cx, g,
-                    cx.cur_comp >= 0 || (*get_fn_attrs_done().add(g as usize)) != 0, pcx) {
-                // (0.18.1: for the code cache, back::codecache)
-                cc_note(cx, R_ATTRS, g, pcx);
-                return (*get_fn_attrs().add(g as usize))
-                    | front_attrs((*cx.insts.add(v as usize)).imm, pcx);
-            }
-            return front_attrs((*cx.insts.add(v as usize)).imm, pcx);
+pub fn call_attrs(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> i64 {
+    let op = (cx.insts[v as usize]).op;
+    if op == Call {
+        let g = (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) - 1;
+        if g < 0 {
+            // A C function (builtin.vl's table, or its declaration).
+            return front_attrs((cx.insts[v as usize]).imm, pcx);
         }
-        if op == CallC {
-            let name = (*cx.insts.add(v as usize)).imm;
-            if name == rt_panic_sym(pcx) {
-                // It prints its operands and exits: it writes nothing a later
-                // instruction could see, and nothing comes after it.
-                return ATTR_READNONE | ATTR_READONLY | ATTR_NORETURN;
-            }
-            return c_lib_attrs(cx, v, name, pcx);
+        // (0.18.1: in the bottom-up phase, a callee whose component is
+        // below this one's: one being done on another thread is not)
+        // (0.27.8: FN_ATTRS_DONE[g] read only outside the phase, where
+        // fn_facts_ready reads `done`: in it, another component of this
+        // level may be writing it, infer_component_attrs)
+        if pcx.attrs_ready
+            && fn_facts_ready(cx, g,
+                cx.cur_comp >= 0 || (pcx.fn_attrs_done.get(g)) != 0, pcx) {
+            // (0.18.1: for the code cache, back::codecache)
+            cc_note(cx, R_ATTRS, g, pcx);
+            return (pcx.fn_attrs.get(g))
+                | front_attrs((cx.insts[v as usize]).imm, pcx);
         }
-        0
+        return front_attrs((cx.insts[v as usize]).imm, pcx);
     }
+    if op == CallC {
+        let name = (cx.insts[v as usize]).imm;
+        if name == rt_panic_sym(pcx) {
+            // It prints its operands and exits: it writes nothing a later
+            // instruction could see, and nothing comes after it.
+            return ATTR_READNONE | ATTR_READONLY | ATTR_NORETURN;
+        }
+        return c_lib_attrs(cx, v, name, pcx);
+    }
+    0
 }
 
 // What the front end's effects (0.16, front/effects) say of function f (an
@@ -137,11 +135,55 @@ pub fn front_attrs(f: i64, pcx: &Ctx<Comp>) -> i64 {
     if table {
         attrs = c_lib_bounded(attrs);
     }
+    // (0.29) What a C function of the table writes (middle::callfacts).
+    if pcx.fns[f as usize].is_extern && pcx.fns[f as usize].effect_decl == 0 {
+        attrs = attrs | c_header_writes(f, pcx);
+    }
     if pcx.fns[f as usize].is_extern && (attrs & ATTR_WILLRETURN) == 0 {
         // (A C function that may not return may exit: `exit`, `abort`.)
-        attrs = attrs & ~ATTR_NOPANIC;
+        attrs = attrs & !ATTR_NOPANIC;
     }
     attrs
+}
+
+// (0.29) The Vec headers C function f (undeclared effects: std's table)
+// may write, as callfacts' bits: HW_KNOWN alone for one that writes no
+// memory of the program (strlen; C's allocator, which writes its own
+// blocks and tables), with the bit of each pointer parameter for one that
+// writes through the pointers it is given (memcpy, read, posix_memalign's
+// result); 0 (unknown) for the rest: a function not in the table, a
+// variadic one, one that waits for or starts a thread.
+fn c_header_writes(f: i64, pcx: &Ctx<Comp>) -> i64 {
+    let sym = c_symbol(f, pcx);
+    let class = c_class(sym, pcx);
+    if class == C_READS || class == C_ALLOC && sym != find_sym(b"posix_memalign", pcx) {
+        return HW_KNOWN;
+    }
+    if class != C_NONE && class != C_ALLOC && class != C_IO && class != C_GLOBAL
+        || pcx.fns[f as usize].variadic {
+        return 0;
+    }
+    let mut bits = HW_KNOWN;
+    for k in 0..pcx.fns[f as usize].param_count {
+        let t = (pcx.tlists[(pcx.fns[f as usize].params + k) as usize]);
+        if !is_integer(t) && !is_float(t) && t != TY_BOOL {
+            if k >= HW_ARGS {
+                return 0;
+            }
+            bits = bits | (1 << (HW_ARG_SHIFT + k));
+        }
+    }
+    bits
+}
+
+// (0.29) Whether C function f (undeclared effects) returns a block of C's
+// allocator (malloc, calloc, realloc...; not posix_memalign, whose result
+// is a status).
+pub fn c_allocates(f: i64, pcx: &Ctx<Comp>) -> bool {
+    pcx.fns[f as usize].is_extern && pcx.fns[f as usize].effect_decl == 0 && {
+        let sym = c_symbol(f, pcx);
+        c_class(sym, pcx) == C_ALLOC && sym != find_sym(b"posix_memalign", pcx)
+    }
 }
 
 // The attribute bits effects e give (READNONE too when `readnone_ok`: a C
@@ -170,33 +212,29 @@ fn effects_attrs(e: Effects, readnone_ok: bool) -> i64 {
 // Whether every parameter of function f is a number (an integer, a float,
 // a bool: no pointer, slice or function).
 fn numeric_params(f: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        if pcx.fns[f as usize].variadic {
+    if pcx.fns[f as usize].variadic {
+        return false;
+    }
+    for i in 0..pcx.fns[f as usize].param_count {
+        let t = (pcx.tlists[(pcx.fns[f as usize].params + i) as usize]);
+        if !is_integer(t) && !is_float(t) && t != TY_BOOL {
             return false;
         }
-        for i in 0..pcx.fns[f as usize].param_count {
-            let t = (*pcx.tlists.data.add((pcx.fns[f as usize].params + i) as usize));
-            if !is_integer(t) && !is_float(t) && t != TY_BOOL {
-                return false;
-            }
-        }
-        true
     }
+    true
 }
 
 // What C library function `sym` called by the lowering (CALLC v) does:
 // builtin.vl's table, READNONE when every argument is a float.
-fn c_lib_attrs(cx: &mut FnCtx, v: i64, sym: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut floats = true;
-        for i in 0..(*cx.insts.add(v as usize)).nargs {
-            if !is_float((*cx.argty.data.add(((*cx.insts.add(v as usize)).args + i) as usize))) {
-                floats = false;
-            }
+fn c_lib_attrs(cx: &mut FnCtx<Comp>, v: i64, sym: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut floats = true;
+    for i in 0..(cx.insts[v as usize]).nargs {
+        if !is_float((cx.argty[((cx.insts[v as usize]).args + i) as usize])) {
+            floats = false;
         }
-        let attrs = effects_attrs(known_c_effects(sym, pcx), floats);
-        if (attrs & ATTR_WILLRETURN) == 0 { 0 } else { c_lib_bounded(attrs) }
     }
+    let attrs = effects_attrs(known_c_effects(sym, pcx), floats);
+    if (attrs & ATTR_WILLRETURN) == 0 { 0 } else { c_lib_bounded(attrs) }
 }
 
 // (0.25) A C library function of builtin.vl's table that reads no memory
@@ -214,25 +252,25 @@ pub fn bounded_cost(attrs: i64) -> i64 {
 }
 
 // Whether call v may write memory other than the caller's private slots.
-pub fn call_writes(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> bool {
+pub fn call_writes(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> bool {
     call_attrs(cx, v, pcx) & ATTR_READONLY == 0
 }
 
 // Whether call v may read memory other than the caller's private slots.
-pub fn call_reads(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> bool {
+pub fn call_reads(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> bool {
     call_attrs(cx, v, pcx) & ATTR_READNONE == 0
 }
 
 // Whether call v may be removed when its result is unused: it reads and
 // writes nothing, always returns and cannot panic.
-pub fn call_removable(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> bool {
+pub fn call_removable(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> bool {
     let needed = ATTR_READNONE | ATTR_WILLRETURN | ATTR_NOPANIC;
     call_attrs(cx, v, pcx) & needed == needed
 }
 
 // Whether instruction v must stay even when its value is unused.
-pub fn has_effect(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> bool {
-    let op = unsafe { (*cx.insts.add(v as usize)).op };
+pub fn has_effect(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> bool {
+    let op = (cx.insts[v as usize]).op;
     if op.is_call() {
         return !call_removable(cx, v, pcx);
     }
@@ -242,127 +280,134 @@ pub fn has_effect(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> bool {
 // The attributes of function fi from its instructions, its callees' known
 // attributes, and FN_ATTRS of the functions of its own component (assumed
 // for now: the component is iterated). Also its nocapture bits.
-fn compute_attrs(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if calls_returns_twice(cx, fi, pcx) {
-            (*get_fn_nocapture().add(fi as usize)) = 0;
-            return 0;
-        }
-        find_escaping_slots(cx, fi, pcx);
-        layout_order(cx, fi);
-        let mut attrs = ATTR_ALL;
-        let mut returns = false;
-        // (0.25) Its instructions and its callees' costs, for BOUNDED.
-        let mut cost: i64 = 0;
-        for i in 0..cx.order.count {
-            let b = (*cx.order.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).term == Term::Ret {
-                returns = true;
-            }
-            // A cycle (an edge to a block not later in reverse post-order):
-            // the function may loop forever.
-            for k in 0..succ_count(cx, b) {
-                let s = succ(cx, b, k);
-                if (*cx.blocks.add(s as usize)).order >= 0
-                    && (*cx.blocks.add(s as usize)).order <= (*cx.blocks.add(b as usize)).order {
-                    attrs = attrs & ~(ATTR_WILLRETURN | ATTR_BOUNDED);
-                }
-            }
-            let mut v = (*cx.blocks.add(b as usize)).first;
-            while v != 0 {
-                let op = (*cx.insts.add(v as usize)).op;
-                if op != Const {
-                    cost += 1;
-                }
-                if op == Load {
-                    if reads_shared(cx, (*cx.insts.add(v as usize)).a) {
-                        attrs = attrs & ~ATTR_READNONE;
-                    }
-                } else if op == Store {
-                    if writes_shared(cx, (*cx.insts.add(v as usize)).a) {
-                        attrs = attrs & ~(ATTR_READNONE | ATTR_READONLY);
-                    }
-                } else if is_copy(cx, v, pcx) {
-                    let copy_dst_v = copy_dst(cx, v);
-                    if writes_shared(cx, copy_dst_v) {
-                        attrs = attrs & ~(ATTR_READNONE | ATTR_READONLY);
-                    }
-                    let copy_src_v = copy_src(cx, v);
-                    if reads_shared(cx, copy_src_v) {
-                        attrs = attrs & ~ATTR_READNONE;
-                    }
-                } else if is_barrier(cx, v) {
-                    // (0.21) An atomic or a fence: shared memory read and
-                    // written, other threads synchronized with.
-                    attrs = attrs & ~(ATTR_READNONE | ATTR_READONLY);
-                } else if op.is_call() {
-                    let mut known = call_attrs(cx, v, pcx);
-                    if op == Call {
-                        let g = (*pcx.fn_ir.add((*cx.insts.add(v as usize)).imm as usize)) - 1;
-                        cc_note(cx, R_STATIC, g, pcx);
-                        if g >= 0
-                            && (*pcx.fn_scc.add(g as usize)) == (*pcx.fn_scc.add(fi as usize)) {
-                            // Within the component: what is assumed so far;
-                            // recursion may not return.
-                            known = (*get_fn_attrs().add(g as usize))
-                                & ~(ATTR_WILLRETURN | ATTR_BOUNDED);
-                            cx.used_component = true;
-                        }
-                    }
-                    if known & ATTR_READNONE == 0 {
-                        attrs = attrs & ~ATTR_READNONE;
-                    }
-                    if known & ATTR_READONLY == 0 {
-                        attrs = attrs & ~(ATTR_READNONE | ATTR_READONLY);
-                    }
-                    if known & ATTR_WILLRETURN == 0 && known & ATTR_NORETURN == 0 {
-                        attrs = attrs & ~ATTR_WILLRETURN;
-                    }
-                    if known & ATTR_NOPANIC == 0 {
-                        attrs = attrs & ~ATTR_NOPANIC;
-                    }
-                    // (A call that does not return ends the work too.)
-                    if known & ATTR_NORETURN == 0 {
-                        let c = bounded_cost(known);
-                        if c < 0 {
-                            attrs = attrs & ~ATTR_BOUNDED;
-                        } else {
-                            cost += c;
-                        }
-                    }
-                }
-                v = (*cx.insts.add(v as usize)).next;
-            }
-        }
-        if returns {
-            attrs = attrs & ~ATTR_NORETURN;
-        } else {
-            attrs = attrs & ~(ATTR_WILLRETURN | ATTR_BOUNDED);
-        }
-        if (attrs & ATTR_BOUNDED) != 0 {
-            if cost > SPECULATE_COST {
-                attrs = attrs & ~ATTR_BOUNDED;
-            } else {
-                attrs = attrs | (cost << ATTR_COST_SHIFT);
-            }
-        }
-        (*get_fn_nocapture().add(fi as usize)) = compute_nocapture(cx, fi, pcx);
-        attrs
+fn compute_attrs(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> i64 {
+    if calls_returns_twice(cx, fi, pcx) {
+        pcx.fn_nocapture.set(fi, 0);
+        return 0;
     }
+    find_escaping_slots(cx, fi, pcx);
+    layout_order(cx, fi);
+    mark_returning(cx);
+    let mut attrs = ATTR_ALL;
+    let mut returns = false;
+    // (0.25) Its instructions and its callees' costs, for BOUNDED.
+    let mut cost: i64 = 0;
+    // (0.29) The Vec headers it may write (middle::callfacts).
+    let mut hw = no_writes();
+    for i in 0..cx.order.len() as i64 {
+        let b = (cx.order[i as usize]);
+        if (cx.blocks[b as usize]).term == Term::Ret {
+            returns = true;
+        }
+        // A cycle (an edge to a block not later in reverse post-order):
+        // the function may loop forever.
+        for k in 0..succ_count(cx, b) {
+            let s = succ(cx, b, k);
+            if (cx.blocks[s as usize]).order >= 0
+                && (cx.blocks[s as usize]).order <= (cx.blocks[b as usize]).order {
+                attrs = attrs & !(ATTR_WILLRETURN | ATTR_BOUNDED);
+            }
+        }
+        let mut v = (cx.blocks[b as usize]).first;
+        while v != 0 {
+            let op = (cx.insts[v as usize]).op;
+            if op != Const {
+                cost += 1;
+            }
+            // (0.29) A call's callee's attributes, for the Vec headers
+            // it may write (middle::callfacts).
+            let mut callee: i64 = 0;
+            if op == Load {
+                if reads_shared(cx, (cx.insts[v as usize]).a) {
+                    attrs = attrs & !ATTR_READNONE;
+                }
+            } else if op == Store {
+                if writes_shared(cx, (cx.insts[v as usize]).a) {
+                    attrs = attrs & !(ATTR_READNONE | ATTR_READONLY);
+                }
+            } else if is_copy(cx, v, pcx) {
+                let copy_dst_v = copy_dst(cx, v);
+                if writes_shared(cx, copy_dst_v) {
+                    attrs = attrs & !(ATTR_READNONE | ATTR_READONLY);
+                }
+                let copy_src_v = copy_src(cx, v);
+                if reads_shared(cx, copy_src_v) {
+                    attrs = attrs & !ATTR_READNONE;
+                }
+            } else if is_barrier(cx, v) {
+                // (0.21) An atomic or a fence: shared memory read and
+                // written, other threads synchronized with.
+                attrs = attrs & !(ATTR_READNONE | ATTR_READONLY);
+            } else if op.is_call() {
+                let mut known = call_attrs(cx, v, pcx);
+                if op == Call {
+                    let g = (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) - 1;
+                    cc_note(cx, R_STATIC, g, pcx);
+                    if g >= 0
+                        && (pcx.fn_scc[g as usize]) == (pcx.fn_scc[fi as usize]) {
+                        // Within the component: what is assumed so far;
+                        // recursion may not return.
+                        known = (pcx.fn_attrs.get(g))
+                            & !(ATTR_WILLRETURN | ATTR_BOUNDED);
+                        cx.used_component = true;
+                    }
+                }
+                callee = known;
+                if known & ATTR_READNONE == 0 {
+                    attrs = attrs & !ATTR_READNONE;
+                }
+                if known & ATTR_READONLY == 0 {
+                    attrs = attrs & !(ATTR_READNONE | ATTR_READONLY);
+                }
+                if known & ATTR_WILLRETURN == 0 && known & ATTR_NORETURN == 0 {
+                    attrs = attrs & !ATTR_WILLRETURN;
+                }
+                if known & ATTR_NOPANIC == 0 {
+                    attrs = attrs & !ATTR_NOPANIC;
+                }
+                // (A call that does not return ends the work too.)
+                if known & ATTR_NORETURN == 0 {
+                    let c = bounded_cost(known);
+                    if c < 0 {
+                        attrs = attrs & !ATTR_BOUNDED;
+                    } else {
+                        cost += c;
+                    }
+                }
+            }
+            // (a block that reaches no RET: its writes are not seen)
+            if (cx.blocks[b as usize]).mark == 2 {
+                note_writes(cx, fi, v, callee, &mut hw, pcx);
+            }
+            v = (cx.insts[v as usize]).next;
+        }
+    }
+    if returns {
+        attrs = attrs & !ATTR_NORETURN;
+    } else {
+        attrs = attrs & !(ATTR_WILLRETURN | ATTR_BOUNDED);
+    }
+    if (attrs & ATTR_BOUNDED) != 0 {
+        if cost > SPECULATE_COST {
+            attrs = attrs & !ATTR_BOUNDED;
+        } else {
+            attrs = attrs | (cost << ATTR_COST_SHIFT);
+        }
+    }
+    pcx.fn_nocapture.set(fi, compute_nocapture(cx, fi, pcx));
+    attrs | writes_bits(&hw)
 }
 
 // Whether a load from address a may read memory other than private slots
 // and constant data.
-fn reads_shared(cx: &mut FnCtx, a: i64) -> bool {
+fn reads_shared(cx: &mut FnCtx<Comp>, a: i64) -> bool {
     let ir_val_v = ir_val(cx, a);
     let root = root_of(cx, ir_val_v);
-    unsafe {
-        !is_private_root(cx, root) && !(root != 0 && (*cx.insts.add(root as usize)).op == SAddr)
-    }
+    !is_private_root(cx, root) && !(root != 0 && (cx.insts[root as usize]).op == SAddr)
 }
 
 // Whether a store to address a may write memory other than private slots.
-fn writes_shared(cx: &mut FnCtx, a: i64) -> bool {
+fn writes_shared(cx: &mut FnCtx<Comp>, a: i64) -> bool {
     let ir_val_v = ir_val(cx, a);
     let root = root_of(cx, ir_val_v);
     !is_private_root(cx, root)
@@ -371,184 +416,213 @@ fn writes_shared(cx: &mut FnCtx, a: i64) -> bool {
 // The nocapture bits of function fi: a bit per call operand (see
 // param_operand) of a parameter that is only dereferenced, compared, or
 // passed to a nocapture parameter.
-fn compute_nocapture(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut bits: i64 = 0;
-        let entry = (*get_irfuncs().add(fi as usize)).entry;
-        let mut p = (*cx.blocks.add(entry as usize)).first;
-        while p != 0 && (*cx.insts.add(p as usize)).op == Param {
-            let k = param_operand(cx, fi, p, pcx);
-            if k >= 0 && k < 63 && (*cx.insts.add(p as usize)).ty == TY_U64
-                && !captured(cx, fi, p, pcx) {
-                bits = bits | (1 << k);
-            }
-            p = (*cx.insts.add(p as usize)).next;
+fn compute_nocapture(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut bits: i64 = 0;
+    let entry = fn_entry(cx, fi);
+    let mut p = (cx.blocks[entry as usize]).first;
+    while p != 0 && (cx.insts[p as usize]).op == Param {
+        let k = param_operand(cx, fi, p, pcx);
+        if k >= 0 && k < 63 && (cx.insts[p as usize]).ty == TY_U64
+            && !captured(cx, fi, p, pcx) {
+            bits = bits | (1 << k);
         }
-        bits
+        p = (cx.insts[p as usize]).next;
     }
+    bits
 }
 
-fn captured(cx: &mut FnCtx, fi: i64, p: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        cx.capture_stamp += 1;
-        let stamp = cx.capture_stamp;
-        (*cx.insts.add(p as usize)).mark = stamp;
-        let mut result = false;
-        let mut grew = true;
-        while grew && !result {
-            grew = false;
-            for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-                let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-                if (*cx.blocks.add(b as usize)).removed != 0 {
-                    continue;
-                }
-                if (*cx.blocks.add(b as usize)).term == Term::Ret
-                    && (*cx.blocks.add(b as usize)).cond != 0
-                    && (*cx.insts.add(ir_val(cx, (*cx.blocks.add(b as usize)).cond) as usize)).mark
-                    == stamp {
-                    result = true;
-                }
-                let mut v = (*cx.blocks.add(b as usize)).first;
-                while v != 0 && !result {
-                    for k in 0..ir_operand_count(cx, v) {
-                        let ir_operand_v = ir_operand(cx, v, k);
-                        if ir_operand_v == 0
-                            || (*cx.insts.add(ir_val(cx, ir_operand(cx, v, k)) as usize)).mark
-                            != stamp {
-                            continue;
+fn captured(cx: &mut FnCtx<Comp>, fi: i64, p: i64, pcx: &Ctx<Comp>) -> bool {
+    cx.capture_stamp += 1;
+    let stamp = cx.capture_stamp;
+    (cx.insts[p as usize]).mark = stamp;
+    let mut result = false;
+    let mut grew = true;
+    while grew && !result {
+        grew = false;
+        for i in 0..fn_block_count(cx, fi) {
+            let b = (fn_block(cx, fi, i));
+            if (cx.blocks[b as usize]).removed != 0 {
+                continue;
+            }
+            if (cx.blocks[b as usize]).term == Term::Ret
+                && (cx.blocks[b as usize]).cond != 0
+                && {
+                let at_ix = ir_val(cx, (cx.blocks[b as usize]).cond) as usize;
+                cx.insts[at_ix].mark
+            }
+            == stamp {
+                result = true;
+            }
+            let mut v = (cx.blocks[b as usize]).first;
+            while v != 0 && !result {
+                for k in 0..ir_operand_count(cx, v) {
+                    let ir_operand_v = ir_operand(cx, v, k);
+                    if ir_operand_v == 0
+                        || {
+                        let at_ix = ir_val(cx, ir_operand(cx, v, k)) as usize;
+                        cx.insts[at_ix].mark
+                    }
+                    != stamp {
+                        continue;
+                    }
+                    let op = (cx.insts[v as usize]).op;
+                    if op == Add && (cx.insts[v as usize]).ty == TY_U64 && k <= 1 {
+                        if (cx.insts[v as usize]).mark != stamp {
+                            (cx.insts[v as usize]).mark = stamp;
+                            grew = true;
                         }
-                        let op = (*cx.insts.add(v as usize)).op;
-                        if op == Add && (*cx.insts.add(v as usize)).ty == TY_U64 && k <= 1 {
-                            if (*cx.insts.add(v as usize)).mark != stamp {
-                                (*cx.insts.add(v as usize)).mark = stamp;
-                                grew = true;
-                            }
-                        } else if (op == Load || op == Store) && k == 0 {
-                        } else if op == Copy && k <= 1 {
-                        } else if op == Cmp {
-                        } else if op == Call && k >= 3 {
-                            let g = (*pcx.fn_ir.add((*cx.insts.add(v as usize)).imm as usize)) - 1;
-                            let bit = k - 3;
-                            cc_note(cx, R_STATIC, g, pcx);
-                            if g >= 0 && g != fi
-                                && (*pcx.fn_scc.add(g as usize)) != (*pcx.fn_scc.add(fi as usize)) {
-                                cc_note(cx, R_ATTRS, g, pcx);
-                            }
-                            if g >= 0 && g != fi
-                                && (*pcx.fn_scc.add(g as usize)) == (*pcx.fn_scc.add(fi as usize)) {
-                                cx.used_component = true;
-                            }
-                            if g < 0 || bit >= 63 || g == fi
-                                || ((*pcx.fn_scc.add(g as usize)) != (*pcx.fn_scc.add(fi as usize))
-                                    && !fn_facts_ready(cx, g,
-                                        cx.cur_comp >= 0
-                                            || (*get_fn_attrs_done().add(g as usize)) != 0, pcx))
-                                || (*get_fn_nocapture().add(g as usize)) & (1 << bit) == 0 {
-                                result = true;
-                            }
+                    } else if (op == Load || op == Store) && k == 0 {
+                    } else if op == Copy && k <= 1 {
+                    } else if op == Cmp {
+                    } else if op == Call && k >= 3 {
+                        let g = (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) - 1;
+                        let bit = k - 3;
+                        cc_note(cx, R_STATIC, g, pcx);
+                        if g >= 0 && g != fi
+                            && (pcx.fn_scc[g as usize]) != (pcx.fn_scc[fi as usize]) {
+                            cc_note(cx, R_ATTRS, g, pcx);
                         }
-                        else if op == CallC
-                            && (*cx.insts.add(v as usize)).imm == rt_panic_sym(pcx) {
-                        } else {
+                        if g >= 0 && g != fi
+                            && (pcx.fn_scc[g as usize]) == (pcx.fn_scc[fi as usize]) {
+                            cx.used_component = true;
+                        }
+                        if g < 0 || bit >= 63 || g == fi
+                            || ((pcx.fn_scc[g as usize]) != (pcx.fn_scc[fi as usize])
+                                && !fn_facts_ready(cx, g,
+                                    cx.cur_comp >= 0
+                                        || (pcx.fn_attrs_done.get(g)) != 0, pcx))
+                            || (pcx.fn_nocapture.get(g)) & (1 << bit) == 0 {
                             result = true;
                         }
                     }
-                    v = (*cx.insts.add(v as usize)).next;
+                    else if op == CallC
+                        && (cx.insts[v as usize]).imm == rt_panic_sym(pcx) {
+                    } else {
+                        result = true;
+                    }
                 }
+                v = (cx.insts[v as usize]).next;
             }
         }
-        result
     }
+    result
 }
 
 // Infers the attributes of the functions SCC_ORDER[start..end] (one
 // component), optimistically: everything is assumed, then taken away
 // until nothing changes. A component whose functions do not call each
 // other (a single function, not recursive) takes one round.
-pub fn infer_component_attrs(cx: &mut FnCtx, start: i64, end: i64, pcx: &Ctx<Comp>) {
-    unsafe {
+pub fn infer_component_attrs(cx: &mut FnCtx<Comp>, start: i64, end: i64, pcx: &Ctx<Comp>) {
+    for i in start..end {
+        let fi = (pcx.scc_order[i as usize]);
+        pcx.fn_attrs.set(fi, (ATTR_ALL & !ATTR_NORETURN) | HW_KNOWN);
+        pcx.fn_nocapture.set(fi, -1);
+    }
+    let mut changed = true;
+    let mut rounds: i64 = 0;
+    while changed && rounds < 16 {
+        changed = false;
+        rounds += 1;
+        cx.used_component = false;
         for i in start..end {
-            let fi = (*pcx.scc_order.data.add(i as usize));
-            (*get_fn_attrs().add(fi as usize)) = ATTR_ALL & ~ATTR_NORETURN;
-            (*get_fn_nocapture().add(fi as usize)) = -1;
+            let fi = (pcx.scc_order[i as usize]);
+            ir_enter(cx, fi, pcx);
+            let nocapture = (pcx.fn_nocapture.get(fi));
+            let attrs = compute_attrs(cx, fi, pcx);
+            if attrs != (pcx.fn_attrs.get(fi))
+                || (pcx.fn_nocapture.get(fi)) != nocapture {
+                pcx.fn_attrs.set(fi, attrs);
+                changed = true;
+            }
         }
-        let mut changed = true;
-        let mut rounds: i64 = 0;
-        while changed && rounds < 16 {
+        if !cx.used_component {
             changed = false;
-            rounds += 1;
-            cx.used_component = false;
-            for i in start..end {
-                let fi = (*pcx.scc_order.data.add(i as usize));
-                ir_enter(cx, fi, pcx);
-                let nocapture = (*get_fn_nocapture().add(fi as usize));
-                let attrs = compute_attrs(cx, fi, pcx);
-                if attrs != (*get_fn_attrs().add(fi as usize))
-                    || (*get_fn_nocapture().add(fi as usize)) != nocapture {
-                    (*get_fn_attrs().add(fi as usize)) = attrs;
-                    changed = true;
-                }
-            }
-            if !cx.used_component {
-                changed = false;
-            }
         }
-        if changed {
-            // Not settled: nothing is known.
-            for i in start..end {
-                (*get_fn_attrs().add((*pcx.scc_order.data.add(i as usize)) as usize)) = 0;
-                (*get_fn_nocapture().add((*pcx.scc_order.data.add(i as usize)) as usize)) = 0;
-            }
-        }
+    }
+    if changed {
+        // Not settled: nothing is known.
         for i in start..end {
-            (*get_fn_attrs_done().add((*pcx.scc_order.data.add(i as usize)) as usize)) = 1;
+            pcx.fn_attrs.set((pcx.scc_order[i as usize]), 0);
+            pcx.fn_nocapture.set((pcx.scc_order[i as usize]), 0);
         }
+    }
+    for i in start..end {
+        pcx.fn_attrs_done.set((pcx.scc_order[i as usize]), 1);
     }
 }
 
 // --print-attrs.
 pub fn print_attrs(pcx: &Ctx<Comp>) {
-    unsafe {
-        let out = buf_new();
-        for fi in 0..pcx.irfunc_count {
-            if (*pcx.fn_live.add(fi as usize)) == 0
-                || (*get_fn_attrs_done().add(fi as usize)) == 0 {
-                continue;
+    let out = buf_new();
+    for fi in 0..pcx.irfunc_count {
+        if (pcx.fn_live[fi as usize]) == 0
+            || (pcx.fn_attrs_done.get(fi)) == 0 {
+            continue;
+        }
+        buf_str(out, sym_name(pcx.fns[pcx.ir_fn[fi as usize] as usize].name, pcx));
+        buf_str(out, c":");
+        let a = (pcx.fn_attrs.get(fi));
+        if a & ATTR_READNONE != 0 {
+            buf_str(out, c" readnone");
+        } else if a & ATTR_READONLY != 0 {
+            buf_str(out, c" readonly");
+        }
+        if a & ATTR_NORETURN != 0 {
+            buf_str(out, c" noreturn");
+        }
+        if a & ATTR_WILLRETURN != 0 {
+            buf_str(out, c" willreturn");
+        }
+        if a & ATTR_NOPANIC != 0 {
+            buf_str(out, c" nopanic");
+        }
+        if a & ATTR_BOUNDED != 0 {
+            buf_str(out, c" bounded(");
+            buf_int(out, bounded_cost(a));
+            buf_str(out, c")");
+        }
+        // (0.29) The Vec headers it may write (middle::callfacts): none,
+        // or where (a static's, the result's, an operand's).
+        if a & HW_KNOWN != 0 {
+            buf_str(out, c" headers(");
+            let mut sep = false;
+            if a & HW_STATIC != 0 {
+                buf_str(out, c"static");
+                sep = true;
             }
-            buf_str(out, sym_name(pcx.fns[(*get_irfuncs().add(fi as usize)).f as usize].name, pcx));
-            buf_str(out, c":");
-            let a = (*get_fn_attrs().add(fi as usize));
-            if a & ATTR_READNONE != 0 {
-                buf_str(out, c" readnone");
-            } else if a & ATTR_READONLY != 0 {
-                buf_str(out, c" readonly");
+            if a & HW_RESULT != 0 {
+                buf_str(out, if sep { c" result" } else { c"result" });
+                sep = true;
             }
-            if a & ATTR_NORETURN != 0 {
-                buf_str(out, c" noreturn");
-            }
-            if a & ATTR_WILLRETURN != 0 {
-                buf_str(out, c" willreturn");
-            }
-            if a & ATTR_NOPANIC != 0 {
-                buf_str(out, c" nopanic");
-            }
-            if a & ATTR_BOUNDED != 0 {
-                buf_str(out, c" bounded(");
-                buf_int(out, bounded_cost(a));
-                buf_str(out, c")");
-            }
-            let nc = (*get_fn_nocapture().add(fi as usize));
-            for k in 0..63 {
-                if nc & (1 << k) != 0 {
-                    buf_str(out, c" nocapture(");
+            for k in 0..HW_ARGS {
+                if a & (1 << (HW_ARG_SHIFT + k)) != 0 {
+                    if sep {
+                        buf_byte(out, b' ');
+                    }
                     buf_int(out, k);
-                    buf_str(out, c")");
+                    // (the first one's range, in bytes)
+                    if writes_hi(a, k) != HW_FAR {
+                        buf_byte(out, b'@');
+                        buf_int(out, writes_lo(a, k) * 8);
+                        buf_str(out, c"..");
+                        buf_int(out, writes_hi(a, k) * 8);
+                    }
+                    sep = true;
                 }
             }
-            buf_byte(out, b'\n');
+            buf_str(out, c")");
         }
-        buf_write_fd(out, STDERR);
+        let nc = (pcx.fn_nocapture.get(fi));
+        for k in 0..63 {
+            if nc & (1 << k) != 0 {
+                buf_str(out, c" nocapture(");
+                buf_int(out, k);
+                buf_str(out, c")");
+            }
+        }
+        buf_byte(out, b'\n');
     }
+    buf_write_fd(out, STDERR);
 }
 
 // ---- Interprocedural constant propagation ----
@@ -560,103 +634,93 @@ pub fn print_attrs(pcx: &Ctx<Comp>) {
 // The direct call sites of every function g: CALL_SITES[CALL_START[g] ..
 // CALL_START[g + 1]], each an instruction of function CALL_FNS[..] (0.17:
 // instruction ids are the caller's own).
-fn collect_call_sites(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let n = pcx.irfunc_count;
-        free(pcx.call_start as *mut u8);
-        free(pcx.call_sites as *mut u8);
-        free(pcx.call_fns as *mut u8);
-        pcx.call_start = alloc_array::<i64>(n + 2);
-        let mut total: i64 = 0;
-        for pass in 0..2 {
-            let fill = alloc_array::<i64>(n + 1);
-            for fi in 0..n {
-                if (*pcx.fn_live.add(fi as usize)) == 0 {
+fn collect_call_sites(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
+    let n = pcx.irfunc_count;
+    sized_table(&mut pcx.call_start, n + 2, 0);
+    let mut total: i64 = 0;
+    for pass in 0..2 {
+        let mut fill: Vec<i64, Comp> = Vec::new_in(Comp {});
+        fill.resize((n + 1) as usize, 0);
+        for fi in 0..n {
+            if (pcx.fn_live[fi as usize]) == 0 {
+                continue;
+            }
+            ir_enter(cx, fi, pcx);
+            for i in 0..fn_block_count(cx, fi) {
+                let b = (fn_block(cx, fi, i));
+                if (cx.blocks[b as usize]).removed != 0 {
                     continue;
                 }
-                ir_enter(cx, fi, pcx);
-                for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-                    let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-                    if (*cx.blocks.add(b as usize)).removed != 0 {
-                        continue;
-                    }
-                    let mut v = (*cx.blocks.add(b as usize)).first;
-                    while v != 0 {
-                        let g = ir_callee(cx, v, pcx);
-                        if g >= 0 {
-                            if pass == 0 {
-                                (*pcx.call_start.add(g as usize)) += 1;
-                            } else {
-                                (*pcx.call_sites.add(
-                                    ((*pcx.call_start.add(g as usize)) + (*fill.add(g as usize))) as usize)) = v;
-                                (*pcx.call_fns.add(
-                                    ((*pcx.call_start.add(g as usize)) + (*fill.add(g as usize))) as usize)) = fi;
-                                (*fill.add(g as usize)) += 1;
-                            }
+                let mut v = (cx.blocks[b as usize]).first;
+                while v != 0 {
+                    let g = ir_callee(cx, v, pcx);
+                    if g >= 0 {
+                        if pass == 0 {
+                            (pcx.call_start[g as usize]) += 1;
+                        } else {
+                            let at = (pcx.call_start[g as usize] + fill[g as usize]) as usize;
+                            pcx.call_sites[at] = v;
+                            pcx.call_fns[at] = fi;
+                            fill[g as usize] += 1;
                         }
-                        v = (*cx.insts.add(v as usize)).next;
                     }
+                    v = (cx.insts[v as usize]).next;
                 }
             }
-            free(fill as *mut u8);
-            if pass == 0 {
-                for g in 0..n + 1 {
-                    let count = (*pcx.call_start.add(g as usize));
-                    (*pcx.call_start.add(g as usize)) = total;
-                    total += count;
-                }
-                pcx.call_sites = alloc_array::<i64>(total + 1);
-                pcx.call_fns = alloc_array::<i64>(total + 1);
+        }
+        if pass == 0 {
+            for g in 0..n + 1 {
+                let count = (pcx.call_start[g as usize]);
+                (pcx.call_start[g as usize]) = total;
+                total += count;
             }
+            sized_table(&mut pcx.call_sites, total + 1, 0);
+            sized_table(&mut pcx.call_fns, total + 1, 0);
         }
     }
 }
 
 // Whether function g is internal: only its direct calls reach it.
 fn is_internal(g: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        (*pcx.fn_live.add(g as usize)) != 0 && (*pcx.fn_address.add(g as usize)) == 0
-            && !fn_is_global((*get_irfuncs().add(g as usize)).f, pcx)
-            && !fn_uses_c((*get_irfuncs().add(g as usize)).f, pcx)
-    }
+    (pcx.fn_live[g as usize]) != 0 && (pcx.fn_address[g as usize]) == 0
+        && !fn_is_global(pcx.ir_fn[g as usize], pcx)
+        && !fn_uses_c(pcx.ir_fn[g as usize], pcx)
 }
 
 // The constant every call site passes as operand k (found: false when
 // they do not agree, or one passes no constant).
-fn common_constant_arg(cx: &mut FnCtx, g: i64, k: i64, found: &mut ConstArg, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let start = (*pcx.call_start.add(g as usize));
-        let end = (*pcx.call_start.add((g + 1) as usize));
-        if end == start {
+fn common_constant_arg(cx: &mut FnCtx<Comp>, g: i64, k: i64, found: &mut ConstArg, pcx: &Ctx<Comp>) -> bool {
+    let start = (pcx.call_start[g as usize]);
+    let end = (pcx.call_start[(g + 1) as usize]);
+    if end == start {
+        return false;
+    }
+    for i in start..end {
+        let call = (pcx.call_sites[i as usize]);
+        ir_enter(cx, (pcx.call_fns[i as usize]), pcx);
+        if (cx.insts[call as usize]).block == 0
+            || k >= (cx.insts[call as usize]).nargs {
             return false;
         }
-        for i in start..end {
-            let call = (*pcx.call_sites.add(i as usize));
-            ir_enter(cx, (*pcx.call_fns.add(i as usize)), pcx);
-            if (*cx.insts.add(call as usize)).block == 0
-                || k >= (*cx.insts.add(call as usize)).nargs {
-                return false;
-            }
-            let ir_arg_v = ir_arg(cx, call, k);
-            let a = ir_val(cx, ir_arg_v);
-            if !is_const(cx, a) && (*cx.insts.add(a as usize)).op != FAddr
-                && (*cx.insts.add(a as usize)).op != Op::RtId {
-                return false;
-            }
-            if i == start {
-                *found = ConstArg {
-                    op: (*cx.insts.add(a as usize)).op, ty: (*cx.insts.add(a as usize)).ty,
-                    imm: (*cx.insts.add(a as usize)).imm,
-                };
-            }
-            else if (*cx.insts.add(a as usize)).op != found.op
-                || (*cx.insts.add(a as usize)).imm != found.imm
-                || (*cx.insts.add(a as usize)).ty != found.ty {
-                return false;
-            }
+        let ir_arg_v = ir_arg(cx, call, k);
+        let a = ir_val(cx, ir_arg_v);
+        if !is_const(cx, a) && (cx.insts[a as usize]).op != FAddr
+            && (cx.insts[a as usize]).op != Op::RtId {
+            return false;
         }
-        true
+        if i == start {
+            *found = ConstArg {
+                op: (cx.insts[a as usize]).op, ty: (cx.insts[a as usize]).ty,
+                imm: (cx.insts[a as usize]).imm,
+            };
+        }
+        else if (cx.insts[a as usize]).op != found.op
+            || (cx.insts[a as usize]).imm != found.imm
+            || (cx.insts[a as usize]).ty != found.ty {
+            return false;
+        }
     }
+    true
 }
 
 // ---- Devirtualization ----
@@ -665,83 +729,77 @@ fn common_constant_arg(cx: &mut FnCtx, g: i64, k: i64, found: &mut ConstArg, pcx
 // pointer's convention is the function's): after constant propagation
 // and inlining, a function pointer argument is often a constant. Returns
 // whether any call changed.
-pub fn devirtualize(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
+pub fn devirtualize(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
     let mut changed = false;
-    unsafe {
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed != 0 {
-                continue;
-            }
-            let mut v = (*cx.blocks.add(b as usize)).first;
-            while v != 0 {
-                if (*cx.insts.add(v as usize)).op == CallI {
-                    let callee = ir_val(cx, (*cx.insts.add(v as usize)).a);
-                    if (*cx.insts.add(callee as usize)).op == FAddr {
-                        let f = (*cx.insts.add(callee as usize)).imm;
-                        let fn_ty = (*cx.insts.add(v as usize)).imm;
-                        if fn_type_uses_c(fn_ty, pcx) == fn_uses_c(f, pcx)
-                            && !pcx.fns[f as usize].variadic
-                            && pcx.fns[f as usize].param_count == pcx.types[fn_ty as usize].count {
-                            (*cx.insts.add(v as usize)).op = Call;
-                            (*cx.insts.add(v as usize)).a = 0;
-                            (*cx.insts.add(v as usize)).imm = f;
-                            changed = true;
-                        }
+    for i in 0..fn_block_count(cx, fi) {
+        let b = (fn_block(cx, fi, i));
+        if (cx.blocks[b as usize]).removed != 0 {
+            continue;
+        }
+        let mut v = (cx.blocks[b as usize]).first;
+        while v != 0 {
+            if (cx.insts[v as usize]).op == CallI {
+                let callee = ir_val(cx, (cx.insts[v as usize]).a);
+                if (cx.insts[callee as usize]).op == FAddr {
+                    let f = (cx.insts[callee as usize]).imm;
+                    let fn_ty = (cx.insts[v as usize]).imm;
+                    if fn_type_uses_c(fn_ty, pcx) == fn_uses_c(f, pcx)
+                        && !pcx.fns[f as usize].variadic
+                        && pcx.fns[f as usize].param_count == pcx.types[fn_ty as usize].count {
+                        (cx.insts[v as usize]).op = Call;
+                        (cx.insts[v as usize]).a = 0;
+                        (cx.insts[v as usize]).imm = f;
+                        changed = true;
                     }
                 }
-                v = (*cx.insts.add(v as usize)).next;
             }
+            v = (cx.insts[v as usize]).next;
         }
     }
     changed
 }
 
 // Replaces the uses of v in function fi by `by`, keeping v.
-fn replace_uses_keep(cx: &mut FnCtx, fi: i64, v: i64, by: i64) {
-    unsafe {
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed != 0 {
-                continue;
-            }
-            let mut w = (*cx.blocks.add(b as usize)).first;
-            while w != 0 {
-                for k in 0..ir_operand_count(cx, w) {
-                    let operand = ir_operand(cx, w, k);
-                    if operand != 0 && ir_val(cx, operand) == v {
-                        ir_set_operand(cx, w, k, by);
-                    }
+fn replace_uses_keep(cx: &mut FnCtx<Comp>, fi: i64, v: i64, by: i64) {
+    for i in 0..fn_block_count(cx, fi) {
+        let b = (fn_block(cx, fi, i));
+        if (cx.blocks[b as usize]).removed != 0 {
+            continue;
+        }
+        let mut w = (cx.blocks[b as usize]).first;
+        while w != 0 {
+            for k in 0..ir_operand_count(cx, w) {
+                let operand = ir_operand(cx, w, k);
+                if operand != 0 && ir_val(cx, operand) == v {
+                    ir_set_operand(cx, w, k, by);
                 }
-                w = (*cx.insts.add(w as usize)).next;
             }
-            if (*cx.blocks.add(b as usize)).cond != 0
-                && ir_val(cx, (*cx.blocks.add(b as usize)).cond) == v {
-                (*cx.blocks.add(b as usize)).cond = by;
-            }
+            w = (cx.insts[w as usize]).next;
+        }
+        if (cx.blocks[b as usize]).cond != 0
+            && ir_val(cx, (cx.blocks[b as usize]).cond) == v {
+            (cx.blocks[b as usize]).cond = by;
         }
     }
 }
 
 // The constant every `ret` of function g returns (a scalar), or 0.
-fn common_constant_result(cx: &mut FnCtx, g: i64) -> i64 {
+fn common_constant_result(cx: &mut FnCtx<Comp>, g: i64) -> i64 {
     let mut first: i64 = 0;
-    unsafe {
-        for i in 0..(*get_irfuncs().add(g as usize)).blocks.count {
-            let b = (*(*get_irfuncs().add(g as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed != 0
-                || (*cx.blocks.add(b as usize)).term != Term::Ret {
-                continue;
-            }
-            let r = ir_val(cx, (*cx.blocks.add(b as usize)).cond);
-            if r == 0 || !is_const(cx, r) {
-                return 0;
-            }
-            if first == 0 {
-                first = r;
-            } else if (*cx.insts.add(r as usize)).imm != (*cx.insts.add(first as usize)).imm {
-                return 0;
-            }
+    for i in 0..fn_block_count(cx, g) {
+        let b = (fn_block(cx, g, i));
+        if (cx.blocks[b as usize]).removed != 0
+            || (cx.blocks[b as usize]).term != Term::Ret {
+            continue;
+        }
+        let r = ir_val(cx, (cx.blocks[b as usize]).cond);
+        if r == 0 || !is_const(cx, r) {
+            return 0;
+        }
+        if first == 0 {
+            first = r;
+        } else if (cx.insts[r as usize]).imm != (cx.insts[first as usize]).imm {
+            return 0;
         }
     }
     first
@@ -751,80 +809,78 @@ fn common_constant_result(cx: &mut FnCtx, g: i64) -> i64 {
 // functions, top-down (callers first, so constants reaching a function
 // can flow on to its callees), and constant results out of them. Returns
 // whether anything changed.
-pub fn propagate_constants(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        collect_call_sites(cx, pcx);
-        let mut any = false;
-        let mut i = pcx.scc_order.count;
-        while i > 0 {
-            i -= 1;
-            let g = (*pcx.scc_order.data.add(i as usize));
-            if !is_internal(g, pcx)
-                || (*pcx.call_start.add((g + 1) as usize)) == (*pcx.call_start.add(g as usize)) {
-                continue;
-            }
-            ir_enter(cx, g, pcx);
-            resolve_all(cx, g);
-            let mut changed = false;
-            let entry = (*get_irfuncs().add(g as usize)).entry;
-            let mut p = (*cx.blocks.add(entry as usize)).first;
-            while p != 0 && (*cx.insts.add(p as usize)).op == Param {
-                let next = (*cx.insts.add(p as usize)).next;
-                let k = param_operand(cx, g, p, pcx);
-                if k >= 0 {
-                    let mut c = ConstArg { op: Const, ty: 0, imm: 0 };
-                    let agree = common_constant_arg(cx, g, k, &mut c, pcx);
-                    ir_enter(cx, g, pcx);
-                    if agree && c.ty == (*cx.insts.add(p as usize)).ty {
-                        let k2 = ir_make(cx, c.op, c.ty, 0, 0, c.imm, pcx);
-                        ir_append_after_params(cx, entry, k2);
-                        replace_uses_keep(cx, g, p, k2);
-                        changed = true;
-                    }
-                }
-                p = next;
-            }
-            if changed {
-                any = true;
-                devirtualize(cx, g, pcx);
-                verify_func(cx, g, c"interprocedural constants (arguments)", pcx);
-                simplify_function(cx, g, pcx);
-            }
+pub fn propagate_constants(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
+    collect_call_sites(cx, pcx);
+    let mut any = false;
+    let mut i = pcx.scc_order.len() as i64;
+    while i > 0 {
+        i -= 1;
+        let g = (pcx.scc_order[i as usize]);
+        if !is_internal(g, pcx)
+            || (pcx.call_start[(g + 1) as usize]) == (pcx.call_start[g as usize]) {
+            continue;
         }
-        // Constant results.
-        for g in 0..pcx.irfunc_count {
-            if !is_internal(g, pcx) {
-                continue;
-            }
-            ir_enter(cx, g, pcx);
-            let r = common_constant_result(cx, g);
-            if r == 0 {
-                continue;
-            }
-            let r_ty = (*cx.insts.add(r as usize)).ty;
-            let r_imm = (*cx.insts.add(r as usize)).imm;
-            for s in (*pcx.call_start.add(g as usize))..(*pcx.call_start.add((g + 1) as usize)) {
-                let call = (*pcx.call_sites.add(s as usize));
-                let fi = (*pcx.call_fns.add(s as usize));
-                ir_enter(cx, fi, pcx);
-                if (*cx.insts.add(call as usize)).block == 0
-                    || (*cx.insts.add(call as usize)).ty == 0
-                    || (*cx.insts.add(call as usize)).ty != r_ty {
-                    continue;
+        ir_enter(cx, g, pcx);
+        resolve_all(cx, g);
+        let mut changed = false;
+        let entry = fn_entry(cx, g);
+        let mut p = (cx.blocks[entry as usize]).first;
+        while p != 0 && (cx.insts[p as usize]).op == Param {
+            let next = (cx.insts[p as usize]).next;
+            let k = param_operand(cx, g, p, pcx);
+            if k >= 0 {
+                let mut c = ConstArg { op: Const, ty: 0, imm: 0 };
+                let agree = common_constant_arg(cx, g, k, &mut c, pcx);
+                ir_enter(cx, g, pcx);
+                if agree && c.ty == (cx.insts[p as usize]).ty {
+                    let k2 = ir_make(cx, c.op, c.ty, 0, 0, c.imm, pcx);
+                    ir_append_after_params(cx, entry, k2);
+                    replace_uses_keep(cx, g, p, k2);
+                    changed = true;
                 }
-                let c = ir_make(cx, Const, r_ty, 0, 0, r_imm, pcx);
-                let next = (*cx.insts.add(call as usize)).next;
-                if next != 0 {
-                    ir_insert_before(cx, next, c);
-                } else {
-                    ir_append(cx, (*cx.insts.add(call as usize)).block, c);
-                }
-                replace_uses_keep(cx, fi, call, c);
-                any = true;
             }
+            p = next;
         }
-        any
+        if changed {
+            any = true;
+            devirtualize(cx, g, pcx);
+            verify_func(cx, g, c"interprocedural constants (arguments)", pcx);
+            simplify_function(cx, g, pcx);
+        }
     }
+    // Constant results.
+    for g in 0..pcx.irfunc_count {
+        if !is_internal(g, pcx) {
+            continue;
+        }
+        ir_enter(cx, g, pcx);
+        let r = common_constant_result(cx, g);
+        if r == 0 {
+            continue;
+        }
+        let r_ty = (cx.insts[r as usize]).ty;
+        let r_imm = (cx.insts[r as usize]).imm;
+        for s in (pcx.call_start[g as usize])..(pcx.call_start[(g + 1) as usize]) {
+            let call = (pcx.call_sites[s as usize]);
+            let fi = (pcx.call_fns[s as usize]);
+            ir_enter(cx, fi, pcx);
+            if (cx.insts[call as usize]).block == 0
+                || (cx.insts[call as usize]).ty == 0
+                || (cx.insts[call as usize]).ty != r_ty {
+                continue;
+            }
+            let c = ir_make(cx, Const, r_ty, 0, 0, r_imm, pcx);
+            let next = (cx.insts[call as usize]).next;
+            if next != 0 {
+                ir_insert_before(cx, next, c);
+            } else {
+                ir_append(cx, (cx.insts[call as usize]).block, c);
+            }
+            replace_uses_keep(cx, fi, call, c);
+            any = true;
+        }
+    }
+    any
 }
 
 // ---- Escape analysis: heap to stack ----
@@ -832,166 +888,153 @@ pub fn propagate_constants(cx: &mut FnCtx, pcx: &mut Ctx<Comp>) -> bool {
 const HEAP_TO_STACK_MAX: i64 = 1024;
 const CALLOC_TO_STACK_MAX: i64 = 256;
 
-static mut MALLOC_SYM: i64 = 0;
-static mut CALLOC_SYM: i64 = 0;
-static mut FREE_SYM: i64 = 0;
-
 // The C function called by v (a symbol), or 0.
-fn c_callee_name(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if (*cx.insts.add(v as usize)).op == Call
-            && (*pcx.fn_ir.add((*cx.insts.add(v as usize)).imm as usize)) == 0 {
-            return pcx.fns[(*cx.insts.add(v as usize)).imm as usize].name;
-        }
-        0
+fn c_callee_name(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> i64 {
+    if (cx.insts[v as usize]).op == Call
+        && (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) == 0 {
+        return pcx.fns[(cx.insts[v as usize]).imm as usize].name;
     }
+    0
 }
 
 // The constant size of allocation call v (malloc or calloc of constant
 // sizes), or -1.
-fn allocation_size(cx: &mut FnCtx, v: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        let name = c_callee_name(cx, v, pcx);
-        if name == get_malloc_sym() && (*cx.insts.add(v as usize)).nargs == 1 {
-            let ir_arg_v = ir_arg(cx, v, 0);
-            let n = ir_val(cx, ir_arg_v);
-            if is_const(cx, n) && (*cx.insts.add(n as usize)).imm > 0
-                && (*cx.insts.add(n as usize)).imm <= HEAP_TO_STACK_MAX {
-                return (*cx.insts.add(n as usize)).imm;
-            }
+fn allocation_size(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> i64 {
+    let name = c_callee_name(cx, v, pcx);
+    if name == pcx.malloc_sym && (cx.insts[v as usize]).nargs == 1 {
+        let ir_arg_v = ir_arg(cx, v, 0);
+        let n = ir_val(cx, ir_arg_v);
+        if is_const(cx, n) && (cx.insts[n as usize]).imm > 0
+            && (cx.insts[n as usize]).imm <= HEAP_TO_STACK_MAX {
+            return (cx.insts[n as usize]).imm;
         }
-        if name == get_calloc_sym() && (*cx.insts.add(v as usize)).nargs == 2 {
-            let ir_arg_v1 = ir_arg(cx, v, 0);
-            let n = ir_val(cx, ir_arg_v1);
-            let ir_arg_v2 = ir_arg(cx, v, 1);
-            let m = ir_val(cx, ir_arg_v2);
-            if is_const(cx, n) && is_const(cx, m) && (*cx.insts.add(n as usize)).imm > 0
-                && (*cx.insts.add(m as usize)).imm > 0
-                && (*cx.insts.add(n as usize)).imm <= CALLOC_TO_STACK_MAX
-                && (*cx.insts.add(m as usize)).imm <= CALLOC_TO_STACK_MAX
-                && (*cx.insts.add(n as usize)).imm * (*cx.insts.add(m as usize)).imm
-                <= CALLOC_TO_STACK_MAX {
-                return (*cx.insts.add(n as usize)).imm * (*cx.insts.add(m as usize)).imm;
-            }
-        }
-        -1
     }
+    if name == pcx.calloc_sym && (cx.insts[v as usize]).nargs == 2 {
+        let ir_arg_v1 = ir_arg(cx, v, 0);
+        let n = ir_val(cx, ir_arg_v1);
+        let ir_arg_v2 = ir_arg(cx, v, 1);
+        let m = ir_val(cx, ir_arg_v2);
+        if is_const(cx, n) && is_const(cx, m) && (cx.insts[n as usize]).imm > 0
+            && (cx.insts[m as usize]).imm > 0
+            && (cx.insts[n as usize]).imm <= CALLOC_TO_STACK_MAX
+            && (cx.insts[m as usize]).imm <= CALLOC_TO_STACK_MAX
+            && (cx.insts[n as usize]).imm * (cx.insts[m as usize]).imm
+            <= CALLOC_TO_STACK_MAX {
+            return (cx.insts[n as usize]).imm * (cx.insts[m as usize]).imm;
+        }
+    }
+    -1
 }
 
 // Whether the pointer p made by an allocation in function fi stays in fi:
 // it (and addresses computed from it) is only dereferenced, compared, or
 // passed itself to free; frees of it are listed in `frees`.
-fn allocation_stays(cx: &mut FnCtx, fi: i64, p: i64, frees: &mut IntVec, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        let mut derived = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        derived.push(p);
-        let mut ok = true;
-        let mut d: i64 = 0;
-        while d < derived.count && ok {
-            let x = (*derived.data.add(d as usize));
-            d += 1;
-            for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-                let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-                if (*cx.blocks.add(b as usize)).removed != 0 {
-                    continue;
-                }
-                if (*cx.blocks.add(b as usize)).cond != 0
-                    && ir_val(cx, (*cx.blocks.add(b as usize)).cond) == x {
-                    ok = false;
-                }
-                let mut v = (*cx.blocks.add(b as usize)).first;
-                while v != 0 && ok {
-                    for k in 0..ir_operand_count(cx, v) {
-                        let ir_operand_v = ir_operand(cx, v, k);
-                        if ir_operand_v == 0 || ir_val(cx, ir_operand(cx, v, k)) != x {
-                            continue;
-                        }
-                        let op = (*cx.insts.add(v as usize)).op;
-                        if op == Add && (*cx.insts.add(v as usize)).ty == TY_U64 && k <= 1 {
-                            derived.push(v);
-                        } else if (op == Load || op == Store) && k == 0 {
-                        } else if op == Copy && k <= 1 {
-                        } else if op == Cmp {
-                        } else if is_copy(cx, v, pcx) && (k == 3 || k == 4) {
-                        }
-                        else if x == p && op == Call && k == 3
-                            && (*cx.insts.add(v as usize)).nargs == 1
-                            && c_callee_name(cx, v, pcx) == get_free_sym() {
-                            frees.push(v);
-                        } else {
-                            ok = false;
-                        }
+fn allocation_stays(cx: &mut FnCtx<Comp>, fi: i64, p: i64, frees: &mut Vec<i64, Comp>,
+    pcx: &Ctx<Comp>) -> bool {
+    let mut derived: Vec<i64, Comp> = Vec::new_in(Comp {});
+    derived.push(p);
+    let mut ok = true;
+    let mut d: i64 = 0;
+    while d < derived.len() as i64 && ok {
+        let x = (derived[d as usize]);
+        d += 1;
+        for i in 0..fn_block_count(cx, fi) {
+            let b = (fn_block(cx, fi, i));
+            if (cx.blocks[b as usize]).removed != 0 {
+                continue;
+            }
+            if (cx.blocks[b as usize]).cond != 0
+                && ir_val(cx, (cx.blocks[b as usize]).cond) == x {
+                ok = false;
+            }
+            let mut v = (cx.blocks[b as usize]).first;
+            while v != 0 && ok {
+                for k in 0..ir_operand_count(cx, v) {
+                    let ir_operand_v = ir_operand(cx, v, k);
+                    if ir_operand_v == 0 || ir_val(cx, ir_operand(cx, v, k)) != x {
+                        continue;
                     }
-                    v = (*cx.insts.add(v as usize)).next;
+                    let op = (cx.insts[v as usize]).op;
+                    if op == Add && (cx.insts[v as usize]).ty == TY_U64 && k <= 1 {
+                        derived.push(v);
+                    } else if (op == Load || op == Store) && k == 0 {
+                    } else if op == Copy && k <= 1 {
+                    } else if op == Cmp {
+                    } else if is_copy(cx, v, pcx) && (k == 3 || k == 4) {
+                    }
+                    else if x == p && op == Call && k == 3
+                        && (cx.insts[v as usize]).nargs == 1
+                        && c_callee_name(cx, v, pcx) == pcx.free_sym {
+                        frees.push(v);
+                    } else {
+                        ok = false;
+                    }
                 }
+                v = (cx.insts[v as usize]).next;
             }
         }
-        free(derived.data as *mut u8);
-        ok
     }
+    ok
 }
 
 // Turns the small allocations of function fi whose pointers stay in it
 // into frame slots (zeroed for calloc), and drops their frees. Returns
 // whether any was. MALLOC_SYM and the others are made before the tasks
 // run (init_syms).
-pub fn heap_to_stack(cx: &mut FnCtx, fi: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        if calls_returns_twice(cx, fi, pcx) {
-            return false;
-        }
-        ir_enter(cx, fi, pcx);
-        resolve_all(cx, fi);
-        let mut changed = false;
-        let mut frees = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        for i in 0..(*get_irfuncs().add(fi as usize)).blocks.count {
-            let b = (*(*get_irfuncs().add(fi as usize)).blocks.data.add(i as usize));
-            if (*cx.blocks.add(b as usize)).removed != 0 {
-                continue;
-            }
-            let mut v = (*cx.blocks.add(b as usize)).first;
-            while v != 0 {
-                let next = (*cx.insts.add(v as usize)).next;
-                let size = allocation_size(cx, v, pcx);
-                frees.count = 0;
-                if size > 0 && allocation_stays(cx, fi, v, &mut frees, pcx) {
-                    let zero = c_callee_name(cx, v, pcx) == get_calloc_sym();
-                    let s = ir_new_slot(cx, size, 16);
-                    let addr = ir_make(cx, Op::Slot, TY_U64, 0, 0, s, pcx);
-                    ir_insert_before(cx, v, addr);
-                    if zero {
-                        zero_fill(cx, addr, size, v, pcx);
-                    }
-                    for k in 0..frees.count {
-                        ir_unlink(cx, (*frees.data.add(k as usize)));
-                    }
-                    ir_replace(cx, v, addr);
-                    changed = true;
-                }
-                v = next;
-            }
-        }
-        free(frees.data as *mut u8);
-        if changed {
-            resolve_all(cx, fi);
-            verify_func(cx, fi, c"heap to stack", pcx);
-        }
-        changed
+pub fn heap_to_stack(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) -> bool {
+    if calls_returns_twice(cx, fi, pcx) {
+        return false;
     }
+    ir_enter(cx, fi, pcx);
+    resolve_all(cx, fi);
+    let mut changed = false;
+    let mut frees: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..fn_block_count(cx, fi) {
+        let b = (fn_block(cx, fi, i));
+        if (cx.blocks[b as usize]).removed != 0 {
+            continue;
+        }
+        let mut v = (cx.blocks[b as usize]).first;
+        while v != 0 {
+            let next = (cx.insts[v as usize]).next;
+            let size = allocation_size(cx, v, pcx);
+            frees.clear();
+            if size > 0 && allocation_stays(cx, fi, v, &mut frees, pcx) {
+                let zero = c_callee_name(cx, v, pcx) == pcx.calloc_sym;
+                let s = ir_new_slot(cx, size, 16);
+                let addr = ir_make(cx, Op::Slot, TY_U64, 0, 0, s, pcx);
+                ir_insert_before(cx, v, addr);
+                if zero {
+                    zero_fill(cx, addr, size, v, pcx);
+                }
+                for k in 0..frees.len() as i64 {
+                    ir_unlink(cx, (frees[k as usize]));
+                }
+                ir_replace(cx, v, addr);
+                changed = true;
+            }
+            v = next;
+        }
+    }
+    if changed {
+        resolve_all(cx, fi);
+        verify_func(cx, fi, c"heap to stack", pcx);
+    }
+    changed
 }
 
 // (0.18.1) The symbols heap_to_stack compares with, made before the tasks
 // run (middle::parallel: interning grows the program's table).
 pub fn init_syms(pcx: &mut Ctx<Comp>) {
-    if get_malloc_sym() == 0 {
-        set_malloc_sym(intern_c(c"malloc", pcx));
-        set_calloc_sym(intern_c(c"calloc", pcx));
-        set_free_sym(intern_c(c"free", pcx));
+    if pcx.malloc_sym == 0 {
+        pcx.malloc_sym = intern_c(c"malloc", pcx);
+        pcx.calloc_sym = intern_c(c"calloc", pcx);
+        pcx.free_sym = intern_c(c"free", pcx);
     }
 }
 
 // Stores zeros to [addr, + size) before instruction `at`.
-fn zero_fill(cx: &mut FnCtx, addr: i64, size: i64, at: i64, pcx: &Ctx<Comp>) {
+fn zero_fill(cx: &mut FnCtx<Comp>, addr: i64, size: i64, at: i64, pcx: &Ctx<Comp>) {
     let mut offset: i64 = 0;
     while offset < size {
         let width: i64 = if size - offset >= 8 { 8 } else { 1 };
@@ -999,175 +1042,21 @@ fn zero_fill(cx: &mut FnCtx, addr: i64, size: i64, at: i64, pcx: &Ctx<Comp>) {
         let zero = ir_make(cx, Const, ty, 0, 0, 0, pcx);
         ir_insert_before(cx, at, zero);
         let st = ir_make(cx, Store, 0, addr, zero, offset, pcx);
-        unsafe { (*cx.insts.add(st as usize)).imm2 = ty; }
+        (cx.insts[st as usize]).imm2 = ty;
         ir_insert_before(cx, at, st);
         offset += width;
     }
 }
 
 // Inserts instruction v in block b after its PARAMs.
-fn ir_append_after_params(cx: &mut FnCtx, b: i64, v: i64) {
-    unsafe {
-        let mut w = (*cx.blocks.add(b as usize)).first;
-        while w != 0 && (*cx.insts.add(w as usize)).op == Param {
-            w = (*cx.insts.add(w as usize)).next;
-        }
-        if w == 0 {
-            ir_append(cx, b, v);
-        } else {
-            ir_insert_before(cx, w, v);
-        }
+fn ir_append_after_params(cx: &mut FnCtx<Comp>, b: i64, v: i64) {
+    let mut w = (cx.blocks[b as usize]).first;
+    while w != 0 && (cx.insts[w as usize]).op == Param {
+        w = (cx.insts[w as usize]).next;
     }
-}
-
-// (0.28.0) FN_ATTRS's accessors: every use of it is one of them.
-pub fn get_fn_attrs() -> *mut i64 {
-    // UNSAFE: the per-function attributes, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: made by init_attrs on the main thread; written only for the
-    // task's own component (infer_component_attrs over start..end,
-    // get_facts); another function g's entry is read only after a readiness
-    // test: call_attrs after fn_facts_ready(g) (lower level, ordered by the
-    // level barrier), compute_attrs only for g in the same SCC (own task),
-    // codecache's fact only via cc_note/reads_hold after ready_or_done
-    unsafe { FN_ATTRS }
-}
-
-pub fn set_fn_attrs(v: *mut i64) {
-    // UNSAFE: the per-function attributes, a process-wide static mut; Rust
-    // has no safe access to a static mut
-    // SAFETY: made by init_attrs on the main thread; written only for the
-    // task's own component (infer_component_attrs over start..end,
-    // get_facts); another function g's entry is read only after a readiness
-    // test: call_attrs after fn_facts_ready(g) (lower level, ordered by the
-    // level barrier), compute_attrs only for g in the same SCC (own task),
-    // codecache's fact only via cc_note/reads_hold after ready_or_done
-    unsafe {
-        FN_ATTRS = v;
-    }
-}
-
-// (0.28.0) FN_NOCAPTURE's accessors: every use of it is one of them.
-pub fn get_fn_nocapture() -> *mut i64 {
-    // UNSAFE: the per-function no-capture bits, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: made by init_attrs on the main thread; written only for the
-    // task's own component (compute_attrs(fi), infer_component_attrs,
-    // get_facts); read of another g in captured only when g is in the same
-    // SCC or fn_facts_ready(g) held (the || chain evaluates FN_NOCAPTURE[g]
-    // last), codecache's fact after ready_or_done
-    unsafe { FN_NOCAPTURE }
-}
-
-pub fn set_fn_nocapture(v: *mut i64) {
-    // UNSAFE: the per-function no-capture bits, a process-wide static mut;
-    // Rust has no safe access to a static mut
-    // SAFETY: made by init_attrs on the main thread; written only for the
-    // task's own component (compute_attrs(fi), infer_component_attrs,
-    // get_facts); read of another g in captured only when g is in the same
-    // SCC or fn_facts_ready(g) held (the || chain evaluates FN_NOCAPTURE[g]
-    // last), codecache's fact after ready_or_done
-    unsafe {
-        FN_NOCAPTURE = v;
-    }
-}
-
-// (0.28.0) FN_ATTRS_DONE's accessors: every use of it is one of them.
-pub fn get_fn_attrs_done() -> *mut i64 {
-    // UNSAFE: the per-function attributes-done flags, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: made by init_attrs on the main thread; written only in the
-    // -O2 component phase, for the task's own component
-    // (infer_component_attrs, called only by run_component; get_facts from
-    // component_install); since 0.27.8 call_attrs and captured read
-    // FN_ATTRS_DONE[g] only when cx.cur_comp < 0, which in a task means
-    // outside the component phase (run_component sets cur_comp = c before
-    // any work and -1 at both returns), where no task writes it and the
-    // component phase's writes are ordered by MUTEX; in the phase it is
-    // read only for the task's own functions (own_fp, put_facts) or, in
-    // fact(R_ATTRS), for a g ready_or_done passed (a finished lower level);
-    // codecache's ready reads it only when cur_comp < 0
-    unsafe { FN_ATTRS_DONE }
-}
-
-pub fn set_fn_attrs_done(v: *mut i64) {
-    // UNSAFE: the per-function attributes-done flags, a process-wide static
-    // mut; Rust has no safe access to a static mut
-    // SAFETY: made by init_attrs on the main thread; written only in the
-    // -O2 component phase, for the task's own component
-    // (infer_component_attrs, called only by run_component; get_facts from
-    // component_install); since 0.27.8 call_attrs and captured read
-    // FN_ATTRS_DONE[g] only when cx.cur_comp < 0, which in a task means
-    // outside the component phase (run_component sets cur_comp = c before
-    // any work and -1 at both returns), where no task writes it and the
-    // component phase's writes are ordered by MUTEX; in the phase it is
-    // read only for the task's own functions (own_fp, put_facts) or, in
-    // fact(R_ATTRS), for a g ready_or_done passed (a finished lower level);
-    // codecache's ready reads it only when cur_comp < 0
-    unsafe {
-        FN_ATTRS_DONE = v;
-    }
-}
-
-// (0.28.0) MALLOC_SYM's accessors: every use of it is one of them.
-fn get_malloc_sym() -> i64 {
-    // UNSAFE: the malloc symbol heap_to_stack compares with, a process-wide
-    // static mut the tasks read; Rust has no safe access to a static mut
-    // SAFETY: written only by ipo::init_syms (only while MALLOC_SYM is 0),
-    // whose only caller is prepare_tasks on the main thread before
-    // pool_start; tasks only read it
-    unsafe { MALLOC_SYM }
-}
-
-fn set_malloc_sym(v: i64) {
-    // UNSAFE: the malloc symbol heap_to_stack compares with, a process-wide
-    // static mut the tasks read; Rust has no safe access to a static mut
-    // SAFETY: written only by ipo::init_syms (only while MALLOC_SYM is 0),
-    // whose only caller is prepare_tasks on the main thread before
-    // pool_start; tasks only read it
-    unsafe {
-        MALLOC_SYM = v;
-    }
-}
-
-// (0.28.0) CALLOC_SYM's accessors: every use of it is one of them.
-fn get_calloc_sym() -> i64 {
-    // UNSAFE: the calloc symbol heap_to_stack compares with, a process-wide
-    // static mut the tasks read; Rust has no safe access to a static mut
-    // SAFETY: written only by ipo::init_syms (under MALLOC_SYM == 0), sole
-    // caller prepare_tasks on the main thread before pool_start; tasks only
-    // read it
-    unsafe { CALLOC_SYM }
-}
-
-fn set_calloc_sym(v: i64) {
-    // UNSAFE: the calloc symbol heap_to_stack compares with, a process-wide
-    // static mut the tasks read; Rust has no safe access to a static mut
-    // SAFETY: written only by ipo::init_syms (under MALLOC_SYM == 0), sole
-    // caller prepare_tasks on the main thread before pool_start; tasks only
-    // read it
-    unsafe {
-        CALLOC_SYM = v;
-    }
-}
-
-// (0.28.0) FREE_SYM's accessors: every use of it is one of them.
-fn get_free_sym() -> i64 {
-    // UNSAFE: the free symbol heap_to_stack compares with, a process-wide
-    // static mut the tasks read; Rust has no safe access to a static mut
-    // SAFETY: written only by ipo::init_syms (under MALLOC_SYM == 0), sole
-    // caller prepare_tasks on the main thread before pool_start; tasks only
-    // read it
-    unsafe { FREE_SYM }
-}
-
-fn set_free_sym(v: i64) {
-    // UNSAFE: the free symbol heap_to_stack compares with, a process-wide
-    // static mut the tasks read; Rust has no safe access to a static mut
-    // SAFETY: written only by ipo::init_syms (under MALLOC_SYM == 0), sole
-    // caller prepare_tasks on the main thread before pool_start; tasks only
-    // read it
-    unsafe {
-        FREE_SYM = v;
+    if w == 0 {
+        ir_append(cx, b, v);
+    } else {
+        ir_insert_before(cx, w, v);
     }
 }

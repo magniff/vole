@@ -14,10 +14,7 @@
 
 mod try_main;
 
-use crate::base::{
-    IntVec, alloc_array, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, free, intern, intern_c,
-    sym_text,
-};
+use crate::base::{buf_bytes, buf_fmt, buf_new, buf_str, intern_buf, intern_c, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{
@@ -42,8 +39,8 @@ use crate::front::lexer::{SUF_NONE, Tok};
 use crate::front::modules::module_of;
 use crate::front::traits::{bound_trait, implements, std_trait, trait_fn};
 use crate::front::types::{
-    REF_MUT, TY_NEVER, TyKind, buf_type, enum_variant, err_type, fn_param, get_enums, is_float,
-    is_integer, is_pointer, primitive_name, type_elem, variant_field,
+    REF_MUT, TY_NEVER, TyKind, buf_type, enum_variant, err_type, fn_param, is_float, is_integer,
+    is_pointer, primitive_name, type_elem, variant_field,
 };
 use crate::middle::lower::ssa::HMap;
 
@@ -77,27 +74,25 @@ pub fn collect_trait_params(tr: i64, pcx: &mut Ctx<Comp>) {
 // Type nodes `g` (a Generics holder) resolved in module m under the
 // current environment, pushed to TLISTS: its index.
 fn resolve_args(g: i64, m: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let saved = pcx.cur_mod;
-        pcx.cur_mod = m;
-        let mark = pcx.tscratch.count;
-        for i in 0..pcx.nodes[g as usize].count {
-            let t = resolve_type(child(g, i, pcx), pcx);
-            pcx.tscratch.push(t);
-        }
-        pcx.cur_mod = saved;
-        let targs = pcx.tlists.count;
-        for i in mark..pcx.tscratch.count {
-            pcx.tlists.push((*pcx.tscratch.data.add(i as usize)));
-        }
-        pcx.tscratch.count = mark;
-        targs
+    let saved = pcx.cur_mod;
+    pcx.cur_mod = m;
+    let mark = pcx.tscratch.len() as i64;
+    for i in 0..pcx.nodes[g as usize].count {
+        let t = resolve_type(child(g, i, pcx), pcx);
+        pcx.tscratch.push(t);
     }
+    pcx.cur_mod = saved;
+    let targs = pcx.tlists.len() as i64;
+    for i in mark..pcx.tscratch.len() as i64 {
+        pcx.tlists.push((pcx.tscratch[i as usize]));
+    }
+    pcx.tscratch.truncate(mark as usize);
+    targs
 }
 
 // One type as a TLISTS list.
 pub fn list_of(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let at = pcx.tlists.count;
+    let at = pcx.tlists.len() as i64;
     pcx.tlists.push(t);
     at
 }
@@ -136,78 +131,64 @@ fn default_trait_args(tr: i64, written: i64, self_node: i64, pos: i64, pcx: &mut
 // module; -1 for a generic impl (`impl<T> From<T> for W<T>`: resolved for
 // each instance, impl_targs) or when they failed.
 pub fn impl_trait_args(i: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let tr = pcx.traits_impls[i as usize].tr;
-        let tname = pcx.nodes[pcx.traits_impls[i as usize].node as usize].a;
-        let mut written = pcx.nodes[tname as usize].g;
-        let count = trait_param_count(tr, pcx);
-        if count == 0 {
-            if written != 0 {
-                err_begin(pcx.nodes[tname as usize].start, pcx);
-                err_fmt(format_args("trait '{}' takes no type arguments",
-                    str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap()), pcx);
-                err_end(pcx);
-            }
-            return;
-        }
-        pcx.traits_impls[i as usize].targs = -1;
-        let mut got: i64 = if written == 0 { 0 } else { pcx.nodes[written as usize].count };
-        if got < count {
-            let impl_node = pcx.traits_impls[i as usize].node;
-            let filled = default_trait_args(tr, written, pcx.nodes[impl_node as usize].b,
-                pcx.nodes[tname as usize].end, pcx);
-            if filled != 0 {
-                pcx.nodes[tname as usize].g = filled;
-                written = filled;
-                got = count;
-            }
-        }
-        if got != count {
+    let tr = pcx.traits_impls[i as usize].tr;
+    let tname = pcx.nodes[pcx.traits_impls[i as usize].node as usize].a;
+    let mut written = pcx.nodes[tname as usize].g;
+    let count = trait_param_count(tr, pcx);
+    if count == 0 {
+        if written != 0 {
             err_begin(pcx.nodes[tname as usize].start, pcx);
-            err_fmt(format_args("trait '{}' takes ",
+            err_fmt(format_args("trait '{}' takes no type arguments",
                 str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap()), pcx);
-            err_int_words(count, c" type argument", c" type arguments", pcx);
-            err_fmt(format_args(", got {got}"), pcx);
-            err_help_fmt(format_args("write them: '{}<T>'",
-                str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap()),
-                pcx);
             err_end(pcx);
         }
-        let into = std_trait(c"Into", pcx);
-        // RULE: Z3.1 (0.27.2: std2's Into is Rust's, with its blanket impl
-        // over From: an impl of it is an impl)
-        if tr == into && !(crate::front::known::on_std2(pcx)) {
-            err_begin(pcx.nodes[tname as usize].start, pcx);
-            err_str(
-                c"Into is not implemented directly: it holds exactly when From does the other way", pcx);
-            err_help(c"implement From instead: 'impl From<", pcx);
-            buf_type(pcx.err_help, pcx.traits_impls[i as usize].ty, pcx);
-            err_help(c"> for U { fn from(x: ", pcx);
-            buf_type(pcx.err_help, pcx.traits_impls[i as usize].ty, pcx);
-            err_help(c") -> U { ... } }' gives 'let u: U = x.into();'", pcx);
-            err_end(pcx);
+        return;
+    }
+    pcx.traits_impls[i as usize].targs = -1;
+    let mut got: i64 = if written == 0 { 0 } else { pcx.nodes[written as usize].count };
+    if got < count {
+        let impl_node = pcx.traits_impls[i as usize].node;
+        let filled = default_trait_args(tr, written, pcx.nodes[impl_node as usize].b,
+            pcx.nodes[tname as usize].end, pcx);
+        if filled != 0 {
+            pcx.nodes[tname as usize].g = filled;
+            written = filled;
+            got = count;
         }
-        if pcx.traits_impls[i as usize].tpl != TPL_NONE {
-            return;
-        }
-        pcx.traits_impls[i as usize].targs = resolve_args(written,
-            pcx.traits_impls[i as usize].module, pcx);
-        let from = std_trait(c"From", pcx);
-        if tr == from
-            && (*pcx.tlists.data.add(pcx.traits_impls[i as usize].targs as usize))
-            == pcx.traits_impls[i as usize].ty {
-            err_begin(pcx.nodes[tname as usize].start, pcx);
-            err_str(c"every type converts from itself already: 'impl From<", pcx);
-            err_type(pcx.traits_impls[i as usize].ty, pcx);
-            err_str(c"> for ", pcx);
-            err_type(pcx.traits_impls[i as usize].ty, pcx);
-            err_str(c"' conflicts with it", pcx);
-            err_end(pcx);
-        }
+    }
+    if got != count {
+        err_begin(pcx.nodes[tname as usize].start, pcx);
+        err_fmt(format_args("trait '{}' takes ",
+            str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap()), pcx);
+        err_int_words(count, c" type argument", c" type arguments", pcx);
+        err_fmt(format_args(", got {got}"), pcx);
+        err_help_fmt(format_args("write them: '{}<T>'",
+            str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap()),
+            pcx);
+        err_end(pcx);
+    }
+    // RULE: Z3.1 (0.27.2: std's Into is Rust's, with its blanket impl
+    // over From: an impl of it is an impl)
+    if pcx.traits_impls[i as usize].tpl != TPL_NONE {
+        return;
+    }
+    pcx.traits_impls[i as usize].targs = resolve_args(written,
+        pcx.traits_impls[i as usize].module, pcx);
+    let from = std_trait(c"From", pcx);
+    if tr == from
+        && (pcx.tlists[pcx.traits_impls[i as usize].targs as usize])
+        == pcx.traits_impls[i as usize].ty {
+        err_begin(pcx.nodes[tname as usize].start, pcx);
+        err_str(c"every type converts from itself already: 'impl From<", pcx);
+        err_type(pcx.traits_impls[i as usize].ty, pcx);
+        err_str(c"> for ", pcx);
+        err_type(pcx.traits_impls[i as usize].ty, pcx);
+        err_str(c"' conflicts with it", pcx);
+        err_end(pcx);
     }
 }
 
-fn err_int_words(n: i64, one: *mut u8, many: *mut u8, pcx: &Ctx<Comp>) {
+fn err_int_words(n: i64, one: *const u8, many: *const u8, pcx: &Ctx<Comp>) {
     err_int(n, pcx);
     err_str(if n == 1 { one } else { many }, pcx);
 }
@@ -230,15 +211,13 @@ pub fn same_trait_args(j: i64, i: i64, pcx: &Ctx<Comp>) -> bool {
 }
 
 pub fn same_list(a: i64, b: i64, count: i64, pcx: &Ctx<Comp>) -> bool {
-    unsafe {
-        for k in 0..count {
-            if (*pcx.tlists.data.add((a + k) as usize))
-                != (*pcx.tlists.data.add((b + k) as usize)) {
-                return false;
-            }
+    for k in 0..count {
+        if (pcx.tlists[(a + k) as usize])
+            != (pcx.tlists[(b + k) as usize]) {
+            return false;
         }
-        true
     }
+    true
 }
 
 // The impl a function belongs to when that impl is of a generic trait
@@ -261,7 +240,7 @@ pub fn impl_fn_symbol(sym: i64, i: i64, pcx: &mut Ctx<Comp>) -> i64 {
         buf_fmt(out, format_args("{}.n{}", str::from_utf8(sym_text(sym, pcx)).unwrap(), -i));
     }
     else { buf_fmt(out, format_args("{}.{i}", str::from_utf8(sym_text(sym, pcx)).unwrap())); }
-    intern(buf_slice(out), pcx)
+    intern_buf(out, pcx)
 }
 
 // Whether impl i is for type t (for a generic impl: t is an instance of
@@ -285,9 +264,7 @@ pub fn impl_targs(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return -1;
     }
     for k in 0..pcx.nodes[params as usize].count {
-        // UNSAFE: TLISTS is a raw table (base/comp.vl); every table read is.
-        // SAFETY: b..b + count was written by impl_bindings for these params.
-        if unsafe { (*pcx.tlists.data.add((b + k) as usize)) } == 0 {
+        if ((pcx.tlists[(b + k) as usize])) == 0 {
             return -1;
         }
     }
@@ -305,64 +282,59 @@ pub fn impl_targs(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // literal; `skip` 1 for a method call) against the declared parameter
 // types of the impl's function f, then the trait arguments resolved; -1
 // when a parameter stays unbound. RULE: F14.1
-pub fn complete_impl_targs(i: i64, f: i64, n: i64, tys: *mut i64, skip: i64,
+pub fn complete_impl_targs(i: i64, f: i64, n: i64, tys: &mut [i64], skip: i64,
     pcx: &mut Ctx<Comp>) -> i64 {
-    // UNSAFE: alloc_array/free for the bindings and the TLISTS reads, as
-    // instantiate_call's.
-    // SAFETY: bound has `count` slots, read and written for k < count; tys
-    // has one slot per argument of n (the caller's).
-    unsafe {
-        let node = pcx.traits_impls[i as usize].node;
-        let params = pcx.nodes[node as usize].g;
-        // (a template impl with parameters its type does not fix, `impl<T:
-        // PartialEq<U>, U> PartialEq<[U]> for [T]`, too)
-        if pcx.traits_impls[i as usize].tpl == TPL_NONE {
-            return -1;
-        }
-        let count = pcx.nodes[params as usize].count;
-        let b = crate::front::traits::impl_bindings(i, pcx.self_type, pcx);
-        let bound = alloc_array::<i64>(count);
-        for k in 0..count {
-            (*bound.add(k as usize)) = if b >= 0 { (*pcx.tlists.data.add((b + k) as usize)) }
-                else { 0 };
-        }
-        let item = pcx.fns[f as usize].node;
-        let tmod = pcx.fns[f as usize].module;
-        for k in 0..pcx.nodes[n as usize].count {
-            if k + skip < pcx.nodes[item as usize].count && (*tys.add(k as usize)) != 0 {
-                crate::front::generics::instantiate::unify(params, bound, tmod,
-                    pcx.nodes[child(item, k + skip, pcx) as usize].b, (*tys.add(k as usize)), pcx);
-            }
-        }
-        // RULE: F14.1 (0.27.3: a parameter the arguments leave free, from the
-        // call's expected type through the result: `r.start_bound()` of a
-        // RangeFull taken as a `Bound<&i64>`)
-        if pcx.hint_node == n && pcx.hint_ty > 0 && pcx.nodes[item as usize].b != 0 {
-            crate::front::generics::instantiate::unify(params, bound, tmod,
-                pcx.nodes[item as usize].b, pcx.hint_ty, pcx);
-        }
-        if skip == 1 {
-            unify_recv_bound(i, n, params, bound, pcx);
-        }
-        let mut complete = true;
-        let mark = pcx.tscratch.count;
-        for k in 0..count {
-            if (*bound.add(k as usize)) == 0 {
-                complete = false;
-            }
-            pcx.tscratch.push((*bound.add(k as usize)));
-        }
-        free(bound as *mut u8);
-        let targs = crate::front::generics::take_targs(mark, pcx);
-        if !complete {
-            return -1;
-        }
-        let saved = env_enter(params, targs, count, pcx);
-        let r = resolve_args(pcx.nodes[pcx.nodes[node as usize].a as usize].g,
-            pcx.traits_impls[i as usize].module, pcx);
-        env_leave(saved, pcx);
-        r
+    let node = pcx.traits_impls[i as usize].node;
+    let params = pcx.nodes[node as usize].g;
+    // (a template impl with parameters its type does not fix, `impl<T:
+    // PartialEq<U>, U> PartialEq<[U]> for [T]`, too)
+    if pcx.traits_impls[i as usize].tpl == TPL_NONE {
+        return -1;
     }
+    let count = pcx.nodes[params as usize].count;
+    let b = crate::front::traits::impl_bindings(i, pcx.self_type, pcx);
+    let mut bound_room: Vec<i64, Comp> = Vec::new_in(Comp {});
+    bound_room.resize((count) as usize, 0);
+    let bound = bound_room.as_mut_slice();
+    for k in 0..count {
+        (bound[k as usize]) = if b >= 0 { (pcx.tlists[(b + k) as usize]) }
+            else { 0 };
+    }
+    let item = pcx.fns[f as usize].node;
+    let tmod = pcx.fns[f as usize].module;
+    for k in 0..pcx.nodes[n as usize].count {
+        if k + skip < pcx.nodes[item as usize].count && (tys[k as usize]) != 0 {
+            crate::front::generics::instantiate::unify(params, bound, tmod,
+                pcx.nodes[child(item, k + skip, pcx) as usize].b, (tys[k as usize]), pcx);
+        }
+    }
+    // RULE: F14.1 (0.27.3: a parameter the arguments leave free, from the
+    // call's expected type through the result: `r.start_bound()` of a
+    // RangeFull taken as a `Bound<&i64>`)
+    if pcx.hint_node == n && pcx.hint_ty > 0 && pcx.nodes[item as usize].b != 0 {
+        crate::front::generics::instantiate::unify(params, bound, tmod,
+            pcx.nodes[item as usize].b, pcx.hint_ty, pcx);
+    }
+    if skip == 1 {
+        unify_recv_bound(i, n, params, bound, pcx);
+    }
+    let mut complete = true;
+    let mark = pcx.tscratch.len() as i64;
+    for k in 0..count {
+        if (bound[k as usize]) == 0 {
+            complete = false;
+        }
+        pcx.tscratch.push((bound[k as usize]));
+    }
+    let targs = crate::front::generics::take_targs(mark, pcx);
+    if !complete {
+        return -1;
+    }
+    let saved = env_enter(params, targs, count, pcx);
+    let r = resolve_args(pcx.nodes[pcx.nodes[node as usize].a as usize].g,
+        pcx.traits_impls[i as usize].module, pcx);
+    env_leave(saved, pcx);
+    r
 }
 
 // RULE: F14.1 (0.28.0) The parameters of pattern impl i that its type
@@ -371,7 +343,7 @@ pub fn complete_impl_targs(i: i64, f: i64, n: i64, tys: *mut i64, skip: i64,
 // RangeBounds<K>`, R = RangeFull, is `impl<T> RangeBounds<T> for
 // RangeFull` with T = K. n is the method call; `params` (the impl's, or
 // its function's, which begin with them) and `bound` are unify's.
-pub fn unify_recv_bound(i: i64, n: i64, params: i64, bound: *mut i64, pcx: &mut Ctx<Comp>) {
+pub fn unify_recv_bound(i: i64, n: i64, params: i64, bound: &mut [i64], pcx: &mut Ctx<Comp>) {
     if pcx.nodes[n as usize].kind != NodeKind::MethodCall {
         return;
     }
@@ -417,49 +389,44 @@ pub fn unify_recv_bound(i: i64, n: i64, params: i64, bound: *mut i64, pcx: &mut 
 // self type t leaves are completed from them; a TLISTS index, -1 when one
 // stays unbound. RULE: F14.1
 pub fn complete_impl_bindings(i: i64, t: i64, targs: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    // UNSAFE: alloc_array/free for the bindings and the TLISTS reads, as
-    // complete_impl_targs's.
-    // SAFETY: bound has `count` slots, read and written for k < count;
-    // targs has one slot per argument the impl's trait is written with.
-    unsafe {
-        if pcx.traits_impls[i as usize].tpl == TPL_NONE {
-            return -1;
-        }
-        let node = pcx.traits_impls[i as usize].node;
-        let params = pcx.nodes[node as usize].g;
-        let args = pcx.nodes[pcx.nodes[node as usize].a as usize].g;
-        if params == 0 || args == 0 {
-            return -1;
-        }
-        let count = pcx.nodes[params as usize].count;
-        let b = crate::front::traits::impl_bindings(i, t, pcx);
-        if b < 0 {
-            return -1;
-        }
-        let bound = alloc_array::<i64>(count);
-        for k in 0..count {
-            (*bound.add(k as usize)) = (*pcx.tlists.data.add((b + k) as usize));
-        }
-        let tmod = pcx.traits_impls[i as usize].module;
-        for k in 0..pcx.nodes[args as usize].count {
-            crate::front::generics::instantiate::unify(params, bound, tmod, child(args, k, pcx),
-                (*pcx.tlists.data.add((targs + k) as usize)), pcx);
-        }
-        let mut complete = true;
-        let mark = pcx.tscratch.count;
-        for k in 0..count {
-            if (*bound.add(k as usize)) == 0 {
-                complete = false;
-            }
-            pcx.tscratch.push((*bound.add(k as usize)));
-        }
-        free(bound as *mut u8);
-        let full = crate::front::generics::take_targs(mark, pcx);
-        if !complete {
-            return -1;
-        }
-        full
+    if pcx.traits_impls[i as usize].tpl == TPL_NONE {
+        return -1;
     }
+    let node = pcx.traits_impls[i as usize].node;
+    let params = pcx.nodes[node as usize].g;
+    let args = pcx.nodes[pcx.nodes[node as usize].a as usize].g;
+    if params == 0 || args == 0 {
+        return -1;
+    }
+    let count = pcx.nodes[params as usize].count;
+    let b = crate::front::traits::impl_bindings(i, t, pcx);
+    if b < 0 {
+        return -1;
+    }
+    let mut bound_room: Vec<i64, Comp> = Vec::new_in(Comp {});
+    bound_room.resize((count) as usize, 0);
+    let bound = bound_room.as_mut_slice();
+    for k in 0..count {
+        (bound[k as usize]) = (pcx.tlists[(b + k) as usize]);
+    }
+    let tmod = pcx.traits_impls[i as usize].module;
+    for k in 0..pcx.nodes[args as usize].count {
+        crate::front::generics::instantiate::unify(params, bound, tmod, child(args, k, pcx),
+            (pcx.tlists[(targs + k) as usize]), pcx);
+    }
+    let mut complete = true;
+    let mark = pcx.tscratch.len() as i64;
+    for k in 0..count {
+        if (bound[k as usize]) == 0 {
+            complete = false;
+        }
+        pcx.tscratch.push((bound[k as usize]));
+    }
+    let full = crate::front::generics::take_targs(mark, pcx);
+    if !complete {
+        return -1;
+    }
+    full
 }
 
 // impl_targs for a pattern impl whose header leaves a parameter unbound,
@@ -498,85 +465,81 @@ fn intrinsic_from(from: i64, to: i64) -> bool {
 // way From holds). tr < 0: a bound that named no trait (an error was
 // reported), which holds.
 pub fn implements_with(tr: i64, t: i64, targs: i64, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        if tr < 0 || has_error_type(t, pcx) || t == TY_NEVER {
-            return true;
-        }
-        let count = trait_param_count(tr, pcx);
-        if count == 0 {
-            return implements(tr, t, pcx);
-        }
-        // RULE: D22.1 (0.27.3: an Ω, by its bounds, FL11)
-        // (0.28.0: or by an impl that covers every type, as any type: std's
-        // `impl<T> Borrow<T> for T` for `K: Borrow<K>` of HashMap::get)
-        if crate::front::opaque::is_opaque(t, pcx) && crate::front::opaque::is_omega(t, pcx)
-            && crate::front::opaque::implements_with(tr, t, targs, pcx) {
-            return true;
-        }
-        for k in 0..count {
-            if has_error_type((*pcx.tlists.data.add((targs + k) as usize)), pcx) {
-                return true;
-            }
-        }
-        let from = std_trait(c"From", pcx);
-        if tr == std_trait(c"Into", pcx) {
-            return from >= 0
-                && implements_with(from, (*pcx.tlists.data.add(targs as usize)), list_of(t, pcx),
-                    pcx);
-        }
-        if tr == from && intrinsic_from((*pcx.tlists.data.add(targs as usize)), t) {
-            return true;
-        }
-        // (0.27.2.1: the impls of tr only, by its chain)
-        let mut next_impl = crate::front::traits::impls_start(tr, pcx);
-        while next_impl >= 0 {
-            let i = next_impl;
-            next_impl = crate::front::traits::impls_after(i, pcx);
-            if pcx.traits_impls[i as usize].tr != tr || !impl_covers(i, t, pcx) {
-                continue;
-            }
-            let mut a = impl_targs(i, t, pcx);
-            if a < 0 {
-                a = complete_impl_targs_by(i, t, targs, pcx);
-            }
-            if a >= 0 && same_list(a, targs, count, pcx) {
-                return true;
-            }
-        }
-        false
+    if tr < 0 || has_error_type(t, pcx) || t == TY_NEVER {
+        return true;
     }
+    let count = trait_param_count(tr, pcx);
+    if count == 0 {
+        return implements(tr, t, pcx);
+    }
+    // RULE: D22.1 (0.27.3: an Ω, by its bounds, FL11)
+    // (0.28.0: or by an impl that covers every type, as any type: std's
+    // `impl<T> Borrow<T> for T` for `K: Borrow<K>` of HashMap::get)
+    if crate::front::opaque::is_opaque(t, pcx) && crate::front::opaque::is_omega(t, pcx)
+        && crate::front::opaque::implements_with(tr, t, targs, pcx) {
+        return true;
+    }
+    for k in 0..count {
+        if has_error_type((pcx.tlists[(targs + k) as usize]), pcx) {
+            return true;
+        }
+    }
+    let from = std_trait(c"From", pcx);
+    if tr == std_trait(c"Into", pcx) {
+        return from >= 0
+            && implements_with(from, (pcx.tlists[targs as usize]), list_of(t, pcx),
+                pcx);
+    }
+    if tr == from && intrinsic_from((pcx.tlists[targs as usize]), t) {
+        return true;
+    }
+    // (0.27.2.1: the impls of tr only, by its chain)
+    let mut next_impl = crate::front::traits::impls_start(tr, pcx);
+    while next_impl >= 0 {
+        let i = next_impl;
+        next_impl = crate::front::traits::impls_after(i, pcx);
+        if pcx.traits_impls[i as usize].tr != tr || !impl_covers(i, t, pcx) {
+            continue;
+        }
+        let mut a = impl_targs(i, t, pcx);
+        if a < 0 {
+            a = complete_impl_targs_by(i, t, targs, pcx);
+        }
+        if a >= 0 && same_list(a, targs, count, pcx) {
+            return true;
+        }
+    }
+    false
 }
 
 // Bound b's trait with its arguments, for messages: `From<i64>`.
 pub fn buf_bound(out: i64, tr: i64, targs: i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        buf_bytes(out, sym_text(pcx.traits[tr as usize].name, pcx));
-        let count = trait_param_count(tr, pcx);
-        // (0.27.2.1: a pattern impl whose arguments are unknown here,
-        // `impl<A: PartialEq<B>, B> PartialEq<&B> for &A`: its trait alone)
-        if count == 0 || targs < 0 {
-            return;
-        }
-        buf_str(out, c"<");
-        for k in 0..count {
-            if k > 0 {
-                buf_str(out, c", ");
-            }
-            let a = (*pcx.tlists.data.add((targs + k) as usize));
-            if a == 0 {
-                buf_str(out, c"_");
-            } else {
-                buf_type(out, a, pcx);
-            }
-        }
-        buf_str(out, c">");
+    buf_bytes(out, sym_text(pcx.traits[tr as usize].name, pcx));
+    let count = trait_param_count(tr, pcx);
+    // (0.27.2.1: a pattern impl whose arguments are unknown here,
+    // `impl<A: PartialEq<B>, B> PartialEq<&B> for &A`: its trait alone)
+    if count == 0 || targs < 0 {
+        return;
     }
+    buf_str(out, c"<");
+    for k in 0..count {
+        if k > 0 {
+            buf_str(out, c", ");
+        }
+        let a = (pcx.tlists[(targs + k) as usize]);
+        if a == 0 {
+            buf_str(out, c"_");
+        } else {
+            buf_type(out, a, pcx);
+        }
+    }
+    buf_str(out, c">");
 }
 
 pub fn err_bound(tr: i64, targs: i64, pcx: &mut Ctx<Comp>) {
     let out = buf_new();
     buf_bound(out, tr, targs, pcx);
-    err_sym(intern(buf_slice(out), pcx), pcx);
+    err_sym(intern_buf(out, pcx), pcx);
 }
 
 // ---- Calls of a generic trait's functions ----
@@ -596,7 +559,7 @@ fn impl_fn(i: i64, member: i64, pcx: &Ctx<Comp>) -> i64 {
     // (those of impl i named member, in order: traits::impl_extra_at)
     let mut k = crate::front::traits::impl_extra_at(i, member, pcx);
     while k >= 0 {
-        let f = pcx.impl_extra.get(k);
+        let f = pcx.impl_extra[k as usize];
         k = crate::front::traits::impl_extra_after(k, pcx);
         if pcx.nodes[f as usize].a == member && pcx.nodes[f as usize].x != 0
             && (pcx.nodes[f as usize].p & FN_SIG_FAILED) == 0
@@ -677,14 +640,14 @@ fn decl_type(tr: i64, decl: i64, targs: i64, t: i64, tn: i64, pcx: &mut Ctx<Comp
     let own = pcx.nodes[decl as usize].g;
     let own_count: i64 = if own != 0 { pcx.nodes[own as usize].count } else { 0 };
     // (in the trait's frame: env_enter would hide the trait's parameters)
-    let frame_end = pcx.tp_names.count;
+    let frame_end = pcx.tp_names.len() as i64;
     for i in 0..own_count {
         pcx.tp_names.push(pcx.nodes[child(own, i, pcx) as usize].a);
         pcx.tp_types.push(pcx.ty_error);
     }
     let ty = resolve_type_or_error(tn, pcx);
-    pcx.tp_names.count = frame_end;
-    pcx.tp_types.count = frame_end;
+    pcx.tp_names.truncate(frame_end as usize);
+    pcx.tp_types.truncate(frame_end as usize);
     env_leave(saved, pcx);
     pcx.cur_mod = saved_mod;
     pcx.self_type = saved_self;
@@ -750,52 +713,50 @@ fn own_bound_misses(tr: i64, decl: i64, targs: i64, t: i64, k: i64, a: i64,
 // Whether candidate c (an index of CANDS, a pair) takes the arguments of
 // call n, of types tys[..] (0 for a literal, kinds[..] its kind); `skip`
 // is 1 for a method call (its receiver is the decl's self).
-fn takes(c: i64, n: i64, t: i64, tys: *mut i64, kinds: *mut i64, skip: i64, pcx: &mut Ctx<Comp>) -> bool {
-    unsafe {
-        let i = (*pcx.cands.data.add(c as usize));
-        let tr = pcx.traits_impls[i as usize].tr;
-        let decl = trait_fn(tr,
-            pcx.nodes[pcx.fns[(*pcx.cands.data.add((c + 1) as usize)) as usize].node as usize].a,
+fn takes(c: i64, n: i64, t: i64, tys: &mut [i64], kinds: &mut [i64], skip: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let i = (pcx.cands[c as usize]);
+    let tr = pcx.traits_impls[i as usize].tr;
+    let decl = trait_fn(tr,
+        pcx.nodes[pcx.fns[(pcx.cands[(c + 1) as usize]) as usize].node as usize].a,
+        pcx);
+    let has_self = pcx.nodes[decl as usize].count > 0
+        && pcx.nodes[child(decl, 0, pcx) as usize].a == pcx.self_sym;
+    if skip == 1 && !has_self {
+        return false;
+    }
+    let count = pcx.nodes[n as usize].count;
+    if pcx.nodes[decl as usize].count - skip != count {
+        return false;
+    }
+    let mut targs = impl_targs(i, t, pcx);
+    if targs < 0 {
+        // RULE: F14.1 (a pattern impl's parameter fixed by the arguments)
+        let saved_self = pcx.self_type;
+        pcx.self_type = t;
+        targs = complete_impl_targs(i, (pcx.cands[(c + 1) as usize]), n, tys, skip,
             pcx);
-        let has_self = pcx.nodes[decl as usize].count > 0
-            && pcx.nodes[child(decl, 0, pcx) as usize].a == pcx.self_sym;
-        if skip == 1 && !has_self {
-            return false;
-        }
-        let count = pcx.nodes[n as usize].count;
-        if pcx.nodes[decl as usize].count - skip != count {
-            return false;
-        }
-        let mut targs = impl_targs(i, t, pcx);
-        if targs < 0 {
-            // RULE: F14.1 (a pattern impl's parameter fixed by the arguments)
-            let saved_self = pcx.self_type;
-            pcx.self_type = t;
-            targs = complete_impl_targs(i, (*pcx.cands.data.add((c + 1) as usize)), n, tys, skip,
-                pcx);
-            pcx.self_type = saved_self;
-        }
-        if targs < 0 {
-            return false;
-        }
-        for k in 0..count {
-            let p = decl_param(tr, decl, targs, t, k + skip, pcx);
-            let a = (*tys.add(k as usize));
-            if a == 0 {
-                if (*kinds.add(k as usize)) == 1 && !is_integer(p)
-                    || (*kinds.add(k as usize)) == 2 && !is_float(p)
-                    || (*kinds.add(k as usize)) == 3
-                    && !literal_tuple_fits(child(n, k, pcx), p, pcx) {
-                    return false;
-                }
-            } else if a != p && a != TY_NEVER && !has_error_type(p, pcx) {
-                return false;
-            } else if a != TY_NEVER && own_bound_misses(tr, decl, targs, t, k + skip, a, pcx) {
+        pcx.self_type = saved_self;
+    }
+    if targs < 0 {
+        return false;
+    }
+    for k in 0..count {
+        let p = decl_param(tr, decl, targs, t, k + skip, pcx);
+        let a = (tys[k as usize]);
+        if a == 0 {
+            if (kinds[k as usize]) == 1 && !is_integer(p)
+                || (kinds[k as usize]) == 2 && !is_float(p)
+                || (kinds[k as usize]) == 3
+                && !literal_tuple_fits(child(n, k, pcx), p, pcx) {
                 return false;
             }
+        } else if a != p && a != TY_NEVER && !has_error_type(p, pcx) {
+            return false;
+        } else if a != TY_NEVER && own_bound_misses(tr, decl, targs, t, k + skip, a, pcx) {
+            return false;
         }
-        true
     }
+    true
 }
 
 // Call n (`T::member(args)`, or `x.member(args)` with t the receiver's
@@ -873,40 +834,35 @@ pub fn template_trait_call(n: i64, tpl: i64, member: i64, pcx: &mut Ctx<Comp>) -
 // Among the candidates of call n that take its arguments, the one whose
 // result type is the expected type `hint`, or -1 when not exactly one is
 // (a candidate whose result type is not known yet counts as one).
-fn by_expected(n: i64, t: i64, mark: i64, tys: *mut i64, kinds: *mut i64, skip: i64, hint: i64,
+fn by_expected(n: i64, t: i64, mark: i64, tys: &mut [i64], kinds: &mut [i64], skip: i64, hint: i64,
     pcx: &mut Ctx<Comp>)
     -> i64 {
     // RULE: F13.2 (`let r: &i64 = w.borrow()` picks Borrow<i64>)
-    // UNSAFE: CANDS is a raw IntVec (base/comp.vl), as every table.
-    // SAFETY: mark <= c < count, pairs dispatch pushed; tys and kinds
-    // hold the call's count arguments (dispatch).
-    unsafe {
-        let mut chosen: i64 = -1;
-        let mut matches: i64 = 0;
-        let mut c = mark;
-        while c < pcx.cands.count {
-            if takes(c, n, t, tys, kinds, skip, pcx) {
-                let i = (*pcx.cands.data.add(c as usize));
-                let tr = pcx.traits_impls[i as usize].tr;
-                let decl = trait_fn(tr,
-                    pcx.nodes[
-                        pcx.fns[(*pcx.cands.data.add((c + 1) as usize)) as usize].node as usize].a,
-                    pcx);
-                let targs = impl_targs(i, t, pcx);
-                let r = if targs < 0 || pcx.nodes[decl as usize].b == 0 {
-                    pcx.ty_error
-                } else {
-                    decl_type(tr, decl, targs, t, pcx.nodes[decl as usize].b, pcx)
-                };
-                if r == hint || has_error_type(r, pcx) {
-                    matches += 1;
-                    chosen = c;
-                }
+    let mut chosen: i64 = -1;
+    let mut matches: i64 = 0;
+    let mut c = mark;
+    while c < pcx.cands.len() as i64 {
+        if takes(c, n, t, tys, kinds, skip, pcx) {
+            let i = (pcx.cands[c as usize]);
+            let tr = pcx.traits_impls[i as usize].tr;
+            let decl = trait_fn(tr,
+                pcx.nodes[
+                    pcx.fns[(pcx.cands[(c + 1) as usize]) as usize].node as usize].a,
+                pcx);
+            let targs = impl_targs(i, t, pcx);
+            let r = if targs < 0 || pcx.nodes[decl as usize].b == 0 {
+                pcx.ty_error
+            } else {
+                decl_type(tr, decl, targs, t, pcx.nodes[decl as usize].b, pcx)
+            };
+            if r == hint || has_error_type(r, pcx) {
+                matches += 1;
+                chosen = c;
             }
-            c += 2;
         }
-        if matches == 1 { chosen } else { -1 }
+        c += 2;
     }
+    if matches == 1 { chosen } else { -1 }
 }
 
 // Among the candidates of method call n that take its arguments, in an
@@ -914,55 +870,51 @@ fn by_expected(n: i64, t: i64, mark: i64, tys: *mut i64, kinds: *mut i64, skip: 
 // one whose trait arguments a bound names (`s.as_ref()` with `S:
 // AsRef<str>`, S = String: AsRef<str>, as the generic body read it), or
 // -1 when not exactly one is.
-fn by_param_bound(n: i64, t: i64, mark: i64, tys: *mut i64, kinds: *mut i64, pcx: &mut Ctx<Comp>)
+fn by_param_bound(n: i64, t: i64, mark: i64, tys: &mut [i64], kinds: &mut [i64],
+    pcx: &mut Ctx<Comp>)
     -> i64 {
     // RULE: D22.3, F13.4 (the bound in the generic body picks the impl)
-    // UNSAFE: CANDS and TLISTS are raw tables (base/comp.vl), as every one.
-    // SAFETY: mark <= c < count, pairs dispatch pushed; bt and targs are
-    // TLISTS lists of tr's count arguments (resolve_args, impl_targs).
-    unsafe {
-        let mut recv = pcx.nodes[n as usize].a;
-        while pcx.nodes[recv as usize].kind == NodeKind::Unary
-            && pcx.nodes[recv as usize].op == Tok::Star {
-            recv = pcx.nodes[recv as usize].b;
-        }
-        if pcx.nodes[recv as usize].kind != NodeKind::Ident
-            || pcx.nodes[recv as usize].res != Res::Local
-            || pcx.nodes[recv as usize].y < 0
-            || pcx.locals[pcx.nodes[recv as usize].y as usize].tparam == 0 {
-            return -1;
-        }
-        let bounds = pcx.nodes[pcx.locals[pcx.nodes[recv as usize].y as usize].tparam as usize].h;
-        let mut chosen: i64 = -1;
-        let mut matches: i64 = 0;
-        let mut c = mark;
-        while c < pcx.cands.count {
-            if takes(c, n, t, tys, kinds, 1, pcx) {
-                let i = (*pcx.cands.data.add(c as usize));
-                let tr = pcx.traits_impls[i as usize].tr;
-                let targs = impl_targs(i, t, pcx);
-                let count = trait_param_count(tr, pcx);
-                let mut hit = false;
-                for k in 0..pcx.nodes[bounds as usize].count {
-                    let b = child(bounds, k, pcx);
-                    if hit || targs < 0 || pcx.nodes[b as usize].kind != NodeKind::TyName
-                        || pcx.nodes[b as usize].g == 0 || bound_trait(b, pcx) != tr {
-                        continue;
-                    }
-                    let bt = resolve_args(pcx.nodes[b as usize].g, pcx.cur_mod, pcx);
-                    hit = bt >= 0
-                        && (0i64..count).all(|j| (*pcx.tlists.data.add((bt + j) as usize))
-                            == (*pcx.tlists.data.add((targs + j) as usize)));
-                }
-                if hit {
-                    matches += 1;
-                    chosen = c;
-                }
-            }
-            c += 2;
-        }
-        if matches == 1 { chosen } else { -1 }
+    let mut recv = pcx.nodes[n as usize].a;
+    while pcx.nodes[recv as usize].kind == NodeKind::Unary
+        && pcx.nodes[recv as usize].op == Tok::Star {
+        recv = pcx.nodes[recv as usize].b;
     }
+    if pcx.nodes[recv as usize].kind != NodeKind::Ident
+        || pcx.nodes[recv as usize].res != Res::Local
+        || pcx.nodes[recv as usize].y < 0
+        || pcx.locals[pcx.nodes[recv as usize].y as usize].tparam == 0 {
+        return -1;
+    }
+    let bounds = pcx.nodes[pcx.locals[pcx.nodes[recv as usize].y as usize].tparam as usize].h;
+    let mut chosen: i64 = -1;
+    let mut matches: i64 = 0;
+    let mut c = mark;
+    while c < pcx.cands.len() as i64 {
+        if takes(c, n, t, tys, kinds, 1, pcx) {
+            let i = (pcx.cands[c as usize]);
+            let tr = pcx.traits_impls[i as usize].tr;
+            let targs = impl_targs(i, t, pcx);
+            let count = trait_param_count(tr, pcx);
+            let mut hit = false;
+            for k in 0..pcx.nodes[bounds as usize].count {
+                let b = child(bounds, k, pcx);
+                if hit || targs < 0 || pcx.nodes[b as usize].kind != NodeKind::TyName
+                    || pcx.nodes[b as usize].g == 0 || bound_trait(b, pcx) != tr {
+                    continue;
+                }
+                let bt = resolve_args(pcx.nodes[b as usize].g, pcx.cur_mod, pcx);
+                hit = bt >= 0
+                    && (0i64..count).all(|j| (pcx.tlists[(bt + j) as usize])
+                        == (pcx.tlists[(targs + j) as usize]));
+            }
+            if hit {
+                matches += 1;
+                chosen = c;
+            }
+        }
+        c += 2;
+    }
+    if matches == 1 { chosen } else { -1 }
 }
 
 // (0.27.2.1) Among the candidates of call n that take its one argument, a
@@ -970,40 +922,32 @@ fn by_param_bound(n: i64, t: i64, mark: i64, tys: *mut i64, kinds: *mut i64, pcx
 // one candidate whose trait argument is not a reference, as `PartialEq<str>`
 // and `PartialEq<&'a str>` for String both take it and compare alike; -1
 // when not exactly one is. RULE: F26.3
-fn by_view_rhs(n: i64, t: i64, mark: i64, tys: *mut i64, kinds: *mut i64, skip: i64,
+fn by_view_rhs(n: i64, t: i64, mark: i64, tys: &mut [i64], kinds: &mut [i64], skip: i64,
     pcx: &mut Ctx<Comp>, any: bool)
     -> i64 {
-    // UNSAFE: CANDS is a raw IntVec (base/comp.vl), as every table; tys is
-    // dispatch's array of the arguments' types.
-    // SAFETY: mark <= c < count, pairs dispatch pushed; the call has one
-    // (a trait argument written `&..`, whatever node it parsed to: `&[U]`
-    // is a view's TySlice, ref_type)
-    // argument, so tys[0] is within its count + 1 slots.
-    unsafe {
-        let a = (*tys.add(0));
-        if pcx.nodes[n as usize].count != 1 || a <= 0
-            || !any && !(pcx.types[a as usize].kind == TyKind::Slice && pcx.types[a as usize].b == 0
-                || crate::front::distinct::is_view_distinct(a, pcx)) {
-            return -1;
-        }
-        let mut chosen: i64 = -1;
-        let mut matches: i64 = 0;
-        let mut c = mark;
-        while c < pcx.cands.count {
-            let i = (*pcx.cands.data.add(c as usize));
-            let tn = pcx.nodes[pcx.traits_impls[i as usize].node as usize].a;
-            let g: i64 = if tn > 0 { pcx.nodes[tn as usize].g } else { 0 };
-            let by_ref = g != 0 && pcx.nodes[g as usize].count > 0
-                && crate::base::get_src()[pcx.nodes[child(g, 0, pcx) as usize].start as usize]
-                == b'&';
-            if !by_ref && takes(c, n, t, tys, kinds, skip, pcx) {
-                matches += 1;
-                chosen = c;
-            }
-            c += 2;
-        }
-        if matches == 1 { chosen } else { -1 }
+    let a = (tys[0]);
+    if pcx.nodes[n as usize].count != 1 || a <= 0
+        || !any && !(pcx.types[a as usize].kind == TyKind::Slice && pcx.types[a as usize].b == 0
+            || crate::front::distinct::is_view_distinct(a, pcx)) {
+        return -1;
     }
+    let mut chosen: i64 = -1;
+    let mut matches: i64 = 0;
+    let mut c = mark;
+    while c < pcx.cands.len() as i64 {
+        let i = (pcx.cands[c as usize]);
+        let tn = pcx.nodes[pcx.traits_impls[i as usize].node as usize].a;
+        let g: i64 = if tn > 0 { pcx.nodes[tn as usize].g } else { 0 };
+        let by_ref = g != 0 && pcx.nodes[g as usize].count > 0
+            && crate::base::get_src()[pcx.nodes[child(g, 0, pcx) as usize].start as usize]
+            == b'&';
+        if !by_ref && takes(c, n, t, tys, kinds, skip, pcx) {
+            matches += 1;
+            chosen = c;
+        }
+        c += 2;
+    }
+    if matches == 1 { chosen } else { -1 }
 }
 
 // RULE: Z9.1c (0.27.4) Whether an impl of a generic trait covering t has
@@ -1021,9 +965,9 @@ fn covers_member(t: i64, member: i64, pcx: &mut Ctx<Comp>) -> bool {
 // RULE: Z9.1c, F6.2 (0.27.4) Whether an impl of a generic trait covering
 // the place `place` has a `&self` function `member` that takes call n's
 // arguments (of types tys, kinds): at the by-value step on its view.
-fn place_takes(n: i64, place: i64, member: i64, tys: *mut i64, kinds: *mut i64,
+fn place_takes(n: i64, place: i64, member: i64, tys: &mut [i64], kinds: &mut [i64],
     pcx: &mut Ctx<Comp>) -> bool {
-    let mark = pcx.cands.count;
+    let mark = pcx.cands.len() as i64;
     for i in 0..pcx.traits_impls.len() as i64 {
         if trait_param_count(pcx.traits_impls[i as usize].tr, pcx) == 0
             || !impl_covers(i, place, pcx) {
@@ -1048,11 +992,11 @@ fn place_takes(n: i64, place: i64, member: i64, tys: *mut i64, kinds: *mut i64,
     }
     let mut c = mark;
     let mut found = false;
-    while c < pcx.cands.count && !found {
+    while c < pcx.cands.len() as i64 && !found {
         found = takes(c, n, place, tys, kinds, 1, pcx);
         c += 2;
     }
-    pcx.cands.count = mark;
+    pcx.cands.truncate(mark as usize);
     found
 }
 
@@ -1063,7 +1007,7 @@ fn place_takes(n: i64, place: i64, member: i64, tys: *mut i64, kinds: *mut i64,
 // copy was added since.
 fn impl_naming(member: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if pcx.name_impls != pcx.traits_impls.len() as i64
-        || pcx.name_extra != pcx.impl_extra.count {
+        || pcx.name_extra != pcx.impl_extra.len() as i64 {
         index_impl_names(pcx);
     }
     pcx.name_first.get(member + 1) - 1
@@ -1072,7 +1016,7 @@ fn impl_naming(member: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // The cell after cell c (impl_naming's), -1 at the end; its impl:
 // pcx.name_cells.get(c).
 fn impl_naming_after(c: i64, pcx: &Ctx<Comp>) -> i64 {
-    pcx.name_cells.get(c + 1) - 1
+    pcx.name_cells[(c + 1) as usize] - 1
 }
 
 // pcx.name_first, name_last and name_cells, for every impl: each name
@@ -1080,21 +1024,21 @@ fn impl_naming_after(c: i64, pcx: &Ctx<Comp>) -> i64 {
 fn index_impl_names(pcx: &mut Ctx<Comp>) {
     pcx.name_first.clear();
     pcx.name_last.clear();
-    pcx.name_cells.count = 0;
+    pcx.name_cells.clear();
     let n = pcx.traits_impls.len() as i64;
     // (the copied defaults by their impl: a chain per impl, extra_head)
     let mut extra_head = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
-    let mut extra_next = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-    for k in 0..pcx.impl_extra.count {
+    let mut extra_next: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for k in 0..pcx.impl_extra.len() as i64 {
         extra_next.push(0);
     }
-    let mut k = pcx.impl_extra.count - 1;
+    let mut k = pcx.impl_extra.len() as i64 - 1;
     while k >= 0 {
-        let f = pcx.impl_extra.get(k);
+        let f = pcx.impl_extra[k as usize];
         if pcx.nodes[f as usize].x != 0 {
             let i = crate::front::traits::impl_of_fn(pcx.nodes[f as usize].x - 1, pcx);
             if i >= 0 {
-                extra_next.set(k, extra_head.get(i + 1));
+                extra_next[k as usize] = extra_head.get(i + 1);
                 extra_head.put(i + 1, k + 1);
             }
         }
@@ -1107,27 +1051,27 @@ fn index_impl_names(pcx: &mut Ctx<Comp>) {
         }
         let mut e = extra_head.get(i + 1) - 1;
         while e >= 0 {
-            name_impl(pcx.nodes[pcx.impl_extra.get(e) as usize].a, i, pcx);
-            e = extra_next.get(e) - 1;
+            name_impl(pcx.nodes[pcx.impl_extra[e as usize] as usize].a, i, pcx);
+            e = extra_next[e as usize] - 1;
         }
     }
     pcx.name_impls = n;
-    pcx.name_extra = pcx.impl_extra.count;
+    pcx.name_extra = pcx.impl_extra.len() as i64;
 }
 
 // Impl i onto name's list, once (the impls come in order).
 fn name_impl(name: i64, i: i64, pcx: &mut Ctx<Comp>) {
     let last = pcx.name_last.get(name + 1) - 1;
-    if last >= 0 && pcx.name_cells.get(last) == i {
+    if last >= 0 && pcx.name_cells[last as usize] == i {
         return;
     }
-    let c = pcx.name_cells.count;
+    let c = pcx.name_cells.len() as i64;
     pcx.name_cells.push(i);
     pcx.name_cells.push(0);
     if last < 0 {
         pcx.name_first.put(name + 1, c + 1);
     } else {
-        pcx.name_cells.set(last + 1, c + 1);
+        pcx.name_cells[(last + 1) as usize] = c + 1;
     }
     pcx.name_last.put(name + 1, c + 1);
 }
@@ -1137,236 +1081,83 @@ fn name_impl(name: i64, i: i64, pcx: &mut Ctx<Comp>) {
 // parameter with exactly one bound `Into<U>` (`fn f<T: Into<M>>(x: T)`,
 // `x.into().v`), U as the generic body read it; 0 when there is none.
 fn into_bound_target(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    // UNSAFE: TLISTS is a raw table (base/comp.vl), as every one.
-    // SAFETY: bt is a TLISTS list of Into's one argument (resolve_args).
-    unsafe {
-        let recv = pcx.nodes[n as usize].a;
-        if pcx.nodes[recv as usize].kind != NodeKind::Ident
-            || pcx.nodes[recv as usize].res != Res::Local
-            || pcx.nodes[recv as usize].y < 0
-            || pcx.locals[pcx.nodes[recv as usize].y as usize].tparam == 0 {
-            return 0;
-        }
-        let into = std_trait(c"Into", pcx);
-        let bounds = pcx.nodes[pcx.locals[pcx.nodes[recv as usize].y as usize].tparam as usize].h;
-        let mut found: i64 = 0;
-        let mut count: i64 = 0;
-        for k in 0..pcx.nodes[bounds as usize].count {
-            let b = child(bounds, k, pcx);
-            if pcx.nodes[b as usize].kind != NodeKind::TyName || pcx.nodes[b as usize].g == 0
-                || bound_trait(b, pcx) != into {
-                continue;
-            }
-            let bt = resolve_args(pcx.nodes[b as usize].g, pcx.cur_mod, pcx);
-            if bt >= 0 {
-                found = (*pcx.tlists.data.add(bt as usize));
-                count += 1;
-            }
-        }
-        if count == 1 { found } else { 0 }
+    let recv = pcx.nodes[n as usize].a;
+    if pcx.nodes[recv as usize].kind != NodeKind::Ident
+        || pcx.nodes[recv as usize].res != Res::Local
+        || pcx.nodes[recv as usize].y < 0
+        || pcx.locals[pcx.nodes[recv as usize].y as usize].tparam == 0 {
+        return 0;
     }
+    let into = std_trait(c"Into", pcx);
+    let bounds = pcx.nodes[pcx.locals[pcx.nodes[recv as usize].y as usize].tparam as usize].h;
+    let mut found: i64 = 0;
+    let mut count: i64 = 0;
+    for k in 0..pcx.nodes[bounds as usize].count {
+        let b = child(bounds, k, pcx);
+        if pcx.nodes[b as usize].kind != NodeKind::TyName || pcx.nodes[b as usize].g == 0
+            || bound_trait(b, pcx) != into {
+            continue;
+        }
+        let bt = resolve_args(pcx.nodes[b as usize].g, pcx.cur_mod, pcx);
+        if bt >= 0 {
+            found = (pcx.tlists[bt as usize]);
+            count += 1;
+        }
+    }
+    if count == 1 { found } else { 0 }
 }
 
 // generic_trait_call, the first `pre` arguments synthesized already.
 fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        if t < 0 || has_error_type(t, pcx) {
-            return -1;
-        }
-        let method = pcx.nodes[n as usize].kind == NodeKind::MethodCall;
-        let from = std_trait(c"From", pcx);
-        let is_from = !method && from >= 0 && member == intern_c(c"from", pcx);
-        if method && member == intern_c(c"into", pcx) && pcx.nodes[n as usize].count == 0
-            && std_trait(c"Into", pcx) >= 0 {
-            let to = into_bound_target(n, pcx);
-            if to > 0 {
-                let r = into_call(n, to, pcx);
-                if r >= 0 {
-                    return r;
-                }
-            }
-            err_begin(pcx.nodes[n as usize].start, pcx);
-            err_str(c"'into' needs the type it converts to: '", pcx);
-            err_type(t, pcx);
-            err_str(c"' into what?", pcx);
-            err_help(c"write the type: 'let y: T = x.into();', or call 'T::from(x)'", pcx);
-            err_end(pcx);
-        }
-        let hint = hint_for(n, pcx);
-        let mark = pcx.cands.count;
-        // (0.28.0: only the impls that may have a function named member,
-        // in order, impl_naming; the others have no candidate)
-        // (the impls there now: one an impl_covers adds is not tried)
-        let impls_now = pcx.traits_impls.len() as i64;
-        let mut c = impl_naming(member, pcx);
-        while c >= 0 {
-            let i = pcx.name_cells.get(c);
-            c = impl_naming_after(c, pcx);
-            if i >= impls_now {
-                break;
-            }
-            if trait_param_count(pcx.traits_impls[i as usize].tr, pcx) == 0
-                || !impl_covers(i, t, pcx) {
-                continue;
-            }
-            let f = impl_fn(i, member, pcx);
-            if f >= 0 {
-                pcx.cands.push(i);
-                pcx.cands.push(f);
+    if t < 0 || has_error_type(t, pcx) {
+        return -1;
+    }
+    let method = pcx.nodes[n as usize].kind == NodeKind::MethodCall;
+    let from = std_trait(c"From", pcx);
+    let is_from = !method && from >= 0 && member == intern_c(c"from", pcx);
+    if method && member == intern_c(c"into", pcx) && pcx.nodes[n as usize].count == 0
+        && std_trait(c"Into", pcx) >= 0 {
+        let to = into_bound_target(n, pcx);
+        if to > 0 {
+            let r = into_call(n, to, pcx);
+            if r >= 0 {
+                return r;
             }
         }
-        if pcx.cands.count == mark && !is_from {
-            // RULE: Z9.1c (0.27.4: a view with no impl of its own: its place's,
-            // `s.to_owned_in(a)`, `s.index(r)` of a `&[T]`)
-            if method {
-                let vt = if pcx.types[t as usize].kind == TyKind::Ptr
-                    && crate::front::types::place_of_view(pcx.types[t as usize].a, pcx) > 0 {
-                    pcx.types[t as usize].a
-                } else {
-                    t
-                };
-                let place = crate::front::types::place_of_view(vt, pcx);
-                if place > 0 && place != t && covers_member(place, member, pcx) {
-                    return dispatch(n, place, member, pre, pcx);
-                }
-            }
-            return -1;
+        err_begin(pcx.nodes[n as usize].start, pcx);
+        err_str(c"'into' needs the type it converts to: '", pcx);
+        err_type(t, pcx);
+        err_str(c"' into what?", pcx);
+        err_help(c"write the type: 'let y: T = x.into();', or call 'T::from(x)'", pcx);
+        err_end(pcx);
+    }
+    let hint = hint_for(n, pcx);
+    let mark = pcx.cands.len() as i64;
+    // (0.28.0: only the impls that may have a function named member,
+    // in order, impl_naming; the others have no candidate)
+    // (the impls there now: one an impl_covers adds is not tried)
+    let impls_now = pcx.traits_impls.len() as i64;
+    let mut c = impl_naming(member, pcx);
+    while c >= 0 {
+        let i = pcx.name_cells[c as usize];
+        c = impl_naming_after(c, pcx);
+        if i >= impls_now {
+            break;
         }
-        // The arguments' types; literals without a suffix are left for
-        // last: they fit any type of their kind.
-        let count = pcx.nodes[n as usize].count;
-        let tys = alloc_array::<i64>(count + 1);
-        let kinds = alloc_array::<i64>(count + 1);
-        let mut failed = false;
-        for k in 0..count {
-            let a = child(n, k, pcx);
-            (*kinds.add(k as usize)) = if k < pre { 0 } else { literal_kind(a, pcx) };
-            // (a tuple of literals: the rust edition's, F20.5; MVS synthesizes it)
-            if k < pre {
-                (*tys.add(k as usize)) = pcx.nodes[a as usize].ty;
-            } else if (*kinds.add(k as usize)) != 0 {
-                (*tys.add(k as usize)) = 0;
-            } else {
-                (*tys.add(k as usize)) = synth_expr(a, pcx);
-                mark_synthed(a, pcx);
-            }
-            if (*tys.add(k as usize)) != 0 && has_error_type((*tys.add(k as usize)), pcx) {
-                failed = true;
-            }
+        if trait_param_count(pcx.traits_impls[i as usize].tr, pcx) == 0
+            || !impl_covers(i, t, pcx) {
+            continue;
         }
-        if failed {
-            pcx.cands.count = mark;
-            return pcx.ty_error;
+        let f = impl_fn(i, member, pcx);
+        if f >= 0 {
+            pcx.cands.push(i);
+            pcx.cands.push(f);
         }
-        // RULE: Z9.1c, F6.2 (0.27.4: on a view the place's `&self` method is
-        // at the by-value step, before the view's own `&self` ones at the `&`
-        // step: `b.as_ref()` of a `&str` `<str as AsRef<[u8]>>`, not `impl
-        // AsRef<U> for &T`; not a receiver of a parameter's type `k: K`, an
-        // instance's, whose method is the bound's, K's)
-        if method && !is_from {
-            let place = crate::front::types::place_of_view(t, pcx);
-            let recv = pcx.nodes[n as usize].a;
-            // (`Tr::m(x)`: x is the `&self` itself, no autoref; in an instance
-            // a receiver `x: &P` is P's, `x: P` or a field of type P the bound's)
-            let param_local = recv > 0 && pcx.nodes[recv as usize].kind == NodeKind::Ident
-                && pcx.nodes[recv as usize].res == Res::Local && pcx.nodes[recv as usize].y >= 0
-                && pcx.locals[pcx.nodes[recv as usize].y as usize].tparam != 0;
-            // (0.28.0: `Tr::m(x)` with x a reference to the view, `<K as
-            // Borrow<Q>>::borrow(k)` of `k: &K`, K = &str: Self is the view)
-            let via_ref = recv > 0 && pcx.nodes[recv as usize].ty > 0
-                && pcx.nodes[recv as usize].ty != t
-                && pcx.types[pcx.nodes[recv as usize].ty as usize].kind == TyKind::Ptr
-                && pcx.types[pcx.nodes[recv as usize].ty as usize].a == t;
-            let place_first = pcx.via_node == n && !via_ref || pcx.place_recv == n
-                // (0.28.0: `x: &P` with P the place, the view x itself; not `k:
-                // &K` with K = &str, a reference to the view: K's own impl,
-                // `<&str as Borrow<&str>>` by the bound `K: Borrow<K>`)
-                || (if param_local {
-                    pcx.locals[pcx.nodes[recv as usize].y as usize].borrow
-                        && pcx.nodes[recv as usize].ty == t
-                }
-                    else { pcx.cur_fn < 0 || pcx.fns[pcx.cur_fn as usize].tmpl == 0 });
-            if place > 0 && place_first && place_takes(n, place, member, tys, kinds, pcx) {
-                pcx.cands.count = mark;
-                return dispatch(n, place, member, count, pcx);
-            }
-        }
-        let skip: i64 = if method { 1 } else { 0 };
-        let mut chosen: i64 = -1;
-        let mut matches: i64 = 0;
-        let mut c = mark;
-        while c < pcx.cands.count {
-            if takes(c, n, t, tys, kinds, skip, pcx) {
-                matches += 1;
-                chosen = c;
-            }
-            c += 2;
-        }
-        if matches > 1 && hint > 0 {
-            let e = by_expected(n, t, mark, tys, kinds, skip, hint, pcx);
-            if e >= 0 {
-                matches = 1;
-                chosen = e;
-            }
-        }
-        if matches > 1 && method {
-            let e = by_view_rhs(n, t, mark, tys, kinds, skip, pcx, false);
-            if e >= 0 {
-                matches = 1;
-                chosen = e;
-            }
-        }
-        if matches > 1 && method {
-            let e = by_param_bound(n, t, mark, tys, kinds, pcx);
-            if e >= 0 {
-                matches = 1;
-                chosen = e;
-            }
-        }
-        // RULE: F26.3 (0.27.3: `impl Extend<T>` and `impl Extend<&'a T>` of
-        // a `Vec<&str>`, where `&&str` is the `&str` view too: the one by
-        // value, as both copy the view)
-        if matches > 1 {
-            let e = by_view_rhs(n, t, mark, tys, kinds, skip, pcx, true);
-            if e >= 0 {
-                matches = 1;
-                chosen = e;
-            }
-        }
-        if matches > 1 {
-            ambiguous_call(n, t, member, mark, tys, kinds, skip, pcx);
-        }
-        if matches == 1 {
-            let f = (*pcx.cands.data.add((chosen + 1) as usize));
-            pcx.cands.count = mark;
-            return if method { method_call(n, t, f, pcx) } else { path_call(n, t, f, pcx) };
-        }
-        // From's intrinsic impls: the type itself, a narrower integer.
-        if is_from && count == 1 {
-            let a = child(n, 0, pcx);
-            let at = (*tys.add(0));
-            if at == 0
-                && ((*kinds.add(0)) == 1 && is_integer(t) || (*kinds.add(0)) == 2 && is_float(t))
-                || at == t {
-                pcx.cands.count = mark;
-                if at == 0 {
-                    check_expr(a, t, pcx);
-                }
-                become_value(n, a, t, pcx);
-                return t;
-            }
-            if at != 0 && widens(at, t) {
-                pcx.cands.count = mark;
-                become_cast(n, a, t, pcx);
-                return t;
-            }
-        }
-        // RULE: Z9.1c, F6.2 (0.27.4: on a view no impl of its own takes the
-        // call: its place's, whose `&self` methods take the view, `a.eq(b)` of
-        // two `&[u8]` `<[u8] as PartialEq>::eq`; a `let` binding's view is
-        // the view. After the view's own: an instance's `k.borrow()` with K =
-        // &str is `<&str as Borrow<&str>>`, as the bound `K: Borrow<Q>` says)
-        if method && !is_from {
+    }
+    if pcx.cands.len() as i64 == mark && !is_from {
+        // RULE: Z9.1c (0.27.4: a view with no impl of its own: its place's,
+        // `s.to_owned_in(a)`, `s.index(r)` of a `&[T]`)
+        if method {
             let vt = if pcx.types[t as usize].kind == TyKind::Ptr
                 && crate::front::types::place_of_view(pcx.types[t as usize].a, pcx) > 0 {
                 pcx.types[t as usize].a
@@ -1375,26 +1166,177 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
             };
             let place = crate::front::types::place_of_view(vt, pcx);
             if place > 0 && place != t && covers_member(place, member, pcx) {
-                pcx.cands.count = mark;
-                return dispatch(n, place, member, count, pcx);
+                return dispatch(n, place, member, pre, pcx);
             }
         }
-        // RULE: F6.2 (0.28.0: in an instance a receiver `*a` of `a: &T` is a
-        // T: with T = `&u8` no impl of what T points to takes the call, and
-        // T's own does, as the generic body resolved it by T's bound: `<&u8
-        // as PartialEq<&u8>>::eq`, `a.eq(b)` and the derives' `PartialEq::eq(a,
-        // b)` in `Option<&u8>::eq`)
-        if method && !is_from && pcx.cur_fn >= 0 && pcx.fns[pcx.cur_fn as usize].tmpl != 0 {
-            let rt = pcx.nodes[pcx.nodes[n as usize].a as usize].ty;
-            if rt > 0 && rt != t && pcx.types[rt as usize].kind == TyKind::Ptr
-                && pcx.types[rt as usize].b == crate::front::types::REF_SHARED
-                && pcx.types[rt as usize].a == t && has_generic_trait_fn(rt, member, pcx) {
-                pcx.cands.count = mark;
-                return dispatch(n, rt, member, count, pcx);
-            }
-        }
-        no_impl_error(n, t, member, mark, tys, kinds, is_from, from, pcx);
+        return -1;
     }
+    // The arguments' types; literals without a suffix are left for
+    // last: they fit any type of their kind.
+    let count = pcx.nodes[n as usize].count;
+    let mut tys_room: Vec<i64, Comp> = Vec::new_in(Comp {});
+    tys_room.resize((count + 1) as usize, 0);
+    let tys = tys_room.as_mut_slice();
+    let mut kinds_room: Vec<i64, Comp> = Vec::new_in(Comp {});
+    kinds_room.resize((count + 1) as usize, 0);
+    let kinds = kinds_room.as_mut_slice();
+    let mut failed = false;
+    for k in 0..count {
+        let a = child(n, k, pcx);
+        (kinds[k as usize]) = if k < pre { 0 } else { literal_kind(a, pcx) };
+        // (a tuple of literals: the rust edition's, F20.5; MVS synthesizes it)
+        if k < pre {
+            (tys[k as usize]) = pcx.nodes[a as usize].ty;
+        } else if (kinds[k as usize]) != 0 {
+            (tys[k as usize]) = 0;
+        } else {
+            (tys[k as usize]) = synth_expr(a, pcx);
+            mark_synthed(a, pcx);
+        }
+        if (tys[k as usize]) != 0 && has_error_type((tys[k as usize]), pcx) {
+            failed = true;
+        }
+    }
+    if failed {
+        pcx.cands.truncate(mark as usize);
+        return pcx.ty_error;
+    }
+    // RULE: Z9.1c, F6.2 (0.27.4: on a view the place's `&self` method is
+    // at the by-value step, before the view's own `&self` ones at the `&`
+    // step: `b.as_ref()` of a `&str` `<str as AsRef<[u8]>>`, not `impl
+    // AsRef<U> for &T`; not a receiver of a parameter's type `k: K`, an
+    // instance's, whose method is the bound's, K's)
+    if method && !is_from {
+        let place = crate::front::types::place_of_view(t, pcx);
+        let recv = pcx.nodes[n as usize].a;
+        // (`Tr::m(x)`: x is the `&self` itself, no autoref; in an instance
+        // a receiver `x: &P` is P's, `x: P` or a field of type P the bound's)
+        let param_local = recv > 0 && pcx.nodes[recv as usize].kind == NodeKind::Ident
+            && pcx.nodes[recv as usize].res == Res::Local && pcx.nodes[recv as usize].y >= 0
+            && pcx.locals[pcx.nodes[recv as usize].y as usize].tparam != 0;
+        // (0.28.0: `Tr::m(x)` with x a reference to the view, `<K as
+        // Borrow<Q>>::borrow(k)` of `k: &K`, K = &str: Self is the view)
+        let via_ref = recv > 0 && pcx.nodes[recv as usize].ty > 0
+            && pcx.nodes[recv as usize].ty != t
+            && pcx.types[pcx.nodes[recv as usize].ty as usize].kind == TyKind::Ptr
+            && pcx.types[pcx.nodes[recv as usize].ty as usize].a == t;
+        let place_first = pcx.via_node == n && !via_ref || pcx.place_recv == n
+            // (0.28.0: `x: &P` with P the place, the view x itself; not `k:
+            // &K` with K = &str, a reference to the view: K's own impl,
+            // `<&str as Borrow<&str>>` by the bound `K: Borrow<K>`)
+            || (if param_local {
+                pcx.locals[pcx.nodes[recv as usize].y as usize].borrow
+                    && pcx.nodes[recv as usize].ty == t
+            }
+                else { pcx.cur_fn < 0 || pcx.fns[pcx.cur_fn as usize].tmpl == 0 });
+        if place > 0 && place_first && place_takes(n, place, member, tys, kinds, pcx) {
+            pcx.cands.truncate(mark as usize);
+            return dispatch(n, place, member, count, pcx);
+        }
+    }
+    let skip: i64 = if method { 1 } else { 0 };
+    let mut chosen: i64 = -1;
+    let mut matches: i64 = 0;
+    let mut c = mark;
+    while c < pcx.cands.len() as i64 {
+        if takes(c, n, t, tys, kinds, skip, pcx) {
+            matches += 1;
+            chosen = c;
+        }
+        c += 2;
+    }
+    if matches > 1 && hint > 0 {
+        let e = by_expected(n, t, mark, tys, kinds, skip, hint, pcx);
+        if e >= 0 {
+            matches = 1;
+            chosen = e;
+        }
+    }
+    if matches > 1 && method {
+        let e = by_view_rhs(n, t, mark, tys, kinds, skip, pcx, false);
+        if e >= 0 {
+            matches = 1;
+            chosen = e;
+        }
+    }
+    if matches > 1 && method {
+        let e = by_param_bound(n, t, mark, tys, kinds, pcx);
+        if e >= 0 {
+            matches = 1;
+            chosen = e;
+        }
+    }
+    // RULE: F26.3 (0.27.3: `impl Extend<T>` and `impl Extend<&'a T>` of
+    // a `Vec<&str>`, where `&&str` is the `&str` view too: the one by
+    // value, as both copy the view)
+    if matches > 1 {
+        let e = by_view_rhs(n, t, mark, tys, kinds, skip, pcx, true);
+        if e >= 0 {
+            matches = 1;
+            chosen = e;
+        }
+    }
+    if matches > 1 {
+        ambiguous_call(n, t, member, mark, tys, kinds, skip, pcx);
+    }
+    if matches == 1 {
+        let f = (pcx.cands[(chosen + 1) as usize]);
+        pcx.cands.truncate(mark as usize);
+        return if method { method_call(n, t, f, pcx) } else { path_call(n, t, f, pcx) };
+    }
+    // From's intrinsic impls: the type itself, a narrower integer.
+    if is_from && count == 1 {
+        let a = child(n, 0, pcx);
+        let at = (tys[0]);
+        if at == 0
+            && ((kinds[0]) == 1 && is_integer(t) || (kinds[0]) == 2 && is_float(t))
+            || at == t {
+            pcx.cands.truncate(mark as usize);
+            if at == 0 {
+                check_expr(a, t, pcx);
+            }
+            become_value(n, a, t, pcx);
+            return t;
+        }
+        if at != 0 && widens(at, t) {
+            pcx.cands.truncate(mark as usize);
+            become_cast(n, a, t, pcx);
+            return t;
+        }
+    }
+    // RULE: Z9.1c, F6.2 (0.27.4: on a view no impl of its own takes the
+    // call: its place's, whose `&self` methods take the view, `a.eq(b)` of
+    // two `&[u8]` `<[u8] as PartialEq>::eq`; a `let` binding's view is
+    // the view. After the view's own: an instance's `k.borrow()` with K =
+    // &str is `<&str as Borrow<&str>>`, as the bound `K: Borrow<Q>` says)
+    if method && !is_from {
+        let vt = if pcx.types[t as usize].kind == TyKind::Ptr
+            && crate::front::types::place_of_view(pcx.types[t as usize].a, pcx) > 0 {
+            pcx.types[t as usize].a
+        } else {
+            t
+        };
+        let place = crate::front::types::place_of_view(vt, pcx);
+        if place > 0 && place != t && covers_member(place, member, pcx) {
+            pcx.cands.truncate(mark as usize);
+            return dispatch(n, place, member, count, pcx);
+        }
+    }
+    // RULE: F6.2 (0.28.0: in an instance a receiver `*a` of `a: &T` is a
+    // T: with T = `&u8` no impl of what T points to takes the call, and
+    // T's own does, as the generic body resolved it by T's bound: `<&u8
+    // as PartialEq<&u8>>::eq`, `a.eq(b)` and the derives' `PartialEq::eq(a,
+    // b)` in `Option<&u8>::eq`)
+    if method && !is_from && pcx.cur_fn >= 0 && pcx.fns[pcx.cur_fn as usize].tmpl != 0 {
+        let rt = pcx.nodes[pcx.nodes[n as usize].a as usize].ty;
+        if rt > 0 && rt != t && pcx.types[rt as usize].kind == TyKind::Ptr
+            && pcx.types[rt as usize].b == crate::front::types::REF_SHARED
+            && pcx.types[rt as usize].a == t && has_generic_trait_fn(rt, member, pcx) {
+            pcx.cands.truncate(mark as usize);
+            return dispatch(n, rt, member, count, pcx);
+        }
+    }
+    no_impl_error(n, t, member, mark, tys, kinds, is_from, from, pcx);
 }
 
 // Call n of generic-trait function f (`T::from(x)`), checked.
@@ -1516,127 +1458,119 @@ fn become_cast(n: i64, a: i64, t: i64, pcx: &mut Ctx<Comp>) {
 }
 
 // The arguments' types, for messages: `(i64, [u8])`.
-fn err_arg_types(n: i64, tys: *mut i64, kinds: *mut i64, pcx: &Ctx<Comp>) {
-    unsafe {
-        err_str(c"(", pcx);
-        for k in 0..pcx.nodes[n as usize].count {
-            if k > 0 {
-                err_str(c", ", pcx);
-            }
-            if (*tys.add(k as usize)) != 0 {
-                err_type((*tys.add(k as usize)), pcx);
-            } else if (*kinds.add(k as usize)) == 3 {
-                // (a tuple of literals: its elements' kinds)
-                let a = child(n, k, pcx);
-                err_str(c"(", pcx);
-                for i in 0..pcx.nodes[a as usize].count {
-                    err_str(if i > 0 { c", " } else { c"" }, pcx);
-                    err_str(if pcx.nodes[child(a, i, pcx) as usize].kind
-                        == NodeKind::Int { c"{integer}" }
-                        else { c"{float}" }, pcx);
-                }
-                err_str(c")", pcx);
-            } else if (*kinds.add(k as usize)) == 1 {
-                err_str(c"{integer}", pcx);
-            } else {
-                err_str(c"{float}", pcx);
-            }
+fn err_arg_types(n: i64, tys: &mut [i64], kinds: &mut [i64], pcx: &Ctx<Comp>) {
+    err_str(c"(", pcx);
+    for k in 0..pcx.nodes[n as usize].count {
+        if k > 0 {
+            err_str(c", ", pcx);
         }
-        err_str(c")", pcx);
+        if (tys[k as usize]) != 0 {
+            err_type((tys[k as usize]), pcx);
+        } else if (kinds[k as usize]) == 3 {
+            // (a tuple of literals: its elements' kinds)
+            let a = child(n, k, pcx);
+            err_str(c"(", pcx);
+            for i in 0..pcx.nodes[a as usize].count {
+                err_str(if i > 0 { c", " } else { c"" }, pcx);
+                err_str(if pcx.nodes[child(a, i, pcx) as usize].kind
+                    == NodeKind::Int { c"{integer}" }
+                    else { c"{float}" }, pcx);
+            }
+            err_str(c")", pcx);
+        } else if (kinds[k as usize]) == 1 {
+            err_str(c"{integer}", pcx);
+        } else {
+            err_str(c"{float}", pcx);
+        }
     }
+    err_str(c")", pcx);
 }
 
 // The candidates from mark on, for a help line: `From<i64>, From<[u8]>`.
 fn help_candidates(mark: i64, t: i64, pcx: &mut Ctx<Comp>) {
-    unsafe {
-        let mut c = mark;
-        while c < pcx.cands.count {
-            if c > mark {
+    let mut c = mark;
+    while c < pcx.cands.len() as i64 {
+        if c > mark {
+            err_help(c", ", pcx);
+        }
+        let i = (pcx.cands[c as usize]);
+        let targs = impl_targs(i, t, pcx);
+        if targs >= 0 {
+            buf_bound(pcx.err_help, pcx.traits_impls[i as usize].tr, targs, pcx);
+        } else {
+            err_help_sym(pcx.traits[pcx.traits_impls[i as usize].tr as usize].name, pcx);
+        }
+        c += 2;
+    }
+}
+
+fn ambiguous_call(n: i64, t: i64, member: i64, mark: i64, tys: &mut [i64], kinds: &mut [i64],
+    skip: i64, pcx: &mut Ctx<Comp>)
+    -> ! {
+    err_begin(pcx.nodes[n as usize].start, pcx);
+    err_str(c"'", pcx);
+    err_type(t, pcx);
+    err_fmt(format_args("::{}' is ambiguous for arguments ",
+        str::from_utf8(sym_text(member, pcx)).unwrap()), pcx);
+    err_arg_types(n, tys, kinds, pcx);
+    err_help(c"more than one impl takes them: ", pcx);
+    let mut c = mark;
+    let mut first = true;
+    while c < pcx.cands.len() as i64 {
+        if takes(c, n, t, tys, kinds, skip, pcx) {
+            if !first {
                 err_help(c", ", pcx);
             }
-            let i = (*pcx.cands.data.add(c as usize));
+            first = false;
+            let i = (pcx.cands[c as usize]);
             let targs = impl_targs(i, t, pcx);
-            if targs >= 0 {
-                buf_bound(pcx.err_help, pcx.traits_impls[i as usize].tr, targs, pcx);
-            } else {
-                err_help_sym(pcx.traits[pcx.traits_impls[i as usize].tr as usize].name, pcx);
-            }
-            c += 2;
+            buf_bound(pcx.err_help, pcx.traits_impls[i as usize].tr, targs, pcx);
         }
+        c += 2;
     }
+    if (0i64..pcx.nodes[n as usize].count).any(|k| (kinds[k as usize]) != 0) {
+        err_help(c"; give the literal a type: '3i32', '3i64', '2.5f32'", pcx);
+    }
+    err_end(pcx)
 }
 
-fn ambiguous_call(n: i64, t: i64, member: i64, mark: i64, tys: *mut i64, kinds: *mut i64, skip: i64,
-    pcx: &mut Ctx<Comp>)
-    -> ! {
-    unsafe {
-        err_begin(pcx.nodes[n as usize].start, pcx);
-        err_str(c"'", pcx);
+fn no_impl_error(n: i64, t: i64, member: i64, mark: i64, tys: &mut [i64], kinds: &mut [i64],
+    is_from: bool, from: i64, pcx: &mut Ctx<Comp>) -> ! {
+    err_begin(pcx.nodes[n as usize].start, pcx);
+    if is_from && pcx.nodes[n as usize].count == 1 && (tys[0]) != 0 {
+        err_str(c"cannot convert '", pcx);
+        err_type((tys[0]), pcx);
+        err_str(c"' into '", pcx);
         err_type(t, pcx);
-        err_fmt(format_args("::{}' is ambiguous for arguments ",
+        err_str(c"': no impl of 'From<", pcx);
+        err_type((tys[0]), pcx);
+        err_str(c">' for '", pcx);
+        err_type(t, pcx);
+        err_str(c"'", pcx);
+        if crate::front::check::is_std_named(t, c"String", pcx) {
+            // (0.28.0: std's String is built on an allocator, not From)
+            err_help(c"a String is made on an allocator: `String::from_in(s, gpa)`, or `s.to_string_in(gpa)`", pcx);
+        } else {
+            help_from_impl((tys[0]), t, pcx);
+        }
+        if pcx.cands.len() as i64 > mark {
+            err_help(c" (its impls: ", pcx);
+            help_candidates(mark, t, pcx);
+            err_help(c")", pcx);
+        }
+    } else {
+        err_str(c"no impl of '", pcx);
+        err_type(t, pcx);
+        err_fmt(format_args("::{}' takes arguments ",
             str::from_utf8(sym_text(member, pcx)).unwrap()), pcx);
         err_arg_types(n, tys, kinds, pcx);
-        err_help(c"more than one impl takes them: ", pcx);
-        let mut c = mark;
-        let mut first = true;
-        while c < pcx.cands.count {
-            if takes(c, n, t, tys, kinds, skip, pcx) {
-                if !first {
-                    err_help(c", ", pcx);
-                }
-                first = false;
-                let i = (*pcx.cands.data.add(c as usize));
-                let targs = impl_targs(i, t, pcx);
-                buf_bound(pcx.err_help, pcx.traits_impls[i as usize].tr, targs, pcx);
-            }
-            c += 2;
+        if pcx.cands.len() as i64 > mark {
+            err_help(c"its impls: ", pcx);
+            help_candidates(mark, t, pcx);
         }
-        if (0i64..pcx.nodes[n as usize].count).any(|k| (*kinds.add(k as usize)) != 0) {
-            err_help(c"; give the literal a type: '3i32', '3i64', '2.5f32'", pcx);
-        }
-        err_end(pcx)
     }
-}
-
-fn no_impl_error(n: i64, t: i64, member: i64, mark: i64, tys: *mut i64, kinds: *mut i64,
-    is_from: bool, from: i64, pcx: &mut Ctx<Comp>) -> ! {
-    unsafe {
-        err_begin(pcx.nodes[n as usize].start, pcx);
-        if is_from && pcx.nodes[n as usize].count == 1 && (*tys.add(0)) != 0 {
-            err_str(c"cannot convert '", pcx);
-            err_type((*tys.add(0)), pcx);
-            err_str(c"' into '", pcx);
-            err_type(t, pcx);
-            err_str(c"': no impl of 'From<", pcx);
-            err_type((*tys.add(0)), pcx);
-            err_str(c">' for '", pcx);
-            err_type(t, pcx);
-            err_str(c"'", pcx);
-            if crate::front::check::is_std_named(t, c"String", pcx) {
-                // (0.28.0: std's String is built on an allocator, not From)
-                err_help(c"a String is made on an allocator: `String::from_in(s, gpa)`, or `s.to_string_in(gpa)`", pcx);
-            } else {
-                help_from_impl((*tys.add(0)), t, pcx);
-            }
-            if pcx.cands.count > mark {
-                err_help(c" (its impls: ", pcx);
-                help_candidates(mark, t, pcx);
-                err_help(c")", pcx);
-            }
-        } else {
-            err_str(c"no impl of '", pcx);
-            err_type(t, pcx);
-            err_fmt(format_args("::{}' takes arguments ",
-                str::from_utf8(sym_text(member, pcx)).unwrap()), pcx);
-            err_arg_types(n, tys, kinds, pcx);
-            if pcx.cands.count > mark {
-                err_help(c"its impls: ", pcx);
-                help_candidates(mark, t, pcx);
-            }
-        }
-        pcx.cands.count = mark;
-        err_end(pcx)
-    }
+    pcx.cands.truncate(mark as usize);
+    err_end(pcx)
 }
 
 // help: the impl From<from> for to that would convert (a variant of `to`
@@ -1666,20 +1600,18 @@ fn help_from_impl(from: i64, to: i64, pcx: &Ctx<Comp>) {
 
 // A variant of enum `to` with one field, of type `from`; -1 when none.
 fn variant_holding(to: i64, from: i64, pcx: &Ctx<Comp>) -> i64 {
-    unsafe {
-        if pcx.types[to as usize].kind != TyKind::Enum {
-            return -1;
-        }
-        let e = pcx.types[to as usize].a;
-        for k in 0..(*get_enums().add(e as usize)).variant_count {
-            let v = enum_variant(e, k);
-            if pcx.variants[v as usize].field_count == 1
-                && variant_field(v, 0, pcx) == from {
-                return v;
-            }
-        }
-        -1
+    if pcx.types[to as usize].kind != TyKind::Enum {
+        return -1;
     }
+    let e = pcx.types[to as usize].a;
+    for k in 0..(pcx.enums[e as usize]).variant_count {
+        let v = enum_variant(e, k, pcx);
+        if pcx.variants[v as usize].field_count == 1
+            && variant_field(v, 0, pcx) == from {
+            return v;
+        }
+    }
+    -1
 }
 
 // `x.into()` (n, a MethodCall named `into` without arguments) checked
@@ -1737,7 +1669,7 @@ pub fn try_into_call(n: i64, expected: i64, pcx: &mut Ctx<Comp>) -> i64 {
         || std_enum_name(expected, &mut targs, pcx) != intern_c(c"Result", pcx) {
         return -1;
     }
-    let to = pcx.tlists.get(targs);
+    let to = pcx.tlists[targs as usize];
     let name = intern_c(c"try_into", pcx);
     let receiver = pcx.nodes[n as usize].a;
     let rt = synth_expr(receiver, pcx);

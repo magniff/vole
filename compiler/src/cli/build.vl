@@ -15,12 +15,12 @@ use crate::back::objfile::{OUT_ASM, OUT_OBJECT};
 use crate::back::objfile::output::{
     add_framework, add_link_arg, add_link_include, is_link_input, set_linker,
 };
-use crate::base::{IntVec, buf_new, buf_slice, buf_str, die, die2};
+use crate::base::{IntVec, buf_copy, buf_new, buf_str, die, die2};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::print_diagnostic;
 use crate::base::target::target_of_name;
-use crate::base::timer::counters_open;
+use crate::base::timer::{counters_open, passes_open};
 use crate::cli::{c_of, short_of};
 use crate::cli::line::Line;
 use crate::front::stdalloc::{get_check_alloc_mode, set_check_alloc_mode};
@@ -29,7 +29,7 @@ use crate::middle::parallel::parse_jobs;
 // What a build's command line gives main, the globals aside.
 #[derive(Clone, Copy)] pub struct Build {
     pub inputs: IntVec,
-    pub output: *mut u8,
+    pub output: *const u8,
     pub output_given: bool,
     pub tokens_only: bool,
     pub target: i64,
@@ -88,10 +88,10 @@ pub fn build_command(gpa: Gpa) -> Command<'static, Gpa> {
         .arg(flag("deny-warnings", "make warnings errors"))
         .arg(Arg::option("allow").value_name("CODE")
             .help("--allow=CODE[,CODE]: report no warning of that code or family (`--allow=borrowck`), repeatable"))
+        .arg(Arg::option("deny").value_name("CODE")
+            .help("--deny=CODE[,CODE]: a warning of that code or family is an error (`--deny=unsafe`: with `volec check`, each unsafe site without its comments and each unsafe block with nothing unsafe inside), repeatable"))
         .arg(Arg::option("max-errors").value_name("N")
             .help("--max-errors=N: stop after N errors, not 50 (0: report every error)"))
-        .arg(Arg::option("edition").value_name("EDITION")
-            .help("--edition rust: deprecated and ignored: there is one edition (0.28.0; the option goes in 0.29)"))
         .arg(Arg::option("color").value_name("WHEN")
             .help("--color=auto|always|never: colour and progress on a terminal (auto: when stderr is one, and NO_COLOR is not set)"))
         .arg(flag("verbose", "a failed link: its command and the linker's whole text"))
@@ -106,7 +106,7 @@ pub fn build_command(gpa: Gpa) -> Command<'static, Gpa> {
         .arg(flag("print-after-all", "print the IR after every pass (stderr)"))
         .arg(flag("print-attrs", "print the inferred function attributes (-O2, stderr)"))
         .arg(Arg::option("time-passes").value_name("WHAT").default_missing("time")
-            .help("--time-passes: the CPU time of each phase (stderr); --time-passes=instructions: the instructions retired (docs/optimizer.md)"))
+            .help("--time-passes: the CPU time of each phase (stderr); --time-passes=instructions: the instructions retired; =passes: and those of each optimizer pass (docs/optimizer.md)"))
         .arg(flag("trace", "failure traces: a crash prints its line and callers"))
         .arg(Arg::option("atomics").value_name("KIND")
             .help(
@@ -178,7 +178,7 @@ fn instructions_refused(pcx: &mut Ctx<Comp>) -> ! {
     buf_str(t, c"error[time.instructions]: the instructions retired cannot be read here\n");
     buf_str(t, c"  = help: the system's counter refused this process (Linux: perf_event_open, which /proc/sys/kernel/perf_event_paranoid above 2 or a container's seccomp profile forbids); --time-passes counts CPU time\n");
     buf_str(t, c"  = try: volec --time-passes FILE.vl -c -o /dev/null\n");
-    print_diagnostic(-1, buf_slice(t), pcx);
+    print_diagnostic(-1, &buf_copy(t), pcx);
     std::process::exit(1i32)
 }
 
@@ -266,7 +266,7 @@ fn apply(line: Line<'_>, m: &Matches<'_, &ArenaScope<'_, Gpa>>, pcx: &mut Ctx<Co
     // (0.18.1) -j N or -jN: the threads code generation may use (the
     // output is the same whatever their number; middle::parallel).
     for &v in m.values("jobs") {
-        pcx.jobs = parse_jobs(c_of(v));
+        pcx.jobs = parse_jobs(v);
         if pcx.jobs < 1 {
             die(c"-j wants a number of threads: -j4, or -j 1 for one");
         }
@@ -283,14 +283,18 @@ fn apply(line: Line<'_>, m: &Matches<'_, &ArenaScope<'_, Gpa>>, pcx: &mut Ctx<Co
     pcx.print_after_all = pcx.print_after_all || m.flag("print-after-all");
     pcx.print_attrs = pcx.print_attrs || m.flag("print-attrs");
     // (0.25.5) --time-passes=instructions: the instructions retired
-    values_in(line, m, "time-passes", "time|instructions", "--time-passes");
+    // (0.29) --time-passes=passes: and those of each optimizer pass
+    values_in(line, m, "time-passes", "time|instructions|passes", "--time-passes");
     for &v in m.values("time-passes") {
         pcx.time_passes = true;
-        if v == "instructions" {
+        if v == "instructions" || v == "passes" {
             pcx.time_instructions = true;
             if !counters_open(pcx) {
                 instructions_refused(pcx);
             }
+        }
+        if v == "passes" {
+            passes_open(pcx);
         }
     }
     pcx.debug_info = pcx.debug_info || m.flag("debug");
@@ -387,13 +391,13 @@ fn apply(line: Line<'_>, m: &Matches<'_, &ArenaScope<'_, Gpa>>, pcx: &mut Ctx<Co
     pcx.no_positions = pcx.no_positions || m.flag("no-positions");
     pcx.debug_contracts = pcx.debug_contracts || m.flag("debug-contracts");
     pcx.test_build = pcx.test_build || m.flag("test-build");
-    // (0.28.0) A test build reads std2 whole: the harness written after
+    // (0.28.0) A test build reads std whole: the harness written after
     // the program is read (front/tests: `<test>`) reaches std::test, whose
     // properties and fuzz targets need u64's built-in impls and more that
     // a program without them never names; the lazy build failed and was
     // made again whole (rerun_eager): twice the time, and no `ok:` line.
     if pcx.test_build {
-        crate::front::modules::std2lazy::set_eager(true);
+        crate::front::modules::stdlazy::set_eager(true);
     }
     pcx.coverage = pcx.coverage || m.flag("coverage");
     pcx.check_unsafe = pcx.check_unsafe || m.flag("check-unsafe");

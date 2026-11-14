@@ -12,14 +12,14 @@
 //   --in FILE|MODULE|FILE:LINE, --count, --limit N, --all: as for refs
 
 use crate::base::{
-    IntVec, SOURCE_WGSL, STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_str,
-    buf_write_fd, get_src, strlen,
+    SOURCE_WGSL, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd, c_bytes,
+    get_src,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::lexer::{Tok, is_ident_byte};
-use crate::front::modules::{file_of_pos, module_at};
-use crate::tools::ctx::Tcx;
+use crate::front::modules::{file_made, file_of_pos, module_at};
+use crate::tools::ctx::{Tcx, zeros};
 use crate::tools::query::defs::mod_fqn;
 use crate::tools::query::diagnostics::{diag, put_cword, put_word, try_begin, try_end};
 use crate::tools::query::positions::{
@@ -66,7 +66,7 @@ fn place_of(pos: i64, pcx: &Ctx<Comp>) -> i64 {
         || k == Tok::FTail { G_STRING } else { G_CODE }
 }
 
-fn place_name(p: i64) -> *mut u8 {
+fn place_name(p: i64) -> *const u8 {
     if p == G_CODE { c"code" } else if p == G_COMMENT { c"comment" } else { c"string" }
 }
 
@@ -118,25 +118,29 @@ pub fn lower(c: u8) -> u8 {
 
 // The hits of the patterns (C strings in pats), in order, each position
 // once, into out.
-fn find_hits(pats: IntVec, out: &mut IntVec, tcx: &Tcx<Comp>, pcx: &mut Ctx<Comp>) {
+fn find_hits(pats: &[i64], out: &mut Vec<i64, Comp>, tcx: &Tcx<Comp>, pcx: &mut Ctx<Comp>) {
+    // UNSAFE: strlen is C's; a file's path and the patterns are C strings,
+    // read through raw pointers.
+    // SAFETY: a path has at least its 0 byte; each pattern is a C string of
+    // the command line's words, alive for the process; its slice covers the
+    // bytes before the 0.
     unsafe {
-        let mut all = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let mut all: Vec<i64, Comp> = Vec::new_in(Comp {});
         for f in 0..pcx.files.len() as i64 {
-            let generated = (*pcx.files[f as usize].path.add(0)) == b'<';
+            let generated = file_made(f, pcx);
             let m = pcx.files[f as usize].module;
             let asked = pcx.opt_in != 0 as *mut u8
-                && ((pcx.in_file.count > f && (*pcx.in_file.data.add(f as usize)) != 0)
-                    || (m >= 0 && pcx.in_module.count > m
-                        && (*pcx.in_module.data.add(m as usize)) != 0));
+                && ((pcx.in_file.len() as i64 > f && (pcx.in_file[f as usize]) != 0)
+                    || (m >= 0 && pcx.in_module.len() as i64 > m
+                        && (pcx.in_module[m as usize]) != 0));
             if generated && !asked {
                 continue;
             }
             let start = pcx.files[f as usize].start;
             let end = pcx.files[f as usize].end;
-            for k in 0..pats.count {
-                let p = (*pats.data.add(k as usize)) as *mut u8;
-                let pat = std::slice::from_raw_parts(p.add((0) as usize),
-                    (strlen(p) as i64 - (0)) as usize);
+            for k in 0..pats.len() as i64 {
+                let p = (pats[k as usize]) as *mut u8;
+                let pat = c_bytes(p);
                 if pat.len() == 0 {
                     continue;
                 }
@@ -153,19 +157,19 @@ fn find_hits(pats: IntVec, out: &mut IntVec, tcx: &Tcx<Comp>, pcx: &mut Ctx<Comp
                 }
             }
         }
-        let n = all.count;
-        let k1 = alloc_array::<i64>(n + 1);
-        let k2 = alloc_array::<i64>(n + 1);
-        let mut idx = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
+        let n = all.len() as i64;
+        let mut k1 = zeros(n + 1);
+        let mut k2 = zeros(n + 1);
+        let mut idx: Vec<i64, Comp> = Vec::new_in(Comp {});
         for i in 0..n {
             idx.push(i);
-            (*k1.add(i as usize)) = rank_of((*all.data.add(i as usize)), tcx, pcx);
-            (*k2.add(i as usize)) = (*all.data.add(i as usize));
+            (k1[i as usize]) = rank_of((all[i as usize]), tcx, pcx);
+            (k2[i as usize]) = (all[i as usize]);
         }
-        sort_by_keys(idx, k1, k2);
+        sort_by_keys(&mut idx, &k1, &k2);
         for i in 0..n {
-            let pos = (*all.data.add((*idx.data.add(i as usize)) as usize));
-            if out.count == 0 || (*out.data.add((out.count - 1) as usize)) != pos {
+            let pos = (all[(idx[i as usize]) as usize]);
+            if out.len() as i64 == 0 || (out[(out.len() as i64 - 1) as usize]) != pos {
                 out.push(pos);
             }
         }
@@ -173,147 +177,154 @@ fn find_hits(pats: IntVec, out: &mut IntVec, tcx: &Tcx<Comp>, pcx: &mut Ctx<Comp
 }
 
 // A `try:` line: the same grep with one more option (and its value).
-fn try_grep(pats: IntVec, option: *mut u8, value: &[u8], tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
-    unsafe {
-        let out = try_begin(c"grep", &value[0..0], false, tcx, pcx);
-        for k in 0..pats.count {
-            put_cword(out, (*pats.data.add(k as usize)) as *mut u8);
-        }
-        if pcx.opt_in != 0 as *mut u8 && !crate::base::streq(option, c"--in") {
-            buf_str(out, c" --in");
-            put_cword(out, pcx.opt_in);
-        }
-        if (tcx.opt_where & G_CODE) != 0 {
-            buf_str(out, c" --code");
-        }
-        if (tcx.opt_where & G_COMMENT) != 0 {
-            buf_str(out, c" --comments");
-        }
-        if (tcx.opt_where & G_STRING) != 0 {
-            buf_str(out, c" --strings");
-        }
-        if tcx.opt_word {
-            buf_str(out, c" --word");
-        }
-        if tcx.opt_nocase {
-            buf_str(out, c" --ignore-case");
-        }
-        buf_byte(out, b' ');
-        buf_str(out, option);
-        if value.len() > 0 {
-            put_word(out, value);
-        }
-        try_end(out);
+fn try_grep(pats: &[i64], option: *const u8, value: &[u8], tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
+    let out = try_begin(c"grep", &value[0..0], false, tcx, pcx);
+    for k in 0..pats.len() as i64 {
+        put_cword(out, (pats[k as usize]) as *mut u8);
     }
+    if pcx.opt_in != 0 as *mut u8 && !crate::base::streq(option, c"--in") {
+        buf_str(out, c" --in");
+        put_cword(out, pcx.opt_in);
+    }
+    if (tcx.opt_where & G_CODE) != 0 {
+        buf_str(out, c" --code");
+    }
+    if (tcx.opt_where & G_COMMENT) != 0 {
+        buf_str(out, c" --comments");
+    }
+    if (tcx.opt_where & G_STRING) != 0 {
+        buf_str(out, c" --strings");
+    }
+    if tcx.opt_word {
+        buf_str(out, c" --word");
+    }
+    if tcx.opt_nocase {
+        buf_str(out, c" --ignore-case");
+    }
+    buf_byte(out, b' ');
+    buf_str(out, option);
+    if value.len() > 0 {
+        put_word(out, value);
+    }
+    try_end(out);
 }
 
 // `query grep PATTERN...`: the exit status (0, also for no hit).
-pub fn query_grep(pats: IntVec, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    unsafe {
-        let mut hits = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        find_hits(pats, &mut hits, tcx, pcx);
-        let out = buf_new();
-        let total = hits.count;
-        if tcx.opt_count {
-            buf_int(out, total);
-            buf_byte(out, b'\n');
-            buf_write_fd(out, STDOUT);
-            return 0;
-        }
-        if total == 0 {
-            let d = diag(c"note", c"query.empty", tcx);
-            buf_str(d, c"0 hits");
-            if pcx.opt_in != 0 as *mut u8 {
-                buf_str(d, c" in ");
-                buf_str(d, pcx.opt_in);
-            }
-            buf_byte(d, b'\n');
-            return 0;
-        }
-        // Per file: the number of hits.
-        let mut files = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut per_file = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut biggest: i64 = -1;
-        let mut biggest_n: i64 = 0;
-        for i in 0..total {
-            let f = file_of_pos((*hits.data.add(i as usize)), pcx);
-            if files.count == 0 || (*files.data.add((files.count - 1) as usize)) != f {
-                files.push(f);
-                per_file.push(0);
-            }
-            (*per_file.data.add((per_file.count - 1) as usize)) += 1;
-            if (*per_file.data.add((per_file.count - 1) as usize)) > biggest_n {
-                biggest_n = (*per_file.data.add((per_file.count - 1) as usize));
-                biggest = f;
+pub fn query_grep(pats: &[i64], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    // (0.29) a pattern that is a file on disk, with no --in: the file was
+    // not searched, and `0 hits` would read as "the text is not there"
+    if pcx.opt_in == 0 as *mut u8 && pats.len() > 1 {
+        for k in 0..pats.len() as i64 {
+            if crate::tools::textfile::plain_file(pats[k as usize] as *mut u8, pcx) {
+                crate::tools::textfile::not_searched(pats, k, tcx, pcx);
+                return 1;
             }
         }
-        if tcx.opt_limit < 0 && !tcx.opt_all && total > REFS_BUDGET {
-            for i in 0..files.count {
-                buf_bytes(out, file_text((*files.data.add(i as usize)), pcx));
-                buf_byte(out, b'\t');
-                buf_int(out, (*per_file.data.add(i as usize)));
-                buf_byte(out, b'\n');
-            }
-            buf_write_fd(out, STDOUT);
-            let d = diag(c"note", c"query.truncated", tcx);
-            buf_int(d, total);
-            buf_str(d, c" hits in ");
-            buf_int(d, files.count);
-            buf_str(d, if files.count == 1 { c" file\n" } else { c" files\n" });
-            if files.count > 1 {
-                try_grep(pats, c"--in", file_text(biggest, pcx), tcx, pcx);
-            }
-            try_grep(pats, c"--limit 60", &file_text(biggest, pcx)[0..0], tcx, pcx);
-            try_grep(pats, c"--all", &file_text(biggest, pcx)[0..0], tcx, pcx);
-            return 0;
+    }
+    let mut hits: Vec<i64, Comp> = Vec::new_in(Comp {});
+    find_hits(pats, &mut hits, tcx, pcx);
+    let out = buf_new();
+    let total = hits.len() as i64;
+    if tcx.opt_count {
+        buf_int(out, total);
+        buf_byte(out, b'\n');
+        buf_write_fd(out, STDOUT);
+        return 0;
+    }
+    if total == 0 {
+        let d = diag(c"note", c"query.empty", tcx);
+        buf_str(d, c"0 hits");
+        if pcx.opt_in != 0 as *mut u8 {
+            buf_str(d, c" in ");
+            buf_str(d, pcx.opt_in);
         }
-        let shown = if tcx.opt_limit >= 0 && tcx.opt_limit < total { tcx.opt_limit } else { total };
-        let mut cur: i64 = -1;
-        for i in 0..shown {
-            let pos = (*hits.data.add(i as usize));
-            let f = file_of_pos(pos, pcx);
-            if f != cur {
-                buf_str(out, c"# ");
-                buf_bytes(out, file_text(f, pcx));
-                buf_byte(out, b'\n');
-                cur = f;
-            }
-            buf_int(out, line_of(pos, pcx));
-            buf_byte(out, b':');
-            buf_int(out, pos - line_start(pos, pcx) + 1);
+        buf_byte(d, b'\n');
+        return 0;
+    }
+    // Per file: the number of hits.
+    let mut files: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut per_file: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut biggest: i64 = -1;
+    let mut biggest_n: i64 = 0;
+    for i in 0..total {
+        let f = file_of_pos((hits[i as usize]), pcx);
+        if files.len() as i64 == 0 || (files[(files.len() as i64 - 1) as usize]) != f {
+            files.push(f);
+            per_file.push(0);
+        }
+        let last_file = per_file.len() - 1;
+        per_file[last_file] += 1;
+        if (per_file[(per_file.len() as i64 - 1) as usize]) > biggest_n {
+            biggest_n = (per_file[(per_file.len() as i64 - 1) as usize]);
+            biggest = f;
+        }
+    }
+    if tcx.opt_limit < 0 && !tcx.opt_all && total > REFS_BUDGET {
+        for i in 0..files.len() as i64 {
+            buf_bytes(out, file_text((files[i as usize]), pcx));
             buf_byte(out, b'\t');
-            buf_str(out, place_name(place_of(pos, pcx)));
-            buf_byte(out, b'\t');
-            let mut e = enclosing(pos, tcx, pcx);
-            if place_of(pos, pcx) == G_COMMENT {
-                // (a doc comment: the item below it, 0.17)
-                let doc = documented(pos, pcx);
-                if doc >= 0
-                    && (e < 0 || pcx.defs[e as usize].start < pcx.defs[doc as usize].start) {
-                    e = doc;
-                }
-            }
-            put_short(out,
-                if e >= 0 { pcx.defs[e as usize].fqn }
-                else { mod_fqn(module_at(pos, pcx), tcx, pcx) },
-                pcx);
-            buf_byte(out, b'\t');
-            put_line(out, pos, pcx);
+            buf_int(out, (per_file[i as usize]));
             buf_byte(out, b'\n');
         }
         buf_write_fd(out, STDOUT);
-        if shown < total {
-            let d = diag(c"note", c"query.truncated", tcx);
-            buf_str(d, c"showing ");
-            buf_int(d, shown);
-            buf_str(d, c" of ");
-            buf_int(d, total);
-            buf_str(d, c" hits\n");
-            if files.count > 1 {
-                try_grep(pats, c"--in", file_text(biggest, pcx), tcx, pcx);
-            }
-            try_grep(pats, c"--all", &file_text(biggest, pcx)[0..0], tcx, pcx);
+        let d = diag(c"note", c"query.truncated", tcx);
+        buf_int(d, total);
+        buf_str(d, c" hits in ");
+        buf_int(d, files.len() as i64);
+        buf_str(d, if files.len() as i64 == 1 { c" file\n" } else { c" files\n" });
+        if files.len() as i64 > 1 {
+            try_grep(pats, c"--in", file_text(biggest, pcx), tcx, pcx);
         }
-        0
+        try_grep(pats, c"--limit 60", &file_text(biggest, pcx)[0..0], tcx, pcx);
+        try_grep(pats, c"--all", &file_text(biggest, pcx)[0..0], tcx, pcx);
+        return 0;
     }
+    let shown = if tcx.opt_limit >= 0 && tcx.opt_limit < total { tcx.opt_limit } else { total };
+    let mut cur: i64 = -1;
+    for i in 0..shown {
+        let pos = (hits[i as usize]);
+        let f = file_of_pos(pos, pcx);
+        if f != cur {
+            buf_str(out, c"# ");
+            buf_bytes(out, file_text(f, pcx));
+            buf_byte(out, b'\n');
+            cur = f;
+        }
+        buf_int(out, line_of(pos, pcx));
+        buf_byte(out, b':');
+        buf_int(out, pos - line_start(pos, pcx) + 1);
+        buf_byte(out, b'\t');
+        buf_str(out, place_name(place_of(pos, pcx)));
+        buf_byte(out, b'\t');
+        let mut e = enclosing(pos, tcx, pcx);
+        if place_of(pos, pcx) == G_COMMENT {
+            // (a doc comment: the item below it, 0.17)
+            let doc = documented(pos, pcx);
+            if doc >= 0
+                && (e < 0 || pcx.defs[e as usize].start < pcx.defs[doc as usize].start) {
+                e = doc;
+            }
+        }
+        put_short(out,
+            if e >= 0 { pcx.defs[e as usize].fqn }
+            else { mod_fqn(module_at(pos, pcx), tcx, pcx) },
+            pcx);
+        buf_byte(out, b'\t');
+        put_line(out, pos, pcx);
+        buf_byte(out, b'\n');
+    }
+    buf_write_fd(out, STDOUT);
+    if shown < total {
+        let d = diag(c"note", c"query.truncated", tcx);
+        buf_str(d, c"showing ");
+        buf_int(d, shown);
+        buf_str(d, c" of ");
+        buf_int(d, total);
+        buf_str(d, c" hits\n");
+        if files.len() as i64 > 1 {
+            try_grep(pats, c"--in", file_text(biggest, pcx), tcx, pcx);
+        }
+        try_grep(pats, c"--all", &file_text(biggest, pcx)[0..0], tcx, pcx);
+    }
+    0
 }

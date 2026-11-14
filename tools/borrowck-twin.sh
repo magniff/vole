@@ -3,17 +3,17 @@
 # compiled by rustc too, and rustc's verdict (accept or reject) must be the
 # case's. Verdicts only, not messages.
 #
-# usage: tools/borrowck-twin.sh [-v] [-r RUSTC] [--std2|--shim] CASE...
+# usage: tools/borrowck-twin.sh [-v] [-r RUSTC] [--std|--shim] CASE...
 #
 #   -v        print every case's line (default: only mismatches and the
 #             summary)
-#   --std2    (0.27.2) cases spelled on std2: the capability's textual
+#   --std    (0.27.2) cases spelled on std: the capability's textual
 #             inverse first (plan-0272 §4): `fn main(gpa: Gpa)` ->
 #             `fn main()`, `, Gpa>` and `<Gpa>` dropped, `X_in(.., gpa)`
 #             and `X_in(gpa)` -> `X(..)`, `format_in(A, ` -> `format!(`,
-#             std2-only imports (`ToStringIn`, `DefaultIn`, `CloneIn`,
+#             std-only imports (`ToStringIn`, `DefaultIn`, `CloneIn`,
 #             `CollectIn`, `FromIteratorIn`) dropped
-#   --shim    (0.27.3) cases spelled on std2, made Rust by the rustc twin's
+#   --shim    (0.27.3) cases spelled on std, made Rust by the rustc twin's
 #             shim instead (tools/rustc-twin/twin.py: the allocator calls
 #             kept, served by tools/rustc-twin/prelude.rs's extension
 #             traits over a `Gpa`; an allocator generic becomes Gpa); a
@@ -55,13 +55,13 @@
 
 VERBOSE=0
 RUSTC=
-STD2=0
+STD=0
 SHIM=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -v) VERBOSE=1 ;;
         -r) RUSTC=$2; shift ;;
-        --std2) STD2=1 ;;
+        --std) STD=1 ;;
         --shim) SHIM=1 ;;
         -h|--help) sed -n '2,/^[^#]/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
         --) shift; break ;;
@@ -152,9 +152,10 @@ for case_ in "$@"; do
     else
         awk '{ if ($0 ~ /^[ \t]*\/\/ [A-Z][A-Z0-9-]*(\([^)]*\))?:/) print ""; else print }' "$case_" \
             | sed -E 's/(^|[^A-Za-z0-9_!])println\(/\1println!(/g' >"$rs.0"
-        if [ $STD2 -eq 1 ]; then
-            # (the capability's inverse, --std2)
-            sed -E -e 's/fn main\(gpa: Gpa\)/fn main()/' -e 's/, Gpa>/>/g' -e 's/<Gpa>//g' \
+        if [ $STD -eq 1 ]; then
+            # (the capability's inverse, --std)
+            sed -E -e 's/fn main\(gpa: Gpa\)/fn main()/' -e 's/, Gpa, FixedState>/>/g' \
+                -e 's/, Gpa>/>/g' -e 's/<Gpa>//g' \
                 -e 's/format_in\([a-z_]+, /format!(/g' \
                 -e 's/([A-Za-z_][A-Za-z0-9_]*)_in\(gpa\)/\1()/g' \
                 -e 's/([A-Za-z_][A-Za-z0-9_]*)_in\(([^()]*), gpa\)/\1(\2)/g' \

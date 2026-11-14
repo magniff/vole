@@ -20,9 +20,7 @@
 
 use std::alloc::Arena;
 
-use crate::base::{
-    IntVec, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq,
-};
+use crate::base::{buf_byte, buf_bytes, buf_copy, buf_int, buf_new, buf_str, streq};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, EV_OPTION, EV_WORD, Leaf, Line, option, word_of};
@@ -40,8 +38,14 @@ use crate::tools::query::command_line::load_program;
 use crate::tools::query::defs::bytes_eq;
 use crate::tools::query::diagnostics::{diag, program_errors, put_root, write_diags};
 
+// UNSAFE: POSIX's open, dup2 and close: a step's stdin is a file put on
+// descriptor 0 for the command run in this process.
+// SAFETY: each declaration is the function's C prototype on the targets
+// vole builds for (64-bit macOS and Linux: int and pid_t are i32, size_t
+// u64, ssize_t i64; a mode_t is passed as an int, which both calling
+// conventions pass alike); what a call must hold is said at the call.
 extern "C" {
-    fn open(path: *mut u8, flags: i32) -> i32;
+    fn open(path: *const u8, flags: i32) -> i32;
     fn dup2(from: i32, to: i32) -> i32;
     fn close(fd: i32) -> i32;
 }
@@ -53,7 +57,7 @@ pub fn run_script(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     status
 }
 
-fn usage(message: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
+fn usage(message: *const u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
     let d = diag(c"error", c"refactor.usage", tcx);
     buf_str(d, message);
     buf_byte(d, b'\n');
@@ -69,71 +73,67 @@ fn usage(message: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) -> i64 {
 // The words of a line, as sh splits them (`'...'`, `"..."` with `\"` and
 // `\\`; a word starting with `#` starts a comment), into `words` (C
 // strings). False when a quote is not closed.
-fn split_words(line: &[u8], words: *mut IntVec) -> bool {
-    unsafe {
-        let mut i: i64 = 0;
-        while i < line.len() as i64 {
-            while i < line.len() as i64
-                && (line[i as usize] == b' ' || line[i as usize] == b'\t'
-                    || line[i as usize] == b'\r') {
+fn split_words(line: &[u8], words: &mut Vec<i64, Comp>) -> bool {
+    let mut i: i64 = 0;
+    while i < line.len() as i64 {
+        while i < line.len() as i64
+            && (line[i as usize] == b' ' || line[i as usize] == b'\t'
+                || line[i as usize] == b'\r') {
+            i += 1;
+        }
+        if i >= line.len() as i64 || line[i as usize] == b'#' {
+            break;
+        }
+        let w = buf_new();
+        while i < line.len() as i64 && line[i as usize] != b' ' && line[i as usize] != b'\t'
+            && line[i as usize] != b'\r' {
+            let c = line[i as usize];
+            if c == b'\'' || c == b'"' {
                 i += 1;
-            }
-            if i >= line.len() as i64 || line[i as usize] == b'#' {
-                break;
-            }
-            let w = buf_new();
-            while i < line.len() as i64 && line[i as usize] != b' ' && line[i as usize] != b'\t'
-                && line[i as usize] != b'\r' {
-                let c = line[i as usize];
-                if c == b'\'' || c == b'"' {
-                    i += 1;
-                    while i < line.len() as i64 && line[i as usize] != c {
-                        if c == b'"' && line[i as usize] == b'\\' && i + 1 < line.len() as i64
-                            && (line[(i + 1) as usize] == b'"' || line[(i + 1) as usize] == b'\\') {
-                            i += 1;
-                        }
-                        buf_byte(w, line[i as usize]);
+                while i < line.len() as i64 && line[i as usize] != c {
+                    if c == b'"' && line[i as usize] == b'\\' && i + 1 < line.len() as i64
+                        && (line[(i + 1) as usize] == b'"' || line[(i + 1) as usize] == b'\\') {
                         i += 1;
                     }
-                    if i >= line.len() as i64 {
-                        return false;
-                    }
-                    i += 1;
-                } else {
-                    buf_byte(w, c);
+                    buf_byte(w, line[i as usize]);
                     i += 1;
                 }
+                if i >= line.len() as i64 {
+                    return false;
+                }
+                i += 1;
+            } else {
+                buf_byte(w, c);
+                i += 1;
             }
-            words.push(buf_cstr(w) as i64);
         }
-        true
+        words.push(buf_cstr(w) as i64);
     }
+    true
 }
 
 fn note_file(path: &[u8], state: i64, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
-    unsafe {
-        for i in 0..tcx.script_changed.count {
-            if crate::tools::proc::same_bytes(
-                c_slice((*tcx.script_changed.data.add(i as usize)) as *mut u8), path) {
-                let was = (*tcx.made.data.add(i as usize));
-                if state == 2 {
-                    // (moved away: a file made by a step before is none)
-                    (*tcx.made.data.add(i as usize)) = if was == 1 { 3 } else { 2 };
-                    remove_file(copy_path((*tcx.script_changed.data.add(i as usize)) as *mut u8,
-                        pcx));
-                } else if state == 1 && was == 2 {
-                    (*tcx.made.data.add(i as usize)) = 0;
-                } else if state == 1 && was == 3 {
-                    (*tcx.made.data.add(i as usize)) = 1;
-                }
-                return;
+    for i in 0..tcx.script_changed.len() as i64 {
+        if crate::tools::proc::same_bytes(
+            &c_slice((tcx.script_changed[i as usize]) as *mut u8), path) {
+            let was = (tcx.made[i as usize]);
+            if state == 2 {
+                // (moved away: a file made by a step before is none)
+                (tcx.made[i as usize]) = if was == 1 { 3 } else { 2 };
+                remove_file(copy_path((tcx.script_changed[i as usize]) as *mut u8,
+                    pcx));
+            } else if state == 1 && was == 2 {
+                (tcx.made[i as usize]) = 0;
+            } else if state == 1 && was == 3 {
+                (tcx.made[i as usize]) = 1;
             }
+            return;
         }
-        let b = buf_new();
-        buf_bytes(b, path);
-        tcx.script_changed.push(buf_cstr(b) as i64);
-        tcx.made.push(state);
     }
+    let b = buf_new();
+    buf_bytes(b, path);
+    tcx.script_changed.push(buf_cstr(b) as i64);
+    tcx.made.push(state);
 }
 
 // The files a step listed (`file PATH`, `new PATH`).
@@ -142,7 +142,7 @@ fn read_report(path: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
     if !read_file_if(path, b) {
         return;
     }
-    let t = buf_slice(b);
+    let t = buf_copy(b);
     let mut i: i64 = 0;
     while i < t.len() as i64 {
         let mut e = i;
@@ -165,20 +165,23 @@ fn read_report(path: *mut u8, tcx: &mut Tcx<Comp>, pcx: &Ctx<Comp>) {
 }
 
 fn remove_all_copies(tcx: &Tcx<Comp>, pcx: &Ctx<Comp>) {
-    unsafe {
-        for i in 0..tcx.script_changed.count {
-            remove_file(copy_path((*tcx.script_changed.data.add(i as usize)) as *mut u8, pcx));
-            if (*tcx.made.data.add(i as usize)) == 1 {
-                remove_empty_dirs((*tcx.script_changed.data.add(i as usize)) as *mut u8);
-            }
+    for i in 0..tcx.script_changed.len() as i64 {
+        remove_file(copy_path((tcx.script_changed[i as usize]) as *mut u8, pcx));
+        if (tcx.made[i as usize]) == 1 {
+            remove_empty_dirs((tcx.script_changed[i as usize]) as *mut u8);
         }
     }
 }
 
 // Runs step `words` (stdin from `input`, when not 0) in a copy of this
 // process: its exit status.
-fn run_step(words: *mut IntVec, input: *mut u8, root: *mut u8, report: *mut u8, gpa: Gpa,
+fn run_step(words: &[i64], input: *const u8, root: *const u8, report: *mut u8, gpa: Gpa,
     tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>, wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
+    // UNSAFE: open, dup2 and close are C's: the step's stdin is a file, in
+    // the forked copy that runs it.
+    // SAFETY: input is checked not null, a C string of the script's words;
+    // fd is checked before dup2 puts it on descriptor 0 and is closed once;
+    // this runs in the copy only (pid == 0), which ends in worker_exit.
     unsafe {
         let pid = fork_worker();
         if pid < 0 {
@@ -186,10 +189,10 @@ fn run_step(words: *mut IntVec, input: *mut u8, root: *mut u8, report: *mut u8, 
         }
         if pid == 0 {
             // The copy: the program as the steps before left it.
-            for i in 0..tcx.script_changed.count {
-                let p = (*tcx.script_changed.data.add(i as usize)) as *mut u8;
+            for i in 0..tcx.script_changed.len() as i64 {
+                let p = (tcx.script_changed[i as usize]) as *mut u8;
                 pcx.overlay.push(p as i64);
-                pcx.overlay.push(if (*tcx.made.data.add(i as usize)) >= 2 { gone_path(p) }
+                pcx.overlay.push(if (tcx.made[i as usize]) >= 2 { gone_path(p) }
                     else { copy_path(p, pcx) } as i64);
             }
             tcx.step_report = report;
@@ -208,11 +211,11 @@ fn run_step(words: *mut IntVec, input: *mut u8, root: *mut u8, report: *mut u8, 
                 dup2(fd, 0);
                 close(fd);
             }
-            let n = (*words).count;
+            let n = words.len() as i64;
             let mut w: Vec<&str, Gpa> = Vec::new_in(gpa);
             w.push(word_of(pcx.prog));
             for i in 0..n {
-                w.push(word_of((*words).get(i) as *mut u8));
+                w.push(word_of(words[i as usize] as *mut u8));
             }
             w.push("--root");
             w.push(word_of(root));
@@ -242,9 +245,9 @@ fn script_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     set_command(c.line, tcx);
     pcx.prog = c.prog();
     tcx.tool = c"refactor";
-    let mut root = 0 as *mut u8;
-    let mut file = 0 as *mut u8;
-    let mut label = 0 as *mut u8;
+    let mut root = 0 as *const u8;
+    let mut file = 0 as *const u8;
+    let mut label = 0 as *const u8;
     for e in c.evs.iter().copied() {
         let mut ev = e;
         let a = ev.value;
@@ -271,267 +274,264 @@ fn script_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
             return usage(c"one FILE of commands", tcx, pcx);
         }
     }
-    unsafe {
-        if file == 0 as *mut u8 {
-            return usage(c"a FILE of commands is needed", tcx, pcx);
+    if file == 0 as *mut u8 {
+        return usage(c"a FILE of commands is needed", tcx, pcx);
+    }
+    tcx.root_given = root;
+    root = root_or_diag(root, c"--script", &c_slice(file), true, tcx, pcx);
+    if root == 0 as *mut u8 {
+        return 2;
+    }
+    let text = buf_new();
+    if !read_file_if(file, text) {
+        let d = diag(c"error", c"refactor.script", tcx);
+        buf_str(d, c"cannot read '");
+        buf_str(d, file);
+        buf_str(d, c"'\n");
+        return 2;
+    }
+    // The steps: the words of each line, its stdin, its line number.
+    let mut steps: Vec<Vec<i64, Comp>, Comp> = Vec::new_in(Comp {});
+    let mut inputs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut bodies: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut numbers: Vec<i64, Comp> = Vec::new_in(Comp {});
+    if !read_commands(&buf_copy(text), file, c"refactor.script", &mut steps, &mut inputs,
+        &mut bodies, &mut numbers, tcx) {
+        return 2;
+    }
+    for k in 0..steps.len() as i64 {
+        let w = &steps[k as usize];
+        let first = ((*w)[0]) as *mut u8;
+        if !is_tool(word_of(first))
+            || ((*w).len() as i64 > 1 && streq(first, c"refactor")
+                && streq(((*w)[1]) as *mut u8, c"--script")) {
+            return line_error(file, (numbers[k as usize]),
+                c"not a command a script runs (refactor, rewrite, edit, fix)", tcx);
         }
-        tcx.root_given = root;
-        root = root_or_diag(root, c"--script", c_slice(file), true, tcx, pcx);
-        if root == 0 as *mut u8 {
-            return 2;
-        }
-        let text = buf_new();
-        if !read_file_if(file, text) {
-            let d = diag(c"error", c"refactor.script", tcx);
-            buf_str(d, c"cannot read '");
-            buf_str(d, file);
-            buf_str(d, c"'\n");
-            return 2;
-        }
-        // The steps: the words of each line, its stdin, its line number.
-        let mut steps = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut inputs = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut bodies = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        let mut numbers = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        if !read_commands(buf_slice(text), file, c"refactor.script", &mut steps, &mut inputs,
-            &mut bodies, &mut numbers, tcx) {
-            return 2;
-        }
-        for k in 0..steps.count {
-            let w = (*steps.data.add(k as usize)) as *mut IntVec;
-            let first = (*(*w).data.add(0)) as *mut u8;
-            if !is_tool(word_of(first))
-                || ((*w).count > 1 && streq(first, c"refactor")
-                    && streq((*(*w).data.add(1)) as *mut u8, c"--script")) {
-                return line_error(file, (*numbers.data.add(k as usize)),
-                    c"not a command a script runs (refactor, rewrite, edit, fix)", tcx);
-            }
-            for x in 1..(*w).count {
-                if streq((*(*w).data.add(x as usize)) as *mut u8, c"--root")
-                    || streq((*(*w).data.add(x as usize)) as *mut u8, c"--target") {
-                    return line_error(file, (*numbers.data.add(k as usize)),
-                        c"--root and --target are the script's, not a line's", tcx);
-                }
+        for x in 1..(*w).len() as i64 {
+            if streq(((*w)[x as usize]) as *mut u8, c"--root")
+                || streq(((*w)[x as usize]) as *mut u8, c"--target") {
+                return line_error(file, (numbers[k as usize]),
+                    c"--root and --target are the script's, not a line's", tcx);
             }
         }
-        if steps.count == 0 {
-            let d = diag(c"note", c"refactor.script", tcx);
-            buf_str(d, c"no commands in '");
-            buf_str(d, file);
-            buf_str(d, c"'\n");
-            return 0;
-        }
-        // The steps, in turn.
-        let report_buf = buf_new();
-        buf_str(report_buf, root);
-        // (0.25.5: tagged as the edit copies are, apply.vl copy_path)
-        buf_str(report_buf, c".vole-script-");
-        buf_str(report_buf, pcx.edit_tag);
-        buf_byte(report_buf, b'~');
-        let report = buf_cstr(report_buf);
-        let dry = tcx.dry_run;
-        let no_check = tcx.no_check;
-        for k in 0..steps.count {
-            remove_file(report);
-            write_diags(tcx);
-            // (a text after `<<WORD`: in a file next to the report, while
-            // the command runs)
-            let mut input = (*inputs.data.add(k as usize)) as *mut u8;
-            let stdin_buf = buf_new();
-            buf_str(stdin_buf, root);
-            buf_str(stdin_buf, c".vole-stdin-");
-            buf_str(stdin_buf, pcx.edit_tag);
-            buf_byte(stdin_buf, b'~');
-            let stdin_path = buf_cstr(stdin_buf);
-            if (*bodies.data.add(k as usize)) >= 0 {
-                if !write_file_if(stdin_path, buf_slice((*bodies.data.add(k as usize)))) {
-                    remove_all_copies(tcx, pcx);
-                    return line_error(file, (*numbers.data.add(k as usize)),
-                        c"cannot write the text after <<", tcx);
-                }
-                input = stdin_path;
-            }
-            let status = run_step((*steps.data.add(k as usize)) as *mut IntVec, input, root, report,
-                gpa, tcx, pcx, wgx);
-            if (*bodies.data.add(k as usize)) >= 0 {
-                remove_file(stdin_path);
-            }
-            if status != 0 {
-                read_report(report, tcx, pcx);
-                remove_file(report);
-                remove_all_copies(tcx, pcx);
-                let d = diag(c"error", c"refactor.script", tcx);
-                buf_str(d, file);
-                buf_byte(d, b':');
-                buf_int(d, (*numbers.data.add(k as usize)));
-                buf_str(d, c": the command failed (exit ");
-                buf_int(d, status);
-                buf_str(d, c"):");
-                let w = (*steps.data.add(k as usize)) as *mut IntVec;
-                for x in 0..(*w).count {
-                    crate::tools::query::diagnostics::put_word(d,
-                        c_slice((*(*w).data.add(x as usize)) as *mut u8));
-                }
-                buf_str(d, c"; nothing written\n");
-                return 1;
-            }
-            read_report(report, tcx, pcx);
-        }
+    }
+    if steps.len() as i64 == 0 {
+        let d = diag(c"note", c"refactor.script", tcx);
+        buf_str(d, c"no commands in '");
+        buf_str(d, file);
+        buf_str(d, c"'\n");
+        return 0;
+    }
+    // The steps, in turn.
+    let report_buf = buf_new();
+    buf_str(report_buf, root);
+    // (0.25.5: tagged as the edit copies are, apply.vl copy_path)
+    buf_str(report_buf, c".vole-script-");
+    buf_str(report_buf, pcx.edit_tag);
+    buf_byte(report_buf, b'~');
+    let report = buf_cstr(report_buf);
+    let dry = tcx.dry_run;
+    let no_check = tcx.no_check;
+    for k in 0..steps.len() as i64 {
         remove_file(report);
-        tcx.dry_run = dry;
-        tcx.no_check = no_check;
-        if tcx.script_changed.count == 0 {
-            let d = diag(c"note", c"edit.unchanged", tcx);
-            buf_str(d, c"nothing to change\n");
-            return 0;
+        write_diags(tcx);
+        // (a text after `<<WORD`: in a file next to the report, while
+        // the command runs)
+        let mut input = (inputs[k as usize]) as *mut u8;
+        let stdin_buf = buf_new();
+        buf_str(stdin_buf, root);
+        buf_str(stdin_buf, c".vole-stdin-");
+        buf_str(stdin_buf, pcx.edit_tag);
+        buf_byte(stdin_buf, b'~');
+        let stdin_path = buf_cstr(stdin_buf);
+        if (bodies[k as usize]) >= 0 {
+            if !write_file_if(stdin_path, &buf_copy((bodies[k as usize]))) {
+                remove_all_copies(tcx, pcx);
+                return line_error(file, (numbers[k as usize]),
+                    c"cannot write the text after <<", tcx);
+            }
+            input = stdin_path;
         }
-        // One edit: the copies, checked once.
-        if !load_program(root, tcx.target, tcx, pcx, wgx) {
-            program_errors(c"error", root, true, tcx, pcx);
+        let status = run_step(steps[k as usize].as_slice(), input, root, report,
+            gpa, tcx, pcx, wgx);
+        if (bodies[k as usize]) >= 0 {
+            remove_file(stdin_path);
+        }
+        if status != 0 {
+            read_report(report, tcx, pcx);
+            remove_file(report);
             remove_all_copies(tcx, pcx);
+            let d = diag(c"error", c"refactor.script", tcx);
+            buf_str(d, file);
+            buf_byte(d, b':');
+            buf_int(d, (numbers[k as usize]));
+            buf_str(d, c": the command failed (exit ");
+            buf_int(d, status);
+            buf_str(d, c"):");
+            let w = &steps[k as usize];
+            for x in 0..(*w).len() as i64 {
+                crate::tools::query::diagnostics::put_word(d,
+                    &c_slice(((*w)[x as usize]) as *mut u8));
+            }
+            buf_str(d, c"; nothing written\n");
             return 1;
         }
-        for k in 0..tcx.script_changed.count {
-            let path = (*tcx.script_changed.data.add(k as usize)) as *mut u8;
-            let state = (*tcx.made.data.add(k as usize));
-            if state == 3 {
-                continue;
-            }
-            let ok = if state == 2 { edit_remove_file(c_slice(path), tcx, pcx) }
-                else if state == 1 { copy_made(path, tcx, pcx) }
-                else { copy_rewritten(c_slice(path), tcx, pcx) };
-            if !ok {
-                remove_all_copies(tcx, pcx);
-                let d = diag(c"error", c"edit.write", tcx);
-                buf_str(d, c"cannot read the copy of '");
-                buf_str(d, path);
-                buf_str(d, c"'\n");
-                return 1;
-            }
-        }
-        let what = buf_new();
-        if label != 0 as *mut u8 {
-            buf_str(what, label);
-        } else {
-            buf_str(what, c"script ");
-            buf_str(what, file);
-            buf_str(what, c": ");
-            buf_int(what, steps.count);
-            buf_str(what, if steps.count == 1 { c" command" } else { c" commands" });
-        }
-        finish_edit(buf_slice(what), root, tcx, pcx)
+        read_report(report, tcx, pcx);
     }
+    remove_file(report);
+    tcx.dry_run = dry;
+    tcx.no_check = no_check;
+    if tcx.script_changed.len() as i64 == 0 {
+        let d = diag(c"note", c"edit.unchanged", tcx);
+        buf_str(d, c"nothing to change\n");
+        return 0;
+    }
+    // One edit: the copies, checked once.
+    if !load_program(root, tcx.target, tcx, pcx, wgx) {
+        program_errors(c"error", root, true, tcx, pcx);
+        remove_all_copies(tcx, pcx);
+        return 1;
+    }
+    for k in 0..tcx.script_changed.len() as i64 {
+        let path = (tcx.script_changed[k as usize]) as *mut u8;
+        let state = (tcx.made[k as usize]);
+        if state == 3 {
+            continue;
+        }
+        let ok = if state == 2 { edit_remove_file(&c_slice(path), tcx, pcx) }
+            else if state == 1 { copy_made(path, tcx, pcx) }
+            else { copy_rewritten(&c_slice(path), tcx, pcx) };
+        if !ok {
+            remove_all_copies(tcx, pcx);
+            let d = diag(c"error", c"edit.write", tcx);
+            buf_str(d, c"cannot read the copy of '");
+            buf_str(d, path);
+            buf_str(d, c"'\n");
+            return 1;
+        }
+    }
+    let what = buf_new();
+    if label != 0 as *mut u8 {
+        buf_str(what, label);
+    } else {
+        buf_str(what, c"script ");
+        buf_str(what, file);
+        buf_str(what, c": ");
+        buf_int(what, steps.len() as i64);
+        buf_str(what, if steps.len() as i64 == 1 { c" command" } else { c" commands" });
+    }
+    finish_edit(&buf_copy(what), root, tcx, pcx)
 }
 
-fn line_error(file: *mut u8, line: i64, message: *mut u8, tcx: &mut Tcx<Comp>) -> i64 {
+fn line_error(file: *const u8, line: i64, message: *const u8, tcx: &mut Tcx<Comp>) -> i64 {
     format_error(c"refactor.script", file, line, message, tcx);
     2
 }
 
 // The commands of text t (of FILE, for messages), one per line, as typed
 // after `volec` (0.15: refactor --script's and batch's): per command
-// its words (an IntVec of C strings, as split_words splits them), its
+// its words (a list of C strings, as split_words splits them), its
 // stdin (`< PATH`: the path; `<<WORD`: WORD), the text after `<<WORD` (a
 // buffer, else -1) and its line. False after the diagnostic (`code`:
 // refactor.script, batch.format).
-pub fn read_commands(t: &[u8], file: *mut u8, code: *mut u8, steps: &mut IntVec,
-    inputs: &mut IntVec, bodies: &mut IntVec, numbers: &mut IntVec, tcx: &mut Tcx<Comp>) -> bool {
-    unsafe {
-        let mut p: i64 = 0;
-        let mut line_no: i64 = 0;
-        while p < t.len() as i64 {
-            let mut e = p;
-            while e < t.len() as i64 && t[e as usize] != b'\n' {
-                e += 1;
-            }
-            line_no += 1;
-            let words = alloc_array::<IntVec>(1i64);
-            (*words.add(0)) = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-            let ok = split_words(&t[p as usize..e as usize], words.add(0));
-            p = e + 1;
-            let w = words.add(0) as *mut IntVec;
-            if !ok {
-                format_error(code, file, line_no, c"a quote is not closed", tcx);
-                return false;
-            }
-            if (*w).count == 0 {
-                continue;
-            }
-            // (`< PATH`: stdin; 0.14: `<<WORD`, the lines after it up to
-            // a line WORD)
-            let cmd_line = line_no;
-            let mut input = 0 as *mut u8;
-            let mut body: i64 = -1;
-            let n = (*w).count;
-            let last = (*(*w).data.add((n - 1) as usize)) as *mut u8;
-            let mut word = 0 as *mut u8;
-            if n >= 2 && streq((*(*w).data.add((n - 2) as usize)) as *mut u8, c"<<") {
-                word = last;
-                (*w).count = n - 2;
-            } else if (*last.add(0)) == b'<' && (*last.add(1)) == b'<' && (*last.add(2)) != 0 {
-                word = last.add(2);
-                (*w).count = n - 1;
-            }
-            if word != 0 as *mut u8 {
-                input = word;
-                body = buf_new();
-                let mut found = false;
-                while p < t.len() as i64 && !found {
-                    let mut e2 = p;
-                    while e2 < t.len() as i64 && t[e2 as usize] != b'\n' {
-                        e2 += 1;
-                    }
-                    line_no += 1;
-                    let mut b = e2;
-                    while b > p
-                        && (t[(b - 1) as usize] == b' ' || t[(b - 1) as usize] == b'\t'
-                            || t[(b - 1) as usize] == b'\r') {
-                        b -= 1;
-                    }
-                    if bytes_eq(&t[p as usize..b as usize], c_slice(word)) {
-                        found = true;
-                    } else {
-                        buf_bytes(body, &t[p as usize..e2 as usize]);
-                        buf_byte(body, b'\n');
-                    }
-                    p = e2 + 1;
-                }
-                if !found {
-                    let d = diag(c"error", code, tcx);
-                    buf_str(d, file);
-                    buf_byte(d, b':');
-                    buf_int(d, cmd_line);
-                    buf_str(d, c": no line '");
-                    buf_str(d, word);
-                    buf_str(d, c"' ends the text of <<");
-                    buf_str(d, word);
-                    buf_byte(d, b'\n');
-                    return false;
-                }
-            } else if n >= 2 && streq((*(*w).data.add((n - 2) as usize)) as *mut u8, c"<") {
-                input = (*(*w).data.add((n - 1) as usize)) as *mut u8;
-                (*w).count = n - 2;
-            }
-            else if (*(*w).data.add((n - 1) as usize)) as *mut u8 != 0 as *mut u8
-                && (*((*(*w).data.add((n - 1) as usize)) as *mut u8).add(0)) == b'<' {
-                input = ((*(*w).data.add((n - 1) as usize)) as *mut u8).add(1);
-                (*w).count = n - 1;
-            }
-            if (*w).count == 0 {
-                format_error(code, file, cmd_line, c"stdin is given, but no command", tcx);
-                return false;
-            }
-            steps.push(w as i64);
-            inputs.push(input as i64);
-            bodies.push(body);
-            numbers.push(cmd_line);
+pub fn read_commands(t: &[u8], file: *const u8, code: *const u8,
+    steps: &mut Vec<Vec<i64, Comp>, Comp>, inputs: &mut Vec<i64, Comp>, bodies: &mut Vec<i64, Comp>,
+    numbers: &mut Vec<i64, Comp>, tcx: &mut Tcx<Comp>) -> bool {
+    let mut p: i64 = 0;
+    let mut line_no: i64 = 0;
+    while p < t.len() as i64 {
+        let mut e = p;
+        while e < t.len() as i64 && t[e as usize] != b'\n' {
+            e += 1;
         }
-        true
+        line_no += 1;
+        let mut words: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let ok = split_words(&t[p as usize..e as usize], &mut words);
+        p = e + 1;
+        let w = &mut words;
+        if !ok {
+            format_error(code, file, line_no, c"a quote is not closed", tcx);
+            return false;
+        }
+        if (*w).len() as i64 == 0 {
+            continue;
+        }
+        // (`< PATH`: stdin; 0.14: `<<WORD`, the lines after it up to
+        // a line WORD)
+        let cmd_line = line_no;
+        let mut input = 0 as *const u8;
+        let mut body: i64 = -1;
+        let n = (*w).len() as i64;
+        let last = ((*w)[(n - 1) as usize]) as *mut u8;
+        let mut word = 0 as *const u8;
+        if n >= 2 && streq(((*w)[(n - 2) as usize]) as *mut u8, c"<<") {
+            word = last;
+            (*w).truncate((n - 2) as usize);
+        } else if crate::base::c_starts(last, b"<<") && crate::base::c_len(last) > 2 {
+            word = crate::base::c_tail(last, 2);
+            (*w).truncate((n - 1) as usize);
+        }
+        if word != 0 as *mut u8 {
+            input = word;
+            body = buf_new();
+            let mut found = false;
+            while p < t.len() as i64 && !found {
+                let mut e2 = p;
+                while e2 < t.len() as i64 && t[e2 as usize] != b'\n' {
+                    e2 += 1;
+                }
+                line_no += 1;
+                let mut b = e2;
+                while b > p
+                    && (t[(b - 1) as usize] == b' ' || t[(b - 1) as usize] == b'\t'
+                        || t[(b - 1) as usize] == b'\r') {
+                    b -= 1;
+                }
+                if bytes_eq(&t[p as usize..b as usize], &c_slice(word)) {
+                    found = true;
+                } else {
+                    buf_bytes(body, &t[p as usize..e2 as usize]);
+                    buf_byte(body, b'\n');
+                }
+                p = e2 + 1;
+            }
+            if !found {
+                let d = diag(c"error", code, tcx);
+                buf_str(d, file);
+                buf_byte(d, b':');
+                buf_int(d, cmd_line);
+                buf_str(d, c": no line '");
+                buf_str(d, word);
+                buf_str(d, c"' ends the text of <<");
+                buf_str(d, word);
+                buf_byte(d, b'\n');
+                return false;
+            }
+        } else if n >= 2 && streq(((*w)[(n - 2) as usize]) as *mut u8, c"<") {
+            input = ((*w)[(n - 1) as usize]) as *mut u8;
+            (*w).truncate((n - 2) as usize);
+        }
+        else if ((*w)[(n - 1) as usize]) as *mut u8 != 0 as *mut u8
+            && crate::base::c_starts(((*w)[(n - 1) as usize]) as *mut u8, b"<") {
+            input = crate::base::c_tail(((*w)[(n - 1) as usize]) as *mut u8, 1);
+            (*w).truncate((n - 1) as usize);
+        }
+        if (*w).len() as i64 == 0 {
+            format_error(code, file, cmd_line, c"stdin is given, but no command", tcx);
+            return false;
+        }
+        steps.push(words);
+        inputs.push(input as i64);
+        bodies.push(body);
+        numbers.push(cmd_line);
     }
+    true
 }
 
 // `CODE: FILE:LINE: MESSAGE; nothing run`.
-pub fn format_error(code: *mut u8, file: *mut u8, line: i64, message: *mut u8, tcx: &mut Tcx<Comp>) {
+pub fn format_error(code: *const u8, file: *const u8, line: i64, message: *const u8,
+    tcx: &mut Tcx<Comp>) {
     let d = diag(c"error", code, tcx);
     buf_str(d, file);
     buf_byte(d, b':');

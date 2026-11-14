@@ -19,7 +19,7 @@
 
 use crate::back::abi::returns_through_pointer;
 use crate::back::dwarf::{dbg_function_begin, dbg_function_end};
-use crate::base::{IntVec, buf_bytes, buf_clear, buf_slice, free};
+use crate::base::{buf_append, buf_clear};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{NodeKind, child};
@@ -28,8 +28,8 @@ use crate::front::contracts::sites::site_of;
 use crate::front::distinct::{enum_niche, erase_type};
 use crate::front::lexer::Tok;
 use crate::front::types::{
-    TY_BOOL, TY_I64, TY_NEVER, TY_U64, TyKind, field_offset, fn_param, get_enums, int_bits,
-    is_compound, is_float, is_integer, is_signed, is_slice, is_vector, is_void, tuple_offset,
+    TY_BOOL, TY_I64, TY_NEVER, TY_U64, TyKind, field_offset, fn_param, int_bits, is_compound,
+    is_float, is_integer, is_signed, is_slice, is_vector, is_void, struct_field, tuple_offset,
     type_elem, type_size, variant_field, variant_field_offset,
 };
 use crate::gen0::gen::{
@@ -76,7 +76,7 @@ use crate::places::shim::drop_shim_fn;
 // Function f (its Fn node: item) generated from its kept body: false
 // when it has none (or one take_body leaves to the AST walk), or is an
 // atomic intrinsic.
-pub fn gen_places_function(cx: &mut FnCtx, item: i64, f: i64, pbody: &mut Body<Comp>,
+pub fn gen_places_function(cx: &mut FnCtx<Comp>, item: i64, f: i64, pbody: &mut Body<Comp>,
     pcx: &mut Ctx<Comp>) -> bool {
     if atomic_intrinsic(f, pcx) >= 0 {
         return false;
@@ -90,7 +90,7 @@ pub fn gen_places_function(cx: &mut FnCtx, item: i64, f: i64, pbody: &mut Body<C
 }
 
 // Generates the operand node n is bound to; false when it is not bound.
-pub fn gen_bound(cx: &mut FnCtx, n: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> bool {
+pub fn gen_bound(cx: &mut FnCtx<Comp>, n: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> bool {
     let mut k: i64 = 0;
     while k < pcx.g_bound.len() as i64 {
         if pcx.g_bound[k as usize] == n {
@@ -123,72 +123,65 @@ fn unbind(pcx: &mut Ctx<Comp>) {
 
 // As mod.vl's gen_function: the prologue, the parameters, the blocks,
 // the epilogue.
-fn gen_body(cx: &mut FnCtx, item: i64, f: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: NODES, FNS and LOCALS are the checker's raw tables, cx the code
-    // generator's raw context pointer (as in mod.vl's gen_function).
-    // SAFETY: item is f's Fn node and f below FN_COUNT; ast is checked against
-    // LOCAL_COUNT before LOCALS is written; cx points at compile_program's live
-    // FnCtx; code generation is single-threaded.
-    unsafe {
-        pcx.gen_cur_fn = f;
-        buf_clear(cx.code);
-        pcx.depth = 0;
-        pcx.frame_size = 0;
-        pcx.overaligned.count = 0;
-        pcx.return_label = new_label(cx);
-        pcx.stmt_pos = -1;
-        dbg_function_begin(cx, f, fn_symbol_prefix(f, pcx), pcx.nodes[item as usize].start, pcx);
-        emit_function_start(cx, fn_symbol_prefix(f, pcx), pcx.fns[f as usize].name,
-            fn_is_global(f, pcx), pcx);
-        let ret = pcx.fns[f as usize].ret;
-        pcx.result_slot = 0;
-        if returns_through_pointer(cx, ret, pcx) {
-            pcx.result_slot = alloc_slot(8, 8, pcx);
-            emit_frame_addr(cx, R_ADDR, pcx.result_slot, pcx);
-            emit_store(cx, TY_U64, R_RESULT, R_ADDR, pcx);
-        }
-        let n = local_count(pbody);
-        pcx.slot.clear();
-        for _ in 0..n {
-            pcx.slot.push(-1);
-        }
-        // (the parameters' slots: gen_params' param_slot)
-        gen_params(cx, item, f, pcx);
-        gen_main_arch_init(cx, f, pcx);
-        forward_blocks(pbody, pcx);
-        scan_locals(pbody, pcx);
-        for l in 0..n {
-            let ty = local_type(l, pcx);
-            if has_flag(l, LF_STATIC, pbody) || is_void(ty) || ty == TY_NEVER
-                || pcx.acc_only[l as usize] {
-                continue;
-            }
-            if pcx.slot[l as usize] < 0 && !shares_slot(l, pbody, pcx)
-                && (pcx.mentions[l as usize] > 0 || pbody.locals[l as usize].src >= 0) {
-                pcx.slot[l as usize] = alloc_slot_for(ty, pcx);
-            }
-            let ast = pbody.locals[l as usize].src;
-            if ast >= 0 && ast < pcx.locals.len() as i64 {
-                pcx.locals[ast as usize].offset = pcx.slot[l as usize];
-            }
-        }
-        share_slots(pbody, pcx);
-        gen_blocks(cx, pbody, pcx);
-        emit_label(cx, pcx.return_label);
-        if is_void(ret) && pcx.fns[f as usize].name == pcx.main_sym {
-            // `main` without a result exits with 0.
-            emit_load_imm(cx, R_ACC, 0);
-        }
-        emit_epilogue(cx);
-        emit_frame_reserve(cx, pcx.frame_size);
-        buf_bytes(cx.asm, buf_slice(cx.code));
-        dbg_function_end(cx, pcx);
+fn gen_body(cx: &mut FnCtx<Comp>, item: i64, f: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    pcx.gen_cur_fn = f;
+    buf_clear(cx.code);
+    pcx.depth = 0;
+    pcx.frame_size = 0;
+    pcx.overaligned.clear();
+    pcx.return_label = new_label(cx);
+    pcx.stmt_pos = -1;
+    dbg_function_begin(cx, f, fn_symbol_prefix(f, pcx), pcx.nodes[item as usize].start, pcx);
+    emit_function_start(cx, fn_symbol_prefix(f, pcx), pcx.fns[f as usize].name,
+        fn_is_global(f, pcx), pcx);
+    let ret = pcx.fns[f as usize].ret;
+    pcx.result_slot = 0;
+    if returns_through_pointer(cx, ret, pcx) {
+        pcx.result_slot = alloc_slot(8, 8, pcx);
+        emit_frame_addr(cx, R_ADDR, pcx.result_slot, pcx);
+        emit_store(cx, TY_U64, R_RESULT, R_ADDR, pcx);
     }
+    let n = local_count(pbody);
+    pcx.slot.clear();
+    for _ in 0..n {
+        pcx.slot.push(-1);
+    }
+    // (the parameters' slots: gen_params' param_slot)
+    gen_params(cx, item, f, pcx);
+    gen_main_arch_init(cx, f, pcx);
+    forward_blocks(pbody, pcx);
+    scan_locals(pbody, pcx);
+    for l in 0..n {
+        let ty = local_type(l, pcx);
+        if has_flag(l, LF_STATIC, pbody) || is_void(ty) || ty == TY_NEVER
+            || pcx.acc_only[l as usize] {
+            continue;
+        }
+        if pcx.slot[l as usize] < 0 && !shares_slot(l, pbody, pcx)
+            && (pcx.mentions[l as usize] > 0 || pbody.locals[l as usize].src >= 0) {
+            pcx.slot[l as usize] = alloc_slot_for(ty, pcx);
+        }
+        let ast = pbody.locals[l as usize].src;
+        if ast >= 0 && ast < pcx.locals.len() as i64 {
+            pcx.locals[ast as usize].offset = pcx.slot[l as usize];
+        }
+    }
+    share_slots(pbody, pcx);
+    gen_blocks(cx, pbody, pcx);
+    emit_label(cx, pcx.return_label);
+    if is_void(ret) && pcx.fns[f as usize].name == pcx.main_sym {
+        // `main` without a result exits with 0.
+        emit_load_imm(cx, R_ACC, 0);
+    }
+    emit_epilogue(cx);
+    emit_frame_reserve(cx, pcx.frame_size);
+    buf_append(cx.asm, cx.code);
+    dbg_function_end(cx, pcx);
 }
 
 // The blocks in reverse postorder, each its label, its statements and
 // its terminator.
-fn gen_blocks(cx: &mut FnCtx, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+fn gen_blocks(cx: &mut FnCtx<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     pcx.label.clear();
     for _ in 0..block_count(pbody) {
         pcx.label.push(0);
@@ -589,7 +582,7 @@ fn reads_first(at: i64, l: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> bool
 // R_SECOND = operand i at `ops` when that takes no stack and leaves the
 // accumulator: an integer constant, or an 8-byte integer (or pointer)
 // in the frame; false (nothing emitted) otherwise.
-fn gen_second(cx: &mut FnCtx, ops: i64, i: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> bool {
+fn gen_second(cx: &mut FnCtx<Comp>, ops: i64, i: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> bool {
     let k = op_kind(ops, i, pbody);
     if k == OK_INT || k == OK_CONST {
         let t = erase_type(op_b(ops, i, pbody), pcx);
@@ -695,7 +688,7 @@ fn jumped_to(b: i64, prev: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> bool {
 }
 
 // A jump to block b (forwarded), unless it is the next one emitted.
-fn jump_to(cx: &mut FnCtx, b: i64, pcx: &Ctx<Comp>) {
+fn jump_to(cx: &mut FnCtx<Comp>, b: i64, pcx: &Ctx<Comp>) {
     let t = pcx.gen0_fwd[b as usize];
     if t != pcx.next {
         emit_jump(cx, pcx.label[t as usize]);
@@ -721,32 +714,28 @@ fn const_chain(p: i64, pbody: &Body<Comp>) -> bool {
 // The offset of projection p (a field, a union's field, a constant
 // index) in the place of its parent, of local l.
 fn proj_offset(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
-    // UNSAFE: TYPES is the checker's raw table of types.
-    // SAFETY: pt is the checked (erased) type of p's parent, below TYPE_COUNT.
-    unsafe {
-        let parent = proj_parent(p, pbody);
-        let k = proj_kind(p, pbody);
-        let v = proj_val(p, pbody);
-        if k == PJ_VARIANT {
-            return 0;
-        }
-        let pt = place_ty(l, parent, pbody, pcx);
-        if k == PJ_CONST {
-            return v * type_size(pcx.types[pt as usize].a, pcx);
-        }
-        if parent > 0 && proj_kind(parent, pbody) == PJ_VARIANT {
-            return variant_field_offset(proj_val(parent, pbody), v, pcx);
-        }
-        let tk = pcx.types[pt as usize].kind;
-        if tk == TyKind::Struct {
-            return field_offset(pcx.types[pt as usize].a, v, pcx);
-        }
-        if tk == TyKind::Tuple {
-            return tuple_offset(pt, v, pcx);
-        }
-        // (a slice's pointer and length)
-        v * 8
+    let parent = proj_parent(p, pbody);
+    let k = proj_kind(p, pbody);
+    let v = proj_val(p, pbody);
+    if k == PJ_VARIANT {
+        return 0;
     }
+    let pt = place_ty(l, parent, pbody, pcx);
+    if k == PJ_CONST {
+        return v * type_size(pcx.types[pt as usize].a, pcx);
+    }
+    if parent > 0 && proj_kind(parent, pbody) == PJ_VARIANT {
+        return variant_field_offset(proj_val(parent, pbody), v, pcx);
+    }
+    let tk = pcx.types[pt as usize].kind;
+    if tk == TyKind::Struct {
+        return field_offset(pcx.types[pt as usize].a, v, pcx);
+    }
+    if tk == TyKind::Tuple {
+        return tuple_offset(pt, v, pcx);
+    }
+    // (a slice's pointer and length)
+    v * 8
 }
 
 // The offset of place (l, p) in l, p a constant chain.
@@ -766,65 +755,60 @@ fn in_frame(l: i64, p: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> bool {
 }
 
 // Accumulator = the address of place (l, p).
-fn gen_place_addr(cx: &mut FnCtx, l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: P_LOCALS is the places IR's table and TYPES the checker's.
-    // SAFETY: l is a local of the body held (below local_count), pt the checked
-    // type of p's parent.
-    unsafe {
-        if in_frame(l, p, pbody, pcx) {
-            emit_frame_addr(cx, R_ACC, pcx.slot[l as usize] - chain_offset(l, p, pbody, pcx), pcx);
-            return;
-        }
-        if p == 0 && (pbody.locals[l as usize].flags & crate::places::ir::LF_STATIC) == 0 {
-            // (a zero-sized local, which has no slot: a borrowed `()` or unit
-            // struct receiver; nothing is read or written through it)
-            emit_frame_addr(cx, R_ACC, 0, pcx);
-            return;
-        }
-        if p == 0 {
-            // (a static's: its symbol)
-            emit_static_addr(cx, pbody.locals[l as usize].src, pcx);
-            return;
-        }
-        let parent = proj_parent(p, pbody);
-        let k = proj_kind(p, pbody);
-        if k == PJ_DEREF {
-            gen_place_value(cx, l, parent, pbody, pcx);
-            return;
-        }
-        if k == PJ_VARIANT {
-            gen_place_addr(cx, l, parent, pbody, pcx);
-            return;
-        }
-        if k == PJ_FIELD || k == PJ_UNION || k == PJ_CONST {
-            gen_place_addr(cx, l, parent, pbody, pcx);
-            let off = proj_offset(l, p, pbody, pcx);
-            if off != 0 {
-                emit_add_imm(cx, R_ACC, off);
-            }
-            return;
-        }
-        // PJ_INDEX: element v (a local) of an array, a slice's buffer or a
-        // pointer's
-        let pt = place_ty(l, parent, pbody, pcx);
-        let elem_size = type_size(pcx.types[pt as usize].a, pcx);
-        if pcx.types[pt as usize].kind == TyKind::Ptr {
-            gen_place_value(cx, l, parent, pbody, pcx);
-        } else if is_slice(pt, pcx) {
-            gen_place_addr(cx, l, parent, pbody, pcx);
-            emit_load_reg(cx, R_ACC, R_ACC);
-        } else {
-            gen_place_addr(cx, l, parent, pbody, pcx);
-        }
-        push_x0(cx, pcx);
-        gen_place_value(cx, proj_val(p, pbody), 0, pbody, pcx);
-        pop_x(cx, R_SECOND, pcx);
-        emit_index_addr(cx, elem_size);
+fn gen_place_addr(cx: &mut FnCtx<Comp>, l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    if in_frame(l, p, pbody, pcx) {
+        emit_frame_addr(cx, R_ACC, pcx.slot[l as usize] - chain_offset(l, p, pbody, pcx), pcx);
+        return;
     }
+    if p == 0 && (pbody.locals[l as usize].flags & crate::places::ir::LF_STATIC) == 0 {
+        // (a zero-sized local, which has no slot: a borrowed `()` or unit
+        // struct receiver; nothing is read or written through it)
+        emit_frame_addr(cx, R_ACC, 0, pcx);
+        return;
+    }
+    if p == 0 {
+        // (a static's: its symbol)
+        emit_static_addr(cx, pbody.locals[l as usize].src, pcx);
+        return;
+    }
+    let parent = proj_parent(p, pbody);
+    let k = proj_kind(p, pbody);
+    if k == PJ_DEREF {
+        gen_place_value(cx, l, parent, pbody, pcx);
+        return;
+    }
+    if k == PJ_VARIANT {
+        gen_place_addr(cx, l, parent, pbody, pcx);
+        return;
+    }
+    if k == PJ_FIELD || k == PJ_UNION || k == PJ_CONST {
+        gen_place_addr(cx, l, parent, pbody, pcx);
+        let off = proj_offset(l, p, pbody, pcx);
+        if off != 0 {
+            emit_add_imm(cx, R_ACC, off);
+        }
+        return;
+    }
+    // PJ_INDEX: element v (a local) of an array, a slice's buffer or a
+    // pointer's
+    let pt = place_ty(l, parent, pbody, pcx);
+    let elem_size = type_size(pcx.types[pt as usize].a, pcx);
+    if pcx.types[pt as usize].kind == TyKind::Ptr {
+        gen_place_value(cx, l, parent, pbody, pcx);
+    } else if is_slice(pt, pcx) {
+        gen_place_addr(cx, l, parent, pbody, pcx);
+        emit_load_reg(cx, R_ACC, R_ACC);
+    } else {
+        gen_place_addr(cx, l, parent, pbody, pcx);
+    }
+    push_x0(cx, pcx);
+    gen_place_value(cx, proj_val(p, pbody), 0, pbody, pcx);
+    pop_x(cx, R_SECOND, pcx);
+    emit_index_addr(cx, elem_size);
 }
 
 // Accumulator = the value of place (l, p) (a compound one's address).
-fn gen_place_value(cx: &mut FnCtx, l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+fn gen_place_value(cx: &mut FnCtx<Comp>, l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     if p == 0 && pcx.acc_only[l as usize] {
         return;
     }
@@ -838,7 +822,7 @@ fn gen_place_value(cx: &mut FnCtx, l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut
 
 // Place (l, p) = the accumulator's value, of the place's type (a compound
 // one's address, copied).
-fn write_place(cx: &mut FnCtx, l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+fn write_place(cx: &mut FnCtx<Comp>, l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let ty = place_ty(l, p, pbody, pcx);
     if is_void(ty) || ty == TY_NEVER {
         return;
@@ -868,7 +852,7 @@ fn write_place(cx: &mut FnCtx, l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx
 }
 
 // Accumulator = operand i at `ops` (a compound one's address).
-fn gen_op(cx: &mut FnCtx, ops: i64, i: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+fn gen_op(cx: &mut FnCtx<Comp>, ops: i64, i: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let k = op_kind(ops, i, pbody);
     let a = op_a(ops, i, pbody);
     let b = op_b(ops, i, pbody);
@@ -900,7 +884,7 @@ fn gen_op(cx: &mut FnCtx, ops: i64, i: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Co
 
 // ---- Statements ----
 
-fn gen_stmt(cx: &mut FnCtx, at: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+fn gen_stmt(cx: &mut FnCtx<Comp>, at: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let s = pbody.stmts[at as usize];
     let k = s.kind;
     if k != SK_ASSIGN && k != SK_CALL && k != SK_INTRINSIC && k != SK_DROP && k != SK_ASSERT {
@@ -945,140 +929,132 @@ fn gen_stmt(cx: &mut FnCtx, at: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
 
 // `drop(P)` kept: its type's drop shim called with `&mut P`; under a flag
 // (DS_FLAG, flag local d): only when the flag is true.
-fn gen_drop(cx: &mut FnCtx, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: FNS is the checker's raw table of functions.
-    // SAFETY: f is a shim's function (drop_shim_fn), below FN_COUNT.
-    unsafe {
-        if s.c != DS_KEPT && s.c != DS_FLAG {
-            return;
-        }
-        let f = drop_shim_fn(full_place_type(s.a, s.b, pbody, pcx), pcx);
-        if f < 0 {
-            return;
-        }
-        let mut skip: i64 = 0;
-        if s.c == DS_FLAG {
-            skip = new_label(cx);
-            gen_place_value(cx, s.d, 0, pbody, pcx);
-            emit_jump_if_zero(cx, skip);
-        }
-        if s.node > 0 {
-            crate::gen0::gen::checkalloc::site_before_drop(cx,
-                crate::places::print::drop_pos(s.node, pcx), pcx);
-        }
-        gen_place_addr(cx, s.a, s.b, pbody, pcx);
-        let mut arg_types: [i64; 1] = [fn_param(f, 0, pcx)];
-        gen_pass_arg(cx, arg_types[0], false, pcx);
-        gen_call_sequence(cx, f, arg_types.as_mut_ptr() as *mut i64, 1,
-            pcx.fns[f as usize].param_count, false, 1, pcx.fns[f as usize].ret, pcx);
-        if skip != 0 {
-            emit_label(cx, skip);
-        }
+fn gen_drop(cx: &mut FnCtx<Comp>, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    if s.c != DS_KEPT && s.c != DS_FLAG {
+        return;
+    }
+    let f = drop_shim_fn(full_place_type(s.a, s.b, pbody, pcx), pcx);
+    if f < 0 {
+        return;
+    }
+    let mut skip: i64 = 0;
+    if s.c == DS_FLAG {
+        skip = new_label(cx);
+        gen_place_value(cx, s.d, 0, pbody, pcx);
+        emit_jump_if_zero(cx, skip);
+    }
+    if s.node > 0 {
+        crate::gen0::gen::checkalloc::site_before_drop(cx,
+            crate::places::print::drop_pos(s.node, pcx), pcx);
+    }
+    gen_place_addr(cx, s.a, s.b, pbody, pcx);
+    let mut arg_types: [i64; 1] = [fn_param(f, 0, pcx)];
+    gen_pass_arg(cx, arg_types[0], false, pcx);
+    gen_call_sequence(cx, f, &mut arg_types[..], 1,
+        pcx.fns[f as usize].param_count, false, 1, pcx.fns[f as usize].ret, pcx);
+    if skip != 0 {
+        emit_label(cx, skip);
     }
 }
 
-fn gen_assign(cx: &mut FnCtx, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+fn gen_assign(cx: &mut FnCtx<Comp>, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let rv = s.c;
     let dl = s.a;
     let dp = s.b;
     let dt = place_ty(dl, dp, pbody, pcx);
-    // UNSAFE: NODES and TYPES are the checker's raw tables.
-    // SAFETY: s.e is the statement's node when it has one (a vector
-    // operation's), t a checked type.
-    unsafe {
-        if rv == RV_USE || rv == RV_REF {
-            gen_op(cx, s.ops, 0, pbody, pcx);
-        } else if rv == RV_BINARY || rv == RV_CHECKED && s.nops == 2 {
-            let ot = op_type(s.ops, 0, pbody, pcx);
-            if is_vector(ot, pcx) {
-                gen_vector_assign(cx, s, dt, pbody, pcx);
-                return;
-            }
-            // (the second operand first, the operator swapped, when the
-            // accumulator holds it: find_acc_only)
-            let swap = is_carried(s.ops, 1, pbody, pcx);
-            gen_op(cx, s.ops, if swap { 1 } else { 0 }, pbody, pcx);
-            if is_float(ot) || !gen_second(cx, s.ops, if swap { 0 } else { 1 }, pbody, pcx) {
-                push_value(cx, ot, pcx);
-                gen_op(cx, s.ops, if swap { 0 } else { 1 }, pbody, pcx);
-                pop_second_operand(cx, ot, pcx);
-            }
-            let tok = if swap { swapped(s.d) } else { token_of(s.d) };
-            if rv == RV_CHECKED {
-                // (0.26.3, decision 6) Rust's checks: a shift's amount, as
-                // unsigned, below the bits; `+ - *` by their result
-                let kind = arith_panic_kind(s.d, false, false, pcx);
-                let site = site_of(s.e, 0, pcx);
-                if s.d == BO_SHL || s.d == BO_SHR {
-                    emit_check_imm(cx, true, int_bits(ot), true, kind, site, pcx);
-                    gen_operator(cx, tok, ot, dt, pcx);
-                } else {
-                    emit_checked_binary(cx, tok, ot, kind, site, pcx);
-                }
-            } else {
-                if (s.d == BO_DIV || s.d == BO_REM) && is_integer(ot) {
-                    gen_division_checks(cx, s, ot, pbody, pcx);
-                }
-                gen_operator(cx, tok, ot, dt, pcx);
-            }
-        } else if rv == RV_UNARY || rv == RV_CHECKED {
-            if is_vector(dt, pcx) {
-                bind(pcx.nodes[s.e as usize].b, s.ops, 0, pcx);
-                gen_vector_negate(cx, pcx.nodes[s.e as usize].b, dt, pbody, pcx);
-                unbind(pcx);
-            } else {
-                gen_op(cx, s.ops, 0, pbody, pcx);
-                if rv == RV_CHECKED {
-                    // (0.26.3) `-x`: x is not a signed MIN, or is an
-                    // unsigned 0 (below 1)
-                    let kind = arith_panic_kind(UO_NEG, true, false, pcx);
-                    if is_signed(dt) {
-                        emit_check_imm(cx, false, (0 - 1) << (int_bits(dt) - 1) as u64, false,
-                            kind, site_of(s.e, 0, pcx), pcx);
-                    } else {
-                        emit_check_imm(cx, false, 1, true, kind, site_of(s.e, 0, pcx), pcx);
-                    }
-                }
-                let tok = if s.d == UO_NEG { Tok::Minus } else if s.d == UO_NOT { Tok::Bang }
-                    else { Tok::Tilde };
-                gen_unop(cx, tok, dt);
-            }
-        } else if rv == RV_CAST {
-            gen_op(cx, s.ops, 0, pbody, pcx);
-            gen_cast(cx, op_type(s.ops, 0, pbody, pcx), erase_type(s.d, pcx), pcx);
-        } else if rv == RV_DISCR {
-            gen_discriminant(cx, s.ops, pbody, pcx);
-        } else if rv == RV_LEN {
-            let t = op_type(s.ops, 0, pbody, pcx);
-            if pcx.types[t as usize].kind == TyKind::Array {
-                emit_load_imm(cx, R_ACC, pcx.types[t as usize].b as u64);
-            } else {
-                gen_op(cx, s.ops, 0, pbody, pcx);
-                emit_add_imm(cx, R_ACC, 8);
-                emit_load(cx, TY_U64, R_ACC, pcx);
-            }
-        } else if rv == RV_AGG {
-            gen_aggregate(cx, s, dt, pbody, pcx);
-            return;
-        } else if rv == RV_REPEAT {
-            let slot = alloc_slot_for(dt, pcx);
-            gen_op(cx, s.ops, 0, pbody, pcx);
-            gen_repeat_fill(cx, dt, slot, pcx);
-            emit_frame_addr(cx, R_ACC, slot, pcx);
-        } else if rv == RV_SLICE {
-            gen_slice(cx, s, pbody, pcx);
-        } else {
+    if rv == RV_USE || rv == RV_REF {
+        gen_op(cx, s.ops, 0, pbody, pcx);
+    } else if rv == RV_BINARY || rv == RV_CHECKED && s.nops == 2 {
+        let ot = op_type(s.ops, 0, pbody, pcx);
+        if is_vector(ot, pcx) {
+            gen_vector_assign(cx, s, dt, pbody, pcx);
             return;
         }
-        write_place(cx, dl, dp, pbody, pcx);
+        // (the second operand first, the operator swapped, when the
+        // accumulator holds it: find_acc_only)
+        let swap = is_carried(s.ops, 1, pbody, pcx);
+        gen_op(cx, s.ops, if swap { 1 } else { 0 }, pbody, pcx);
+        if is_float(ot) || !gen_second(cx, s.ops, if swap { 0 } else { 1 }, pbody, pcx) {
+            push_value(cx, ot, pcx);
+            gen_op(cx, s.ops, if swap { 0 } else { 1 }, pbody, pcx);
+            pop_second_operand(cx, ot, pcx);
+        }
+        let tok = if swap { swapped(s.d) } else { token_of(s.d) };
+        if rv == RV_CHECKED {
+            // (0.26.3, decision 6) Rust's checks: a shift's amount, as
+            // unsigned, below the bits; `+ - *` by their result
+            let kind = arith_panic_kind(s.d, false, false, pcx);
+            let site = site_of(s.e, 0, pcx);
+            if s.d == BO_SHL || s.d == BO_SHR {
+                emit_check_imm(cx, true, int_bits(ot), true, kind, site, pcx);
+                gen_operator(cx, tok, ot, dt, pcx);
+            } else {
+                emit_checked_binary(cx, tok, ot, kind, site, pcx);
+            }
+        } else {
+            if (s.d == BO_DIV || s.d == BO_REM) && is_integer(ot) {
+                gen_division_checks(cx, s, ot, pbody, pcx);
+            }
+            gen_operator(cx, tok, ot, dt, pcx);
+        }
+    } else if rv == RV_UNARY || rv == RV_CHECKED {
+        if is_vector(dt, pcx) {
+            bind(pcx.nodes[s.e as usize].b, s.ops, 0, pcx);
+            gen_vector_negate(cx, pcx.nodes[s.e as usize].b, dt, pbody, pcx);
+            unbind(pcx);
+        } else {
+            gen_op(cx, s.ops, 0, pbody, pcx);
+            if rv == RV_CHECKED {
+                // (0.26.3) `-x`: x is not a signed MIN, or is an
+                // unsigned 0 (below 1)
+                let kind = arith_panic_kind(UO_NEG, true, false, pcx);
+                if is_signed(dt) {
+                    emit_check_imm(cx, false, (0 - 1) << (int_bits(dt) - 1) as u64, false,
+                        kind, site_of(s.e, 0, pcx), pcx);
+                } else {
+                    emit_check_imm(cx, false, 1, true, kind, site_of(s.e, 0, pcx), pcx);
+                }
+            }
+            let tok = if s.d == UO_NEG { Tok::Minus } else if s.d == UO_NOT { Tok::Bang }
+                else { Tok::Tilde };
+            gen_unop(cx, tok, dt);
+        }
+    } else if rv == RV_CAST {
+        gen_op(cx, s.ops, 0, pbody, pcx);
+        gen_cast(cx, op_type(s.ops, 0, pbody, pcx), erase_type(s.d, pcx), pcx);
+    } else if rv == RV_DISCR {
+        gen_discriminant(cx, s.ops, pbody, pcx);
+    } else if rv == RV_LEN {
+        let t = op_type(s.ops, 0, pbody, pcx);
+        if pcx.types[t as usize].kind == TyKind::Array {
+            emit_load_imm(cx, R_ACC, pcx.types[t as usize].b as u64);
+        } else {
+            gen_op(cx, s.ops, 0, pbody, pcx);
+            emit_add_imm(cx, R_ACC, 8);
+            emit_load(cx, TY_U64, R_ACC, pcx);
+        }
+    } else if rv == RV_AGG {
+        gen_aggregate(cx, s, dt, pbody, pcx);
+        return;
+    } else if rv == RV_REPEAT {
+        let slot = alloc_slot_for(dt, pcx);
+        gen_op(cx, s.ops, 0, pbody, pcx);
+        gen_repeat_fill(cx, dt, slot, pcx);
+        emit_frame_addr(cx, R_ACC, slot, pcx);
+    } else if rv == RV_SLICE {
+        gen_slice(cx, s, pbody, pcx);
+    } else {
+        return;
     }
+    write_place(cx, dl, dp, pbody, pcx);
 }
 
 // (0.26.3, decision 6) The checks of an integer `a / b` or `a % b`
 // (R_ACC a, R_SECOND b), at every level: b is not 0, and (signed) not a
 // MIN / -1, each Rust's panic at its node. A constant divisor needs
 // neither, or only the second when it is -1.
-fn gen_division_checks(cx: &mut FnCtx, s: PStmt, ot: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+fn gen_division_checks(cx: &mut FnCtx<Comp>, s: PStmt, ot: i64, pbody: &Body<Comp>,
+    pcx: &mut Ctx<Comp>) {
     let site = site_of(s.e, 0, pcx);
     let k = op_kind(s.ops, 1, pbody);
     let known = k == OK_INT || k == OK_CONST;
@@ -1095,185 +1071,165 @@ fn gen_division_checks(cx: &mut FnCtx, s: PStmt, ot: i64, pbody: &Body<Comp>, pc
 
 // A binary operation on vectors (its node: the Binary, or the Assign of
 // `v op= x`), by vector.vl's functions.
-fn gen_vector_assign(cx: &mut FnCtx, s: PStmt, dt: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: NODES is the checker's raw table of nodes.
-    // SAFETY: s.e is the vector operation's node (scan_body leaves a body with
-    // a vector operation without one to the AST walk).
-    unsafe {
-        let n = s.e;
-        if pcx.nodes[n as usize].kind == NodeKind::Assign {
-            gen_op(cx, s.ops, 1, pbody, pcx);
-            let b = vector_value_to_slot(cx, dt, pcx);
-            let addr = alloc_slot(8, 8, pcx);
-            gen_place_addr(cx, s.a, s.b, pbody, pcx);
-            store_reg_to_frame(cx, R_ACC, addr, pcx);
-            vector_assign_lanes(cx, token_of(s.d), dt, b, addr, pcx);
-            return;
-        }
-        bind(pcx.nodes[n as usize].b, s.ops, 0, pcx);
-        bind(pcx.nodes[n as usize].c, s.ops, 1, pcx);
-        gen_vector_binary(cx, pcx.nodes[n as usize].op, pcx.nodes[n as usize].b,
-            pcx.nodes[n as usize].c, dt, pbody, pcx);
-        unbind(pcx);
-        write_place(cx, s.a, s.b, pbody, pcx);
+fn gen_vector_assign(cx: &mut FnCtx<Comp>, s: PStmt, dt: i64, pbody: &Body<Comp>,
+    pcx: &mut Ctx<Comp>) {
+    let n = s.e;
+    if pcx.nodes[n as usize].kind == NodeKind::Assign {
+        gen_op(cx, s.ops, 1, pbody, pcx);
+        let b = vector_value_to_slot(cx, dt, pcx);
+        let addr = alloc_slot(8, 8, pcx);
+        gen_place_addr(cx, s.a, s.b, pbody, pcx);
+        store_reg_to_frame(cx, R_ACC, addr, pcx);
+        vector_assign_lanes(cx, token_of(s.d), dt, b, addr, pcx);
+        return;
     }
+    bind(pcx.nodes[n as usize].b, s.ops, 0, pcx);
+    bind(pcx.nodes[n as usize].c, s.ops, 1, pcx);
+    gen_vector_binary(cx, pcx.nodes[n as usize].op, pcx.nodes[n as usize].b,
+        pcx.nodes[n as usize].c, dt, pbody, pcx);
+    unbind(pcx);
+    write_place(cx, s.a, s.b, pbody, pcx);
 }
 
 // Accumulator = the discriminant of place ops[0], an enum: a scalar
 // enum's value, the null niche's test, else the tag in memory.
-fn gen_discriminant(cx: &mut FnCtx, ops: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: the checker's TYPES, ENUMS and VARIANTS are raw tables.
-    // SAFETY: t is the checked enum type of operand 0, so TYPES[t].a is an ENUMS
-    // index; v stays below VARIANT_COUNT.
-    unsafe {
-        let t = op_type(ops, 0, pbody, pcx);
-        let e = pcx.types[t as usize].a;
-        let tag = (*get_enums().add(e as usize)).tag;
-        if !is_compound(t, pcx) {
-            gen_place_value(cx, op_a(ops, 0, pbody), op_b(ops, 0, pbody), pbody, pcx);
-            return;
-        }
-        gen_op(cx, ops, 0, pbody, pcx);
-        if !enum_niche(e, pcx) {
-            emit_load(cx, tag, R_ACC, pcx);
-            return;
-        }
-        // (the variant with the pointer when it is not null)
-        let mut some: i64 = 0;
-        let mut none: i64 = 0;
-        for v in 0..pcx.variants.len() as i64 {
-            if pcx.variants[v as usize].enum_id == e {
-                if pcx.variants[v as usize].field_count == 1 {
-                    some = wrap_int(pcx.variants[v as usize].discr, tag);
-                } else {
-                    none = wrap_int(pcx.variants[v as usize].discr, tag);
-                }
+fn gen_discriminant(cx: &mut FnCtx<Comp>, ops: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    let t = op_type(ops, 0, pbody, pcx);
+    let e = pcx.types[t as usize].a;
+    let tag = (pcx.enums[e as usize]).tag;
+    if !is_compound(t, pcx) {
+        gen_place_value(cx, op_a(ops, 0, pbody), op_b(ops, 0, pbody), pbody, pcx);
+        return;
+    }
+    gen_op(cx, ops, 0, pbody, pcx);
+    if !enum_niche(e, pcx) {
+        emit_load(cx, tag, R_ACC, pcx);
+        return;
+    }
+    // (the variant with the pointer when it is not null)
+    let mut some: i64 = 0;
+    let mut none: i64 = 0;
+    for v in 0..pcx.variants.len() as i64 {
+        if pcx.variants[v as usize].enum_id == e {
+            if pcx.variants[v as usize].field_count == 1 {
+                some = wrap_int(pcx.variants[v as usize].discr, tag);
+            } else {
+                none = wrap_int(pcx.variants[v as usize].discr, tag);
             }
         }
-        emit_load(cx, TY_U64, R_ACC, pcx);
-        emit_load_imm(cx, R_SECOND, 0);
-        emit_compare(cx, Cond::Ne, TY_U64, pcx);
-        if some == 1 && none == 0 {
-            return;
-        }
-        emit_load_imm(cx, R_SECOND, (some - none) as u64);
-        emit_int_binary(cx, Tok::Star, tag);
-        emit_add_imm(cx, R_ACC, none);
-        emit_normalize(cx, tag, pcx);
     }
+    emit_load(cx, TY_U64, R_ACC, pcx);
+    emit_load_imm(cx, R_SECOND, 0);
+    emit_compare(cx, Cond::Ne, TY_U64, pcx);
+    if some == 1 && none == 0 {
+        return;
+    }
+    emit_load_imm(cx, R_SECOND, (some - none) as u64);
+    emit_int_binary(cx, Tok::Star, tag);
+    emit_add_imm(cx, R_ACC, none);
+    emit_normalize(cx, tag, pcx);
 }
 
 // An aggregate into its place: built there when it is in a frame slot
 // and no operand reads its local, else in a new slot then copied.
-fn gen_aggregate(cx: &mut FnCtx, s: PStmt, dt: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: the checker's TYPES, ENUMS and VARIANTS are raw tables,
-    // struct_field returns a raw pointer into the checker's field table.
-    // SAFETY: dt is the place's checked type (an enum's for a variant, so
-    // TYPES[dt].a is an ENUMS index); s.e is the builder's variant of that enum;
-    // i is below the struct's field count (the builder makes one operand a field).
-    unsafe {
-        let ak = s.d;
-        if ak == AK_VARIANT && !is_compound(dt, pcx) {
-            let v = s.e;
-            emit_load_imm(cx, R_ACC,
-                wrap_int(pcx.variants[v as usize].discr,
-                    (*get_enums().add(pcx.types[dt as usize].a as usize)).tag) as u64);
-            write_place(cx, s.a, s.b, pbody, pcx);
-            return;
+fn gen_aggregate(cx: &mut FnCtx<Comp>, s: PStmt, dt: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    let ak = s.d;
+    if ak == AK_VARIANT && !is_compound(dt, pcx) {
+        let v = s.e;
+        emit_load_imm(cx, R_ACC,
+            wrap_int(pcx.variants[v as usize].discr,
+                (pcx.enums[pcx.types[dt as usize].a as usize]).tag) as u64);
+        write_place(cx, s.a, s.b, pbody, pcx);
+        return;
+    }
+    let mut in_place = in_frame(s.a, s.b, pbody, pcx);
+    for i in 0..s.nops {
+        let k = op_kind(s.ops, i, pbody);
+        if (k == OK_COPY || k == OK_MOVE || k == OK_PLACE) && op_a(s.ops, i, pbody) == s.a {
+            in_place = false;
         }
-        let mut in_place = in_frame(s.a, s.b, pbody, pcx);
-        for i in 0..s.nops {
-            let k = op_kind(s.ops, i, pbody);
-            if (k == OK_COPY || k == OK_MOVE || k == OK_PLACE) && op_a(s.ops, i, pbody) == s.a {
-                in_place = false;
-            }
-        }
-        let base = if in_place { pcx.slot[s.a as usize] - chain_offset(s.a, s.b, pbody, pcx) }
-            else { alloc_slot_for(dt, pcx) };
-        if ak == AK_VARIANT {
-            let v = s.e;
-            let tag = (*get_enums().add(pcx.types[dt as usize].a as usize)).tag;
-            if enum_niche(pcx.types[dt as usize].a, pcx) {
-                if s.nops == 1 {
-                    gen_op(cx, s.ops, 0, pbody, pcx);
-                } else {
-                    emit_load_imm(cx, R_ACC, 0);
-                }
-                store_to_frame(cx, TY_U64, base, pcx);
+    }
+    let base = if in_place { pcx.slot[s.a as usize] - chain_offset(s.a, s.b, pbody, pcx) }
+        else { alloc_slot_for(dt, pcx) };
+    if ak == AK_VARIANT {
+        let v = s.e;
+        let tag = (pcx.enums[pcx.types[dt as usize].a as usize]).tag;
+        if enum_niche(pcx.types[dt as usize].a, pcx) {
+            if s.nops == 1 {
+                gen_op(cx, s.ops, 0, pbody, pcx);
             } else {
-                for i in 0..s.nops {
-                    gen_op(cx, s.ops, i, pbody, pcx);
-                    store_to_frame(cx, erase_type(variant_field(v, i, pcx), pcx),
-                        base - variant_field_offset(v, i, pcx), pcx);
-                }
-                emit_load_imm(cx, R_ACC, wrap_int(pcx.variants[v as usize].discr, tag) as u64);
-                store_to_frame(cx, tag, base, pcx);
+                emit_load_imm(cx, R_ACC, 0);
             }
+            store_to_frame(cx, TY_U64, base, pcx);
         } else {
             for i in 0..s.nops {
-                let mut offset: i64 = 0;
-                let mut elem_ty: i64 = 0;
-                if ak == AK_STRUCT || ak == AK_CLOSURE {
-                    let st = pcx.types[dt as usize].a;
-                    offset = field_offset(st, i, pcx);
-                    elem_ty = erase_type((*crate::front::types::struct_field(st, i, pcx)).ty, pcx);
-                } else if ak == AK_TUPLE {
-                    offset = tuple_offset(dt, i, pcx);
-                    elem_ty = erase_type(type_elem(dt, i, pcx), pcx);
-                } else {
-                    elem_ty = erase_type(pcx.types[dt as usize].a, pcx);
-                    offset = i * type_size(elem_ty, pcx);
-                }
-                // (a union literal's fields not written: `const ()`)
-                if op_kind(s.ops, i, pbody) == OK_UNIT {
-                    continue;
-                }
                 gen_op(cx, s.ops, i, pbody, pcx);
-                store_to_frame(cx, elem_ty, base - offset, pcx);
+                store_to_frame(cx, erase_type(variant_field(v, i, pcx), pcx),
+                    base - variant_field_offset(v, i, pcx), pcx);
             }
+            emit_load_imm(cx, R_ACC, wrap_int(pcx.variants[v as usize].discr, tag) as u64);
+            store_to_frame(cx, tag, base, pcx);
         }
-        if !in_place {
-            emit_frame_addr(cx, R_ACC, base, pcx);
-            write_place(cx, s.a, s.b, pbody, pcx);
+    } else {
+        for i in 0..s.nops {
+            let mut offset: i64 = 0;
+            let mut elem_ty: i64 = 0;
+            if ak == AK_STRUCT || ak == AK_CLOSURE {
+                let st = pcx.types[dt as usize].a;
+                offset = field_offset(st, i, pcx);
+                elem_ty = erase_type((struct_field(st, i, pcx)).ty, pcx);
+            } else if ak == AK_TUPLE {
+                offset = tuple_offset(dt, i, pcx);
+                elem_ty = erase_type(type_elem(dt, i, pcx), pcx);
+            } else {
+                elem_ty = erase_type(pcx.types[dt as usize].a, pcx);
+                offset = i * type_size(elem_ty, pcx);
+            }
+            // (a union literal's fields not written: `const ()`)
+            if op_kind(s.ops, i, pbody) == OK_UNIT {
+                continue;
+            }
+            gen_op(cx, s.ops, i, pbody, pcx);
+            store_to_frame(cx, elem_ty, base - offset, pcx);
         }
+    }
+    if !in_place {
+        emit_frame_addr(cx, R_ACC, base, pcx);
+        write_place(cx, s.a, s.b, pbody, pcx);
     }
 }
 
 // Accumulator = `base[lo..hi]` (node s.d), as expr.vl's gen_slicing: the
 // base (a pointer's value, a slice's or an array's address), the bounds
 // (absent: OK_UNIT), then gen_slice_tail.
-fn gen_slice(cx: &mut FnCtx, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: TYPES is the checker's raw table of types.
-    // SAFETY: bt is operand 0's checked type.
-    unsafe {
-        let bt = op_type(s.ops, 0, pbody, pcx);
-        let slot = alloc_slot(16, 8, pcx);
-        let length = alloc_slot(8, 8, pcx);
-        let low_slot = alloc_slot(8, 8, pcx);
-        let high_slot = alloc_slot(8, 8, pcx);
-        if pcx.types[bt as usize].kind == TyKind::Ptr {
-            gen_place_value(cx, op_a(s.ops, 0, pbody), op_b(s.ops, 0, pbody), pbody, pcx);
-        } else {
-            gen_op(cx, s.ops, 0, pbody, pcx);
-        }
-        store_reg_to_frame(cx, R_ACC, slot, pcx);
-        let mut bound_ty = TY_U64;
-        if op_kind(s.ops, 1, pbody) != OK_UNIT {
-            gen_op(cx, s.ops, 1, pbody, pcx);
-            bound_ty = op_type(s.ops, 1, pbody, pcx);
-        } else {
-            emit_load_imm(cx, R_ACC, 0);
-        }
-        store_reg_to_frame(cx, R_ACC, low_slot, pcx);
-        let has_high = op_kind(s.ops, 2, pbody) != OK_UNIT;
-        if has_high {
-            gen_op(cx, s.ops, 2, pbody, pcx);
-            bound_ty = op_type(s.ops, 2, pbody, pcx);
-            store_reg_to_frame(cx, R_ACC, high_slot, pcx);
-        }
-        gen_slice_tail(cx, s.d, bt, false, has_high, bound_ty, slot, length, low_slot, high_slot,
-            pcx);
+fn gen_slice(cx: &mut FnCtx<Comp>, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    let bt = op_type(s.ops, 0, pbody, pcx);
+    let slot = alloc_slot(16, 8, pcx);
+    let length = alloc_slot(8, 8, pcx);
+    let low_slot = alloc_slot(8, 8, pcx);
+    let high_slot = alloc_slot(8, 8, pcx);
+    if pcx.types[bt as usize].kind == TyKind::Ptr {
+        gen_place_value(cx, op_a(s.ops, 0, pbody), op_b(s.ops, 0, pbody), pbody, pcx);
+    } else {
+        gen_op(cx, s.ops, 0, pbody, pcx);
     }
+    store_reg_to_frame(cx, R_ACC, slot, pcx);
+    let mut bound_ty = TY_U64;
+    if op_kind(s.ops, 1, pbody) != OK_UNIT {
+        gen_op(cx, s.ops, 1, pbody, pcx);
+        bound_ty = op_type(s.ops, 1, pbody, pcx);
+    } else {
+        emit_load_imm(cx, R_ACC, 0);
+    }
+    store_reg_to_frame(cx, R_ACC, low_slot, pcx);
+    let has_high = op_kind(s.ops, 2, pbody) != OK_UNIT;
+    if has_high {
+        gen_op(cx, s.ops, 2, pbody, pcx);
+        bound_ty = op_type(s.ops, 2, pbody, pcx);
+        store_reg_to_frame(cx, R_ACC, high_slot, pcx);
+    }
+    gen_slice_tail(cx, s.d, bt, false, has_high, bound_ty, slot, length, low_slot, high_slot,
+        pcx);
 }
 
 // ---- Calls and intrinsics ----
@@ -1281,80 +1237,73 @@ fn gen_slice(cx: &mut FnCtx, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) 
 // A call: by call.vl's gen_call of its node with the operands bound (its
 // intrinsics, contracts and convention), or, for one the builder made,
 // the call sequence itself.
-fn gen_call_stmt(cx: &mut FnCtx, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: NODES, FNS and TYPES are the checker's raw tables; arg_types is a
-    // local array passed by its address.
-    // SAFETY: n is the statement's node (0: none), f a FNS index when >= 0, the
-    // callee's type a checked fn type otherwise; arg_types has 64 entries and
-    // count is checked against it.
-    unsafe {
-        let n = s.node;
-        let f = s.c;
-        let skip: i64 = if f < 0 { 1 } else { 0 };
-        // (a compound result made in its destination's slot: into_dest)
-        let into = into_dest(s, pbody, pcx);
-        if bound_call(s, pcx) {
-            if f < 0 {
-                bind(pcx.nodes[n as usize].a, s.ops, 0, pcx);
-            }
-            for i in 0..pcx.nodes[n as usize].count {
-                bind(child(n, i, pcx), s.ops, i + skip, pcx);
-            }
-            if into != 0 {
-                pcx.result_into = into;
-            }
-            gen_call(cx, n, pbody, pcx);
-            pcx.result_into = 0;
-            unbind(pcx);
-            if into == 0 {
-                write_place(cx, s.a, s.b, pbody, pcx);
-            }
-            return;
-        }
-        let mut param_count: i64 = 0;
-        let mut ret: i64 = 0;
-        let mut variadic = false;
-        let mut callee_ty: i64 = 0;
-        if f >= 0 {
-            param_count = pcx.fns[f as usize].param_count;
-            ret = pcx.fns[f as usize].ret;
-            variadic = pcx.fns[f as usize].variadic;
-        } else {
-            callee_ty = op_type(s.ops, 0, pbody, pcx);
-            param_count = pcx.types[callee_ty as usize].count;
-            ret = pcx.types[callee_ty as usize].a;
-        }
-        let count = s.nops - skip;
-        if count > 64 {
-            crate::base::die(c"places: a call with more than 64 arguments");
-        }
-        let mut arg_types: [i64; 64] = [0i64; 64];
-        let mut pushed: i64 = 0;
-        for i in 0..count {
-            let mut ty = op_type(s.ops, i + skip, pbody, pcx);
-            if i < param_count {
-                ty = if f >= 0 { fn_param(f, i, pcx) } else { type_elem(callee_ty, i, pcx) };
-            }
-            gen_op(cx, s.ops, i + skip, pbody, pcx);
-            if gen_pass_arg(cx, ty, op_fresh(s.ops, i + skip, pbody), pcx) {
-                arg_types[i as usize] = ty;
-                pushed += 1;
-            }
-        }
+fn gen_call_stmt(cx: &mut FnCtx<Comp>, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    let n = s.node;
+    let f = s.c;
+    let skip: i64 = if f < 0 { 1 } else { 0 };
+    // (a compound result made in its destination's slot: into_dest)
+    let into = into_dest(s, pbody, pcx);
+    if bound_call(s, pcx) {
         if f < 0 {
-            gen_op(cx, s.ops, 0, pbody, pcx);
-            push_x0(cx, pcx);
-            pushed += 1;
+            bind(pcx.nodes[n as usize].a, s.ops, 0, pcx);
         }
-        if n > 0 && pcx.nodes[n as usize].kind == NodeKind::Call {
-            site_before_call(cx, n, pcx);
+        for i in 0..pcx.nodes[n as usize].count {
+            bind(child(n, i, pcx), s.ops, i + skip, pcx);
         }
-        pcx.result_into = into;
-        gen_call_sequence(cx, f, arg_types.as_mut_ptr() as *mut i64, count, param_count, variadic,
-            pushed, ret, pcx);
+        if into != 0 {
+            pcx.result_into = into;
+        }
+        gen_call(cx, n, pbody, pcx);
+        pcx.result_into = 0;
+        unbind(pcx);
         if into == 0 {
             write_place(cx, s.a, s.b, pbody, pcx);
         }
+        return;
+    }
+    let mut param_count: i64 = 0;
+    let mut ret: i64 = 0;
+    let mut variadic = false;
+    let mut callee_ty: i64 = 0;
+    if f >= 0 {
+        param_count = pcx.fns[f as usize].param_count;
+        ret = pcx.fns[f as usize].ret;
+        variadic = pcx.fns[f as usize].variadic;
+    } else {
+        callee_ty = op_type(s.ops, 0, pbody, pcx);
+        param_count = pcx.types[callee_ty as usize].count;
+        ret = pcx.types[callee_ty as usize].a;
+    }
+    let count = s.nops - skip;
+    if count > 64 {
+        crate::base::die(c"places: a call with more than 64 arguments");
+    }
+    let mut arg_types: [i64; 64] = [0i64; 64];
+    let mut pushed: i64 = 0;
+    for i in 0..count {
+        let mut ty = op_type(s.ops, i + skip, pbody, pcx);
+        if i < param_count {
+            ty = if f >= 0 { fn_param(f, i, pcx) } else { type_elem(callee_ty, i, pcx) };
+        }
+        gen_op(cx, s.ops, i + skip, pbody, pcx);
+        if gen_pass_arg(cx, ty, op_fresh(s.ops, i + skip, pbody), pcx) {
+            arg_types[i as usize] = ty;
+            pushed += 1;
+        }
+    }
+    if f < 0 {
+        gen_op(cx, s.ops, 0, pbody, pcx);
+        push_x0(cx, pcx);
+        pushed += 1;
+    }
+    if n > 0 && pcx.nodes[n as usize].kind == NodeKind::Call {
+        site_before_call(cx, n, pcx);
+    }
+    pcx.result_into = into;
+    gen_call_sequence(cx, f, &mut arg_types[..], count, param_count, variadic,
+        pushed, ret, pcx);
+    if into == 0 {
+        write_place(cx, s.a, s.b, pbody, pcx);
     }
 }
 
@@ -1400,92 +1349,80 @@ fn bound_call(s: PStmt, pcx: &Ctx<Comp>) -> bool {
 // lower_contract_failure): ops[1] the site, ops[2..] the shown values
 // (widened to 64 bits), the helper called with the message, whose text
 // alone is the AST's; the block ends in `unreachable`.
-fn gen_contract_failure(cx: &mut FnCtx, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: shown is a raw IntVec this function owns; NODES is the checker's
-    // raw table.
-    // SAFETY: check_values fills shown, whose data is freed once here; s.d is
-    // the check's call node, below NODE_COUNT.
-    unsafe {
-        let n = s.d;
-        let check = pcx.nodes[child(n, 2, pcx) as usize].a;
-        let mut shown = IntVec { data: 0 as *mut i64, count: 0, cap: 0 };
-        crate::front::contracts::checks::check_values(n, s.e, &mut shown, pcx);
-        // (the site: a `$pre` function's SITE parameter, or the check's
-        // own, the AST's constant)
-        let site_kind = op_kind(s.ops, 1, pbody);
-        if site_kind == OK_COPY || site_kind == OK_MOVE {
-            gen_op(cx, s.ops, 1, pbody, pcx);
-            gen_cast(cx, op_type(s.ops, 1, pbody, pcx), TY_I64, pcx);
-        } else {
-            gen_expr(cx, child(n, 1, pcx), pbody, pcx);
-        }
-        push_x0(cx, pcx);
-        let count = s.nops - 2;
-        for i in 0..count {
-            let ty = op_type(s.ops, i + 2, pbody, pcx);
-            gen_op(cx, s.ops, i + 2, pbody, pcx);
-            gen_cast(cx, ty, if is_signed(ty) { TY_I64 } else { TY_U64 }, pcx);
-            push_x0(cx, pcx);
-        }
-        if count > 2 {
-            pop_x(cx, R_ADDR, pcx);
-        }
-        if count > 1 {
-            pop_x(cx, R_SECOND, pcx);
-        }
-        if count > 0 {
-            pop_x(cx, R_ACC, pcx);
-        }
-        let kind = message_kind(crate::front::contracts::checks::check_message(check, s.e, shown,
-            pcx.gen_cur_fn, pcx), pcx);
-        emit_panic_site_popped(cx, kind, pcx);
-        free(shown.data as *mut u8);
+fn gen_contract_failure(cx: &mut FnCtx<Comp>, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    let n = s.d;
+    let check = pcx.nodes[child(n, 2, pcx) as usize].a;
+    let mut shown: Vec<i64, Comp> = Vec::new_in(Comp {});
+    crate::front::contracts::checks::check_values(n, s.e, &mut shown, pcx);
+    // (the site: a `$pre` function's SITE parameter, or the check's
+    // own, the AST's constant)
+    let site_kind = op_kind(s.ops, 1, pbody);
+    if site_kind == OK_COPY || site_kind == OK_MOVE {
+        gen_op(cx, s.ops, 1, pbody, pcx);
+        gen_cast(cx, op_type(s.ops, 1, pbody, pcx), TY_I64, pcx);
+    } else {
+        gen_expr(cx, child(n, 1, pcx), pbody, pcx);
     }
+    push_x0(cx, pcx);
+    let count = s.nops - 2;
+    for i in 0..count {
+        let ty = op_type(s.ops, i + 2, pbody, pcx);
+        gen_op(cx, s.ops, i + 2, pbody, pcx);
+        gen_cast(cx, ty, if is_signed(ty) { TY_I64 } else { TY_U64 }, pcx);
+        push_x0(cx, pcx);
+    }
+    if count > 2 {
+        pop_x(cx, R_ADDR, pcx);
+    }
+    if count > 1 {
+        pop_x(cx, R_SECOND, pcx);
+    }
+    if count > 0 {
+        pop_x(cx, R_ACC, pcx);
+    }
+    let kind = message_kind(crate::front::contracts::checks::check_message(check, s.e, &shown,
+        pcx.gen_cur_fn, pcx), pcx);
+    emit_panic_site_popped(cx, kind, pcx);
 }
 
-fn gen_intrinsic_stmt(cx: &mut FnCtx, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
-    // UNSAFE: NODES is the checker's raw table of nodes.
-    // SAFETY: s.d is the intrinsic's node (the EnumPanic, the contract check's
-    // or the vector or std::arch call), below NODE_COUNT.
-    unsafe {
-        let n = s.d;
-        if s.c == IK_PANIC {
-            gen_op(cx, s.ops, 0, pbody, pcx);
-            gen_cast(cx, op_type(s.ops, 0, pbody, pcx), TY_I64, pcx);
-            let pcx_site2 = site_of(n, 0, pcx);
-            emit_panic(cx, pcx.nodes[n as usize].x, pcx, pcx_site2);
-            return;
-        }
-        if s.c == IK_CONTRACT {
-            gen_contract_failure(cx, s, pbody, pcx);
-            return;
-        }
-        if s.c == IK_VECTOR {
-            let mut j: i64 = 0;
-            if pcx.nodes[n as usize].a != 0 {
-                bind(pcx.nodes[n as usize].a, s.ops, 0, pcx);
-                j = 1;
-            }
-            for i in 0..pcx.nodes[n as usize].count {
-                bind(child(n, i, pcx), s.ops, i + j, pcx);
-            }
-            gen_vecop(cx, n, pbody, pcx);
-        } else if s.c == IK_ARCH {
-            for i in 0..pcx.nodes[n as usize].count {
-                bind(child(n, i, pcx), s.ops, i, pcx);
-            }
-            gen_call(cx, n, pbody, pcx);
-        } else {
-            return;
-        }
-        unbind(pcx);
-        write_place(cx, s.a, s.b, pbody, pcx);
+fn gen_intrinsic_stmt(cx: &mut FnCtx<Comp>, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+    let n = s.d;
+    if s.c == IK_PANIC {
+        gen_op(cx, s.ops, 0, pbody, pcx);
+        gen_cast(cx, op_type(s.ops, 0, pbody, pcx), TY_I64, pcx);
+        let pcx_site2 = site_of(n, 0, pcx);
+        emit_panic(cx, pcx.nodes[n as usize].x, pcx, pcx_site2);
+        return;
     }
+    if s.c == IK_CONTRACT {
+        gen_contract_failure(cx, s, pbody, pcx);
+        return;
+    }
+    if s.c == IK_VECTOR {
+        let mut j: i64 = 0;
+        if pcx.nodes[n as usize].a != 0 {
+            bind(pcx.nodes[n as usize].a, s.ops, 0, pcx);
+            j = 1;
+        }
+        for i in 0..pcx.nodes[n as usize].count {
+            bind(child(n, i, pcx), s.ops, i + j, pcx);
+        }
+        gen_vecop(cx, n, pbody, pcx);
+    } else if s.c == IK_ARCH {
+        for i in 0..pcx.nodes[n as usize].count {
+            bind(child(n, i, pcx), s.ops, i, pcx);
+        }
+        gen_call(cx, n, pbody, pcx);
+    } else {
+        return;
+    }
+    unbind(pcx);
+    write_place(cx, s.a, s.b, pbody, pcx);
 }
 
 // ---- Terminators ----
 
-fn gen_term(cx: &mut FnCtx, at: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+fn gen_term(cx: &mut FnCtx<Comp>, at: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let s = pbody.stmts[at as usize];
     let k = s.kind;
     if k == TK_GOTO && !pcx.places_ret_block[s.a as usize] {
@@ -1495,9 +1432,7 @@ fn gen_term(cx: &mut FnCtx, at: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     } else if k == TK_RETURN || k == TK_GOTO {
         // (a return, or a jump to a block with nothing but one: the return
         // itself)
-        // UNSAFE: FNS is the checker's raw table of functions.
-        // SAFETY: CUR_FN is the function being generated.
-        let ret = unsafe { pcx.fns[pcx.gen_cur_fn as usize].ret };
+        let ret = pcx.fns[pcx.gen_cur_fn as usize].ret;
         if !is_void(ret) && ret != TY_NEVER {
             gen_place_value(cx, 0, 0, pbody, pcx);
             gen_return_value(cx, ret, pcx);
@@ -1510,7 +1445,7 @@ fn gen_term(cx: &mut FnCtx, at: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
 
 // `switch op [v: b, .., otherwise: c]`: a bool's a branch, else a compare
 // and jump per value.
-fn gen_switch(cx: &mut FnCtx, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
+fn gen_switch(cx: &mut FnCtx<Comp>, s: PStmt, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let ty = op_type(s.ops, 0, pbody, pcx);
     gen_op(cx, s.ops, 0, pbody, pcx);
     if s.b == 1 && pbody.targets[s.a as usize] == 0 && ty == TY_BOOL {

@@ -70,7 +70,7 @@ checks.vl:1:1: error[import.wildcard] wildcard imports are not allowed: 'use sup
 $ edit patch checks.vl:1 --old 'use super::*;' --new ''
 patched checks.vl:1	checks.vl	+0 -1 lines
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (2 files, 0 shaders)
 ## a #[test] takes nothing or `gpa: Gpa`
 % printf '#[test]\nfn takes(n: i64) {\n}\n' > checks.vl
 $ test

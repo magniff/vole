@@ -28,7 +28,7 @@ use std::collections::HashMap;
 
 fn main(gpa: Gpa) {
     let text = io::read_to_string_in(io::stdin(), gpa).unwrap();
-    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    let mut counts: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     count::add_words(&mut counts, &text, gpa);
     let top = report::top(&counts, 5, gpa);
     report::print_table(&top);
@@ -66,7 +66,7 @@ fn trim_punct(word: &str) -> &str {
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: Gpa) {
+pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: &str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -84,7 +84,7 @@ And `report.vl`, the table:
 
 use std::collections::HashMap;
 
-pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts {
         pairs.push((word.clone(), *k));
@@ -200,7 +200,7 @@ mod count;
 use std::collections::HashMap;
 
 fn main(gpa: Gpa) {
-    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    let mut counts: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     count::add_words(&mut counts, "the cat and the hat", gpa);
     println("{} different words", counts.len());
 }
@@ -209,7 +209,7 @@ fn main(gpa: Gpa) {
 ```vole count.vl
 use std::collections::HashMap;
 
-fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: Gpa) {
+fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: &str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = word.to_lowercase_in(gpa);
         *counts.entry(w).or_insert(0) += 1;
@@ -395,7 +395,7 @@ use std::collections::HashMap;
 
 fn run(gpa: Gpa) -> io::Result<()> {
     let args: Vec<&str, Gpa> = env::args().collect_in(gpa);
-    let mut counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
+    let mut counts: HashMap<String<Gpa>, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     for path in &args[1..] {
         let text = fs::read_to_string_in(path, gpa)?;
         count::add_words(&mut counts, &text, gpa);
@@ -449,7 +449,7 @@ fn trim_punct(word: &str) -> &str {
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: Gpa) {
+pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa, FixedState>, text: &str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -465,7 +465,7 @@ pub fn add_words(counts: &mut HashMap<String<Gpa>, i64, Gpa>, text: &str, gpa: G
 
 use std::collections::HashMap;
 
-pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
+pub fn top(counts: &HashMap<String<Gpa>, i64, Gpa, FixedState>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
     let mut pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts {
         pairs.push((word.clone(), *k));

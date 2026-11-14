@@ -5,15 +5,22 @@
 # usage: tools/premerge.sh [BASE]     (default: the release-* branch it forked from, the nearest merge-base; else main)
 #
 #   base     the branch contains BASE's tip (else: merge BASE first)
-#   unsafe   no new unsafe without // UNSAFE: and // SAFETY: (tools/unsafe-diff-check.py)
+#   unsafe   no new unsafe without // UNSAFE: and // SAFETY: (tools/unsafe-diff-check.py),
+#            and (0.29) none at all in compiler/src and std without them, no unsafe
+#            block of compiler/src with nothing unsafe inside: each one named, with
+#            its position (tests/unsafe_audit.sh, the gate's unsafe-audit row;
+#            `volec check --deny=unsafe` reports them as errors)
 #   fmt      every changed .vl outside tests/ is in the standard style
 #            (by the branch's own target/volec when the last tested build
 #            cannot read it: 0.27.0, a rust-edition file)
-#   check    every program the change touches checks with no error and no warning
+#   check    every program a changed file belongs to (a .vl, a shader it embeds,
+#            a file beside its main.vl) checks with no error and no warning;
+#            SKIP, never PASS, when the change touches no program
+#            (`volec check --changed --since BASE`)
 #            (but one whose main.vl says `// premerge: broken on purpose`)
-#            (but unsafe.unjustified: legacy sites are the baseline's, and new
-#            ones the unsafe row's)
-#   std      the committed compiler/src/front/stdsrc_rust.vl is what compiler/std/embed.sh
+#            (but unsafe.unjustified, a warning in a program that is not the
+#            compiler: the lines a change adds are the unsafe row's)
+#   std      the committed compiler/src/front/stdsrc.vl is what compiler/std/embed.sh
 #            makes of the committed std (0.25.3: made by the commit hook and the
 #            merge driver, tools/git-hooks/setup.sh; said when they are not set up)
 #   layout   every tests/examples case names a SOURCE that exists
@@ -71,11 +78,20 @@ else
     row base FAIL "$BASE has moved: git merge $BASE first"
 fi
 
-# unsafe
-if python3 -I tools/unsafe-diff-check.py "$BASE" > "$TMP/unsafe" 2>&1; then
-    row unsafe PASS "$(tail -1 "$TMP/unsafe" | sed 's/^unsafe-diff-check: //; s/^$/no new unsafe/')"
-else
+# unsafe: the lines the change adds, then (0.29) the whole of compiler/src
+# and std, where the rule is none (tests/unsafe_audit.sh)
+if ! python3 -I tools/unsafe-diff-check.py "$BASE" > "$TMP/unsafe" 2>&1; then
     row unsafe FAIL "$(tail -1 "$TMP/unsafe" | sed 's/^unsafe-diff-check: //')"
+elif [ -n "$VOLEC" ] && [ -f tests/unsafe_audit.sh ] && [ -f compiler/src/main.vl ] \
+    && ! sh tests/unsafe_audit.sh -c "$VOLEC" > "$TMP/audit" 2>&1; then
+    row unsafe FAIL "$(tail -1 "$TMP/audit" | sed 's/^unsafe-audit: //')"
+    grep -v '^unsafe-audit: compiler/src' "$TMP/audit" | head -40 | sed 's/^/    /' >> "$TMP/unsafe"
+else
+    audit=
+    [ -s "$TMP/audit" ] && audit="; $(tail -1 "$TMP/audit" | sed 's/^unsafe-audit: //; s/ (.*$//')"
+    # (the diff's check prints nothing when the change adds no unsafe)
+    added=$(tail -1 "$TMP/unsafe" | sed 's/^unsafe-diff-check: //')
+    row unsafe PASS "${added:-no new unsafe}$audit"
 fi
 
 # fmt
@@ -83,7 +99,7 @@ if [ -z "$VOLEC" ]; then
     row fmt SKIP "no volec (bootstrap/bootstrap.sh --dev)"
 else
     : > "$TMP/fmt"
-    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v -e '^tests/' -e '^editors/vscode/test/samples/' | grep -v 'front/stdsrc_rust\.vl$'); do
+    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v -e '^tests/' -e '^editors/vscode/test/samples/' | grep -v 'front/stdsrc\.vl$'); do
         # (or by the branch's own build: a build before 0.28.0 reads a
         # module of compiler/src alone as the old edition's)
         "$VOLEC" fmt --check "$f" > /dev/null 2>&1 \
@@ -92,50 +108,53 @@ else
     if [ -s "$TMP/fmt" ]; then row fmt FAIL "$(wc -l < "$TMP/fmt" | tr -d ' ') file(s)"; else row fmt PASS "changed .vl files formatted"; fi
 fi
 
-# check: the program roots the change touches
-if [ -z "$VOLEC" ]; then
-    row check SKIP "no volec"
+# check: the programs the change touches, by `volec check --changed`
+# (0.29, compiler/src/tools/changed.vl; the same command an agent whose
+# harness has no hooks runs after its edits). Every changed file counts,
+# not only a .vl: a shader a program embeds, a README beside its main.vl
+# (the nearest main.vl above the file is its program; a .vl that is a
+# program of its own, with `fn main`, is checked alone). Files under
+# tests/ are their suites' (a case names the errors it expects, a tool's
+# fixture is broken on purpose): tests/affected.sh runs them. The row
+# never passes on nothing: with no program it is SKIP and says why.
+# (Its fmt --check is the fmt row's again, for the programs' files.)
+CHK=
+for c in "$VOLEC" "$PWD/target/volec" "$PWD/target/tools/volec"; do
+    [ -n "$c" ] && [ -x "$c" ] && "$c" check --help 2>&1 | grep -q -e '--changed' && { CHK=$c; break; }
+done
+if [ -z "$CHK" ]; then
+    row check SKIP "no volec with check --changed (bootstrap/bootstrap.sh --dev --no-suite builds target/volec)"
 else
-    : > "$TMP/roots"
-    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v '^tests/'); do
-        case "$f" in
-            compiler/src/*|compiler/std/*) echo compiler/src/main.vl ;;
-            *) d=$(dirname "$f")
-               while [ "$d" != . ] && [ ! -f "$d/main.vl" ]; do d=$(dirname "$d"); done
-               [ -f "$d/main.vl" ] && echo "$d/main.vl" ;;
-        esac
-    done | sort -u > "$TMP/roots"
+    # (0.25.3: not unsafe.unjustified, the unsafe row's: a warning in a
+    # program that is not the compiler, none in compiler/src and std)
+    out=$(VOLE_OK=1 "$CHK" check --changed --since "$BASE" 2>&1 | grep -v 'warning\[unsafe\.unjustified\]')
+    last=$(printf '%s\n' "$out" | tail -1)
     : > "$TMP/check"
-    while read -r r; do
-        # (a program that fails on purpose, e.g. a walkthrough's: its
-        # main.vl has the line `// premerge: broken on purpose (why)`)
-        grep -q '^// premerge: broken on purpose' "$r" && continue
-        out=$( (cd "$(dirname "$r")" && "$VOLEC" check main.vl) 2>&1 )
-        # (0.25.3: not unsafe.unjustified, the unsafe row's and the baseline's)
-        out=$(printf '%s\n' "$out" | grep -v 'warning\[unsafe\.unjustified\]')
-        printf '%s\n' "$out" | grep -E '(error|warning)\[|^error ' > /dev/null && \
-            printf '  %s:\n%s\n' "$r" "$(printf '%s\n' "$out" | grep -E '(error|warning)\[|^error ' | head -5 | sed 's/^/    /')" >> "$TMP/check"
-    done < "$TMP/roots"
-    n=$(wc -l < "$TMP/roots" | tr -d ' ')
-    if [ -s "$TMP/check" ]; then row check FAIL "errors or warnings in the touched programs"; else row check PASS "$n program(s) check clean"; fi
+    printf '%s\n' "$out" | grep -E '(error|warning)\[|^error ' | head -12 | sed 's/^/    /' > "$TMP/check"
+    case "$last" in
+        "ok: no program to check"*) [ -s "$TMP/check" ] || row check SKIP "${last#ok: }" ;;
+        "ok: "*) [ -s "$TMP/check" ] || row check PASS "${last#ok: }: $(printf '%s\n' "$out" | sed -n 's/^ok: [^(]* in \(.*\)$/\1/p' | tr '\n' ' ' | sed 's/ $//')" ;;
+        *) [ -s "$TMP/check" ] || printf '    %s\n' "$last" > "$TMP/check" ;;
+    esac
+    [ -s "$TMP/check" ] && row check FAIL "errors or warnings in the touched programs"
 fi
 
 # std: the embedded std is up to date, as committed (0.25.3: made from
 # HEAD's compiler/std in a copy, so the work tree is left as it is)
 setup=""
 [ -n "$(git config merge.stdsrc.driver)" ] || setup="; the stdsrc merge driver is not set up: tools/git-hooks/setup.sh"
-if printf '%s\n' "$CHANGED" | grep -q -e '^compiler/std/' -e '^compiler/src/front/stdsrc_rust\.vl$'; then
+if printf '%s\n' "$CHANGED" | grep -q -e '^compiler/std/' -e '^compiler/src/front/stdsrc\.vl$'; then
     mkdir -p "$TMP/std/compiler/src/front"
     git archive HEAD compiler/std | tar -xf - -C "$TMP/std"
     # (the committed file, whose index of units embed.sh keeps when no
     # compiler here makes it; this tree's compiler makes it when it can)
-    git show HEAD:compiler/src/front/stdsrc_rust.vl > "$TMP/std/compiler/src/front/stdsrc_rust.vl"
+    git show HEAD:compiler/src/front/stdsrc.vl > "$TMP/std/compiler/src/front/stdsrc.vl"
     if ! VOLE_EMBED_VOLEC="${VOLE_EMBED_VOLEC:-$PWD/target/volec}" sh "$TMP/std/compiler/std/embed.sh" > "$TMP/std.out" 2>&1; then
         row std FAIL "compiler/std/embed.sh failed: $(head -1 "$TMP/std.out")"
-    elif git show HEAD:compiler/src/front/stdsrc_rust.vl | cmp -s - "$TMP/std/compiler/src/front/stdsrc_rust.vl"; then
-        row std PASS "the committed stdsrc_rust.vl matches compiler/std$setup"
+    elif git show HEAD:compiler/src/front/stdsrc.vl | cmp -s - "$TMP/std/compiler/src/front/stdsrc.vl"; then
+        row std PASS "the committed stdsrc.vl matches compiler/std$setup"
     else
-        row std FAIL "the committed stdsrc_rust.vl is stale: compiler/std/embed.sh, then commit it$setup"
+        row std FAIL "the committed stdsrc.vl is stale: compiler/std/embed.sh, then commit it$setup"
     fi
 else
     row std SKIP "compiler/std unchanged$setup"

@@ -246,10 +246,12 @@ first=$(printf '%s\n' "$out" | grep "${TAB}fn\$" | head -1 | cut -f1)
     && ! printf '%s\n' "$out" | grep -q "^crate::main${TAB}" && ok=1
 check self_unused "$ok" "$(printf '%s\n' "$out" | head -5)"
 # impact: the calls of a function used in several files.
-out=$("$COMPILER" query impact base::grow 2>&1)
+# (0.29: sized_table; base::grow, the raw arrays' growth, has one file's
+# callers left)
+out=$("$COMPILER" query impact base::sized_table 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q "^crate::base::grow${TAB}compiler/src/base/mod.vl:" \
-    && printf '%s\n' "$out" | grep -q "^instances${TAB}[0-9]*${TAB}grow<" \
+printf '%s\n' "$out" | head -1 | grep -q "^crate::base::sized_table${TAB}compiler/src/base/mod.vl:" \
+    && printf '%s\n' "$out" | grep -q "^instances${TAB}[0-9]*${TAB}sized_table<" \
     && printf '%s\n' "$out" | grep -q "^total${TAB}[0-9]*${TAB}[0-9]*${TAB}[0-9]* files" && ok=1
 check self_impact "$ok" "$(printf '%s\n' "$out" | head -3)"
 # lint: the files over 300 lines, each with the deps of its module.
@@ -262,12 +264,14 @@ check self_lint "$ok" "$(printf '%s\n' "$out" | head -4)"
 "$COMPILER" lint --max-lines 100000 >/dev/null 2>&1
 check self_lint_ok "$([ $? = 0 ] && echo 1)" "lint --max-lines 100000 failed"
 # check: the compiler's source has no errors, quickly.
-"$COMPILER" check compiler/src/main.vl >"$WORK/check.out" 2>&1
+# (0.29: with --deny=unsafe: an unsafe site without its comments and an
+# unsafe block with nothing unsafe inside are errors in the compiler's
+# source, each where it is; docs/unsafe-baseline.md's counts are 0)
+"$COMPILER" check --deny=unsafe compiler/src/main.vl >"$WORK/check.out" 2>&1
 rc=$?
-# (0.18.1: a clean check says so in one line; 0.25.3: but for one
-# unsafe.unjustified warning, the compiler's legacy unsafe, which
-# docs/unsafe-baseline.md counts)
-clean=$(grep -v 'warning\[unsafe\.unjustified\]' "$WORK/check.out" | sed 's/^ok: 0 errors, 1 warning in /ok: 0 errors in /')
+# (0.18.1: a clean check says so in one line, with no warning)
+clean=$(sed -e 's/ ([0-9]* files, 0 shaders)$//' "$WORK/check.out")
+# (0.29: the line ends with what was read, ` (N files, 0 shaders)`)
 check self_check "$([ $rc = 0 ] && [ "$clean" = "ok: 0 errors in compiler/src/main.vl" ] && echo 1)" "$(cat "$WORK/check.out")"
 # same-output: the compiler against a copy of itself (identical), and
 # against a wrapper that changes one compilation (different).

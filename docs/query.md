@@ -14,7 +14,7 @@ compiler's own `<std>` and `<C import>` last), then line, then column.
 ```
 volec query def NAME... [--root ROOT] [--exact]
 volec query show NAME... [--root ROOT] [--exact] [--with-comments]
-volec query show FILE.vl... | MODULE::use | MODULE::header | MODULE::extern
+volec query show FILE... | MODULE::use | MODULE::header | MODULE::extern
 volec query context NAME...|MODULE [--budget TOKENS]     (0.15) source, calls, types, callers
 volec query text FILE[:A[-B]]...                         (no program read)
 volec query diff [ROOT]                                  the last journaled edit
@@ -22,7 +22,7 @@ volec query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [-
 volec query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 volec query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
-volec query unsafe [FILE...|DIR|std] [--no-std] [--unjustified] [--summary] [--json]   (0.25.3) every unsafe site
+volec query unsafe [FILE...|DIR|std] [--no-std] [--unjustified] [--unneeded] [--summary] [--json]   (0.25.3) every unsafe site
 volec query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
 volec query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
 volec query items [MODULE|TYPE...] [--root ROOT] [--comments] [--find WORD] [--kind KIND,...] [--names]
@@ -44,6 +44,8 @@ budget](#the-output-budget-015)), and answers about std from any program
 `ROOT` is the program's root file: `--root ROOT`, or (the form of 0.11's
 first query) a last argument ending in `.vl` after the NAMEs (`items
 ROOT` alone too). Without it: `$VOLE_ROOT`, else `./main.vl`, else
+(0.29) the `main.vl` of a directory above the current one, inside the
+checkout (the program the current directory is in), else
 `./compiler/src/main.vl`. Positions are `file:line:col`, 1-based, with
 the file as the module loader names it (relative to the current
 directory when ROOT is).
@@ -59,6 +61,12 @@ edit, refactor, fix, check, probe, test; `tools/query/roots.vl`):
   `edit patch examples/nes/check.vl --old A --new B --all` and `probe
   examples/nes/check.vl:234 x -- --check` work from the root of the
   tree. Their `try:` lines then say `--root examples/nes/main.vl`.
+- (0.29) In a directory inside a program (`examples/nes/`, or a
+  directory under it), that program is the default one for every
+  command: `volec check`, `query show NAME`, `edit patch NAME`, `refactor
+  rename`, `fix` there mean it, with no `--root`. The checkout's top (the
+  directory with `.git`) ends the search upward; there the default is
+  the compiler.
 - A NAME the default program does not define, with no ROOT and no
   `$VOLE_ROOT`, is looked for in the other programs under the current
   directory (`git grep` of its definition, tracked and untracked files):
@@ -114,7 +122,7 @@ tools` the ones a program needs.
 | the type of an expression | `target/volec query type FILE:LINE:COL` |
 | a function's drops, each decided (kept, removed, flagged, opened) and where it runs (0.26.1) | `target/volec query drops FILE:LINE` |
 | what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
-| every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--summary`, `--json`) |
+| every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--unneeded`, `--summary`, `--json`) |
 | the CPU intrinsic for a task, its instruction and feature; what a function needs of the CPU (0.19) | `target/volec query arch WORDS` (`--feature crc`, `--equiv NAME`); `query show vqtbl1q_u8`; `query features NAME --why crc` |
 | where it is defined, its signature | `target/volec query def NAME` |
 | what a module contains; a type's methods | `target/volec query items MODULE`; `query items TYPE`; `query show TYPE` (its source, then a line a method) |
@@ -122,7 +130,9 @@ tools` the ones a program needs.
 | the item at a compiler error's position | `target/volec query show FILE:LINE` (`--with-comments`: its section comment too) |
 | a module's `use` lines, header comment, extern blocks | `target/volec query show MODULE::use` (`::header`, `::extern`) |
 | change a module's `use` lines or header comment | `target/volec edit patch\|replace MODULE::use` (`MODULE::header`, `MODULE::extern`; `edit insert --after MODULE::use`, `edit delete`) |
-| lines of any file (a test, a fixture, conflict markers), a small file | `target/volec query text FILE:A-B`, `query show FILE.vl` |
+| lines of any file (a test, a fixture, conflict markers), a small file (a source, a shader's `.wgsl`, a README) | `target/volec query text FILE:A-B`, `query show FILE` |
+| text in a file that is no source: a shader a program embeds, a README, a script | `target/volec query grep TEXT --in FILE` (a `.wgsl` of the program: code or comment; another file: as text; a FILE given as a pattern is `query.not-in-program`, never `0 hits`) |
+| change a shader's file, checked; a text file git tracks, not checked | `target/volec edit patch x.wgsl --old A --new B` (the program that embeds it validates it: `--root DIR/main.vl`, or a path under DIR); `edit patch README.md --old A --new B` (exact match, `--nth N`, `--all`, `--dry-run`; `volec undo`) |
 | merge conflicts: the regions, their items, both sides; resolve one | `target/volec query conflicts [FILE] [--show]`; `target/volec edit resolve FILE:LINE\|NAME --ours\|--theirs\|--both` (`< text`, `--all`) |
 | change a few lines inside an item (a condition, a statement; FILE:LINE: a comment between items too) | `target/volec edit patch NAME\|FILE:LINE --old 'TEXT' --new 'TEXT'` (pairs repeat; several lines: `< pairs` or `--pairs FILE`, blocks `<<<<<<< OLD` / `=======` / `>>>>>>> NEW`; `--loose` for other indentation; OLD there several times: `--nth N`, `--all`) |
 | add statements inside an item | `target/volec edit insert --in NAME --after\|--before 'ANCHOR' < text` |
@@ -145,7 +155,8 @@ tools` the ones a program needs.
 | split a module into files | `target/volec refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`; `--names a,b`; `--reexport` leaves code outside as it is; `--header TEXT`) |
 | several changes, checked once, all or nothing | `target/volec refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
 | several queries and edits in one call, outputs under `## $ volec ARGS` lines | `target/volec batch < cmds.txt` (one command per line; `--stop` at the first failure) |
-| the errors, one per line (front end only) | `target/volec check` |
+| the errors, one per line (front end only); `ok: 0 errors in ROOT (N files, M shaders)` names what was checked | `target/volec check` (no ROOT: `./main.vl`, else the compiler) |
+| check after edits with no hook: every program the files changed since the branch's base belong to (shaders too), and `fmt --check` of them | `target/volec check --changed` (`--since REV`) |
 | build a program and run it: DIR/main.vl (DIR: `.`), rebuilt only when it changed, kept in volec's cache (0.25.4) | `target/volec run [DIR] [OPTIONS] [-- ARGS]` (a build's options; off a terminal only the program's output, its exit status volec's; `run --help`) |
 | build what changed and run the tests; counts, then each failure | `target/volec test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`; what tests print: under a failure, every test's with `--show-output`) |
 | a crash's line and callers; values at a line as the program runs; a failing input made small | `target/volec test` (built with `--trace`), `target/volec probe FILE:LINE EXPR... -- ARGS`, `target/volec reduce FILE --until 'CMD'` (`guide debug`) |
@@ -621,7 +632,8 @@ sites: 7 (5 blocks, 1 unsafe fns, 1 extern blocks); unjustified: 4; unneeded: 0
   tables are), `int-to-ptr`, `c-call(F)`, `unsafe-call(F)`,
   `union-field`, `fn-value`. `none (unneeded)`: a block the checker read
   with nothing unsafe inside (remove it: 0.25.5, when there are any, the
-  total line is followed by `try: volec fix --only unneeded-unsafe`);
+  total line is followed by `try: volec fix --only unneeded-unsafe`, or,
+  0.29, `--only unneeded-justified` when each one left has comments);
   `not checked`: code the checker
   did not reach (a generic function never instantiated); an extern block
   says how many C functions it declares.
@@ -639,11 +651,16 @@ sites: 7 (5 blocks, 1 unsafe fns, 1 extern blocks); unjustified: 4; unneeded: 0
   the site starts (no blank line between; a `let x = unsafe { .. }`'s
   are the `let`'s), comments inside that statement before the site, and
   a comment ending the site's line. `volec check` uses the same rule
-  (`unsafe.unjustified`, a warning; an error with `--deny-warnings`),
+  (`unsafe.unjustified`, a warning; an error with `--deny-warnings`
+  or, each site at its position, `--deny=unsafe`),
   and so does the commit hook (tools/unsafe-diff-check.py), for the
   lines a commit adds.
 - FILE (or a DIR, or `std`) keeps the sites there; `--unjustified` the
-  sites without both comments; `--summary` prints the counts instead:
+  sites without both comments; `--unneeded` (0.29) the unsafe blocks
+  with nothing unsafe inside (`none (unneeded)`: `volec fix --only
+  unneeded-unsafe` takes them away, `--only unneeded-justified` those
+  with comments too, and says of each one it leaves why);
+  `--summary` prints the counts instead:
   the total line, then by class, by top-level module, by file (the 20
   with the most sites; `--all`: every one) and by justification, each
   `KEY \t SITES \t UNJUSTIFIED`; `--json` one object a site (`file`,
@@ -653,8 +670,12 @@ sites: 7 (5 blocks, 1 unsafe fns, 1 extern blocks); unjustified: 4; unneeded: 0
 The sites are found in the files' text (not the parser's tree, so code
 the checker never reaches is listed too); the operations need the
 program checked, so `unsafe` reads it in full (no cache).
-docs/unsafe-baseline.md is the compiler's and std's summary, which the
-gate's `unsafe-audit` row holds them to (tests/unsafe_audit.sh).
+docs/unsafe-baseline.md is the compiler's and std's summary; the gate's
+`unsafe-audit` row and premerge's unsafe row (tests/unsafe_audit.sh)
+hold them to none unjustified and, in compiler/src, none unneeded
+(0.29). A block of a generic function of std that the program never
+instantiates is listed `none (unneeded)` though it holds what needs it:
+std's unneeded count depends on the program and is not judged.
 
 ## features (0.19)
 
@@ -1028,7 +1049,7 @@ when it was given, names quoted for the shell when they need it).
 error query.no-match: no definition 'run_gnv'
 try: target/volec query def crate::middle::gvn::run_gvn
 note query.alias: 'MyVec' is an import alias in crate, for crate::myvec::Vec
-error query.no-root: no root (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl)
+error query.no-root: no root (VOLE_ROOT, ./main.vl, a main.vl above, ./compiler/src/main.vl)
 try: target/volec query def main path/to/main.vl
 warning query.program-errors: 4 errors in the program; results may be incomplete
 try: target/volec --diagnostics=short broken/main.vl -c -o /dev/null

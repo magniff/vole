@@ -150,16 +150,9 @@ and the `sync` family:
 
 ```console
 $ volec explain --list | grep '^sync\.'
-sync.borrow_escapes
 sync.not_send
 sync.not_sync
 sync.global
-sync.scope_write
-sync.scope_escape
-sync.scope_shared_write
-sync.scope_local
-sync.scope_spawn
-sync.spawn_closure
 sync.view_item
 sync.static
 ```
@@ -347,7 +340,7 @@ try: volec query items trace.vl
 $ echo $?
 1
 $ volec query show nosuch
-error query.no-root: no root (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl)
+error query.no-root: no root (VOLE_ROOT, ./main.vl, a main.vl above, ./compiler/src/main.vl)
 try: volec query show nosuch path/to/main.vl
 $ echo $?
 2

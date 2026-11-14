@@ -1,6 +1,6 @@
 ## volec refactor signature|field|variant (tests/refactor/shapes/).
 $ check
-ok: 0 errors in main.vl
+ok: 0 errors in main.vl (3 files, 0 shaders)
 ## --- signature ---
 ## A parameter added: the definition, and each call with the value.
 $ refactor signature area --add 'scale: i64 = 1' --fill-calls --dry-run
@@ -99,7 +99,7 @@ $ refactor signature area --type p '*const Point' --dry-run
 @@ -17 +17 @@
 -pub fn area(p: Point) -> i64 {
 +pub fn area(p: *const Point) -> i64 {
-main.vl:16:18: error[type error] expected '*Point', got 'Point' | help: a pointer to it: its address | try: &p | try: volec fix --suggested main.vl  [in crate::main]
+main.vl:16:18: error[type error] expected '*const Point', got 'Point' | help: a pointer to it: its address | try: &p | try: volec fix --suggested main.vl  [in crate::main]
 geom.vl:18:5: error[unsafe] access to a field through a raw pointer is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl  [edited: crate::geom::area]
 geom.vl:18:11: error[unsafe] access to a field through a raw pointer is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl  [edited: crate::geom::area]
 warning edit.breaks: 3 new errors (2 in the edited text, 1 in crate::main, which the edit does not change) (dry run); the first in the edited text: geom.vl:18:5: access to a field through a raw pointer is unsafe
