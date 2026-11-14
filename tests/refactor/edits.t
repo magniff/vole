@@ -167,10 +167,7 @@ $ undo
 error undo.empty: no edit to undo
 [exit 1]
 $ edit delete shapes::area --no-check
-main.vl:15:27: error[type error] no 'area' in module 'shapes'  [in crate::main]
 deleted crate::shapes::area	shapes.vl	+0 -4 lines
-warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change); written anyway (--no-check); the error: main.vl:15:27: no 'area' in module 'shapes'
-try: volec check
 $ check
 main.vl:15:27: error[type error] no 'area' in module 'shapes'
 [exit 1]
