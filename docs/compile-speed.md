@@ -230,18 +230,18 @@ What it costs the programs: `bench/run.sh --instructions` geomean
 self-build in 111.81 G and 111.54 G.
 
 Against the released 0.29.0 (`tools/perf-experiment.sh`, each compiler
-on the tree's source, a load of 4.8):
+on the tree's source, a load of 7):
 
 | workload | 0.29.0 | this tree | |
 |---|---:|---:|---:|
-| self-build -O2 | 124.68 G | 104.87 G | -15.9% |
-| self-build -O0 | 34.26 G | 31.27 G | -8.7% |
-| check | 25.25 G | 22.19 G | -12.1% |
+| self-build -O2 | 124.74 G | 104.50 G | -16.2% |
+| self-build -O0 | 34.31 G | 31.21 G | -9.0% |
+| check | 25.28 G | 22.21 G | -12.1% |
 | hello | 153.0 M | 149.0 M | -2.6% |
-| std_heavy | 1228.0 M | 1126.0 M | -8.3% |
-| regions | 1119.0 M | 1121.0 M | +0.2% |
+| std_heavy | 1231.0 M | 1119.0 M | -9.1% |
+| regions | 1125.5 M | 1126.6 M | +0.1% |
 
-(taken before the last change, which is -0.5% of the -O2 row.) 0.28.0's
+0.28.0's
 figures, each release on its own source, were 103.6 G, 29.9 G and
 21.3 G: the -O2 build is within 1% of it with every check kept, the -O0
 build and the check 4% above.

@@ -3259,7 +3259,7 @@ rows against 0.28.0, release tree and this: hello 1.02x and 0.97x, std
 ## 0.30: the compiler's own speed
 
 The -O2 self-build went from 127.0 G to 106.3 G instructions (0.29.0:
-124.7 G to 104.9 G by `tools/perf-experiment.sh`), with every bounds
+124.7 G to 104.5 G by `tools/perf-experiment.sh`), with every bounds
 check kept; where it went, what the checks cost (21 G, a sixth) and why
 no fact removes them, each change with its measurement, and what is
 left: [compile-speed.md](compile-speed.md). What changed in the
