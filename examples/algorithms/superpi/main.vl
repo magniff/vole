@@ -47,7 +47,7 @@
 
 import "time.h" as c;
 
-use std::{env, mem, thread};
+use std::{cmp, env, mem, thread};
 use std::alloc::Allocator;
 use std::arch::detect;
 use std::arch::aarch64::{
@@ -56,9 +56,9 @@ use std::arch::aarch64::{
     vst1q_u32, vsubq_u32, vuzp1q_u32, vuzp2q_u32, vzip1q_u32, vzip1q_u64, vzip2q_u32, vzip2q_u64,
 };
 use std::cli::{Arg, Command};
-use std::cmp::Ordering;
 use std::fmt::{Display, Formatter, self};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BASE: u64 = 1_000_000_000;
 
@@ -231,7 +231,7 @@ const NTT_MIN: usize = 256;
 const NTT_MAX_LEN: usize = 1 << 24;
 
 // Transform length from which the three primes run on three threads.
-const NTT_THREADS_MIN: usize = 1 << 16;
+const NTT_THREADS_MIN: usize = 1 << 13;
 
 fn powmod(x: u64, e: u64, p: u64) -> u64 {
     let mut r = 1u64;
@@ -587,6 +587,13 @@ struct Engine<A: Allocator> {
     mont: [Mont; 3],
     garner: Garner,
     tables: [RwLock<Vec<u32, A>>; 3],
+    // Threads that may still be started: the machine's cores less the
+    // threads running. Whoever has independent work takes from it and
+    // gives back when its threads are joined, so the split's subtrees,
+    // a product's primes and the reconstruction share the cores without
+    // a plan made in advance and without starting more threads than
+    // there are cores.
+    idle: AtomicUsize,
 }
 
 impl Engine<Gpa> {
@@ -598,8 +605,23 @@ impl Engine<Gpa> {
             mont,
             tables: [RwLock::new(Vec::new_in(gpa)), RwLock::new(Vec::new_in(gpa)),
                 RwLock::new(Vec::new_in(gpa))],
+            idle: AtomicUsize::new(thread::available_parallelism() - 1),
         }
     }
+
+    // Takes n threads from the idle ones, if there are that many.
+    fn take(&self, n: usize) -> bool {
+        let mut idle = self.idle.load(Ordering::Relaxed);
+        while idle >= n {
+            match self.idle.compare_exchange(idle, idle - n, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(now) => idle = now,
+            }
+        }
+        false
+    }
+
+    fn give(&self, n: usize) { self.idle.fetch_add(n, Ordering::AcqRel); }
 
     // Makes prime pi's table at least l entries long.
     fn grow(&self, pi: usize, l: usize) {
@@ -754,8 +776,21 @@ fn ntt_residues(a: &[u32], b: &[u32], same: bool, pi: usize, l: usize,
     cx.grow(pi, l);
     let roots = cx.tables[pi].read().unwrap();
     let table = roots.as_slice();
+    if same {
+        let fa = forward_limbs(a, l, table, m, gpa);
+        return inverse_product(&fa, &fa, table, m, gpa);
+    }
+    // The two forward transforms beside each other, on an idle thread.
+    if l >= NTT_THREADS_MIN && cx.take(1) {
+        let (fa, fb) = thread::scope(|sc| {
+            let h = sc.spawn(move || forward_limbs(a, l, table, m, gpa));
+            let fb = forward_limbs(b, l, table, m, gpa);
+            (h.join().unwrap(), fb)
+        });
+        cx.give(1);
+        return inverse_product(&fa, &fb, table, m, gpa);
+    }
     let fa = forward_limbs(a, l, table, m, gpa);
-    if same { return inverse_product(&fa, &fa, table, m, gpa); }
     let fb = forward_limbs(b, l, table, m, gpa);
     inverse_product(&fa, &fb, table, m, gpa)
 }
@@ -768,22 +803,17 @@ fn mul_ntt(a: &[u32], b: &[u32], r: &mut [u32], cx: &Engine<Gpa>) {
     while l < need { l *= 2; }
     let same = a == b; // a square needs two transforms, not three
     let mut res: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa), Vec::new_in(gpa)];
-    if l >= NTT_THREADS_MIN {
-        // The primes are independent: one thread each. Only the big
-        // products pay for a thread; below this, spawning costs more
-        // than the transform.
+    if l >= NTT_THREADS_MIN && cx.take(2) {
+        // The primes are independent: two on threads of their own, the
+        // third here. Only the big products pay for a thread; below
+        // this, starting one costs more than the transform.
         res = thread::scope(|sc| {
-            let mut hs = Vec::with_capacity_in(3, gpa);
-            for pi in 0..3 { hs.push(sc.spawn(move || ntt_residues(a, b, same, pi, l, cx))); }
-            let mut out: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa),
-                Vec::new_in(gpa)];
-            let mut pi = 0;
-            for h in hs {
-                out[pi] = h.join().unwrap();
-                pi += 1;
-            }
-            out
+            let h0 = sc.spawn(move || ntt_residues(a, b, same, 0, l, cx));
+            let h1 = sc.spawn(move || ntt_residues(a, b, same, 1, l, cx));
+            let r2 = ntt_residues(a, b, same, 2, l, cx);
+            [h0.join().unwrap(), h1.join().unwrap(), r2]
         });
+        cx.give(2);
     } else {
         for pi in 0..3 { res[pi] = ntt_residues(a, b, same, pi, l, cx); }
     }
@@ -843,32 +873,84 @@ fn coefficient(x1: u64, y2: u64, y3: u64, carry: u64, g: &Garner, m2: &Mont,
     ((mid - q0 * BASE) as u32, (q1 << 32) + q0)
 }
 
-// From the three primes' residues to the limbs of the product (r
-// zeroed, of `need` limbs). Coefficient i is at (n - i) mod n: see
-// `ntt`.
-fn finish_product(res: &[Vec<u32, Gpa>; 3], need: usize, r: &mut [u32], cx: &Engine<Gpa>) {
+// Coefficients i0..i1 from the three primes' residues into out, their
+// limbs, starting from no carry; the carry out of the last one.
+// Coefficient i is at (n - i) mod n: see `ntt`.
+fn garner_range(res: &[Vec<u32, Gpa>; 3], i0: usize, i1: usize, out: &mut [u32],
+    cx: &Engine<Gpa>) -> u64 {
     let (g, m2, m3) = (&cx.garner, &cx.mont[1], &cx.mont[2]);
     let (r1, r2, r3) = (res[0].as_slice(), res[1].as_slice(), res[2].as_slice());
-    let top = need - 1;
-    let (limb, mut carry) = coefficient(r1[0] as u64, r2[0] as u64, r3[0] as u64, 0, g, m2, m3);
-    r[0] = limb;
-    // Coefficients 1..top are at n - 1 down to n - top + 1.
-    let from = r1.len() + 1 - top;
-    let residues = r1[from..]
+    let mut carry = 0;
+    let mut first = i0;
+    if i0 == 0 {
+        let (limb, next) = coefficient(r1[0] as u64, r2[0] as u64, r3[0] as u64, 0, g, m2, m3);
+        out[0] = limb;
+        carry = next;
+        first = 1;
+    }
+    // Coefficients first..i1 are at n - first down to n - i1 + 1.
+    let (lo, hi) = (r1.len() + 1 - i1, r1.len() + 1 - first);
+    let residues = r1[lo..hi]
         .iter()
         .rev()
-        .zip(r2[from..].iter().rev())
-        .zip(r3[from..].iter().rev());
-    for (((x1, y2), y3), out) in residues.zip(r[1..top].iter_mut()) {
-        let (limb, next) = coefficient(*x1 as u64, *y2 as u64, *y3 as u64, carry, g, m2, m3);
-        *out = limb;
+        .zip(r2[lo..hi].iter().rev())
+        .zip(r3[lo..hi].iter().rev());
+    for (((x1, y2), y3), limb) in residues.zip(out[first - i0..].iter_mut()) {
+        let (low, next) = coefficient(*x1 as u64, *y2 as u64, *y3 as u64, carry, g, m2, m3);
+        *limb = low;
         carry = next;
     }
-    let mut k = top;
-    while carry > 0 {
-        r[k] = (carry % BASE) as u32;
-        carry /= BASE;
-        k += 1;
+    carry
+}
+
+// r[off..] += carry, a carry out of garner_range (below BASE^2).
+fn add_carry(r: &mut [u32], carry: u64, off: usize) {
+    let limbs: [u32; 2] = [(carry % BASE) as u32, (carry / BASE) as u32];
+    add_at(r, trimmed(&limbs), off);
+}
+
+// Coefficients a product must have before its reconstruction is cut
+// into pieces for idle threads.
+const GARNER_THREADS_MIN: usize = 1 << 13;
+
+// From the three primes' residues to the limbs of the product (r
+// zeroed, of `need` limbs). The coefficients do not depend on each
+// other, only the carries do: with idle threads the range is cut in
+// four (or two), each piece carried from zero, and the pieces' carries
+// are added in afterwards.
+fn finish_product(res: &[Vec<u32, Gpa>; 3], need: usize, r: &mut [u32], cx: &Engine<Gpa>) {
+    let top = need - 1;
+    if top >= GARNER_THREADS_MIN && cx.take(3) {
+        let (c1, c2, c3) = (top / 4, top / 2, top / 4 * 3);
+        let carries = thread::scope(|sc| {
+            let (h0, h1) = r[..top].split_at_mut(c2);
+            let (p0, p1) = h0.split_at_mut(c1);
+            let (p2, p3) = h1.split_at_mut(c3 - c2);
+            let t0 = sc.spawn(move || garner_range(res, 0, c1, p0, cx));
+            let t1 = sc.spawn(move || garner_range(res, c1, c2, p1, cx));
+            let t2 = sc.spawn(move || garner_range(res, c2, c3, p2, cx));
+            let last = garner_range(res, c3, top, p3, cx);
+            [t0.join().unwrap(), t1.join().unwrap(), t2.join().unwrap(), last]
+        });
+        cx.give(3);
+        add_carry(r, carries[0], c1);
+        add_carry(r, carries[1], c2);
+        add_carry(r, carries[2], c3);
+        add_carry(r, carries[3], top);
+    } else if top >= GARNER_THREADS_MIN && cx.take(1) {
+        let mid = top / 2;
+        let carries = thread::scope(|sc| {
+            let (p0, p1) = r[..top].split_at_mut(mid);
+            let t0 = sc.spawn(move || garner_range(res, 0, mid, p0, cx));
+            let last = garner_range(res, mid, top, p1, cx);
+            [t0.join().unwrap(), last]
+        });
+        cx.give(1);
+        add_carry(r, carries[0], mid);
+        add_carry(r, carries[1], top);
+    } else {
+        let carry = garner_range(res, 0, top, &mut r[..top], cx);
+        add_carry(r, carry, top);
     }
 }
 
@@ -913,25 +995,16 @@ fn product_pair(x: &BigUint<Gpa>, y1: &BigUint<Gpa>, y2: &BigUint<Gpa>,
     while l2 < need2 { l2 *= 2; }
     let mut res1: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa), Vec::new_in(gpa)];
     let mut res2: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa), Vec::new_in(gpa)];
-    if l1 >= NTT_THREADS_MIN || l2 >= NTT_THREADS_MIN {
-        let (r1, r2) = thread::scope(|sc| {
-            let mut hs = Vec::with_capacity_in(3, gpa);
-            for pi in 0..3 { hs.push(sc.spawn(move || pair_residues(xs, a, b, pi, l1, l2, cx))); }
-            let mut out1: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa),
-                Vec::new_in(gpa)];
-            let mut out2: [Vec<u32, Gpa>; 3] = [Vec::new_in(gpa), Vec::new_in(gpa),
-                Vec::new_in(gpa)];
-            let mut pi = 0;
-            for h in hs {
-                let (u, v) = h.join().unwrap();
-                out1[pi] = u;
-                out2[pi] = v;
-                pi += 1;
-            }
-            (out1, out2)
+    if (l1 >= NTT_THREADS_MIN || l2 >= NTT_THREADS_MIN) && cx.take(2) {
+        let (r0, r1, r2) = thread::scope(|sc| {
+            let h0 = sc.spawn(move || pair_residues(xs, a, b, 0, l1, l2, cx));
+            let h1 = sc.spawn(move || pair_residues(xs, a, b, 1, l1, l2, cx));
+            let r2 = pair_residues(xs, a, b, 2, l1, l2, cx);
+            (h0.join().unwrap(), h1.join().unwrap(), r2)
         });
-        res1 = r1;
-        res2 = r2;
+        cx.give(2);
+        res1 = [r0.0, r1.0, r2.0];
+        res2 = [r0.1, r1.1, r2.1];
     } else {
         for pi in 0..3 {
             let (u, v) = pair_residues(xs, a, b, pi, l1, l2, cx);
@@ -1072,18 +1145,18 @@ impl BigUint<Gpa> {
 // Longer is larger; at equal lengths, the first limb that differs from
 // the top decides.
 impl Ord for BigUint<Gpa> {
-    fn cmp(&self, other: &BigUint<Gpa>) -> Ordering {
+    fn cmp(&self, other: &BigUint<Gpa>) -> cmp::Ordering {
         let (a, b) = (self.limbs.as_slice(), other.limbs.as_slice());
         if a.len() != b.len() { return a.len().cmp(&b.len()); }
         for i in (0..a.len()).rev() {
             if a[i] != b[i] { return a[i].cmp(&b[i]); }
         }
-        Ordering::Equal
+        cmp::Ordering::Equal
     }
 }
 
 impl PartialOrd for BigUint<Gpa> {
-    fn partial_cmp(&self, other: &BigUint<Gpa>) -> Option<Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &BigUint<Gpa>) -> Option<cmp::Ordering> { Some(self.cmp(other)) }
 }
 
 // Decimal: the top limb as it is, every other one as nine digits.
@@ -1270,13 +1343,13 @@ fn quotient_with_rcp(a: &BigUint<Gpa>, b: &BigUint<Gpa>, rcp: &BigUint<Gpa>, s: 
     let mut steps = 0;
     // The quotient is a few units off at most; each correction is an
     // addition, not a product.
-    while qb.cmp(a) == Ordering::Greater && steps < 100 {
+    while qb.cmp(a) == cmp::Ordering::Greater && steps < 100 {
         q = q.minus(&one);
         qb = qb.minus(b);
         steps += 1;
     }
     while steps < 100 {
-        if a.minus(&qb).cmp(b) == Ordering::Less { break; }
+        if a.minus(&qb).cmp(b) == cmp::Ordering::Less { break; }
         q = q.plus(&one);
         qb = qb.plus(b);
         steps += 1;
@@ -1338,7 +1411,7 @@ fn isqrt(n: &BigUint<Gpa>, cx: &Engine<Gpa>) -> BigUint<Gpa> {
     let one = BigUint::from_u64(1, gpa);
     let mut sq = x.times(&x, cx);
     let mut steps = 0;
-    while sq.cmp(n) == Ordering::Greater && steps < 100 {
+    while sq.cmp(n) == cmp::Ordering::Greater && steps < 100 {
         // (x - 1)^2 = sq - 2x + 1.
         let mut twox = x.clone();
         twox.mul_small(2);
@@ -1351,7 +1424,7 @@ fn isqrt(n: &BigUint<Gpa>, cx: &Engine<Gpa>) -> BigUint<Gpa> {
         let mut twox = x.clone();
         twox.mul_small(2);
         let next = sq.plus(&twox).plus(&one);
-        if next.cmp(n) == Ordering::Greater { break; }
+        if next.cmp(n) == cmp::Ordering::Greater { break; }
         sq = next;
         x = x.plus(&one);
         steps += 1;
@@ -1379,6 +1452,9 @@ fn signed_add(a: BigUint<Gpa>, aneg: bool, b: BigUint<Gpa>, bneg: bool,
     if a == b { return (BigUint::zero(gpa), false); }
     if a > b { (a.minus(&b), aneg) } else { (b.minus(&a), bneg) }
 }
+
+// Ranges of at least this many terms may give a half to another thread.
+const SPLIT_THREADS_MIN: u64 = 512;
 
 // Ranges of at most this many terms are computed term by term.
 const LEAF_TERMS: u64 = 16;
@@ -1446,6 +1522,17 @@ fn series_coefficient(k: u64) -> u64 { 13591409 + 545140134 * k }
 fn binary_split(a: u64, b: u64, root: bool, cx: &Engine<Gpa>) -> Split<Gpa> {
     if b - a <= LEAF_TERMS { return leaf(a, b, cx.gpa); }
     let mid = (a + b) / 2;
+    // The halves are independent: the left one on a thread of its own
+    // when one is idle and the range is worth it.
+    if b - a >= SPLIT_THREADS_MIN && cx.take(1) {
+        let (left, right) = thread::scope(|sc| {
+            let h = sc.spawn(move || binary_split(a, mid, false, cx));
+            let right = binary_split(mid, b, false, cx);
+            (h.join().unwrap(), right)
+        });
+        cx.give(1);
+        return combine(&left, &right, root, cx);
+    }
     let left = binary_split(a, mid, false, cx);
     let right = binary_split(mid, b, false, cx);
     combine(&left, &right, root, cx)
@@ -1473,6 +1560,7 @@ fn chudnovsky(digits: i64, scale: i64, timings: bool, gpa: Gpa) -> BigUint<Gpa> 
     // It depends on nothing in the series, so it runs beside the split.
     let mut radicand = pow10((2 * scale) as usize, gpa);
     radicand.mul_small(10005);
+    let counted = cx.take(1);
     let (s, root) = thread::scope(|sc| {
         let h = sc.spawn(move || isqrt(&radicand, cx));
         let s = binary_split(0, terms, true, cx);
@@ -1491,6 +1579,7 @@ fn chudnovsky(digits: i64, scale: i64, timings: bool, gpa: Gpa) -> BigUint<Gpa> 
         num.mul_small(426880);
         (num, h.join().unwrap())
     });
+    if counted { cx.give(1); }
     let (q, _) = quotient_with_rcp(&num, &s.t, &rcp, prec, cx);
     let t2 = now_ns();
     if timings {
