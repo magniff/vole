@@ -74,6 +74,15 @@ $ check
 ok: 0 errors in main.vl (2 files, 0 shaders)
 $ undo
 undid applied 4 blocks: replaced crate::shapes::area; added crate::shapes::perimeter; inserted after crate::describe; replaced crate::main	2 files	+13 -5 lines
+## (0.30) A blocks FILE ending in .vl outside the program is no root:
+## the program is still ./main.vl, and the FILE is not edited.
+% cp $T/inputs/multi_apply.items ../multi_apply_outside.vl
+$ edit apply ../multi_apply_outside.vl
+applied 4 blocks: replaced crate::shapes::area; added crate::shapes::perimeter; inserted after crate::describe; replaced crate::main	2 files	+13 -5 lines
+note edit.imports: added the imports the new text needs (fix --only imports)
+$ undo
+undid applied 4 blocks: replaced crate::shapes::area; added crate::shapes::perimeter; inserted after crate::describe; replaced crate::main	2 files	+13 -5 lines
+% cmp ../multi_apply_outside.vl $T/inputs/multi_apply.items && rm ../multi_apply_outside.vl
 ## `new in MODULE`, `new before NAME`, `delete NAME`; from stdin.
 $ edit apply $T/inputs/multi_end.items --dry-run
 --- a/shapes.vl

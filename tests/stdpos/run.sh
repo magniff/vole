@@ -6,9 +6,12 @@
 # `## exact-std` (a README: `<!-- exact-std -->`) exactly. POSIX sh and
 # awk only.
 #
-# usage: tests/stdpos/run.sh [-c COMPILER] [--real]
+# usage: tests/stdpos/run.sh [-c COMPILER] [-j JOBS] [--real]
 #
 #   -c COMPILER   the volec binary (default: target/volec)
+#   -j JOBS       (0.30) the runners' jobs: with more than 1, the four
+#                 runners run at once and the query and refactor runners
+#                 with -j JOBS each (default 1: one by one, as before)
 #   --real        also the change itself: in a copy of the tree, a line
 #                 added at the top of compiler/std/gpu/mod.vl and one in
 #                 std.vl's first comment (every position after it moves),
@@ -39,13 +42,16 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 COMPILER="$ROOT/target/volec"
 REAL=0
+JOBS=1
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) [ $# -ge 2 ] || exit 2; COMPILER=$2; shift 2 ;;
+        -j) [ $# -ge 2 ] || exit 2; JOBS=$2; shift 2 ;;
         --real) REAL=1; shift ;;
-        *) echo "usage: tests/stdpos/run.sh [-c COMPILER] [--real]" >&2; exit 2 ;;
+        *) echo "usage: tests/stdpos/run.sh [-c COMPILER] [-j JOBS] [--real]" >&2; exit 2 ;;
     esac
 done
+case "$JOBS" in ''|*[!0-9]*|0) echo "tests/stdpos/run.sh: -j takes a number, 1 or more" >&2; exit 2 ;; esac
 case "$COMPILER" in
     /*) ;;
     *) COMPILER="$(pwd)/$COMPILER" ;;
@@ -134,12 +140,20 @@ run_runners() {
         [ "$4" = moved ] || [ "$kind" = lsp ] && names=
         # (0.30: the query and refactor runners' names are filters, a name
         # containing one; `=NAME` is NAME alone)
+        jflag=
         case "$kind" in
-            query|refactor) names=$(printf '%s\n' $names | sed 's/^./=&/' | tr '\n' ' ') ;;
+            query|refactor) names=$(printf '%s\n' $names | sed 's/^./=&/' | tr '\n' ' '); jflag="-j $JOBS" ;;
         esac
-        # shellcheck disable=SC2086
-        env $3 sh "$1/tests/$kind/run.sh" -c "$2" $names >"$WORK/$4-$kind.out" 2>&1
+        # (0.30: with -j, the four at once)
+        if [ "$JOBS" -gt 1 ]; then
+            # shellcheck disable=SC2086
+            env $3 sh "$1/tests/$kind/run.sh" -c "$2" $jflag $names >"$WORK/$4-$kind.out" 2>&1 &
+        else
+            # shellcheck disable=SC2086
+            env $3 sh "$1/tests/$kind/run.sh" -c "$2" $names >"$WORK/$4-$kind.out" 2>&1
+        fi
     done
+    wait
     while read -r kind name how; do
         out="$WORK/$4-$kind.out"
         if grep -q "^xfail $name\\( \\|:\\)" "$out" && ! grep -q "^FAIL $name\\( \\|:\\)" "$out"; then

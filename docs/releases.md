@@ -6662,6 +6662,7 @@ $ bootstrap/gate.sh --quick --no-wait  # fail at once if another gate runs, rath
 $ bootstrap/gate.sh --release --no-linux -j 4   # the release's macOS steps within four slots (0.29)
 $ bootstrap/gate.sh --release -j 4 --plan       # how they are scheduled: heavy or not, the slots each holds
 $ bootstrap/gate.sh --self-test        # the gate's own machinery: the lock, the stall check, the modes' steps, what runs at once
+$ bootstrap/gate.sh --self-test lock,hung   # (0.30) some of its rows (`--self-test list` names them)
 $ bootstrap/gate.sh --with-x86         # with x86_64 (off by default since 0.15)
 $ bootstrap/gate.sh --only 'fuzz-*,objcheck'   # some steps (--list shows them)
 $ bootstrap/gate.sh --release --bench  # the gate, then the benchmarks alone
@@ -6971,7 +6972,7 @@ Nothing else is trusted: no binary built before, no cache.
 | `compiler-memcheck` | the same set on macOS, two ways. With the compiler built `--check-alloc`, a use after free or double free of Gpa memory stops it. Under Guard Malloc, the same for the memory it takes from malloc itself. The objects must be the plain compiler's | every gate but `--quick` |
 | `stress-grow` | with every table growth moving and poisoning the old block, the self-compile is the same and the suite passes | every gate but `--quick` |
 | `fuzz-seed` | random programs give the same output from the seed, the oracle written in Rust, as from HEAD | every gate |
-| `fuzz-sem` | random programs over owned values (moves, borrows, drops and their order, temporaries, `?`, closures) print what `tools/semfuzz/semfuzz.py`'s model of the ownership rules says, drop every value once and leak nothing, at -O0, -O1 and -O2 with `--check-alloc`; five runs: plain, `--assign-calls`, `--try-args`, `--closure-params`, `--deref-assign` (0.30: assignments through a Box, a guard, a type's DerefMut and a function's `&mut T`). The model and the generator are themselves checked against rustc with `--rustc` (not in the gate). What it found and is not fixed: `tools/semfuzz/findings/` | every gate |
+| `fuzz-sem` | random programs over owned values (moves, borrows, drops and their order, temporaries, `?`, closures) print what `tools/semfuzz/semfuzz.py`'s model of the ownership rules says, drop every value once and leak nothing, at -O0, -O1 and -O2 with `--check-alloc`; five runs: plain, `--assign-calls`, `--try-args`, `--closure-params`, `--deref-assign` (0.30: assignments through a Box, a guard, a type's DerefMut and a function's `&mut T`); `gate.sh --self-test fuzz-sem` checks that the row runs one per mode of the generator and that each mode makes a program. The model and the generator are themselves checked against rustc with `--rustc` (not in the gate). What it found and is not fixed: `tools/semfuzz/findings/` | every gate |
 
 **chain-fresh's record.** A release adds its line when it is tagged, with
 `bootstrap/chain-fresh.sh --record`. The first record (0.25) was written

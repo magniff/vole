@@ -1,237 +1,108 @@
 # Working on vole (for agents)
 
 Vole's compiler is written in vole: `compiler/src/`, a module tree
-under `main.vl`. Releases, the bootstrap chain and the release gate are
-in [docs/releases.md](docs/releases.md) and
-[docs/roadmap.md](docs/roadmap.md); the language in
-[docs/grammar.md](docs/grammar.md).
+under `main.vl`. Releases, the bootstrap chain and the gate are in
+[docs/releases.md](docs/releases.md) and [docs/roadmap.md](docs/roadmap.md);
+the language in [docs/grammar.md](docs/grammar.md).
 
 **First, in a new worktree, run `bootstrap/bootstrap.sh --dev
 --no-suite`** (seconds): before it there is no compiler here. It leaves
-two: `target/volec` is your build of this tree (what you check, build
-and test with), `target/tools/volec` the installed, tested one (what
-you query and edit with while you change the compiler: it works when
-your build does not). For an example or a test alone either one does.
+two: `target/volec`, your build of this tree (check, build and test
+with it), and `target/tools/volec`, the installed, tested one (query and
+edit with it while you change the compiler: it works when your build
+does not). For an example or a test alone either one does.
 
-**There is one language, with Rust's surface** (0.28.0; `target/volec
-guide rust`: where vole differs from Rust): `&T`, `&mut T`, `let mut`,
-`&'static [u8]`, Rust's meanings. A static of
-compiler/src is read and written only through its accessors at its
-file's end (`get_x()`, `set_x(v)`); their `unsafe` blocks' UNSAFE:/
-SAFETY: lines (from the review in tools/statics/statics.tsv, with
-its evidence) say which functions and threads write
-and read it: a change to who writes or reads a static keeps them true.
-
-**New to vole? Run `target/volec guide` first**: the language in
-about 2.5k tokens (10k bytes), for a reader who knows Rust (where it looks like Rust
-and means something else, std's most used items, the first errors and
-their fixes). Before using a construct you are unsure of, fetch the
-lines on it: `target/volec guide --find WORDS` or `guide
-TOPIC#SECTION` (`guide --list`: the topics with their sizes; a shell
-tool that shows 30k bytes cuts `guide --full`, `guide std --whole` and
-`guide std#every-item`: send those to a file, or ask for a section or
-`--find NAME`). The text is `compiler/guide/*.md`; every example in it is
-compiled and run by `tests/run.sh guide`.
+**One language, with Rust's surface** (`target/volec guide rust`: where
+vole differs from Rust). **New to vole? Run `target/volec guide`**
+(about 10k bytes); before a construct you are unsure of, `guide --find
+WORDS` or `guide TOPIC#SECTION` (`guide --list`; send `--full` and `std
+--whole` to a file). A static of compiler/src is read and written only
+through its accessors at its file's end (`get_x()`, `set_x(v)`), whose
+UNSAFE:/SAFETY: lines say which functions and threads write and read
+it: a change to who does keeps them true.
 
 ## Read source through the compiler
 
-The compiler answers questions about the program and makes checked
-edits; `volec check` runs by itself after every edit (the hook,
-below). **For an unfamiliar item, run `target/volec query context
-NAME` first**: its source, the signatures of what it calls and its
-callers, in one call (`target/volec query context run_gvn`). Use
-these first:
+The tools answer questions about a program and make checked edits.
+**For an unfamiliar item, `target/volec query context NAME` first**: its
+source, what it calls and its callers, in one call.
 
 | you want | run |
 |---|---|
-| an unfamiliar item: its source, callers and what it calls, in one call | `target/volec query context NAME` (replaces show + refs + def) |
-| the source of an item; a whole small file | `target/volec query show NAME`; `query show FILE` (a `.vl`, a shader's `.wgsl`, a README; a file under 300 lines is cheaper read whole) |
-| every use of a name | `target/volec query refs NAME` (`--count`, `--in FILE`) |
-| change a few lines of an item, checked | `target/volec edit patch NAME --old 'TEXT' --new 'TEXT'` (`--all`: every match, in an item or a FILE; a FILE is also a program's `.wgsl`, checked, or a text file git tracks, not checked) |
+| an item's source, callers, what it calls | `target/volec query context NAME`; `query show NAME` (or a FILE); `query refs NAME` (`--count`, `--in FILE`) |
+| change a few lines, checked | `target/volec edit patch NAME --old 'TEXT' --new 'TEXT'` (`--all`; a FILE too: a `.wgsl`, a text file git tracks); by position: `--at FILE:LINE --old A --new B`, many: `--from LIST` (`FILE:LINE<TAB>OLD<TAB>NEW` lines, one check) |
 | replace, add, remove an item | `target/volec edit replace\|insert\|delete NAME` (`< text`) |
-| rename, move, change a signature, field or variant everywhere | `target/volec refactor rename\|move\|signature\|field\|variant ...` |
-| missing imports, `pub`, `unsafe` blocks | `target/volec fix` |
-| the errors' exact fixes (an error with `try: volec fix --suggested`: a did-you-mean, a conversion, a path, a `use`, a `pub`), instead of sed | `target/volec fix --suggested` (one checked edit, then the errors left; `--dry-run`, `--show`, `--at FILE:LINE`) |
-| a bug: where it fails, the values at a line, which change broke a test | `target/volec guide debug` (`test` prints a crash's line and callers; `probe FILE:LINE EXPR... -- ARGS`; `reduce`) |
-| work on an example, GPU or not: its program, its shaders, a headless run | `target/volec guide gpu-workflow` (short); in the example's directory `volec check`, `query`, `edit` mean that program (from the root: a FILE of it, or `--root examples/X/main.vl`); `volec check` says what it read (`ok: 0 errors in ROOT (N files, M shaders)`); its tests: `tests/run.sh NAME` |
-| std (0.30): search and change its files, check every body, see what an edit did to effects | `target/volec query grep TEXT --in compiler/std/FILE.vl` (`--std`), `target/volec edit patch compiler/std/FILE.vl --old 'TEXT' --new 'TEXT'`, `target/volec check --std` (seconds; a generic function nothing instantiates too), `tools/std-effects-diff.sh [BASE]` |
-| what a change costs or did in the optimizer (0.30) | `target/volec build --help` (the options: `--time-passes=passes\|json`, `--print-after-all=FN`, `--vec-stats=FN`, `--emit-ir`), `tools/perf-diff.sh A B FILE.vl` (two compilers, by pass), `tools/perf-experiment.sh [-b BASELINE]` (self-build, check, cost programs, in instructions), `bench/run.sh --instructions -p BASELINE`, `target/volec query asm NAME` |
-| build and test what a change touches | `bootstrap/bootstrap.sh --dev --no-suite`, `tests/run.sh FILTER...`, `tests/affected.sh` (the inner loop, below) |
+| an unsafe site's comments | `target/volec edit justify FILE:LINE --unsafe 'WHY' --safety 'WHY SOUND'` |
+| rename, move, change a signature, field or variant everywhere | `target/volec refactor rename\|move\|signature\|field\|variant ...`; a predicate now constant: `refactor fold FN --as true\|false` |
+| an idiom everywhere, typed | `target/volec rewrite 'OLD' 'NEW' --where '$v: T' --dry-run` (`--in FILE\|MODULE\|std`, `--not-in ITEM`; a list: `--from FILE`, one check) |
+| imports, `pub`, unneeded `unsafe`; the errors' exact fixes | `target/volec fix`; `fix --suggested` (`--dry-run`, `--at FILE:LINE`) instead of sed |
+| std: search, change, check every body | `query grep TEXT --std` (`--in compiler/std/FILE.vl`), `edit patch compiler/std/FILE.vl ...` then `sh compiler/std/embed.sh`, `target/volec check --std` (seconds), `tools/std-effects-diff.sh [BASE]` |
+| a bug: where it fails, the values at a line | `target/volec guide debug` (`test`, `probe FILE:LINE EXPR... -- ARGS`, `reduce`) |
+| an example, GPU or not | `target/volec guide gpu-workflow`; in its directory `check`, `query`, `edit` mean that program (else `--root examples/X/main.vl`) |
+| what a change did in the optimizer, and its cost | `target/volec build --help`, `tools/perf-diff.sh A B FILE.vl`, `tools/perf-experiment.sh -b BASELINE`, `bench/run.sh --instructions -p BASELINE`, `query asm NAME` |
+| build and test what a change touches | `bootstrap/bootstrap.sh --dev --no-suite`, `tests/run.sh FILTER...`, `tests/affected.sh` (below) |
 
-Everything else (`query grep|items|type|effects|impact`, `edit apply`,
-`rewrite`, `refactor extract-function|inline|split`, `batch`, `undo`):
-`target/volec --help`, `target/volec CMD --help`, `target/volec
-guide tools`, or `explain CODE` on any error; adding a std function, a
-pass, a diagnostic: `target/volec guide how`. Every command in one
-table: [docs/query.md](docs/query.md#every-command-at-a-glance-for-agents);
-the edits in [docs/refactor.md](docs/refactor.md). NAME is `foo`,
-`module::foo`, `Type::method`, `Struct.field` or `FILE:LINE`; a problem
-is one line, `error CODE: message`, then `try:` lines to run as they are.
-The program is the compiler's from the tree's root; an example's (any
-program's) in its directory or one under it, when a FILE or FILE:LINE
-argument is one of its files, or with `--root DIR` (`query context examples/nes/check.vl:232`, `probe
-examples/nes/check.vl:234 x -- --check`); a NAME the default program
-lacks gets the `try:` of the program that defines it.
+The rest: `target/volec --help`, `CMD --help`, `guide tools`, `explain
+CODE` on any error, `guide how` (a std function, a pass, a diagnostic),
+[docs/query.md](docs/query.md#every-command-at-a-glance-for-agents),
+[docs/refactor.md](docs/refactor.md). A problem prints as one line,
+`error CODE: message`, then `try:` lines to run as they are.
 
-**Query and edit with `target/tools/volec` while you change the
-compiler**: only a build whose suite passed goes there (`bootstrap.sh
---dev` with its suite; `--no-suite` leaves it, or copies the main
-checkout's when the worktree has none), so it always works (your own
-builds replace `target/volec`, and a broken one breaks `query`).
-
-**No hooks in your harness?** The hooks below are Claude Code's: under
-another harness nothing checks after an edit, and a shader edit is
-checked by no hook at all. After your edits run `target/volec check
---changed`: every program a file changed since the branch's base
-belongs to (a `.vl`, a `.wgsl` it embeds, a file beside its `main.vl`)
-is checked and its changed files compared with `fmt`'s layout; each
-program answers `ok: 0 errors in ROOT (N files, M shaders)` and the
-last line counts what was checked (`no program to check` when it was
-nothing). `tools/premerge.sh`'s check row is the same command.
-
-**Hooks.** `tools/agent-hooks/query-first.py` blocks shell commands that
-read or rewrite the compiler's `.vl` source (compiler/src, compiler/std:
-grep, sed, `sed -i`, Python writing it) and suggests the query or `edit
-patch`; a program's `.vl` (examples, tests, your own) is read and
-rewritten freely, and so is a whole file under 300 lines or a range of
-at most 200 lines of any (`sed -n 'A,Bp'`, `head -n N`). A blocked line
-ran nothing: the block names the command and gives the whole line again
-(with the read as its query, or without it). When the tool
-is not enough, rerun with a trailing reason, which is recorded: `#
-no-query: need the comment above run_gvn, show omits it` (or `# no-tool:
-...` for an edit). `check-after-edit.py` runs `volec check` after
-every Write/Edit of a `.vl` file and every writing `volec` command:
-what changed since the last check (new errors, how many fixed) is added
-to that call's result; nothing added means no change, so do not run
-`check` after an edit. It makes one fix itself (it removes an import
-unused at two checks)
-and shows each change, `changed FILE:LINE: OLD -> NEW`, then `the hook rewrote FILE: ...`, all it wrote (`volec undo`
-takes it back; `VOLE_HOOK_FIX=0`: off); a new `.vl` file you Write
-outside compiler/src and compiler/std it formats (`volec fmt`) and names
-the same way; it says once when another file you changed is not
-formatted (`volec fmt FILE`); the other exact fixes (a
-did-you-mean, a conversion, a `use`) it shows under `suggested, not
-applied`, with the ones `fix` refuses and why: check each before
-running `volec fix --suggested`. `check` and a build
-print `ok: ...` when there is no error. `turn-end.py` checks once more when you stop and
-blocks the stop once if errors are left; of the examples you changed it
-checks the format and that each has its case, and does not run the
-cases (0.29; `VOLE_TURN_END_EXAMPLES=run` does, reporting only what
-fails twice): run them yourself, `tests/run.sh example_NAME`. When a tool falls short, record
-it in one line: `tools/agent-feedback "query refs" "misses uses inside
-never-instantiated generic fns"`; `tools/agent-feedback --find WORDS`
-says whether someone has seen it already (`--list`: the last ones).
-
-**Without those hooks** (opencode and other agent harnesses: only git's
-hooks run there) nothing blocks a shell read, checks an edit or stops
-you with errors left, so do it by hand: read the compiler's source with
-`target/tools/volec query context|show|grep` (a `grep` or `cat` of
-compiler/src floods the context); after every edit of a `.vl` file run
-`target/volec check` (the compiler from the tree's root; `target/volec
-check FILE.vl` a program of your own) until it prints `ok: 0 errors`;
-look at what `target/volec fix --suggested --dry-run` would write
-before running it; `target/volec fmt FILE` each `.vl` you wrote; and
-`tools/premerge.sh` before a commit. The commit hook below still
-applies (`tools/git-hooks/setup.sh` once per clone).
+**Hooks** (Claude Code's, tools/agent-hooks): a shell read or rewrite of
+compiler/src or compiler/std beyond a 200-line range is blocked with
+the query or edit to use (override with a trailing `# no-query: why` or
+`# no-tool: why`); every edit is checked and what changed is added to
+its result (nothing added: no change; do not run `check` again). **Under
+another harness** nothing does this: read with `target/tools/volec
+query`, run `target/volec check --changed` after your edits (every
+program you touched, checked and its layout compared) and `volec fmt
+FILE` on what you wrote. When a tool falls short: `tools/agent-feedback
+"TOOL" "what"` (`--find WORDS` first).
 
 ## The inner loop
 
 Every suite run costs every agent on the machine: test what a change
-touches, and leave the whole suite to the one who merges. Four tiers,
-each run once by the one it names; **an agent runs tiers 1 and 2 only,
-never the whole suite or a gate unless its task says so**:
+touches. **An agent runs tiers 1 and 2 only, never the whole suite or a
+gate unless its task says so**:
 
 1. **While working (agent):** `bootstrap/bootstrap.sh --dev --no-suite`
-   builds `target/volec` in seconds (under 20 s) in a fresh worktree (the releases
-   come from the main checkout's cache, only the working tree is built
-   and its fixpoint checked; no suite runs, and `target/tools/volec`
-   stays the last build whose suite passed). After an edit: the check
-   hook's errors (or `target/volec check`), then only the cases the
-   change concerns: `tests/run.sh FILTER...` (every case whose name
-   contains a FILTER: `tests/run.sh pathtrace`; `-n NAME`: the one
-   case NAME exactly; `-f FILE` a list; `-l` lists them), or
-   `tests/affected.sh -O 2` for what the branch touches so far.
-   Its first line is the plan (how many cases, which suites): read it
-   before waiting. A suite's transcripts by name (0.30):
-   `tests/run.sh -j 2 refactor:NAME query:NAME` (also `lsp:`, `fmt:`;
-   the runners themselves take `-j N`, `-l`, `-u --grep TEXT`);
-   `--cases-only`: no suite; `--bless NAME`: a case's `// ERROR:`
-   positions that only moved (`volec guide testing`).
+   (under 20 s; the fixpoint checked), then the cases the change
+   concerns: `tests/run.sh -j 2 FILTER...` (options before the filters;
+   `-n NAME` exactly; `-l` lists; a suite's own by name:
+   `refactor:NAME`, `query:NAME`, `lsp:`, `fmt:`; `--cases-only`;
+   `--bless NAME` rewrites `// ERROR:` positions that only moved). Its
+   first line is the plan: read it before waiting.
 2. **Before reporting (agent):** `tools/premerge.sh` (prints `premerge:
-   ok`) and `tests/affected.sh`: the tests `tests/affected.map` names for
-   the paths changed since the branch's base, at -O0 and -O2 (`--list`
-   prints the plan and why each item is in it; a changed test runs
-   itself; an unknown path gets the smoke set; a file git does not
-   track is named in the plan and not counted: `git add` a new test,
-   or `--untracked`). A plan of most of the suite (over 600 cases: a
-   front end or std change): `tests/affected.sh --narrow` (0.30: the
-   changed tests, the cases and transcripts that name a changed item,
-   the smoke set; the plan says how it chose, and the report says it
-   was the narrow one). When `--list` says
-   `linux: platform-relevant`, `tests/affected.sh --linux` runs the
-   same plan in the aarch64-linux container too (colima must run).
-3. **Per merge batch (integrator):** after merging the batch into the
-   integration branch, one `tests/run.sh` and one `bootstrap/gate.sh
-   --quick` (the chain, the suite at -O2, a short fuzz in every mode,
-   and the `linux-smoke` row: the compiler cross-built for
-   aarch64-linux and, in the container, the runner's checks, the LSP,
-   the examples' builds, every case, the walkthroughs and the book;
-   `SKIP`, not pass, when colima is not running: `colima start`), and
-   `bootstrap/bootstrap.sh --dev` there, which installs a tested
-   `target/tools/volec`.
-4. **A release:** one `bootstrap/gate.sh --release`, then `gate.sh
-   --only bench` on an idle machine ([docs/releases.md](docs/releases.md),
-   "The gate"). The gate keeps to its `-j` slots (0.29): the heavy steps
-   (the suites, objcheck, stress-grow, the chain rows, ...) run one at a
-   time and the rest beside them, so `gate.sh --release --no-linux -j 4`
-   is run whole, not step by step (`--plan` prints the schedule).
+   ok`) and `tests/affected.sh` (the tests tests/affected.map names for
+   what changed since the base, at -O0 and -O2; `--list`: the plan and
+   why; a plan over 600 cases: `--narrow`). `linux: platform-relevant`
+   in the plan: `tests/affected.sh --linux` too (colima).
+3. **Per merge batch (integrator):** one `tests/run.sh`, one
+   `bootstrap/gate.sh --quick`, then `bootstrap/bootstrap.sh --dev`,
+   which installs a tested `target/tools/volec`.
+4. **A release:** `bootstrap/gate.sh --release`, then `--only bench` on
+   an idle machine (docs/releases.md, "The gate").
 
-A test that fails in the plan is yours until shown otherwise: rerun it
-alone (`tests/run.sh -n NAME`) before calling it
-load or inherited.
+A test that fails in your plan is yours until shown otherwise: rerun it
+alone (`tests/run.sh -n NAME`) before calling it load or inherited.
 
 ## Before you commit, before a merge
 
-- **Start from green.** Branch from the integration branch (`release-X`),
-  not from a main nobody has checked; if your base fails tests, say which
-  ones and fix or report them before your own work, so that your results
-  are not mixed with inherited failures.
-- **The commit hook** (`tools/git-hooks/setup.sh`, once per clone:
-  core.hooksPath and the stdsrc merge driver) refuses a commit that adds
-  `unsafe` without its `UNSAFE:`/`SAFETY:` comments, stages an
-  unformatted `.vl`, or adds an example case whose SOURCE does not
-  exist (0.29: of a merge, only what the merge itself adds, the lines
-  in neither parent; what a side brings passed on its branch); a commit that changes `compiler/std` gets the
-  `compiler/src/front/stdsrc.vl` made from it, staged by the hook, and a
-  merge makes it from the merged std (no conflict on it). It runs for
-  every committer, under any agent harness (Claude Code's hooks do not
-  run under opencode or other tools; git's do).
-- **Transcripts** (tests/query, tests/refactor, the walkthroughs)
-  compare std's positions as `<std>:L:C`: a std change does not touch
-  them; `## exact-std` in one that is about std's positions.
-- **A change to an example** also needs its `tests/examples/*.test` case
-  (`// REQUIRES: metal` and `// LINK:` for std::gpu/std::window) and
-  `tests/run.sh example example_build`; moving an example moves its case.
-- **Linux too:** a change to tests/, the runner, std, the LSP or anything
-  platform-specific (`tests/affected.sh --list` says `linux:
-  platform-relevant`) runs its plan in the Linux container before it is
-  called done: `tests/affected.sh --linux` (colima must run). The whole
-  container row (`bootstrap/gate.sh --only linux-aarch64`) is tier 3's.
-- **Before reporting (tier 2):** `tools/premerge.sh` in the branch's
-  worktree (base contained, unsafe justified and none unneeded, fmt, every touched program
-  checks clean, the embedded std up to date, example cases' sources
-  exist) prints `premerge: ok`, and `tests/affected.sh` passes; report
-  its plan line (`plan: N of M cases; ...`) and result. No full suite,
-  no gate: the integrator runs one per merge batch (tier 3).
-- **Report what was asked, checkably:** a task's "Done means" list is
-  answered item by item with the command or count that shows it (e.g.
-  "argv uses in compiler/src: 0, `volec query refs arg_at --count`").
-- **Mind the machine:** at most five agents build and test the compiler
-  at once, and one gate runs at a time: `gate.sh` takes a lock for all
-  worktrees and a second gate waits, saying whose gate runs (`--no-wait`
-  fails instead; `bootstrap.sh --dev` and `tests/run.sh` take none).
-  Under heavy load, timing results are not evidence (the runner SKIPs
-  time budgets with the load).
+- **Start from green:** branch from the integration branch (`release-X`);
+  if your base fails tests, say which before your own work.
+- **The commit hook** (`tools/git-hooks/setup.sh` once per clone) refuses
+  an `unsafe` without its comments, an unformatted `.vl`, an example case
+  whose SOURCE is missing, and stages `compiler/src/front/stdsrc.vl` for
+  a std change. It runs under any harness.
+- **A change to an example** needs its `tests/examples/*.test` case
+  (`// REQUIRES: metal`, `// LINK:` for std::gpu/std::window) and
+  `tests/run.sh example_NAME example_build`.
+- **Report what was asked, checkably:** each "Done means" item with the
+  command or count that shows it; premerge's result and affected.sh's
+  plan line (`plan: N of M cases; ...`) and result.
+- **Mind the machine:** a few agents build and test at once; one gate at
+  a time (`gate.sh` waits for another, `--no-wait` fails). Timings under
+  load are not evidence: count instructions.
 
 ## Conventions
 
@@ -242,23 +113,17 @@ load or inherited.
 - No undefined behaviour, no wildcard imports; compile speed is measured
   every release.
 - `unsafe` must be justified. Try the safe way first (std's APIs, `Vec`,
-  slices, `str`, or a new safe std function); use `unsafe` only when
-  that is impossible, around the one operation that needs it, with a
-  comment right above it:
+  slices, `str`, a new safe function); use `unsafe` only when that is
+  impossible, around the one operation that needs it, with a comment
+  right above it (an `unsafe fn` and an `extern` block too):
 
   ```
   // UNSAFE: why this cannot be safe (C or the OS, allocator internals, a measured hot path)
   // SAFETY: why it is sound (bounds, lifetimes, aliasing, initialization, and what guarantees them)
   ```
 
-  The same goes for an `unsafe fn` and an `extern` block. Never add
-  `unsafe` (or let `volec fix` add it) to silence an error. In
-  compiler/src and std this is an error, not a warning (0.29): a site
-  without both comments, and in compiler/src an unsafe block with
-  nothing unsafe inside, fails `tools/premerge.sh` (its unsafe row) and
-  the gate (`tests/unsafe_audit.sh`: the count is 0 and stays 0), each
-  named with its position; `volec check --deny=unsafe` reports them as
-  errors where they are (the edit hook checks the compiler so), and
-  `volec fix --only unneeded-unsafe` takes an unneeded block away.
-  Another program's unjustified site is a warning
-  (`unsafe.unjustified`).
+  Never add `unsafe` (or let `volec fix` add it) to silence an error. In
+  compiler/src and std a site without both comments, and in compiler/src
+  a block with nothing unsafe inside, is an error (`volec check
+  --deny=unsafe`, `tools/premerge.sh`, `tests/unsafe_audit.sh`); `volec
+  fix --only unneeded-unsafe` removes an unneeded block.
