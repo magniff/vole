@@ -31,8 +31,9 @@ pub mod regex;
 mod subst;
 mod after;
 mod guard;
+mod stdfiles;
 
-use std::alloc::Arena;
+use std::alloc::{Allocator, Arena};
 
 use crate::base::{
     STDOUT, buf_append, buf_at, buf_byte, buf_bytes, buf_copy, buf_int, buf_len, buf_new, buf_str,
@@ -46,6 +47,7 @@ use crate::cli::line::{
 use crate::front::ast::NodeKind;
 use crate::front::embed::wgsl::WgslCx;
 use crate::front::modules::{file_made, file_of_pos};
+use crate::front::stdtree::find_std_tree;
 use crate::front::types::buf_type;
 use crate::tools::ctx::Tcx;
 use crate::tools::edit::edit_replace;
@@ -69,6 +71,7 @@ use pattern::{
     parse_text, replacement_level, replacement_text, rest_hole_of, seq_at, seq_len, types_match,
 };
 use regex::re_valid;
+use stdfiles::{in_std_path, names_std, note_no_std_files, std_mapped, std_site, write_std};
 use subst::{choose_fresh, find_substs, note_subst_holes, put_site};
 
 // ---- The command ----
@@ -240,6 +243,33 @@ pub fn rewrite_leaf(gpa: Gpa) -> Leaf<'static, Gpa> {
     Leaf::new(table, "word")
 }
 
+// (0.30) Where the rewrite looks beyond --in: the scopes of --not-in (as
+// resolve_in made them: the ranges of its items, its files, its modules)
+// and whether std's files were asked for.
+struct Scope<A: Allocator> {
+    not_ranges: Vec<i64, A>,
+    not_files: Vec<i64, A>,
+    not_modules: Vec<i64, A>,
+    std_asked: bool,
+}
+
+// Whether a site at pos is one the rewrite looks at: in a file of the
+// program (or, asked for, of std), in --in, not in --not-in.
+fn site_in(pos: i64, scope: &Scope<Comp>, pcx: &mut Ctx<Comp>) -> bool {
+    let f = file_of_pos(pos, pcx);
+    if file_made(f, pcx) && !(scope.std_asked && std_site(pos, pcx) >= 0) {
+        return false;
+    }
+    if !ref_in(pos, pcx) {
+        return false;
+    }
+    let none = scope.not_ranges.len() == 0 && scope.not_files.len() == 0
+        && scope.not_modules.len() == 0;
+    none
+        || !pos_in(pos, scope.not_ranges.as_slice(), scope.not_files.as_slice(),
+            scope.not_modules.as_slice(), pcx)
+}
+
 fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>,
     wgx: &mut WgslCx<Arena<Gpa>>) -> i64 {
     set_command(c.line, tcx);
@@ -328,14 +358,29 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
     // (0.15: the imports names of the replacement need, as edit
     // replace adds them)
     tcx.add_imports = true;
+    // (0.30: std asked for, `--in std`, `--in compiler/std/vec.vl`: std is
+    // read from its files, which the rewrite then searches and writes,
+    // stdfiles.vl)
+    let mut std_asked = false;
+    for k in 0..ins.len() {
+        std_asked = std_asked || names_std(&c_slice(ins[k] as *mut u8));
+    }
+    if std_asked && pcx.std_tree == 0 as *const u8 {
+        pcx.std_tree = find_std_tree(pcx);
+    }
     if !load_program(root, tcx.target, tcx, pcx, wgx) {
         program_errors(c"error", root, true, tcx, pcx);
         return 1;
     }
+    if std_asked && !std_mapped(pcx) {
+        note_no_std_files(tcx);
+        return 0;
+    }
     // (0.30: --not-in, resolved as --in is, its scopes kept apart)
-    let mut not_ranges: Vec<i64, Comp> = Vec::new_in(Comp {});
-    let mut not_files: Vec<i64, Comp> = Vec::new_in(Comp {});
-    let mut not_modules: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut scope: Scope<Comp> = Scope {
+        not_ranges: Vec::new_in(Comp {}), not_files: Vec::new_in(Comp {}),
+        not_modules: Vec::new_in(Comp {}), std_asked: std_asked,
+    };
     for k in 0..nots.len() {
         if !resolve_in(&c_slice(nots[k] as *mut u8), tcx, pcx) {
             let d = diag(c"error", c"rewrite.bad-in", tcx);
@@ -345,19 +390,31 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
     }
     if nots.len() > 0 {
         for i in 0..pcx.in_ranges.len() {
-            not_ranges.push(pcx.in_ranges[i]);
+            scope.not_ranges.push(pcx.in_ranges[i]);
         }
         pcx.in_ranges.clear();
         for i in 0..pcx.in_file.len() {
-            not_files.push(pcx.in_file[i]);
+            scope.not_files.push(pcx.in_file[i]);
             pcx.in_file[i] = 0;
         }
         for i in 0..pcx.in_module.len() {
-            not_modules.push(pcx.in_module[i]);
+            scope.not_modules.push(pcx.in_module[i]);
             pcx.in_module[i] = 0;
         }
     }
     for k in 0..ins.len() as i64 {
+        let x = c_slice((ins[k as usize]) as *mut u8);
+        if std_asked && names_std(&x) && !(x.len() >= 3 && x[0..3] == b"std") {
+            // (a file of std, a directory of them)
+            if !in_std_path(&x, pcx) {
+                let d = diag(c"error", c"rewrite.bad-in", tcx);
+                buf_str(d, c"std has no file '");
+                buf_bytes(d, &x);
+                buf_str(d, c"'\n");
+                return 1;
+            }
+            continue;
+        }
         if !resolve_in(&c_slice((ins[k as usize]) as *mut u8), tcx, pcx) {
             let d = diag(c"error", c"rewrite.bad-in", tcx);
             put_bad_in(d, (ins[k as usize]) as *mut u8, tcx);
@@ -453,7 +510,7 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
         tcx.s_pat.push(sp);
     }
     if replacement == 0 as *mut u8 {
-        return list_sites(proot, program_end, pattern, tcx, pcx);
+        return list_sites(proot, program_end, pattern, &scope, tcx, pcx);
     }
     let rfirst = pcx.parsed_nodes.len() as i64;
     tcx.r_root = parse_text(rtext, tcx.stmts, c"replacement", tcx, pcx);
@@ -551,13 +608,7 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
         if pk(n, pcx) != pkind {
             continue;
         }
-        let f = file_of_pos(pstart(n, pcx), pcx);
-        if file_made(f, pcx) || !ref_in(pstart(n, pcx), pcx) {
-            continue;
-        }
-        if nots.len() > 0
-            && pos_in(pstart(n, pcx), not_ranges.as_slice(), not_files.as_slice(),
-                not_modules.as_slice(), pcx) {
+        if !site_in(pstart(n, pcx), &scope, pcx) {
             continue;
         }
         for h in 0..tcx.h_sym.len() as i64 {
@@ -670,14 +721,20 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
     let mut done_start: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut done_end: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut done_text: Vec<i64, Comp> = Vec::new_in(Comp {});
+    // (0.30: the sites in std's files, written by stdfiles.vl)
+    let mut in_std: i64 = 0;
     for a in 0..order.len() as i64 {
         let k = (order[a as usize]);
         if (s_start[k as usize]) < last_end {
             nested += 1;
             continue;
         }
-        edit_replace((s_start[k as usize]), (s_end[k as usize]),
-            (s_text[k as usize]), pcx);
+        if std_asked && std_site(s_start[k as usize], pcx) >= 0 {
+            in_std += 1;
+        } else {
+            edit_replace((s_start[k as usize]), (s_end[k as usize]),
+                (s_text[k as usize]), pcx);
+        }
         done_start.push((s_start[k as usize]));
         done_end.push((s_end[k as usize]));
         done_text.push((s_text[k as usize]));
@@ -706,6 +763,19 @@ fn run_rewrite_inner(c: &Call<'_, Gpa>, tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>
         buf_str(d, c" left; run the rewrite again\n");
     }
     notes(pattern, replacement, tcx, pcx);
+    if in_std > 0 {
+        if in_std < sites {
+            let d = diag(c"error", c"rewrite.std", tcx);
+            buf_int(d, in_std);
+            buf_str(d, if in_std == 1 { c" site is" } else { c" sites are" });
+            buf_str(d, c" in std's files and ");
+            buf_int(d, sites - in_std);
+            buf_str(d, c" in the program's: std is rewritten in a run of its own (--in std alone), the program in another; nothing written\n");
+            return 1;
+        }
+        return write_std(done_start.as_slice(), done_end.as_slice(), done_text.as_slice(), root,
+            tcx, pcx);
+    }
     // (0.17: the imports it leaves unused go)
     let dropped = drop_unused_imports(done_start.as_slice(), done_end.as_slice(),
         done_text.as_slice(), pcx);
@@ -786,8 +856,8 @@ fn recursive_sites(sites: &[i64], defs: &[i64], tcx: &mut Tcx<Comp>, pcx: &mut C
 
 // `--list` without a REPLACEMENT (0.16): the sites PATTERN (proot)
 // matches with their --where types and names, a line each.
-fn list_sites(proot: i64, program_end: i64, pattern: *mut u8, tcx: &mut Tcx<Comp>,
-    pcx: &mut Ctx<Comp>) -> i64 {
+fn list_sites(proot: i64, program_end: i64, pattern: *mut u8, scope: &Scope<Comp>,
+    tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     for _ in 0..tcx.h_sym.len() as i64 {
         tcx.b_node.push(-1);
         tcx.pattern_b_start.push(-1);
@@ -802,8 +872,7 @@ fn list_sites(proot: i64, program_end: i64, pattern: *mut u8, tcx: &mut Tcx<Comp
         if pk(n, pcx) != pkind {
             continue;
         }
-        let f = file_of_pos(pstart(n, pcx), pcx);
-        if file_made(f, pcx) || !ref_in(pstart(n, pcx), pcx) {
+        if !site_in(pstart(n, pcx), scope, pcx) {
             continue;
         }
         for h in 0..tcx.h_sym.len() as i64 {

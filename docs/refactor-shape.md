@@ -304,6 +304,22 @@ operand's type. A callee the pattern has too, with the same receiver, is
 not new at the site (a recursive function's own calls rewritten) and is
 never refused. A pattern's `&mut $e` no longer matches `&e`.
 
+(0.30) **std's files.** To the compiler std is one text, `<std>`, which
+no rewrite searched (`nothing matches`, whatever `--in` said). In the
+vole repository that text is compiler/std's files, and a rewrite asked
+for std, `--in std`, `--in std::vec`, `--in compiler/std/vec.vl` (a
+directory of them too), reads std from those files, matches in them and
+writes them: `--list` and the diff name `compiler/std/FILE.vl:LINE`, the
+program (the compiler, from the repository's root) is checked with
+std's new texts (`edit.breaks` when it has a new error: what the program
+uses of std is what is checked), and the files are written as one edit,
+which `undo` takes back. The result ends with `note rewrite.std`:
+`sh compiler/std/embed.sh` and the build are the caller's next steps
+(the compiler's own std text is the old one until then). A run rewrites
+std or the program, not both (`error rewrite.std`). Where std has no
+files (a program outside the repository) `--in std` gets `note
+rewrite.std`: std is the compiler's text there and is not searched.
+
 Nothing matches: `note rewrite.none`, exit 0; when sites matched but for
 --where, `note rewrite.types` gives the first one's type and place, and
 `try:` the command with that type; sites whose type the checker never
@@ -517,6 +533,7 @@ as it changes the program through the edit engine (`edit_replace`,
 | `refactor.script` | error | 1, 2 | a line is no command, a command failed: nothing written | |
 | `rewrite.pattern`, `rewrite.unbound` | error | 2 | the pattern or replacement does not parse, a hole alone, `$x...` outside a list, a hole of the replacement not in the pattern and bound by it nowhere, a bad `~/RE/` | |
 | `rewrite.bad-in` | error | 1 | `--in` or `--not-in` names no file, module or item | |
+| `rewrite.std` | note; error | 0; 1 | (0.30) std's files rewritten: embed.sh and the build are next; std has no files here and is not searched; sites in std and in the program in one run (nothing written) | `sh compiler/std/embed.sh` |
 | `rewrite.recursive` | error (note with `--force`) | 1 | (0.30) sites inside the function the replacement calls there: nothing written | the command with `--not-in` those functions; with `--force` |
 | `rewrite.none` | note | 0 | nothing matches | |
 | `rewrite.types` | note | 0 | sites match but for --where | the command with the type found |
