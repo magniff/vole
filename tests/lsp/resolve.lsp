@@ -9,6 +9,7 @@
 > @open main.vl
 ## std's modules and items named by `use`; `std` itself
 > {"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":4,"character":4}}}
+< {"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://@DIR@/more.vl","diagnostics":[{"range":{"start":{"line":3,"character":18},"end":{"line":3,"character":22}},"severity":2,"code":"use.redundant","source":"volec","message":"redundant import 'From': the prelude gives it to every module\nhelp: remove it (`volec fix` removes every redundant import)","relatedInformation":[{"location":{"uri":"file://@DIR@/more.vl","range":{"start":{"line":3,"character":18},"end":{"line":3,"character":22}}},"message":"try: volec fix --only redundant @DIR@/main.vl"}]}]}}
 < {"jsonrpc":"2.0","id":2,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/std.vl","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}
 > {"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":4,"character":4}}}
 < {"jsonrpc":"2.0","id":3,"result":{"contents":{"kind":"markdown","value":"```vole\nmod std\n```\nThe standard library, built into the compiler; its most used names (the prelude: `Vec`, `println`, `Gpa`...) need no `use`. (`volec guide std`)\n"},"range":{"start":{"line":4,"character":4},"end":{"line":4,"character":7}}}}
