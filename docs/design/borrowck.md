@@ -927,6 +927,16 @@ D3.6).
   rehearsal's F4). `Cloned<I>` is the same. *Anchor:* `places/regions.vl:
   proj_bound, unnamed_param, bound_at`. *Cases:* `rust_b_ok_copied_items`,
   `rust_b_copied_items_err`.
+  (0.30) The same parameter in a closure's bound, `fold`'s `F: FnMut(B,
+  Self::Item) -> B` on `Copied<I>`: D19.10 (4) reads the closure's
+  signature with the bound, and its `Self::Item` slot is `T`'s; the
+  universal of `T`'s slot is made by the bound's ties, so they come first
+  (`sig_compute`: bound_ties, then subst_requirements), and one a bound's
+  result alone gives (`B` of `Map<I, F>`, from `F: FnMut(I::Item) -> B`)
+  is made where the closure's signature names it. Before, neither had a
+  universal and the closure's `|acc, p| p` requirement was dropped: a use
+  after free in safe code. *Cases:* `rust_b_err_adapter_item_copied`,
+  `rust_b_err_adapter_item_map`, `rust_b_err_adapter_item_user`.
 
 ## 5. Variance (S5)
 
@@ -1462,7 +1472,14 @@ outside the holes named below.
   reference result, and a call of a generic parameter's method or of a
   closure is a direct call in the instance. *What remains of R6* is
   D20.5's identity of `fn` items above: the value's own signature is not
-  compared with the bound's.
+  compared with the bound's. (0.30) An instance's flows made by a call
+  through a `fn` value are its own to judge, not exempted as a pair of
+  substitutions (D4.4 (g)): a fn item whose result borrows from its
+  argument, given for `F: Fn(&T) -> R`, is `borrowck.outlives` at the
+  call in the instance (rustc: E0308 at the caller), where before it let
+  the result outlive the argument (case `rust_b_err_fn_item_bound_result`).
+  Stricter than rustc for a fn item whose result is `'static` (the erased
+  type says every argument region outlives every result region).
 - R7 Constant index projections `P[k]` vs `P[k']` with `k ≠ k'` were
   disjoint (D1.5), so `&mut a[0]` and `&mut a[1]` could coexist on an
   array and through a `&mut [T]`, and so could `a[i]` and `a[j]` by
