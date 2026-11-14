@@ -490,16 +490,13 @@ Many of the compiler's errors know their own fix. You've seen `try:`
 lines throughout this book; when the fix is an exact edit, `volec fix
 --suggested` makes it for you.
 
-Let's make a mistake on purpose. `--no-check` writes an edit even when it
-breaks the program, so we can turn the `&mut` at the call in `run`
-into a plain `&`, which may not change the map (chapter 4):
+Let's make a mistake on purpose. `--no-check` writes an edit without
+checking the program after it, so we can turn the `&mut` at the call in
+`run` into a plain `&`, which may not change the map (chapter 4):
 
 ```console
 $ volec edit patch run --old '(&mut counts' --new '(&counts' --no-check
-main.vl:15:28: error[type error] expected '&mut HashMap<String<Gpa>, i64, Gpa, FixedState>', got '&HashMap<String<Gpa>, i64, Gpa, FixedState>' | help: the types differ in mutability (rustc E0308): the parameter takes an exclusive reference, `&mut x` | try: &mut counts | try: volec fix --suggested main.vl  [edited: crate::run]
 patched crate::run	main.vl	+1 -1 lines
-warning edit.breaks: 1 new error; written anyway (--no-check); the error: main.vl:15:28: expected '&mut HashMap<String<Gpa>, i64, Gpa, FixedState>', got '&HashMap<String<Gpa>, i64, Gpa, FixedState>'
-try: volec check
 $ volec check
 main.vl:15:28: error[type error] expected '&mut HashMap<String<Gpa>, i64, Gpa, FixedState>', got '&HashMap<String<Gpa>, i64, Gpa, FixedState>' | help: the types differ in mutability (rustc E0308): the parameter takes an exclusive reference, `&mut x` | try: &mut counts | try: volec fix --suggested main.vl
 ```
