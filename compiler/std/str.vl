@@ -621,71 +621,246 @@ impl str {
 #[effects(panic, diverge, unsafe)]
 pub fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error> {
     let n = v.len();
-    // (the ASCII start of v a block at a time: text that is all ASCII is
-    // checked three times faster; after the first byte that is not, byte
-    // by byte: trying blocks again inside the loop cost mixed text a
-    // quarter of its speed)
-    let mut i: usize = ascii_blocks(v, 0);
-    while i < n {
-        let b = v[i];
-        if b < 0x80 {
-            i += 1;
-            continue;
+    let mut i: usize = 0;
+    // (a v of sixteen bytes or more by blocks of sixteen: its ASCII
+    // start; then, after its first sequences byte by byte when there are
+    // not three bytes behind for the blocks to look back at, the blocks,
+    // up to v's end, its last sequence or the block with an error; the
+    // bytes left, and a short v, byte by byte)
+    let mut until = n;
+    if n >= 16 {
+        i = utf8_ascii_blocks(v);
+        if i < n {
+            until = if i < 3 { 3 } else { i };
         }
-        // the sequence's length, and the range its second byte must be in
-        // (no overlong forms, no surrogates, nothing over U+10FFFF)
-        let (w, lo, hi): (usize, u8, u8) = if b >= 0xC2 && b <= 0xDF {
-            (2, 0x80, 0xBF)
-        } else if b == 0xE0 {
-            (3, 0xA0, 0xBF)
-        } else if b == 0xED {
-            (3, 0x80, 0x9F)
-        } else if b >= 0xE1 && b <= 0xEF {
-            (3, 0x80, 0xBF)
-        } else if b == 0xF0 {
-            (4, 0x90, 0xBF)
-        } else if b >= 0xF1 && b <= 0xF3 {
-            (4, 0x80, 0xBF)
-        } else if b == 0xF4 {
-            (4, 0x80, 0x8F)
-        } else {
-            return Err(Utf8Error { valid_up_to: i, error_len: Some(1) });
-        };
-        let mut k: usize = 1;
-        while k < w {
-            if i + k >= n {
-                return Err(Utf8Error { valid_up_to: i, error_len: None });
+    }
+    loop {
+        while i < until {
+            let b = v[i];
+            if b < 0x80 {
+                i += 1;
+                continue;
             }
-            let c = v[i + k];
-            let ok = if k == 1 { c >= lo && c <= hi } else { c & 0xC0 == 0x80 };
-            if !ok {
-                return Err(Utf8Error { valid_up_to: i, error_len: Some(k as u8) });
+            // the sequence's length, and the range its second byte must be
+            // in (no overlong forms, no surrogates, nothing over U+10FFFF)
+            let (w, lo, hi): (usize, u8, u8) = if b >= 0xC2 && b <= 0xDF {
+                (2, 0x80, 0xBF)
+            } else if b == 0xE0 {
+                (3, 0xA0, 0xBF)
+            } else if b == 0xED {
+                (3, 0x80, 0x9F)
+            } else if b >= 0xE1 && b <= 0xEF {
+                (3, 0x80, 0xBF)
+            } else if b == 0xF0 {
+                (4, 0x90, 0xBF)
+            } else if b >= 0xF1 && b <= 0xF3 {
+                (4, 0x80, 0xBF)
+            } else if b == 0xF4 {
+                (4, 0x80, 0x8F)
+            } else {
+                return Err(Utf8Error { valid_up_to: i, error_len: Some(1) });
+            };
+            let mut k: usize = 1;
+            while k < w {
+                if i + k >= n {
+                    return Err(Utf8Error { valid_up_to: i, error_len: None });
+                }
+                let c = v[i + k];
+                let ok = if k == 1 { c >= lo && c <= hi } else { c & 0xC0 == 0x80 };
+                if !ok {
+                    return Err(Utf8Error { valid_up_to: i, error_len: Some(k as u8) });
+                }
+                k += 1;
             }
-            k += 1;
+            i += w;
         }
-        i += w;
+        if until == n {
+            break;
+        }
+        i = utf8_valid_blocks(v, i);
+        until = n;
     }
     // UNSAFE: the checked bytes as a str.
-    // SAFETY: every sequence of v was checked to be UTF-8 above.
+    // SAFETY: every sequence of v was checked to be UTF-8: by the blocks,
+    // and from where they stopped by the byte loop.
     Ok(unsafe { from_utf8_unchecked(v) })
 }
 
-// Where the blocks of sixteen ASCII bytes of v from `from` on end: the
-// index after the last block none of whose bytes has its high bit
-// (from_utf8's fast path).
-fn ascii_blocks(v: &[u8], from: usize) -> usize {
+// ---- UTF-8 validation by blocks (0.30) ----
+//
+// Sixteen bytes a step, with the vector types' compares (NEON, SSE2): a
+// byte breaks UTF-8 when it is a continuation byte where the three bytes
+// before it ask for none, or is none where they ask for one; when it is
+// the second byte of an overlong form, a surrogate or a value past
+// U+10FFFF (the lead bytes E0, ED, F0, F4 each narrow their second
+// byte's range); or when it is a byte no sequence has (C0, C1, F5..FF).
+// A block of four vectors with no high bit is ASCII, and only ends what
+// the bytes before it began. The blocks say whether a byte is wrong, not
+// which or why: from_utf8's byte loop finds the error and makes the
+// Utf8Error, from the start of the sequence, and is what the blocks are
+// tested against (tests/run/std_str_from_utf8_blocks.vl).
+
+// The constants of utf8_block_errors, a register each.
+struct Utf8Consts {
+    cont_max: v16i8,
+    c0: v16u8,
+    x80: v16u8,
+    e0: v16u8,
+    f0: v16u8,
+    a0: v16u8,
+    x90: v16u8,
+    ed: v16u8,
+    f4: v16u8,
+    f5: v16u8,
+    fe: v16u8,
+}
+
+// The errors of the sixteen bytes cur = w[at + 3..at + 19], given the
+// three before them: a lane is not 0 where its byte breaks UTF-8.
+#[inline]
+fn utf8_block_errors(w: &[u8], at: i64, cur: v16u8, k: &Utf8Consts) -> v16u8 {
+    let p1 = v16u8::load(w, at + 2);
+    let p2 = v16u8::load(w, at + 1);
+    let p3 = v16u8::load(w, at);
+    // (a continuation byte, 0x80..0xBF, is below -64 as an i8)
+    let is_cont = v16u8::from_bits(v16i8::from_bits(cur) < k.cont_max);
+    let must = (p1 >= k.c0) | (p2 >= k.e0) | (p3 >= k.f0);
+    // (after E0 a byte below A0 is overlong, after ED one from A0 on is a
+    // surrogate; after F0 one below 90 is overlong, after F4 one from 90
+    // on is past U+10FFFF: the lead byte that makes cur wrong)
+    let special = (p1 == (cur < k.a0).select(k.e0, k.ed))
+        | (p1 == (cur < k.x90).select(k.f0, k.f4));
+    let no_lead = (cur >= k.f5) | ((cur & k.fe) == k.c0);
+    (must ^ is_cont) | special | no_lead
+}
+
+// Whether a lane of e is not 0.
+#[inline]
+fn any_lane(e: v16u8) -> bool {
+    let w = v2u64::from_bits(e);
+    (w.lane(0) | w.lane(1)) != 0
+}
+
+// The length of v's ASCII start, by blocks: v's length when v is ASCII
+// (its last block is its last sixteen bytes), else the blocks of sixteen
+// before the first byte with its high bit. v has sixteen bytes or more.
+fn utf8_ascii_blocks(v: &[u8]) -> usize {
     let n = v.len();
-    let mut i = from;
-    while i + 16 <= n {
-        let c = &v[i..i + 16];
-        let m = c[0] | c[1] | c[2] | c[3] | c[4] | c[5] | c[6] | c[7] | c[8] | c[9] | c[10] | c[11]
-            | c[12] | c[13] | c[14] | c[15];
-        if m >= 0x80 {
+    let high = v16u8::splat(0x80);
+    let mut i: usize = 0;
+    while i + 64 <= n {
+        let w = &v[i..i + 64];
+        let m = v16u8::load(w, 0) | v16u8::load(w, 16) | v16u8::load(w, 32) | v16u8::load(w, 48);
+        if any_lane(m & high) {
             break;
+        }
+        i += 64;
+    }
+    while i + 16 <= n {
+        let w = &v[i..i + 16];
+        if any_lane(v16u8::load(w, 0) & high) {
+            return i;
         }
         i += 16;
     }
+    if i < n && n >= 16 {
+        let w = &v[n - 16..n];
+        if !any_lane(v16u8::load(w, 0) & high) {
+            i = n;
+        }
+    }
     i
+}
+
+// Given that v[..from] is UTF-8 (from a char boundary, 3 or more, in a
+// v of 19 bytes or more): a char boundary at or after `from` that v is
+// UTF-8 up to. It is v's length or the start of its last sequence when v
+// is UTF-8, else less than 67 bytes before the first error.
+fn utf8_valid_blocks(v: &[u8], from: usize) -> usize {
+    let n = v.len();
+    if from < 3 || from > n || n < 19 {
+        return from;
+    }
+    let k = Utf8Consts {
+        cont_max: v16i8::splat(-64),
+        c0: v16u8::splat(0xC0),
+        x80: v16u8::splat(0x80),
+        e0: v16u8::splat(0xE0),
+        f0: v16u8::splat(0xF0),
+        a0: v16u8::splat(0xA0),
+        x90: v16u8::splat(0x90),
+        ed: v16u8::splat(0xED),
+        f4: v16u8::splat(0xF4),
+        f5: v16u8::splat(0xF5),
+        fe: v16u8::splat(0xFE),
+    };
+    // Every byte before v[j + 3] is checked. A window of the blocks and
+    // the three bytes before them is taken once a step: the loads are at
+    // constant places in it, with no check each.
+    let mut j: usize = from - 3;
+    // (whether v[j..j + 3] ask for nothing more: no sequence is open there)
+    let mut closed = true;
+    while j + 67 <= n {
+        let w = &v[j..j + 67];
+        let a = v16u8::load(w, 3);
+        let b = v16u8::load(w, 19);
+        let c = v16u8::load(w, 35);
+        let d = v16u8::load(w, 51);
+        if !any_lane((a | b | c | d) & k.x80) {
+            // (ASCII: wrong only after a sequence that is not ended)
+            if !closed {
+                if w[2] >= 0xC0 || w[1] >= 0xE0 || w[0] >= 0xF0 {
+                    return utf8_sequence_start(v, j, from);
+                }
+                closed = true;
+            }
+        } else {
+            closed = false;
+            let e = utf8_block_errors(w, 0, a, &k) | utf8_block_errors(w, 16, b, &k)
+                | utf8_block_errors(w, 32, c, &k) | utf8_block_errors(w, 48, d, &k);
+            if any_lane(e) {
+                return utf8_sequence_start(v, j, from);
+            }
+        }
+        j += 64;
+    }
+    // (the blocks left, one at a time; the last one is v's last sixteen
+    // bytes, over bytes already checked: the byte loop is left v's last
+    // sequence only)
+    while j + 3 < n {
+        if j + 19 > n {
+            j = n - 19;
+        }
+        let w = &v[j..j + 19];
+        let a = v16u8::load(w, 3);
+        if closed && !any_lane(a & k.x80) {
+            j += 16;
+            continue;
+        }
+        if any_lane(utf8_block_errors(w, 0, a, &k)) {
+            break;
+        }
+        closed = false;
+        j += 16;
+    }
+    // (every byte checked, and the last three end what they began: all of v)
+    if j + 3 == n && v[n - 1] < 0xC0 && v[n - 2] < 0xE0 && v[n - 3] < 0xF0 {
+        return n;
+    }
+    utf8_sequence_start(v, j, from)
+}
+
+// With every byte before v[j + 3] checked: the start of the sequence
+// v[j] is in (it may go on past the checked bytes), at most three
+// continuation bytes back and not before `from`.
+fn utf8_sequence_start(v: &[u8], j: usize, from: usize) -> usize {
+    let mut e = j;
+    let mut t = 0;
+    while e > from && t < 3 && v[e] & 0xC0 == 0x80 {
+        e -= 1;
+        t += 1;
+    }
+    if e < from { from } else { e }
 }
 
 #[effects(unsafe)]
