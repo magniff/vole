@@ -316,6 +316,47 @@ got=$(sh "$ROOT/tests/run.sh" -l refactor:rename query:=clash query:self_ | tr '
 got=$(sh "$ROOT/tests/run.sh" -l -n query query:=clash lsp:embed lsp | tr '\n' ',')
 [ "$got" = "suite query,suite lsp," ] && ok filters_suite_whole || bad filters_suite_whole "got '$got'"
 
+# (0.30) An option after a FILTER is an error that says where it goes.
+got=$(sh "$ROOT/tests/run.sh" -j 2 pathtrace -O 2 2>&1)
+rc=$?
+want="tests/run.sh: the option '-O' comes after the FILTER 'pathtrace': options go before the FILTERs
+try: tests/run.sh -j 2 -O 2 pathtrace"
+[ $rc -eq 2 ] && [ "$got" = "$want" ] && ok filters_option_after || bad filters_option_after "exit $rc: '$got'"
+# (0.30) A FILTER of digits only: a warning, with how many it selects.
+got=$(sh "$ROOT/tests/run.sh" -l 2 2>&1 >/dev/null)
+case "$got" in
+    "tests/run.sh: warning: the FILTER '2' is only digits: it selects every name containing '2' ("*" cases); "*) ok filters_digits ;;
+    *) bad filters_digits "got '$got'" ;;
+esac
+# (0.30) --cases-only: no suite.
+got=$(sh "$ROOT/tests/run.sh" -l --cases-only runner_ fmt | grep -c '^suite ')
+all=$(sh "$ROOT/tests/run.sh" -l runner_ fmt | grep -c '^suite ')
+[ "$got" = 0 ] && [ "$all" -ge 1 ] && ok filters_cases_only || bad filters_cases_only "$got suites with --cases-only, $all without"
+# (0.30) The first line is the plan; a suite's line comes as it ends; a
+# FILTER that selects nothing is an error, and a suite given a name it
+# has not fails saying so (a compiler that fails every case).
+got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n abi_callee_alignment -n readme_sync lsp:no_such_session 2>&1)
+case "$(printf '%s\n' "$got" | sed -n 1p)" in
+    "plan: 1 case, 2 suites (lsp: no_such_session, readme_sync), -j 2, "*) ok plan_first ;;
+    *) bad plan_first "$(printf '%s\n' "$got" | sed -n 1p)" ;;
+esac
+if printf '%s\n' "$got" | sed -n 2p | grep -q '^suite lsp: 0 pass, 0 FAIL, exit 2, [0-9]* s$' \
+    && printf '%s\n' "$got" | grep -q '^FAIL lsp: tests/lsp/run.sh reported nothing:$' \
+    && printf '%s\n' "$got" | grep -q 'tests/lsp/run.sh: no case matches no_such_session'; then
+    ok plan_suite_line
+else
+    bad plan_suite_line "$(printf '%s\n' "$got" | sed -n 2,6p | tr '\n' ';')"
+fi
+got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 no_such_case_at_all 2>&1)
+rc=$?
+case "$rc:$got" in
+    "2:tests/run.sh: no case matches 'no_such_case_at_all' "*) ok filters_no_match ;;
+    *) bad filters_no_match "exit $rc: '$got'" ;;
+esac
+got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n readme_sync no_such_case_at_all 2>&1 | sed -n 1p)
+[ "$got" = "tests/run.sh: warning: no case matches 'no_such_case_at_all' (the other FILTERs select the plan below)" ] \
+    && ok filters_no_match_one || bad filters_no_match_one "got '$got'"
+
 # tests/affected.map: every set, cmd and prefix it names exists.
 problems=$(awk '
     { sub(/#.*/, "") }
