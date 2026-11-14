@@ -156,7 +156,6 @@ vec-stats: kernels, loop at line 17: not vectorized: a branch in its body that i
 vec-stats: kernels, loop at line 31: not vectorized: an unknown trip count: not a loop over a counter to a bound
 vec-stats: kernels, loop at line 35: not vectorized: a float carried from one iteration to the next (a float sum: lanes would add in another order) (phi)
 vec-headers: kernels: unknown: line 20: a store through an address the summary does not follow (a pointer loaded from memory, a raw pointer of unknown origin, a number made a pointer)
-vector loops 6, overlap tests 1, tests dropped by noalias 0
 EOF
 # (0.30) --vec-stats=FN also says what is known of the Vec headers FN may
 # write (middle/callfacts.vl), and for an unknown summary the first
@@ -323,19 +322,30 @@ else
     pass bad-value
 fi
 
+# (0.30) The counts' line, `vector loops N, overlap tests M, tests dropped
+# by noalias K`, is the whole program's: std's loops too (the ones println
+# brings in, some inlined into main), so it moves when std gains or loses
+# a vector loop (twice in 0.30). The checks pin the program's own loops,
+# kernels' lines, and of the counts' line its form and that it counts
+# them (N at least kernels' one vector loop): $1 the file, $2 at least N.
+counts_line() {
+    grep -c '' "$1" | grep -q '^1$' || return 1
+    awk -v min="$2" '/^vector loops [0-9]+, overlap tests [0-9]+, tests dropped by noalias [0-9]+$/ && $3 + 0 >= min + 0 { ok = 1 }
+        END { exit !ok }' "$1"
+}
+
 # vec-stats
 if build -O2 --vec-stats=kernels loops.vl -o loops && [ "$(./loops | tr -d '\n')" = 3045AAA ] \
-    && cmp -s err.out loops.want; then
+    && grep -v '^vector loops ' err.out >err.own && cmp -s err.own loops.want \
+    && grep '^vector loops ' err.out >err.counts && counts_line err.counts 1; then
     pass vec-stats
 else
-    fail vec-stats "$(diff loops.want err.out 2>&1 | head -20)"
+    fail vec-stats "$(diff loops.want err.own 2>&1 | head -20; cat err.counts 2>/dev/null)"
 fi
 
-# vec-counts (the program's loops, std's too: kernels' one, and two
-# in what println brings in, 0.28; 0.30: three more and an overlap test,
-# the copy of a line into println's sink, std::__rt::PrintOut::write_str)
-if build -O2 --vec-stats loops.vl -c -o loops.o \
-    && [ "$(cat err.out)" = "vector loops 6, overlap tests 1, tests dropped by noalias 0" ] \
+# vec-counts (the counts' line alone, at least kernels' one vector loop;
+# nothing at -O0)
+if build -O2 --vec-stats loops.vl -c -o loops.o && counts_line err.out 1 \
     && build -O0 --vec-stats=kernels loops.vl -c -o loops.o && ! grep -q 'loop at' err.out; then
     pass vec-counts
 else

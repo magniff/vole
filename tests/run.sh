@@ -20,7 +20,7 @@
 # files, 0.25.3) and tests/stdpos/run.sh (std's positions in the
 # transcripts, compared normalized, 0.25.3) and tests/cachediff/run.sh
 # --sample (the tools' answers from their cache the same as without it,
-# 0.25.3). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# 0.25.3) and tests/stdtools.sh (std inside the tools, 0.30). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [--cases-only] [--bless] [-n NAME] [FILTER...]
 #
@@ -204,7 +204,8 @@
 # NO-EXTRA-FLAGS.
 # (0.27.2) std's cases (std_*) are built with --check-alloc, and fail
 # when blocks of Gpa are left at exit (and it exits 0) unless a STDERR
-# line expects the list ($VOLE_TEST_STD_PLAIN=1: without it); $VOLE_TEST_XFAIL_WHY=FILE
+# line expects the list (0.30: and so does any case whose FLAGS have
+# --check-alloc) ($VOLE_TEST_STD_PLAIN=1: without it); $VOLE_TEST_XFAIL_WHY=FILE
 # gets each XFAIL case's name and the start of its failure, for a triage;
 # (0.27.2.1) $VOLE_TEST_RESULTS=FILE each case's name, status and borrowck
 # errors at std's positions (the gate's std rows read the suite's).
@@ -393,7 +394,7 @@ want() {
 # NAME)` is below (tests/runner/run.sh checks the two agree): what -l
 # lists. LEVELED: the ones that take -O (the others are the same at
 # every level).
-SUITES="query refactor guide book fmt walkthrough wgsl voltty borrowck-try runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync perf"
+SUITES="query refactor guide book fmt walkthrough wgsl voltty borrowck-try runner embed-checks stdpos stdtools cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync perf"
 LEVELED="gpu arch-gen"
 # (0.30) A FILTER of digits only is warned about: an option's value put
 # after a name was one before 0.30 (`NAME -j 2`).
@@ -697,6 +698,11 @@ check_case() {
                 case " $FLAGS " in *" --check-alloc "*) ;; *) FLAGS="$FLAGS --check-alloc" ;; esac
             fi ;;
     esac
+    # (0.30) and so is any case whose own FLAGS have --check-alloc,
+    # whatever its name: before, an own_ case built so passed while
+    # leaking (not $VOLE_TEST_FLAGS's, the gate's examples-checkalloc row,
+    # which looks for a use after a free)
+    case " $(cat "$dir/flags") " in *" --check-alloc "*) STD_LEAKS=1 ;; esac
     # (0.26.2: --verify-places on every VERIFY_EVERY-th case, chosen by its
     # name's cksum: the places IR's form checked where the suite builds
     # it, now that both code generators read it and -O0 is no independent
@@ -1300,7 +1306,13 @@ esac
 # (0.25.3) std's positions in the transcripts, compared normalized: a std
 # change moves none of them (tests/stdpos/run.sh): category "stdpos".
 case $(want stdpos) in
-    y) run_suite stdpos sh "$ROOT/tests/stdpos/run.sh" -c "$COMPILER" ;;
+    y) run_suite stdpos sh "$ROOT/tests/stdpos/run.sh" -c "$COMPILER" -j "$TJOBS" ;;
+esac
+# (0.30) std inside the tools: std's files named in errors, queries,
+# edits and fixes, and `check --std`, in a copy of compiler/std
+# (tests/stdtools.sh): category "stdtools".
+case $(want stdtools) in
+    y) run_suite stdtools sh "$ROOT/tests/stdtools.sh" -c "$COMPILER" ;;
 esac
 # (0.25.3) The tools' answers from their cache the same as without it, on
 # a sample of the transcripts (tests/cachediff/run.sh --sample; all of
@@ -1342,9 +1354,29 @@ case $(want hooks) in
     y)
         if command -v python3 >/dev/null 2>&1; then
             # (0.25.2.1) the compiler under test, not target/volec, for the
-            # cases that run a real one
+            # cases that run a real one; (0.30) TJOBS files at once (the
+            # query suite's rule, above), their reports in the files' order
             hooks_cases() {
-                for t in "$ROOT"/tools/agent-hooks/test-*.py "$ROOT"/tools/git-hooks/test-*.py; do VOLE_TEST_COMPILER="$COMPILER" python3 -I "$t"; done
+                hd="$WORK/hooks.d"
+                mkdir -p "$hd"
+                mkfifo "$hd/slots"
+                exec 5<>"$hd/slots"
+                hi=0
+                while [ "$hi" -lt "$TJOBS" ]; do echo >&5; hi=$((hi + 1)); done
+                hi=0
+                for t in "$ROOT"/tools/agent-hooks/test-*.py "$ROOT"/tools/git-hooks/test-*.py; do
+                    hi=$((hi + 1))
+                    read -r _ <&5
+                    ( trap 'echo >&5' EXIT; VOLE_HOOKS_JOBS=$TJOBS VOLE_TEST_COMPILER="$COMPILER" python3 -I "$t" >"$hd/$hi.out" 2>&1 ) &
+                done
+                wait
+                exec 5>&-
+                hi=0
+                for t in "$ROOT"/tools/agent-hooks/test-*.py "$ROOT"/tools/git-hooks/test-*.py; do
+                    hi=$((hi + 1))
+                    cat "$hd/$hi.out"
+                done
+                ! cat "$hd"/*.out | grep -q '^FAIL'
             }
             run_suite hooks hooks_cases
         else
@@ -1543,6 +1575,24 @@ case $(want stdpos) in
             { echo "FAIL stdpos: tests/stdpos/run.sh reported nothing:"; sed 's/^/    /' "$WORK/stdpos.out" | head -20; echo; } >>"$FAILURES"
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/stdpos.out" >>"$FAILURES"
+        ;;
+esac
+
+# std inside the tools (0.30, run above); category "stdtools".
+case $(want stdtools) in
+    y)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "stdtools pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "stdtools fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/stdtools.out"
+        if ! grep -q '^pass' "$WORK/stdtools.out"; then
+            echo "stdtools fail" >>"$TALLY"
+            count=$((count + 1))
+            { echo "FAIL stdtools: tests/stdtools.sh reported nothing:"; sed 's/^/    /' "$WORK/stdtools.out" | head -20; echo; } >>"$FAILURES"
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/stdtools.out" >>"$FAILURES"
         ;;
 esac
 

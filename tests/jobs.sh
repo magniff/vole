@@ -35,7 +35,9 @@ jobs_filters_text() {
 # Runs the jobs of file $1, $2 at once: each job's report is printed
 # whole when the job ends, in the order they end (with one at once: the
 # file's order), and kept in $WORK/res/K. A job that reports no verdict
-# (it died) is a FAIL of its name.
+# (it died) is a FAIL of its name. (0.30) $VOLE_JOB_TIMES=FILE: each
+# job's seconds appended to FILE, `SECONDS KIND NAME`, for a profile of
+# the runner (`sort -rn FILE | head`).
 jobs_run() {
     mkdir -p "$WORK/res"
     rm -f "$WORK/jobslots"
@@ -55,7 +57,9 @@ jobs_run() {
             (
                 trap 'echo >&4' EXIT
                 trap 'exit 1' HUP INT TERM
+                jr_t0=$(date +%s)
                 run_job "$jr_kind" "$jr_name" "$jr_k" >"$WORK/res/$jr_k" 2>&1 </dev/null
+                [ -z "${VOLE_JOB_TIMES:-}" ] || echo "$(($(date +%s) - jr_t0)) $jr_kind $jr_name" >>"$VOLE_JOB_TIMES"
                 grep -q -E '^(pass|FAIL|xfail|skip) ' "$WORK/res/$jr_k" \
                     || echo "FAIL $jr_name: the job reported nothing" >>"$WORK/res/$jr_k"
                 echo "$jr_k"
