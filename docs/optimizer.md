@@ -3339,27 +3339,39 @@ bench/iterloop.c beside ours, the same four accumulators in both):
   its own tests, not of the optimizer. 15 panic blocks are left in
   `main` (the checks of `v[child]`, `v[parent]` against the Vec's
   length, which the heap's `end` does not bound for the ranges).
-- **wordcount** (2641, 2359, 877). Without the map the program takes 755
+- **wordcount** (2641, 2284, 877). Without the map the program takes 755
   (the text's generation and the scan); `get` about 1190 and `insert`
   690 for 3,000,000 words, 400 instructions a lookup. `Hash for [T]`
   feeds the hasher the length and then each byte by `write_u8`
   (FoldHasher::write_num: the sponge is in memory, a call a byte until
-  0.30's INLINE_FLOOR took it into `hash_of`: -11%), where the C twin's
+  0.30's INLINE_FLOOR, 80, to which a function may grow whatever its
+  room, took it into `hash_of`: -11% of the instructions, 145 ms ->
+  117 ms), where the C twin's
   FNV is 3 instructions a byte and `str`'s Hash is one `write` of the
   bytes. The fix is `hash_slice` of the integer types writing their
   bytes at once (the integers' Hash impls are the compiler's, not
-  std's text): estimated 0.6 to 0.8 G of the 2.36. Left.
+  std's text): estimated 0.6 to 0.8 G of the 2.28. Left.
 - **arena_trees** (1169, 810, 541). `Arena::allocate -> Chunks::bump
   (63) no:room`: the bump path was a call a node, its refill inlined
   into it. The refill (Chunks::add) is `#[cold]` now, as the C twin's
   is, and bump (38) is inlined into `make`. Left: `make` still has the
   failed `unwrap`'s report in its frame (832 bytes, at every call of a
   recursive function).
-- **interp, fannkuch** (1714 -> 1505, 1378 -> 1240; cc 1314, 1021): the
-  0.29 inliner left the only call of a function of 120 to 250
-  instructions a call (`main -> Vm.run (159) no:room`): the interpreter's
-  state stayed in memory. Now moved when caller and callee are together
-  at most INLINE_ONCE_SUM (250). Both are below 0.28.0's (1534, 1298).
+- **interp, fannkuch** (1714 and 1378 at 0.29.0, 1685 and 1366 now; cc
+  1314 and 1021; 0.28.0's compiler 1534 and 1298). What 0.29's room
+  changed is one decision in each: `main -> Vm.run (159) no:room` and
+  `main -> fannkuch (153) no:room`, the only call of a function just
+  above INLINE_ONCE_FREE (120). A rule that moves an only call when
+  caller and callee are together at most 250 instructions was tried: it
+  takes the instructions to 1505 and 1240 (below 0.28.0's), but the
+  times do not follow (fannkuch 115 ms at 0.29.0, 115 without the rule,
+  121 with it, 119 by 0.28.0's compiler; interp 44, 44, 45, 46; the
+  fastest of 13 to 15 alternating runs, at a load of 5 to 7, twice the
+  same), and it costs the self-build 0.9%. It is not in: these two
+  "regressions" of 0.29 were of instructions, not of time. Why the
+  merged `main` runs more slowly with fewer instructions is not
+  explained (the allocator's spills, as in contracts, are the first
+  suspect).
 - **contracts** (+3.4% against 0.29.0; contracts_plain -29%): kernels 3
   and 4 are in a larger `main` now, and the register allocator reloads
   three values from the stack in the dot product's unrolled loop (`ldp
@@ -3410,14 +3422,17 @@ estimated from the instruction counts above):
 Vectorization, unrolling with several accumulators, if-conversion,
 inlining, scalar replacement, value numbering and LICM are there and, on
 these kernels, produce what cc produces once the loop is in the form
-they know. The geometric mean of the 24 programs' instructions against
-0.29.0 is -13.1% (`bench/run.sh --instructions -p` 0.29.0's compiler).
+they know. The geometric mean of the programs' instructions against
+0.29.0 is -11.9% over 26 programs (`bench/run.sh --instructions -p`
+0.29.0's compiler; superpi's two rows are -4.7% each); contracts
+(+3.4%) is the only one above.
 
 **What it costs the compiler** (tools/perf-experiment.sh against the
-compiler of the branch's base on one source): the self-build at -O2
-+2.5% (exit counts and un-nesting +0.8 G, the functions merged by the
-two inliner rules the rest; INLINE_ONCE_SUM 300 and INLINE_FLOOR 100
-were +3.8%), at -O0 +0.2%, check +0.2%, std_heavy -2.6%.
+compiler of the branch's base on one source, the fewer of 2 runs): the
+self-build at -O2 +2.3% (exit counts and un-nesting +0.8 G, the
+functions INLINE_FLOOR lets grow the rest), at -O0 +0.5%, check +0.2%,
+regions +1.5%, hello +1.3% (2 M), std_heavy -3.7%. Against 0.29.0's
+compiler: +2.4%, +0.7%, +1.0%, +1.4%, +1.3%, -3.4%.
 
 Two rules were added so that the newly counted loops do no harm: a
 loop with a bounds check of a constant length of at most 32 is neither
