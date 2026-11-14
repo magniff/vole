@@ -67,10 +67,12 @@ usage: tools/semfuzz/semfuzz.py [-c VOLEC] [-n COUNT] [-f FIRST] [-k DIR]
                 x`, `h.t = x`, `h[i] = x` where h is a Box, a struct with
                 DerefMut, a MutexGuard or an RwLockWriteGuard (`*h` is
                 `*h.deref_mut()`), and `*pk(&mut place) = x` through a
-                function's `&mut T`; the old value is dropped once, after
+                function's `&mut T`, and `unsafe { *rp(&mut place) = x; }`
+                through a raw pointer; the old value is dropped once, after
                 the right side, before the write (0.29 leaked it: the
                 generator's places were names, fields, indexes and `*` of
-                a named reference only, never a call's result)
+                a named reference only, never a call's result; and a raw
+                pointer's write dropped nothing)
 
 Exit status: 0 when every program behaved as expected.
 """
@@ -1421,13 +1423,18 @@ class Defer(S_):
 
 
 class Assign(S_):
-    """via: `*pk(&mut p) = x`, the place a function's `&mut T` result."""
+    """via: `*pk(&mut p) = x`, the place a function's `&mut T` result;
+    via 'raw': `unsafe { *rp(&mut p) = x; }`, the place a raw pointer's
+    (0.30: it drops the old value as the others do)."""
     def __init__(self, p, x, via=False):
         self.p = p
         self.x = x
         self.via = via
 
     def emit(self, out, ind):
+        if self.via == 'raw':
+            out.append('%sunsafe { *rp(%s) = %s; }' % (ind, lend_mut(self.p), self.x.code()))
+            return
         if self.via:
             out.append('%s*pk(%s) = %s;' % (ind, lend_mut(self.p), self.x.code()))
             return
@@ -2151,6 +2158,8 @@ impl<X> DerefMut for Wr<X> {
 }
 
 fn pk<X>(x: &mut X) -> &mut X { x }
+
+fn rp<X>(x: &mut X) -> *mut X { x as *mut X }
 '''
 
 MAIN = '''fn main(gpa: Gpa) -> i32 {
@@ -3077,6 +3086,8 @@ class Gen:
         # (--deref-assign: `*pk(&mut v) = x`, of a v that is whole)
         via = (self.deref_assign and v.st == 'L' and self.whole(v)
                and v.name not in c.frozen and self.chance(0.5))
+        if via and self.chance(0.4):
+            via = 'raw'
         v.st = 'L'
         if v.fst:
             v.fst = {f: 'L' for f in v.fst}
@@ -3591,7 +3602,10 @@ class Gen:
             elif k < 0.6:
                 ops.append(Do(Call('add', [Arg('val', self.int_k(c))], method=True, recv=rp)))
             elif k < 0.8:
-                ops.append(Assign(rp, Mk(self.int_k(c)), self.deref_assign and self.chance(0.5)))
+                via = self.deref_assign and self.chance(0.5)
+                if via and self.chance(0.4):
+                    via = 'raw'
+                ops.append(Assign(rp, Mk(self.int_k(c)), via))
             else:
                 ops.append(Print(self.obsn(), [Call('obs', [Arg('let', rp)]), Read(PField(rp, 'id'))]))
         return InoutBlock(n, p, Block(ops), 'inout', flat)
