@@ -61,6 +61,12 @@
 #                    (bootstrap/selftest-prune.sh: their directories in
 #                    $TMPDIR, a day old, and nothing else)
 #
+# (0.30.1) A step that passes must also have counted what it exists to
+# count: bootstrap/gate-floors.sh reads its log, and one whose count is
+# missing or below its floor (0.30.0's count less a margin, or the
+# programs asked of a fuzz row) fails. tests/gate_floors.sh shows each
+# floor catching a zero and a low count.
+#
 # Steps: chain; suite-O0, suite-O1, suite-O2; fuzz-plain, fuzz-loops,
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
 # fuzz-div, fuzz-range, fuzz-arch (0.19: intrinsics), fuzz-guard (0.25:
@@ -1158,6 +1164,15 @@ start() { # <step>
         s=$(now)
         run_step "$1" </dev/null >"$RUN/$1.log" 2>&1
         rc=$?
+        # (0.30.1) a row that passed has counted what it exists to count:
+        # its floor (bootstrap/gate-floors.sh), or it fails
+        if [ $rc -eq 0 ] && [ -z "${VOLE_GATE_STUB:-}" ]; then
+            case "$1" in
+                selftest-*) ;;
+                *) sh "$ROOT/bootstrap/gate-floors.sh" "$1" "$RUN/$1.log" "$FZ" "$AB" "$SFZ" \
+                    >>"$RUN/$1.log" 2>&1 || rc=1 ;;
+            esac
+        fi
         echo "$rc $(( $(now) - s ))" >"$RUN/$1.status"
     ) &
     echo $! >"$RUN/$1.pid"

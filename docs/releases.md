@@ -7769,6 +7769,46 @@ From 0.16 the gate gives each test program a minute (`VOLE_TEST_TIMEOUT`,
 with the Linux container, and the heavier examples at -O0 took longer
 than 20 s on a loaded machine (the examples-checkalloc step: 2 minutes).
 
+(0.30.1) **Floors.** A step that passes has also counted what it exists to
+count: `bootstrap/gate-floors.sh` reads the log of every step that passed,
+and one whose count line is missing, or whose count is below its floor,
+fails (`floor STEP: ...`, the last line of its log). The floors are 0.30.0's
+release gate's counts less a margin for cases that come and go (the suite
+rows 6000 cases passed, objcheck 12000 compilations, threads 14000,
+incremental 150 edit series and its 24 warm builds of the pairs, cachediff
+150 transcripts, compiler-memcheck 700, std-check 3500 bodies, std-tests
+1400, borrowck-twin 420, examples-checkalloc 175, stdtools 38, layout 100
+records, chain-fresh 52 releases, chain-diverse 50000 compilations of the
+corpus; voltty-fuzz runs what fits in a minute, 1610 scripts in 0.30.0's
+gate, and its floor is 100), or what the step was asked for (each
+fuzz row's and ABI row's programs, all of them: `-n`; fuzz-sem's five runs);
+`unsafe-audit` must report its canary caught, `debug` both levels,
+`compile-cost` its four programs, `chain` the fixpoint. A row whose
+input changed under it once passed on 4 records of 111 (layout, 0.28.0,
+which then got its own floor): this is such a floor for every row. `tests/gate_floors.sh` shows each floor
+failing a zero count, a quarter of it and a log without its line.
+
+(0.30.1) **The SKIPs a release accepts**, and what each leaves unverified:
+
+- `linux-aarch64`, `linux-x86_64`, `linux-smoke`, and `valgrind` (which runs
+  in the aarch64-linux container): not run on the release machine, by the
+  owner's choice (no containers there). Unverified: everything about
+  aarch64-linux and x86_64-linux (the compiler built for them and their
+  suites, glibc's ABI and headers, the ELF writer and linker, the LSP and
+  the examples there), and the compiler under valgrind's memcheck (the
+  macOS row `compiler-memcheck`, under Guard Malloc and `--check-alloc`,
+  covers the compiler's heap on macOS only).
+- the suite's one skipped case: a std::gpu case whose shader is checked by
+  `spirv-val` when the machine has it (Vulkan's SPIR-V validator; not
+  installed). Unverified: that the SPIR-V the WGSL compiler emits for it is
+  valid by Khronos's validator (the Metal path is run).
+- `voltty-fuzz` and `borrowck-twin` SKIP without cargo and without rustc;
+  the release machine has both, so a release does not accept these.
+- x86_64-macos runs under Rosetta and is not a row by default (`--with-x86`);
+  `objcheck-x86-arch` compiles and assembles x86-64's intrinsics both ways
+  and runs nothing. Unverified: x86-64 code run (but by the fuzzers' and
+  the suite's x86 cases when `--with-x86` is given).
+
 ## Trusting the chain
 
 Every compiler since 0.1.0 was built by the one before it. So a bug, or
