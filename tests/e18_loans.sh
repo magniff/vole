@@ -85,7 +85,9 @@ if [ "$SELF" -eq 1 ]; then
         exit 1
     fi
     echo "e18-loans: self-test ok: a blind walk's borrows and a crash are reported, the forms settled"
-    exit 0
+    if [ -z "$PAT" ]; then
+        exit 0
+    fi
 fi
 OUT=$(mktemp "${TMPDIR:-/tmp}/e18.XXXXXX")
 LIST=$(mktemp "${TMPDIR:-/tmp}/e18l.XXXXXX")
