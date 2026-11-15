@@ -27,17 +27,19 @@
 // allocates) is not checked: the check knows the heap blocks only, and
 // (0.30.1) does not report memory it did not see allocated. So a block the
 // program frees is held back from C's allocator while the check counts it
-// freed (the last 4096, at most 64 MB: a quarantine; a block that alone is
-// more is given back at once, its use after the free not seen), and every
-// block has 16 bytes after its end that no one is given (a red zone): C's
-// own mallocs (strdup's, opendir's) can neither reuse a freed block nor
-// start where a block ends. A block C reallocates or frees inside the C
-// library (getline's, reallocf's) is not seen: before a report the check
-// asks C's allocator for its size and reads its red zone, a tag it wrote
-// (changed): another size or another tag, and the block is forgotten. Left:
-// a block C gave to an allocation of its own of the same size, read past
-// the old end where C did not write (docs/releases.md, 0.30.1's known
-// issues).
+// freed (the last 4096, at most 64 MB of C's sizes: a quarantine; a block
+// that alone is more is given back at once, and only it, its use after the
+// free not seen), and every block has 16 bytes after its end that no one
+// is given (a red zone): C's own mallocs (strdup's, opendir's) can neither
+// reuse a freed block nor start where a block ends. A block C reallocates
+// or frees inside the C library (getline's, reallocf's) is seen on macOS
+// (malloc_logger: logged, in the runtime) and forgotten; on glibc a block
+// whose size by C's allocator changed is forgotten at a report (changed),
+// and one C gave out again at its size is reported, with zone_note's words.
+// C's memcpy, memmove and memset are redirected to wrappers that check
+// their bytes first (std's copies call them). The red zone holds a tag:
+// one written over (strcpy's NUL) is noted in the next report of the
+// block (docs/releases.md, 0.30.1).
 
 use crate::base::{buf_str, intern_c, sym_name};
 use crate::base::comp::Comp;
@@ -56,6 +58,8 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"    fn free(p: *mut u8);\n");
     buf_str(out, c"    fn posix_memalign(out: *mut *mut u8, align: u64, size: u64) -> i32;\n");
     buf_str(out, c"    fn memcpy(dst: *mut u8, src: *const u8, n: u64) -> *mut u8;\n");
+    buf_str(out, c"    fn memmove(dst: *mut u8, src: *const u8, n: u64) -> *mut u8;\n");
+    buf_str(out, c"    fn memset(dst: *mut u8, c: i32, n: u64) -> *mut u8;\n");
     buf_str(out, c"    fn dprintf(fd: i32, format: *const u8, ...) -> i32;\n");
     buf_str(out, c"    fn sched_yield() -> i32;\n");
     buf_str(out, c"    fn exit(code: i32) -> !;\n");
@@ -64,8 +68,8 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"// arrays grown by C's realloc): LIVE, the program's live blocks, and\n");
     buf_str(out, c"// FREED, the last ones it freed, held back from C's allocator (RING\n");
     buf_str(out, c"// holds their starts, oldest first: the oldest is freed when RING is full\n");
-    buf_str(out, c"// or the blocks held pass QUARANTINE bytes, the newest too when it alone\n");
-    buf_str(out, c"// is more). So no block of FREED is\n");
+    buf_str(out, c"// or the blocks held pass QUARANTINE bytes of C's; a block alone more is\n");
+    buf_str(out, c"// given back at once, and only it). So no block of FREED is\n");
     buf_str(out, c"// memory C can hand out again, to the program or to C itself (strdup's\n");
     buf_str(out, c"// malloc, opendir's): a block is reported freed only while it is. A node\n");
     buf_str(out,
@@ -77,10 +81,10 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"static mut LEFT: *mut u64 = 0 as *mut u64;\n");
     buf_str(out, c"static mut RIGHT: *mut u64 = 0 as *mut u64;\n");
     buf_str(out, c"static mut PRIO: *mut u64 = 0 as *mut u64;\n");
-    buf_str(out, c"// (0.30.1) A live block's size by C's allocator when it was recorded\n");
-    buf_str(out, c"// (c_size): another now means C reallocated or freed it unseen (getline's\n");
-    buf_str(out, c"// realloc of the program's buffer, reallocf), and the record is forgotten\n");
-    buf_str(out, c"// instead of reported (so is one whose red zone changed: changed).\n");
+    buf_str(out, c"// (0.30.1) A block's size by C's allocator (c_size): a live one's when it\n");
+    buf_str(out, c"// was recorded (on glibc, another at a report means C reallocated or freed\n");
+    buf_str(out, c"// it unseen, and the record is forgotten: changed); a held one's, which\n");
+    buf_str(out, c"// HELD_BYTES counts.\n");
     buf_str(out, c"static mut ASZ: *mut u64 = 0 as *mut u64;\n");
     buf_str(out, c"static mut NODES: u64 = 0;\n");
     buf_str(out, c"static mut CAP: u64 = 0;\n");
@@ -94,13 +98,17 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"// was asked for, after its end, which no one is given: so no memory of C's\n");
     buf_str(out, c"// (a block the check never saw) starts at a block's end, and an access\n");
     buf_str(out, c"// there is past the block's end. It holds a tag (record writes it): a\n");
-    buf_str(out, c"// red zone not as written means C gave the memory out again unseen.\n");
+    buf_str(out, c"// red zone not as written was written over unchecked (C's strcpy), which\n");
+    buf_str(out, c"// a report notes (zone_note).\n");
     buf_str(out, c"const REDZONE: u64 = 16;\n");
     buf_str(out, c"static mut RING: *mut u64 = 0 as *mut u64;\n");
     buf_str(out, c"static mut RING_OLD: u64 = 0;\n");
     buf_str(out, c"static mut HELD: u64 = 0;\n");
     buf_str(out, c"static mut HELD_BYTES: u64 = 0;\n");
     buf_str(out, c"static mut LOCK: i64 = 0;\n");
+    buf_str(out, c"// (0.30.1) Whether C's own frees are watched yet (watch_c, at the first\n");
+    buf_str(out, c"// block recorded).\n");
+    buf_str(out, c"static mut WATCHING: bool = false;\n");
     buf_str(out, c"// The live block check found last, [HIT_S, HIT_E) (none: 0, 0): checked\n");
     buf_str(out, c"// first; forgotten whenever a live block is.\n");
     buf_str(out, c"static mut HIT_S: u64 = 0;\n");
@@ -126,24 +134,111 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
         buf_str(out, c"unsafe fn c_size(p: u64) -> u64 {\n");
         buf_str(out, c"    malloc_usable_size(p as *const u8)\n");
         buf_str(out, c"}\n");
+        buf_str(out, c"// C's own frees are not seen here (glibc has no malloc_logger).\n");
+        buf_str(out, c"unsafe fn watch_c() {\n");
+        buf_str(out, c"}\n");
+        buf_str(out,
+            c"// (0.30.1) Whether C reallocated or freed live block n unseen (getline's\n");
+        buf_str(out,
+            c"// realloc of the program's buffer): its size by C's allocator is another.\n");
+        buf_str(out, c"// Then it is forgotten, and what would have been reported of it is not.\n");
+        buf_str(out, c"// (A block C freed and gave out again at its size is still reported:\n");
+        buf_str(out,
+            c"// zone_note's words say so when its red zone changed.) Called holding the\n");
+        buf_str(out, c"// lock.\n");
+        buf_str(out, c"unsafe fn changed(n: u64) -> bool {\n");
+        buf_str(out, c"    let s = get(KEY, n);\n");
+        buf_str(out, c"    if c_size(s) == get(ASZ, n) {\n");
+        buf_str(out, c"        return false;\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    LIVE = remove(LIVE, s);\n");
+        buf_str(out, c"    HIT_S = 0;\n");
+        buf_str(out, c"    HIT_E = 0;\n");
+        buf_str(out, c"    true\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"unsafe fn zone_note() {\n");
+        buf_str(out,
+            c"    dprintf(2, c\"note: the %llu bytes after the block, which no one is given, were written over before: an unchecked write (C's, as strcpy's), or C freed the block unseen and gave its memory out again, and then this report is not the program's\\n\", REDZONE);\n");
+        buf_str(out, c"}\n");
     } else {
         buf_str(out, c"// (0.30.1) What C's allocator holds at block start p (macOS's\n");
         buf_str(out, c"// malloc_size: 0 when p is no block of it, freed included).\n");
         buf_str(out, c"extern \"C\" {\n");
         buf_str(out, c"    fn malloc_size(p: *const u8) -> u64;\n");
+        buf_str(out,
+            c"    static mut malloc_logger: extern \"C\" fn(u32, u64, u64, u64, u64, u32);\n");
         buf_str(out, c"}\n");
         buf_str(out, c"unsafe fn c_size(p: u64) -> u64 {\n");
         buf_str(out, c"    malloc_size(p as *const u8)\n");
+        buf_str(out, c"}\n");
+        buf_str(out,
+            c"// (0.30.1) C's own frees and reallocations are seen (macOS's malloc_logger,\n");
+        buf_str(out,
+            c"// which libmalloc calls on each, the C library's own included: getline's\n");
+        buf_str(out,
+            c"// realloc of the program's buffer, reallocf's free): a live block C frees\n");
+        buf_str(out, c"// is forgotten then, and one the program freed (held) that C frees is a\n");
+        buf_str(out,
+            c"// block freed twice. Not the runtime's own calls (holding the lock: mine).\n");
+        buf_str(out, c"// kind: 2 an allocation, 4 a free (both: a realloc), 8 a1 is the zone;\n");
+        buf_str(out, c"// the block is then a2, else a1. (A free is logged before C frees it; a\n");
+        buf_str(out, c"// realloc after, so another thread may have the old memory recorded\n");
+        buf_str(out, c"// first, and its record is then forgotten: a block unchecked, never one\n");
+        buf_str(out, c"// reported wrongly.)\n");
+        buf_str(out,
+            c"extern \"C\" fn logged(kind: u32, a1: u64, a2: u64, _a3: u64, _result: u64, _frames: u32) {\n");
+        buf_str(out, c"    unsafe {\n");
+        buf_str(out, c"        if kind & 4 == 0 || mine() {\n");
+        buf_str(out, c"            return;\n");
+        buf_str(out, c"        }\n");
+        buf_str(out, c"        let p = if kind & 8 != 0 { a2 } else { a1 };\n");
+        buf_str(out, c"        if p == 0 {\n");
+        buf_str(out, c"            return;\n");
+        buf_str(out, c"        }\n");
+        buf_str(out, c"        lock();\n");
+        buf_str(out, c"        let n = find(LIVE, p);\n");
+        buf_str(out, c"        if n != 0 && get(KEY, n) == p {\n");
+        buf_str(out, c"            LIVE = remove(LIVE, p);\n");
+        buf_str(out, c"            HIT_S = 0;\n");
+        buf_str(out, c"            HIT_E = 0;\n");
+        buf_str(out, c"        } else {\n");
+        buf_str(out, c"            let k = find(FREED_ROOT, p);\n");
+        buf_str(out, c"            if k != 0 && get(KEY, k) == p {\n");
+        buf_str(out,
+            c"                fail(c\"(a freed block freed again, by C)\", p, 0, p, get(END, k), c\"C's free\");\n");
+        buf_str(out, c"            }\n");
+        buf_str(out, c"        }\n");
+        buf_str(out, c"        unlock();\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"unsafe fn watch_c() {\n");
+        buf_str(out, c"    malloc_logger = logged;\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"// Whether C freed live block n unseen: never here (logged sees it).\n");
+        buf_str(out, c"unsafe fn changed(_n: u64) -> bool {\n");
+        buf_str(out, c"    false\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"unsafe fn zone_note() {\n");
+        buf_str(out,
+            c"    dprintf(2, c\"note: the %llu bytes after the block, which no one is given, were written over before (an unchecked write: C's, as strcpy's)\\n\", REDZONE);\n");
         buf_str(out, c"}\n");
     }
     if pcx.std_module >= 0 {
         buf_str(out,
             c"// The tables' lock: a spin lock on LOCK, as an atomic (test and test and\n");
         buf_str(out, c"// set: a waiting thread reads it, and yields now and then).\n");
+        buf_str(out, c"extern \"C\" {\n");
+        buf_str(out, c"    fn pthread_self() -> u64;\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"// (0.30.1) The thread holding LOCK (0: none), for mine.\n");
+        buf_str(out, c"static mut OWNER: u64 = 0;\n");
         buf_str(out, c"unsafe fn lock() {\n");
         buf_str(out, c"    let a = &*(&raw mut LOCK as *const std::sync::atomic::Atomic<i64>);\n");
+        buf_str(out, c"    let o = &*(&raw mut OWNER as *const std::sync::atomic::Atomic<u64>);\n");
         buf_str(out, c"    loop {\n");
         buf_str(out, c"        if a.swap(1, std::sync::atomic::Ordering::Acquire) == 0 {\n");
+        buf_str(out,
+            c"            o.store(pthread_self(), std::sync::atomic::Ordering::Relaxed);\n");
         buf_str(out, c"            return;\n");
         buf_str(out, c"        }\n");
         buf_str(out, c"        let mut n = 0;\n");
@@ -158,13 +253,28 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
         buf_str(out, c"}\n");
         buf_str(out, c"unsafe fn unlock() {\n");
         buf_str(out, c"    let a = &*(&raw mut LOCK as *const std::sync::atomic::Atomic<i64>);\n");
+        buf_str(out, c"    let o = &*(&raw mut OWNER as *const std::sync::atomic::Atomic<u64>);\n");
+        buf_str(out, c"    o.store(0, std::sync::atomic::Ordering::Relaxed);\n");
         buf_str(out, c"    a.store(0, std::sync::atomic::Ordering::Release);\n");
         buf_str(out, c"}\n");
+        buf_str(out, c"// Whether this thread holds the lock: C's malloc and free called by the\n");
+        buf_str(out, c"// runtime itself (its tables, the blocks it gives back).\n");
+        buf_str(out, c"unsafe fn mine() -> bool {\n");
+        buf_str(out, c"    let o = &*(&raw mut OWNER as *const std::sync::atomic::Atomic<u64>);\n");
+        buf_str(out, c"    o.load(std::sync::atomic::Ordering::Relaxed) == pthread_self()\n");
+        buf_str(out, c"}\n");
     } else {
-        buf_str(out, c"// The tables' lock: none without std (no threads).\n");
+        buf_str(out, c"// The tables' lock: none without std (no threads); (0.30.1) whether the\n");
+        buf_str(out, c"// runtime is inside, for mine.\n");
+        buf_str(out, c"static mut INSIDE: bool = false;\n");
         buf_str(out, c"unsafe fn lock() {\n");
+        buf_str(out, c"    INSIDE = true;\n");
         buf_str(out, c"}\n");
         buf_str(out, c"unsafe fn unlock() {\n");
+        buf_str(out, c"    INSIDE = false;\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"unsafe fn mine() -> bool {\n");
+        buf_str(out, c"    INSIDE\n");
         buf_str(out, c"}\n");
     }
     buf_str(out, c"// (Called holding the lock, which it gives up: exit's handlers free.)\n");
@@ -173,6 +283,9 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"    unlock();\n");
     buf_str(out,
         c"    dprintf(2, c\"unsafe access %s: %llu bytes at offset %lld of a block of %llu bytes\\n --> %s\\n\", what, size, p as i64 - start as i64, end - start, site);\n");
+    buf_str(out, c"    if end > start && written_over(start, end) {\n");
+    buf_str(out, c"        zone_note();\n");
+    buf_str(out, c"    }\n");
     buf_str(out, c"    exit(101)\n");
     buf_str(out, c"}\n");
     buf_str(out, c"// A node for block [s, e).\n");
@@ -316,19 +429,24 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"    }\n");
     buf_str(out, c"    let s = p as u64;\n");
     buf_str(out, c"    let e = s + (if size == 0 { 1 } else { size });\n");
-    buf_str(out, c"    // (0.30.1: its red zone, no one's to write, is the tag; [e, e +\n");
-    buf_str(out, c"    // REDZONE) is room's)\n");
-    buf_str(out, c"    let mut i: u64 = 0;\n");
-    buf_str(out, c"    while i < REDZONE {\n");
-    buf_str(out, c"        *((e + i) as *mut u8) = tag(s, i);\n");
-    buf_str(out, c"        i += 1;\n");
-    buf_str(out, c"    }\n");
     buf_str(out, c"    lock();\n");
+    buf_str(out, c"    if !WATCHING {\n");
+    buf_str(out, c"        WATCHING = true;\n");
+    buf_str(out, c"        watch_c();\n");
+    buf_str(out, c"    }\n");
     buf_str(out, c"    // Blocks the new one overlaps are forgotten, live or freed (0.30.1): C\n");
     buf_str(out, c"    // freed them without a call the check saw (a block passed to C, which\n");
     buf_str(out, c"    // freed it), since the allocator returns no memory that is in use.\n");
     buf_str(out, c"    forget_freed(s, e);\n");
     buf_str(out, c"    LIVE = forget_overlapping(LIVE, s, e);\n");
+    buf_str(out, c"    // (0.30.1: its red zone, no one's to write, is the tag, [e, e +\n");
+    buf_str(out, c"    // REDZONE), room's; written holding the lock, which every read of it\n");
+    buf_str(out, c"    // holds, so none sees it half made)\n");
+    buf_str(out, c"    let mut i: u64 = 0;\n");
+    buf_str(out, c"    while i < REDZONE {\n");
+    buf_str(out, c"        *((e + i) as *mut u8) = tag(s, i);\n");
+    buf_str(out, c"        i += 1;\n");
+    buf_str(out, c"    }\n");
     buf_str(out, c"    if s < HIT_E && HIT_S < e {\n");
     buf_str(out, c"        HIT_S = 0;\n");
     buf_str(out, c"        HIT_E = 0;\n");
@@ -353,30 +471,19 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"    }\n");
     buf_str(out, c"    ((h >> 32) as u8) | 1\n");
     buf_str(out, c"}\n");
-    buf_str(out, c"// (0.30.1) Whether C reallocated or freed live block n since it was\n");
-    buf_str(out, c"// recorded, unseen (getline's realloc of the program's buffer, reallocf):\n");
-    buf_str(out, c"// its size by C's allocator is another, or its red zone is not the tag\n");
-    buf_str(out, c"// record wrote (C gave the memory out again and its new owner wrote\n");
-    buf_str(out, c"// there). Then it is forgotten, and what would have been reported of it\n");
-    buf_str(out, c"// is not. A report is made only after this (one in the red zone or past\n");
-    buf_str(out, c"// the end: a byte of the red zone is read before it is ever written, the\n");
-    buf_str(out, c"// program's writes being checked first). Called holding the lock.\n");
-    buf_str(out, c"unsafe fn changed(n: u64) -> bool {\n");
-    buf_str(out, c"    let s = get(KEY, n);\n");
-    buf_str(out, c"    let e = get(END, n);\n");
-    buf_str(out, c"    let mut same = c_size(s) == get(ASZ, n);\n");
+    buf_str(out, c"// (0.30.1) Whether the red zone of block [s, e) is not the tag record\n");
+    buf_str(out, c"// wrote: written over since (an unchecked write: C's strcpy or memset of\n");
+    buf_str(out, c"// the program's, or, where C's frees are not seen, C's new owner of the\n");
+    buf_str(out, c"// memory). Only a report reads it, as a note. Called holding the lock.\n");
+    buf_str(out, c"unsafe fn written_over(s: u64, e: u64) -> bool {\n");
     buf_str(out, c"    let mut i: u64 = 0;\n");
-    buf_str(out, c"    while same && i < REDZONE {\n");
-    buf_str(out, c"        same = *((e + i) as *const u8) == tag(s, i);\n");
+    buf_str(out, c"    while i < REDZONE {\n");
+    buf_str(out, c"        if *((e + i) as *const u8) != tag(s, i) {\n");
+    buf_str(out, c"            return true;\n");
+    buf_str(out, c"        }\n");
     buf_str(out, c"        i += 1;\n");
     buf_str(out, c"    }\n");
-    buf_str(out, c"    if same {\n");
-    buf_str(out, c"        return false;\n");
-    buf_str(out, c"    }\n");
-    buf_str(out, c"    LIVE = remove(LIVE, s);\n");
-    buf_str(out, c"    HIT_S = 0;\n");
-    buf_str(out, c"    HIT_E = 0;\n");
-    buf_str(out, c"    true\n");
+    buf_str(out, c"    false\n");
     buf_str(out, c"}\n");
     buf_str(out, c"// FREED without the blocks [s, e) overlaps (no longer held).\n");
     buf_str(out, c"unsafe fn forget_freed(s: u64, e: u64) {\n");
@@ -385,7 +492,7 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"        if n == 0 || get(END, n) <= s {\n");
     buf_str(out, c"            return;\n");
     buf_str(out, c"        }\n");
-    buf_str(out, c"        HELD_BYTES -= get(END, n) - get(KEY, n);\n");
+    buf_str(out, c"        HELD_BYTES -= get(ASZ, n);\n");
     buf_str(out, c"        FREED_ROOT = remove(FREED_ROOT, get(KEY, n));\n");
     buf_str(out, c"    }\n");
     buf_str(out, c"}\n");
@@ -398,7 +505,7 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"    HELD -= 1;\n");
     buf_str(out, c"    let n = find(FREED_ROOT, s);\n");
     buf_str(out, c"    if s != 0 && n != 0 && get(KEY, n) == s {\n");
-    buf_str(out, c"        HELD_BYTES -= get(END, n) - s;\n");
+    buf_str(out, c"        HELD_BYTES -= get(ASZ, n);\n");
     buf_str(out, c"        FREED_ROOT = remove(FREED_ROOT, s);\n");
     buf_str(out, c"        free(s as *mut u8);\n");
     buf_str(out, c"    }\n");
@@ -407,9 +514,10 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"// back to C yet) and its size returned; a block of FREED fails (`again`:\n");
     buf_str(out, c"// freed twice, or reallocated once freed); any other (C's own, or null)\n");
     buf_str(out, c"// returns 0, for C to free. The blocks held are at most FREED, and at most\n");
-    buf_str(out, c"// QUARANTINE bytes: past that the oldest are given back, the one just\n");
-    buf_str(out, c"// freed too when it alone is more (it is then forgotten at once: a use of\n");
-    buf_str(out, c"// it after the free is not seen).\n");
+    buf_str(out, c"// QUARANTINE bytes of C's (its size for each, red zone and rounding\n");
+    buf_str(out, c"// included): past that the oldest are given back. A block that alone is\n");
+    buf_str(out, c"// more is given back at once, and only it (a use of it after the free is\n");
+    buf_str(out, c"// not seen; the blocks held stay held).\n");
     buf_str(out, c"unsafe fn hold(p: *mut u8, again: *const u8, site: *const u8) -> u64 {\n");
     buf_str(out, c"    if p == 0 as *mut u8 {\n");
     buf_str(out, c"        return 0;\n");
@@ -429,6 +537,12 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"    LIVE = remove(LIVE, s);\n");
     buf_str(out, c"    HIT_S = 0;\n");
     buf_str(out, c"    HIT_E = 0;\n");
+    buf_str(out, c"    let bytes = c_size(s);\n");
+    buf_str(out, c"    if bytes > QUARANTINE {\n");
+    buf_str(out, c"        unlock();\n");
+    buf_str(out, c"        free(p);\n");
+    buf_str(out, c"        return e - s;\n");
+    buf_str(out, c"    }\n");
     buf_str(out, c"    if RING == 0 as *mut u64 {\n");
     buf_str(out, c"        RING = calloc(FREED, 8) as *mut u64;\n");
     buf_str(out, c"        if RING == 0 as *mut u64 {\n");
@@ -443,8 +557,10 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"    }\n");
     buf_str(out, c"    set(RING, (RING_OLD + HELD) % FREED, s);\n");
     buf_str(out, c"    HELD += 1;\n");
-    buf_str(out, c"    HELD_BYTES += e - s;\n");
-    buf_str(out, c"    FREED_ROOT = insert(FREED_ROOT, node(s, e));\n");
+    buf_str(out, c"    HELD_BYTES += bytes;\n");
+    buf_str(out, c"    let k = node(s, e);\n");
+    buf_str(out, c"    set(ASZ, k, bytes);\n");
+    buf_str(out, c"    FREED_ROOT = insert(FREED_ROOT, k);\n");
     buf_str(out, c"    while HELD_BYTES > QUARANTINE && HELD > 0 {\n");
     buf_str(out, c"        release_oldest();\n");
     buf_str(out, c"    }\n");
@@ -522,6 +638,23 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"    }\n");
     buf_str(out, c"    r\n");
     buf_str(out, c"}\n");
+    buf_str(out, c"// (0.30.1) C's copies and fills (std's ptr::copy, copy_nonoverlapping and\n");
+    buf_str(out, c"// fill_copies from 4 elements up, and the program's own calls): their\n");
+    buf_str(out, c"// bytes checked as accesses first, the destination's and the source's.\n");
+    buf_str(out, c"pub unsafe fn memcpy_(d: *mut u8, s: *const u8, n: u64) -> *mut u8 {\n");
+    buf_str(out, c"    check(d as u64, n, c\"memcpy, its destination\");\n");
+    buf_str(out, c"    check(s as u64, n, c\"memcpy, its source\");\n");
+    buf_str(out, c"    memcpy(d, s, n)\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"pub unsafe fn memmove_(d: *mut u8, s: *const u8, n: u64) -> *mut u8 {\n");
+    buf_str(out, c"    check(d as u64, n, c\"memmove, its destination\");\n");
+    buf_str(out, c"    check(s as u64, n, c\"memmove, its source\");\n");
+    buf_str(out, c"    memmove(d, s, n)\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"pub unsafe fn memset_(d: *mut u8, c: i32, n: u64) -> *mut u8 {\n");
+    buf_str(out, c"    check(d as u64, n, c\"memset, its destination\");\n");
+    buf_str(out, c"    memset(d, c, n)\n");
+    buf_str(out, c"}\n");
     buf_str(out, c"pub unsafe fn free_(p: *mut u8) {\n");
     buf_str(out, c"    if hold(p, c\"(a block freed twice)\", c\"free\") == 0 {\n");
     buf_str(out, c"        free(p);\n");
@@ -563,6 +696,9 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"            unlock();\n");
     buf_str(out,
         c"            dprintf(2, c\"unsafe address out of bounds: offset %lld of a block of %llu bytes (an address from offset %lld)\\n --> %s\\n\", at as i64 - s as i64, e - s, base as i64 - s as i64, site);\n");
+    buf_str(out, c"            if written_over(s, e) {\n");
+    buf_str(out, c"                zone_note();\n");
+    buf_str(out, c"            }\n");
     buf_str(out, c"            exit(101);\n");
     buf_str(out, c"        }\n");
     buf_str(out, c"    }\n");
@@ -643,7 +779,8 @@ pub fn check_fn(name: *const u8, pcx: &mut Ctx<Comp>) -> i64 {
 }
 
 // The wrapper a call of C function f, from a function of module `from`,
-// goes to instead (malloc, calloc, realloc, posix_memalign and free), or f.
+// goes to instead (malloc, calloc, realloc, posix_memalign and free; 0.30.1:
+// memcpy, memmove and memset, whose bytes are checked first), or f.
 // (The runtimes' own calls are not redirected.) (0.30.1) A C function is
 // the symbol it links to (its FNS name, its #[link_name] when it has one):
 // std's Gpa calls `#[link_name = "malloc"] fn gpa_c_malloc`, which is
@@ -654,10 +791,11 @@ pub fn redirect_alloc(f: i64, from: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return f;
     }
     let name = sym_name(crate::front::effects::builtin::c_symbol(f, pcx), pcx);
-    let names: [*const u8; 5] = [c"malloc", c"calloc", c"realloc", c"posix_memalign", c"free"];
-    let wrappers: [*const u8; 5] = [c"malloc_", c"calloc_", c"realloc_", c"posix_memalign_",
-        c"free_"];
-    for i in 0..5 {
+    let names: [*const u8; 8] = [c"malloc", c"calloc", c"realloc", c"posix_memalign", c"free",
+        c"memcpy", c"memmove", c"memset"];
+    let wrappers: [*const u8; 8] = [c"malloc_", c"calloc_", c"realloc_", c"posix_memalign_",
+        c"free_", c"memcpy_", c"memmove_", c"memset_"];
+    for i in 0..8 {
         if crate::base::streq(name, names[i as usize]) {
             let w = check_fn(wrappers[i as usize], pcx);
             return if w >= 0 { w } else { f };
