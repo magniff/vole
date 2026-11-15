@@ -486,8 +486,12 @@ println, eprint, eprintln, format_in, fmt::write and writeln
 (interp.vl direct_call: `=fK` lets, D2.9's borrow); format_args, assert's
 and debug_assert's message (expand, a value: `=fK = &P`); panic's message
 (written in place, F16.3; its last call never returns, so the scope's
-`mention _k` is never reached, and each open hidden borrow is mentioned
-just before a call of type `!`, build.vl mention_open); a contract's
+`mention _k` is never reached, and each open hidden borrow whose copy has
+been read is mentioned just before a call of a function returning `!`,
+build.vl mention_open, copy_read_yet; an exit, `return` or `break` out of
+the desugaring, mentions only those too: a borrow whose copy is not read
+on the way, `println("{} {}", s, { drop(s); exit(0) })`, keeps nothing
+alive, as rustc accepts; case `rust_b_hidden_diverge_ok`); a contract's
 message (its holes are integers, Copy: nothing to borrow). A
 `format_args` value's hole is borrowed when it is a place of any type
 that is not Copy (0.30.1 review: a struct holding a `&mut`, which the
@@ -596,6 +600,26 @@ type (D4.2's parallel walk) and each slot whose region it names
 outlives it (`'r : 'static`, `'r : 'a` for a named `'a` of the
 function); an elided region adds nothing. With the assignment's `sub`,
 the initializer's regions outlive the annotation's.
+
+**D3.6a (a view argument; 0.30.1).** A mutable view place (`&mut [T]`,
+`&mut str`) given to a call is reborrowed, `_t = slice 'r mut2 s[..]`
+(places/build.vl lower_arg, implicit_reslice; a shared view of it, `'r
+s[..]`, where the parameter is shared, a receiver's `&self` of `len`):
+the slicing node is marked NODE_IMPLICIT, and constraints.vl makes its
+exclusive loan two-phase (`BK_MUT2`), as rustc's implicit `&mut *s`, so
+a later argument may read the view (`g(s, s.len())`,
+`s.split_at_mut(s.len() / 2)`) and none may write it (`g(s, { s[0] = 5;
+0 })`, E0506). Two such loans activated by one call (`f(s, s)`) are one
+`mut_twice` (E0499), reported for the later. A contract's binding of a
+view argument, `?aI = &mut s[..]` (desugar.vl reborrowed_view), is the
+same implicit reborrow. Before, the view was copied into the call
+(I7 read the copy as its reborrow from the call on), and `f(s, s)`
+passed one `&mut [T]` twice: a use after free under `--check-alloc`, a
+result that differed between -O0 and -O2. A mutable slice of a place
+behind a shared reference (`&mut r.s[..]`, `two(r1.s, r2.s)` of `r1,
+r2: &W`) is `borrow_immutable` (E0596, moves.vl mutability). *Cases:*
+`rust_b_err_view_arg_twice`, `rust_b_err_view_arg_written`,
+`rust_b_err_view_through_shared`, `rust_b_tp_view_reborrow_ok`.
 
 **D3.6 (constraints per statement and terminator).** One pass over
 `P_STMTS` in RPO after elaboration (so `DS_*` decisions and flags
@@ -1255,7 +1279,17 @@ struct is moved too), so the paths are built for the body when elab
 skipped them.
 
 **D8.3 (rules).** Each an `error borrowck.use_moved` (rustc E0382)
-unless named, at the access's statement.
+unless named, at the access's statement. (0.30.1: whether a type is Copy,
+regions.vl copy_in, is decided all the way down it: past depth 16 the
+walk answered Copy, and 17 one-element arrays or one-tuples around a
+String were copied twice, `rust_b_err_copy_deep`. The other walks of a
+type or a type node in regions.vl lost their depth cut-offs too,
+slots_in, decl_pairs, bind_walk, slot_variances_in, var_walk, req_walk,
+bound_at, header_param_type, impl_bound_ties, proj_again, proj_bound:
+each follows a finite tree. adt_reqs, which reads the declarations a
+field names and so may come back to one, keeps a stack of them instead
+of its depth 8; raw_in, which follows fields, answers "holds a raw
+pointer", the refusing answer, past depth 16.)
 - (M1) A `Read`, a `WB`/`Reserve`/`Read` by a borrow, an `OK_MOVE`, or
   an `SK_MENTION` of `Q` at `p` with `path(Q) = m` requires `DefInit(m',
   2·loc(p))` for `m` and every descendant `m'` (deep); when `Q` has no

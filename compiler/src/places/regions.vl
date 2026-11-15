@@ -421,7 +421,10 @@ pub fn rust_copy(t: i64, pcx: &mut Ctx<Comp>) -> bool {
 }
 
 fn copy_in(t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
-    if t <= 0 || depth > 16 {
+    // (0.30.1: no depth cut-off: a type is a finite tree, and the walk
+    // follows only its arguments and a closure's captures; past depth 16
+    // it answered Copy, and 17 arrays around a String were copied twice)
+    if t <= 0 {
         return true;
     }
     let k = pcx.types[t as usize].kind;
@@ -489,8 +492,13 @@ pub fn holds_raw(t: i64, pcx: &Ctx<Comp>) -> bool {
 }
 
 fn raw_in(t: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
-    if t <= 0 || depth > 16 {
+    if t <= 0 {
         return false;
+    }
+    // (0.30.1: the walk follows fields, a recursive type's too: past depth
+    // 16 the answer is the refusing one, "holds a raw pointer", not "plain")
+    if depth > 16 {
+        return true;
     }
     let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr {
@@ -533,7 +541,9 @@ pub fn old_plain(t: i64, pcx: &mut Ctx<Comp>) -> bool {
 }
 
 fn slots_in(t: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
-    if t <= 0 || depth > 16 {
+    // (0.30.1: no depth cut-off, a type is a finite tree: past 16 it
+    // counted no slot, and a reference nested deeper had no region)
+    if t <= 0 {
         return 0;
     }
     let k = pcx.types[t as usize].kind;
@@ -859,7 +869,7 @@ fn closure_sig(id: i64, f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
 // (`Scope<'scope, 'env: 'scope>`: 'env outlives 'scope), as pairs of t's
 // slot positions from off (a outlives b; b = -1: 'static), pushed to out.
 fn decl_pairs(t: i64, off: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
-    if t <= 0 || depth > 16 {
+    if t <= 0 {
         return;
     }
     let k = pcx.types[t as usize].kind;
@@ -921,7 +931,8 @@ fn decl_pairs(t: i64, off: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<
     // RULE: D4.6 (the declaration's inferred outlives requirements, a
     // parameter's as each of its substitution's slots)
     let mut reqs = Vec::<i64, Comp>::new_in(Comp {});
-    adt_reqs(t, depth, &mut reqs, pcx);
+    let mut stack = Vec::<i64, Comp>::new_in(Comp {});
+    adt_reqs(t, &mut stack, &mut reqs, pcx);
     let mut r: i64 = 0;
     while r + 1 < reqs.len() as i64 {
         let a = reqs[r as usize];
@@ -943,8 +954,12 @@ fn decl_pairs(t: i64, off: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<
 // declaration (rustc's RFC 2093), from its fields' types: pairs (a, b), a
 // the declaration's lifetime index or, from its lifetime count up, its type
 // parameter's; b a lifetime index or -1 ('static); a outlives b.
-fn adt_reqs(t: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
-    if t <= 0 || depth > 8 {
+// (0.30.1) stack: the declarations being read, outer first: a field that
+// names one of them again (`struct L<'a> { next: Option<&'a L<'a>> }`) adds
+// nothing new, its requirements are the ones being found. Before, a depth
+// cut-off at 8 dropped the requirements of a declaration nested deeper.
+fn adt_reqs(t: i64, stack: &mut Vec<i64, Comp>, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    if t <= 0 {
         return;
     }
     let k = pcx.types[t as usize].kind;
@@ -953,17 +968,19 @@ fn adt_reqs(t: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
         return;
     }
     let node = adt_node(t, pcx);
-    if node <= 0 {
+    if node <= 0 || stack.contains(&node) {
         return;
     }
+    stack.push(node);
     if k == TyKind::Struct {
         let s = pcx.types[t as usize].a;
         for i in 0..pcx.nodes[node as usize].count {
             let field = child(node, i, pcx);
             let ft: i64 = if i < struct_field_count(s, pcx) { struct_field_ty(s, i, pcx) }
                 else { 0 };
-            req_walk(pcx.nodes[field as usize].b, ft, -2, node, depth, out, pcx);
+            req_walk(pcx.nodes[field as usize].b, ft, -2, node, stack, out, pcx);
         }
+        stack.pop();
         return;
     }
     let first = enum_info(pcx.types[t as usize].a, pcx).variants;
@@ -976,9 +993,10 @@ fn adt_reqs(t: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
                 && j < crate::places::ir::variant_field_count(first + i, pcx) {
                 variant_field(first + i, j, pcx)
             } else { 0 };
-            req_walk(fast, ft, -2, node, depth, out, pcx);
+            req_walk(fast, ft, -2, node, stack, out, pcx);
         }
     }
+    stack.pop();
 }
 
 // A lifetime written as sym in declaration dn's fields, as adt_reqs counts
@@ -1008,9 +1026,9 @@ fn req_push(a: i64, b: i64, out: &mut Vec<i64, Comp>) {
 // 'static, -2 none): every lifetime and type parameter n names outlives
 // enc; a reference's or view's lifetime is the new enc below it; a struct
 // or enum named adds its own requirements, read in dn's terms.
-fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: &mut Vec<i64, Comp>,
+fn req_walk(n: i64, t: i64, enc: i64, dn: i64, stack: &mut Vec<i64, Comp>, out: &mut Vec<i64, Comp>,
     pcx: &Ctx<Comp>) {
-    if n <= 0 || depth > 16 {
+    if n <= 0 {
         return;
     }
     let k = pcx.nodes[n as usize].kind;
@@ -1021,9 +1039,9 @@ fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: &mut Vec<i64, Co
             let me = req_lifetime(pcx.nodes[n as usize].c, dn, pcx);
             req_push(me, enc, out);
             req_walk(pcx.nodes[n as usize].a, inner_t, if me == -2 { enc } else { me }, dn,
-                depth + 1, out, pcx);
+                stack, out, pcx);
         } else {
-            req_walk(pcx.nodes[n as usize].a, inner_t, enc, dn, depth + 1, out, pcx);
+            req_walk(pcx.nodes[n as usize].a, inner_t, enc, dn, stack, out, pcx);
         }
         return;
     }
@@ -1031,13 +1049,13 @@ fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: &mut Vec<i64, Co
         let me = req_lifetime(pcx.nodes[n as usize].c, dn, pcx);
         req_push(me, enc, out);
         let inner_t: i64 = if tk == TyKind::Slice { pcx.types[t as usize].a } else { 0 };
-        req_walk(pcx.nodes[n as usize].a, inner_t, if me == -2 { enc } else { me }, dn, depth + 1,
+        req_walk(pcx.nodes[n as usize].a, inner_t, if me == -2 { enc } else { me }, dn, stack,
             out, pcx);
         return;
     }
     if k == NodeKind::TyArray {
         let inner_t: i64 = if tk == TyKind::Array { pcx.types[t as usize].a } else { 0 };
-        req_walk(pcx.nodes[n as usize].a, inner_t, enc, dn, depth + 1, out, pcx);
+        req_walk(pcx.nodes[n as usize].a, inner_t, enc, dn, stack, out, pcx);
         return;
     }
     if k == NodeKind::TyTuple {
@@ -1045,7 +1063,7 @@ fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: &mut Vec<i64, Co
             let et: i64 = if tk == TyKind::Tuple
                 && i < pcx.types[t as usize].count { type_elem(t, i, pcx) }
                 else { 0 };
-            req_walk(child(n, i, pcx), et, enc, dn, depth + 1, out, pcx);
+            req_walk(child(n, i, pcx), et, enc, dn, stack, out, pcx);
         }
         return;
     }
@@ -1083,7 +1101,7 @@ fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: &mut Vec<i64, Co
     let nargs: i64 = if args > 0 { pcx.nodes[args as usize].count } else { 0 };
     for i in 0..nargs {
         let at: i64 = if adt && i < adt_targ_count(t, pcx) { adt_targ(t, i, pcx) } else { 0 };
-        req_walk(child(args, i, pcx), at, enc, dn, depth + 1, out, pcx);
+        req_walk(child(args, i, pcx), at, enc, dn, stack, out, pcx);
     }
     if !adt {
         return;
@@ -1091,7 +1109,7 @@ fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: &mut Vec<i64, Co
     // (the named type's own requirements, its lifetimes and parameters
     // replaced by what n writes for them)
     let mut sub = Vec::<i64, Comp>::new_in(Comp {});
-    adt_reqs(t, depth + 1, &mut sub, pcx);
+    adt_reqs(t, stack, &mut sub, pcx);
     let dm = decl_lifetimes(adt_node(t, pcx), pcx);
     let mut r: i64 = 0;
     while r + 1 < sub.len() as i64 {
@@ -1109,7 +1127,7 @@ fn req_walk(n: i64, t: i64, enc: i64, dn: i64, depth: i64, out: &mut Vec<i64, Co
                 req_push(req_lifetime(pcx.nodes[child(lts, a, pcx) as usize].a, dn, pcx), b, out);
             }
         } else if a - dm < nargs && a - dm < adt_targ_count(t, pcx) {
-            req_walk(child(args, a - dm, pcx), adt_targ(t, a - dm, pcx), b, dn, depth + 1, out,
+            req_walk(child(args, a - dm, pcx), adt_targ(t, a - dm, pcx), b, dn, stack, out,
                 pcx);
         }
     }
@@ -1280,7 +1298,9 @@ fn push_lifetime(sym: i64, up: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
 // parameters in scope; self_node the type `Self` names (0: none).
 fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: &mut Vec<i64, Comp>,
     depth: i64, pcx: &Ctx<Comp>, f: i64) {
-    if t <= 0 || depth > 16 {
+    // (0.30.1: no depth cut-off, as slots_in has none: the walk is of a
+    // finite type and type node, and its entries must be slots_in's)
+    if t <= 0 {
         return;
     }
     if f >= 0 && omega_proj(n0, t, tps, up, out, depth, f, pcx) {
@@ -1665,7 +1685,7 @@ fn proj_map(i: i64, vn: i64, t: i64, s: i64, base: &Vec<i64, Comp>, up: i64,
 // when vn is not such a projection or no impl defines it.
 fn proj_again(i: i64, vn: i64, t: i64, s: i64, base: &Vec<i64, Comp>, up: i64,
     out: &mut Vec<i64, Comp>, depth: i64, pcx: &Ctx<Comp>) -> bool {
-    if depth > 12 || !proj_shape(vn, pcx) {
+    if !proj_shape(vn, pcx) {
         return false;
     }
     let inode = pcx.traits_impls[i as usize].node;
@@ -1708,9 +1728,6 @@ fn proj_again(i: i64, vn: i64, t: i64, s: i64, base: &Vec<i64, Comp>, up: i64,
 // bound reaches it.
 fn proj_bound(i: i64, vn: i64, t: i64, s: i64, base: &Vec<i64, Comp>, up: i64,
     out: &mut Vec<i64, Comp>, depth: i64, pcx: &Ctx<Comp>) -> bool {
-    if depth > 12 {
-        return false;
-    }
     let k = unnamed_param(i, vn, s, pcx);
     if k < 0 {
         return false;
@@ -1786,7 +1803,7 @@ fn unnamed_param(i: i64, vn: i64, s: i64, pcx: &Ctx<Comp>) -> i64 {
 // type node x has type parameter k of generics tps, walking both alike
 // (references, slices, arrays, a type's arguments); 0 where they part.
 fn bound_at(x: i64, v: i64, tps: i64, k: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
-    if x <= 0 || v <= 0 || depth > 8 {
+    if x <= 0 || v <= 0 {
         return 0;
     }
     let kx = pcx.nodes[x as usize].kind;
@@ -2482,7 +2499,7 @@ fn bound_ties(f: i64, tps: i64, self_node: i64, sig: &mut Sig<Comp>, pcx: &mut C
 // (`Rev<Chain<..>>`'s `I: DoubleEndedIterator`, Chain's impl of it).
 fn impl_bound_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, tps: i64, depth: i64,
     sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
-    if s <= 0 || depth > 6 {
+    if s <= 0 {
         return;
     }
     let mut found: i64 = -1;
@@ -2749,7 +2766,7 @@ fn param_proj(i: i64, q: i64, tr: i64, name: i64, sq: i64, bq: &Vec<i64, Comp>,
 // generics itps), or 0: `Chain<A, B>` at Chain<Iter<i64>, Rev<..>> gives B
 // Rev<..>.
 fn header_param_type(n: i64, t: i64, itps: i64, q: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
-    if n <= 0 || t <= 0 || depth > 8 {
+    if n <= 0 || t <= 0 {
         return 0;
     }
     let k = pcx.nodes[n as usize].kind;
@@ -3190,7 +3207,7 @@ pub fn slot_variances(t: i64, c: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>)
 }
 
 fn slot_variances_in(t: i64, c: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
-    if t <= 0 || depth > 16 {
+    if t <= 0 {
         return;
     }
     let k = pcx.types[t as usize].kind;
@@ -3443,7 +3460,7 @@ fn lifetime_at(sym: i64, c: i64, d: i64, dn: i64, pcx: &mut Ctx<Comp>) -> bool {
 // at context c, for declaration d (node dn): D5.2's constructors, D5.3's
 // user types (their variance as it is so far).
 fn var_walk(n: i64, t: i64, c: i64, d: i64, dn: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
-    if n <= 0 || c == V_BI || depth > 16 {
+    if n <= 0 || c == V_BI {
         return false;
     }
     let k = pcx.nodes[n as usize].kind;
