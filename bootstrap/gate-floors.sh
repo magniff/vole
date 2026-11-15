@@ -164,7 +164,7 @@ case "$STEP" in
         echo "floor $STEP: $(awk '$2 == "pass"' "$R" | wc -l | tr -d ' ') passed, $(awk '$2 == "xfail"' "$R" | wc -l | tr -d ' ') xfail, $(wc -l <"$T/skipped" | tr -d ' ') skipped (each for its REQUIRES on $HOST, $cc) of the tree's $(wc -l <"$T/listed" | tr -d ' ') cases, each by its record"
         exit 0 ;;
     # (each program asked for is counted: -n FZ)
-    fuzz-plain|fuzz-loops|fuzz-generics|fuzz-pressure|fuzz-calls|fuzz-lang06|fuzz-vector|fuzz-div|fuzz-range|fuzz-arch|fuzz-guard|fuzz-seed)
+    fuzz-plain|fuzz-loops|fuzz-generics|fuzz-pressure|fuzz-calls|fuzz-lang06|fuzz-vector|fuzz-div|fuzz-range|fuzz-arch|fuzz-guard|fuzz-moves|fuzz-moves-vec|fuzz-seed)
         judge "$(count 'fuzz: ')" "$FZ" "programs" ;;
     # (five runs of SFZ programs each)
     fuzz-sem)
