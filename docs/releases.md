@@ -132,7 +132,9 @@ that keeps few values live is unlikely to make such moves.
   form a cycle through two slots, one holding an integer and one an
   f64, one value is saved in the cycle register first. 0.30.0 chose
   the register and the save's width by the move writing the slot, not
-  by the value in it: an integer went through d31 and was stored as
+  by the value in it. The forms seen, on 0.30.0 or on 0.30.1's branch
+  before the fix (the same code; which programs make the cycle differs
+  with the allocation): an integer went through d31 and was stored as
   `str x63`, which the assembler encoded as `str xzr` (a 0), an f64
   through x17 as `str d-15` (encoded `str s0`), and on x86-64 an f64
   saved by an f32's `movss` lost its upper half, `movq %xmm15, m` was
@@ -142,7 +144,11 @@ that keeps few values live is unlikely to make such moves.
   takes 2 or 4 of the 8-byte slots, and its neighbours may hold other
   values at other times. 0.30.0 ordered an edge's moves by slot
   number, so a move writing slot k+1 could run before the move reading
-  a vector from slot k, which then read half of another value. A
+  a vector from slot k, which then read half of another value (two of
+  the cases, `rt_cg_006_wide_slot_v4f32_beside_f64_swap_o1` and
+  `rt_cg_006_vector_cycle_through_q31_o1`, fail on 0.30.1's branch
+  before the fix and pass on 0.30.0, whose allocation makes no such
+  edge there; the review's vector programs fail on both). A
   location is now a range of cells everywhere the moves are ordered
   and checked.
 - One function orders an edge's moves, and `--verify-regalloc` checks
@@ -161,17 +167,31 @@ that keeps few values live is unlikely to make such moves.
   `movsd m, %r10`). AArch64 `ldr`/`str` of `h` and `b` registers were
   encoded as `q`, and are now encoded by their size. A C function
   named like a register (`d5`, `w7`) is a symbol in `bl`, `adrp` and
-  the other instructions that take one; 0.30.0 took it for a register on aarch64-linux, where C's names have
-  no `_`, and failed to assemble the call.
+  the other instructions that take one; 0.30.0 took it for a register
+  on aarch64-linux, where C's names have no `_`, and failed to
+  assemble the call.
 - The cases: `rt_cg_005_*` and `rt_cg_006_*` in tests/run, 21 of them,
-  most at -O0, -O1 and -O2 (the levels where 0.30.0 made no cycle are
-  output guards) with rustc's output as their EXPECT; one at -O1 whose
-  assembly must save a vector cycle through q31, and one whose two
-  cycles need the cycle register at once (these two expect -O0's
-  output). Random programs of the
-  same kind: `tests/fuzz/run.sh -M` and `-M -V`, the gate's rows
-  `fuzz-moves` and `fuzz-moves-vec`, run by tests/affected.sh for a
-  change to the back end.
+  most at -O0, -O1 and -O2 (the levels where the program makes no
+  cycle are output guards) with rustc's output as their EXPECT; one at
+  -O1 whose assembly must save a vector cycle through q31, and one whose
+  two cycles need the cycle register at once (these two expect -O0's
+  output). Random programs of the same kind, built with
+  `--verify-regalloc`: `tests/fuzz/run.sh -M` and `-M -V`, the gate's
+  rows `fuzz-moves` and `fuzz-moves-vec` and, under Rosetta,
+  `fuzz-moves-x86` and `fuzz-moves-vec-x86` (at least 20 programs
+  each, the quick gate's too), run by tests/affected.sh for a change to
+  the back end with `tests/fuzz/pm_model.py`, a model of the moves'
+  plan run over random edges.
+- How the plan breaks a cycle (`plan_break`): when every pending move
+  waits, a value is saved whose readers can then all be made before the
+  next stall, if there is one; two saves may have to be pending at
+  once (an edge with two cycles joined through a wide move needs them
+  whatever is chosen), the cycle register's and 4 cells kept at the end
+  of a vector function's spill area. Measured on the model, 2,000,000
+  edges for each target: never a third. The plan of this branch's
+  second review walked to a cycle and saved what it found there, and
+  died for want of a third save on 133 of 200,000 x86-64 edges (an
+  internal error, never code).
 - The cost, in instructions: the compiler's -O2 self-build +0.5% (its
   phase of register allocation and emission +4.4%, the registers' and
   cells' checks), -O0 0.0%; examples/nes +0.17% at -O0, +0.37% at -O2.

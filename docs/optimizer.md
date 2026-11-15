@@ -223,8 +223,17 @@ over the control flow graph: the contents of every register and spill
 slot, through the moves (planned by the same functions the emitter uses),
 definitions, stores and clobbers, meeting at joins (a location whose
 predecessors disagree holds nothing), until nothing changes; every use
-must find its value where the allocation says it is. `--print-regalloc`
-shows the blocks' positions and every value's intervals and locations.
+must find its value where the allocation says it is. The moves it
+simulates are those of the gaps between instructions and of the blocks'
+starts and ends (the edges'), in pm_plan's order. It does not simulate
+the moves the emitter makes around them (0.30.1, as
+the second review of RT-CG-6 noted): a call's arguments into the ABI's
+registers and stack slots and its results out (pieces), the entry's
+parameters from the ABI's places to their locations (a parameter is
+taken to be where the allocation has it), and the return value into its
+register. Those are checked only by the class checks of `m_check_reg`
+and by the tests. `--print-regalloc` shows the blocks' positions and
+every value's intervals and locations.
 
 **Registers and their classes** (0.30.1, RT-CG-5). A spill slot is
 shared by values of either class, so an edge's moves can form a cycle
@@ -256,8 +265,9 @@ range of cells: a register is one, slot k with a value of size s is the
 cells k .. k + ceil(s / 8) - 1 (`loc_cells`), and two locations are the
 same place when their cells meet (`locs_overlap`). 0.30.0 compared slot
 numbers, so a move writing slot k+1 was not ordered after the move
-reading a vector from slot k: `ldr d30, [sp]; str d30, [sp, #24]; ldr
-q17, [sp, #16]` on AArch64 at -O1, `movups %xmm2, 144(%rsp)` then
+reading a vector from slot k (0.30.1's branch before the fix, on the
+review's programs): `ldr d30, [sp]; str d30, [sp, #24]; ldr q17, [sp,
+#16]` on AArch64 at -O1, `movups %xmm2, 144(%rsp)` then
 `movsd %xmm2, 152(%rsp)` on x86-64, and the vector read had half of an
 f64 in it. The order of an edge's moves is one function, `pm_plan`: it
 gives the steps (destination, source, type), the emitter emits them and
