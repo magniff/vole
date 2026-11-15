@@ -71,21 +71,47 @@ pub fn query_drops(arg: &[u8], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 
         return 1;
     }
     let pos = line_at(idx, pcx);
-    let f = body_at(pos, line_end(pos, pcx), pcx);
-    if f < 0 {
+    let mut fs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    bodies_at(pos, line_end(pos, pcx), &mut fs, pcx);
+    if fs.len() == 0 {
         let d = diag(c"error", c"query.no-match", tcx);
         buf_bytes(d, arg);
         buf_str(d, c" is in no function with a body in the places IR (a generic one never instantiated, C's, or one with errors)\n");
         try_end(try_begin(c"show", arg, true, tcx, pcx));
         return 1;
     }
-    load_body(f, &mut pbody, pcx);
     let out = buf_new();
+    // (RT-34: a function with an `ensures` holds its body in `f$body`, one
+    // with a `requires` its checks in `f$pre`, a #[multiversion] one a copy
+    // per version, all with its text: each is shown, in the order of FNS)
+    for f in fs.iter().copied() {
+        load_body(f, &mut pbody, pcx);
+        // (two headers alike, a closure and its copy in a #[multiversion]
+        // version: each named with the function it is in)
+        let display = pcx.fns[f as usize].display;
+        let alike = fs.iter().copied().filter(|h| pcx.fns[*h as usize].display == display).count()
+            > 1;
+        put_drops(out, g, line, f, alike, &pbody, pcx);
+    }
+    buf_write_fd(out, STDOUT);
+    0
+}
+
+// Function f's drops (its body pbody), headed by the line asked about
+// (alike: another function shown has its name; a closure's then names
+// the function it is in).
+fn put_drops(out: i64, g: i64, line: i64, f: i64, alike: bool, pbody: &Body<Comp>,
+    pcx: &mut Ctx<Comp>) {
     buf_bytes(out, file_text(g, pcx));
     buf_byte(out, b':');
     buf_int(out, line);
     buf_str(out, c" in ");
     buf_fn_name(out, f, pcx);
+    let c = if alike { crate::places::regions::closure_of_fn(f, pcx) } else { -1 };
+    if c >= 0 && pcx.closures[c as usize].encl_fn >= 0 {
+        buf_str(out, c", in ");
+        buf_fn_name(out, pcx.closures[c as usize].encl_fn, pcx);
+    }
     buf_byte(out, b'\n');
     // (by where they run, then in the body's order)
     let mut order: Vec<i64, Comp> = Vec::new_in(Comp {});
@@ -97,7 +123,7 @@ pub fn query_drops(arg: &[u8], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 
     for i in 1..order.len() as i64 {
         let mut j = i;
         while j > 0
-            && at_of(order[(j - 1) as usize], &pbody, pcx) > at_of(order[j as usize], &pbody, pcx) {
+            && at_of(order[(j - 1) as usize], pbody, pcx) > at_of(order[j as usize], pbody, pcx) {
             order.swap((j - 1) as usize, j as usize);
             j -= 1;
         }
@@ -112,18 +138,16 @@ pub fn query_drops(arg: &[u8], tcx: &mut Tcx<Comp>, pcx: &mut Ctx<Comp>) -> i64 
             buf_str(out, c"-");
         }
         buf_str(out, c"  ");
-        buf_drop(out, s, &pbody, pcx);
+        buf_drop(out, s, pbody, pcx);
         buf_str(out, c"  ");
-        buf_what(out, st.a, &pbody, pcx);
+        buf_what(out, st.a, pbody, pcx);
         buf_str(out, c": ");
-        buf_type(out, full_place_type(st.a, st.b, &pbody, pcx), pcx);
+        buf_type(out, full_place_type(st.a, st.b, pbody, pcx), pcx);
         buf_byte(out, b'\n');
     }
     if n == 0 {
         buf_str(out, c"  (no drops: nothing it holds needs one)\n");
     }
-    buf_write_fd(out, STDOUT);
-    0
 }
 
 // Where drop statement s runs (-1: unknown).
@@ -137,12 +161,16 @@ fn line_at(idx: i64, pcx: &Ctx<Comp>) -> i64 {
     pcx.lines[idx as usize]
 }
 
-// The innermost function with a kept body whose text holds the line
-// [start, end): a closure inside its parent, the first instance of a
-// generic one; -1.
-fn body_at(start: i64, end: i64, pcx: &Ctx<Comp>) -> i64 {
-    let mut best: i64 = -1;
-    let mut size: i64 = 0;
+// The innermost functions with a kept body whose text holds the line
+// [start, end), into fs (empty: none): a closure inside its parent, the
+// first instance of a generic one, and with a function the ones made from
+// it that share its text (a contract's companions, a multiversion copy).
+fn bodies_at(start: i64, end: i64, fs: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    let mut size: i64 = -1;
+    // (the templates of fs's functions: a generic function's instances,
+    // and the template itself, are one, shown by the first in FNS; the
+    // functions the compiler made from it are functions of their own)
+    let mut items: Vec<i64, Comp> = Vec::new_in(Comp {});
     for f in 0..pcx.fns.len() as i64 {
         if !has_kept(f, pcx) {
             continue;
@@ -150,12 +178,20 @@ fn body_at(start: i64, end: i64, pcx: &Ctx<Comp>) -> i64 {
         let item = fn_node(f, pcx);
         let s = pcx.nodes[item as usize].start;
         let e = pcx.nodes[item as usize].end;
-        if s < end && start < e && (best < 0 || e - s < size) {
-            best = f;
+        if !(s < end && start < e) || size >= 0 && e - s > size {
+            continue;
+        }
+        if size < 0 || e - s < size {
+            fs.clear();
+            items.clear();
             size = e - s;
         }
+        let key = if pcx.fns[f as usize].tmpl > 0 { pcx.fns[f as usize].tmpl - 1 } else { f };
+        if !items.contains(&key) {
+            items.push(key);
+            fs.push(f);
+        }
     }
-    best
 }
 
 // `LINE:COL` of pos (buf_pos without its file).

@@ -67,6 +67,18 @@ calls functions; it must be pure: no io, no allocation, no static
 through a fn value too (what every function of its type whose address
 is taken may do).
 Owned parameters are read in place, never moved or dropped.
+A clause is a predicate: it never writes, lends `&mut` or moves what
+the caller owns, nor what `result` holds. It reads the parameters and
+`result` as through a `&` reference, so `o = None`, `o.take()`,
+`mem::replace(&mut o, ..)`, a `mut self` method, `*r.0 = 1` through a
+`&mut` they hold, and the same inside `old(..)` are
+`borrowck.assign_immutable` / `borrowck.borrow_immutable` ("a borrowed
+copy"), and a by-value binding of a part that is not `Copy`
+(`match o { Some(w) => .. }`, `let (a, _) = t;`) is `contract.move`:
+match on `&o`, or bind `ref w`. What a clause makes itself (a `let mut
+n`) it may change. So a contract never changes what the program does:
+`--debug-contracts` on or off prints the same for a program that
+passes its contracts.
 
 An ensures runs after the body, so (`contract.old`):
 
