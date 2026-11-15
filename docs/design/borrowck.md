@@ -649,11 +649,16 @@ of the exclusive reference it declares (`let t: &mut [T] = s;`, `let u:
 two-phase (build.vl annotated_reborrow), as rustc's coercion site: `s`
 is used again once `t` is done; without a type the place moves. A field
 given where a `&mut T` or a mutable view goes (`fill(b.s)`, `fill(v[0].s)`)
-is a place lent mutably in the front (generics/mod.vl check_call_arg),
-reached through the container's DerefMut and IndexMut as `&mut b.s[..]`
-is; vole's Box is std's DerefMut, so `b` must be `let mut`, as for
-`b.s[1] = 3` (rustc's built-in Box deref needs no `mut`: a strictness
-kept, as at 0.30.0). *Cases:* `rust_b_err_view_coerce_shared`,
+(and `fill(vs[0])`, a `let` with its type, a method's receiver that
+is such a place) has its path made mutable in the front, IndexMut and
+DerefMut (front/check/rust.vl reborrow_to_mut, place_to_mut), as rustc's
+is: a Vec's IndexMut and a user DerefMut need the container mutable
+(rustc E0596), a Box's does not (rustc's Box deref is built in, and a
+reborrow through the `&mut` it holds is LocalMutationIsAllowed::Yes:
+pcx.box_unique, calls/mod.vl box_unique_deref). Still refused, open for
+0.30.2: a write through a `&mut` field of a non-`mut` Box (`b.s[0] = 7`,
+rt_b301_009) and a stored view as a method's receiver through a container
+(`b.s.reverse()`, rt_b301_012). *Cases:* `rust_b_err_view_coerce_shared`,
 `rust_b_err_view_reborrow_let`, `rust_b_view_reborrow_let_ok`.
 
 **D3.6 (constraints per statement and terminator).** One pass over
@@ -983,10 +988,13 @@ D3.6).
   slots(τ_T)`, with `τ_T` the type at `T`'s position.
   *Implementation (0.30.1).* `Req` is a least fixpoint over the
   declarations that name each other (regions.vl adt_reqs, ReqMemo): each
-  declaration's set is found once per type read (decl_pairs), its fields
-  walked again until nothing is new, a declaration still being found read
-  as its set so far (one found from such a partial set is found again
-  where it is named next). So `struct L<'a, 'b, T> { x: &'a T, y:
+  declaration's set is found once per type read (decl_pairs); a group of
+  declarations that name each other (a strongly connected component,
+  found by Tarjan's walk) is solved as one unit, its root walking the
+  group in rounds, each member once a round (one walked this round read as
+  its set so far), until a round adds nothing; then every member is
+  final. (Before the fourth review a member found from a partial set was
+  walked again at every use: 2^depth inside one group, 20 s at depth 24.) So `struct L<'a, 'b, T> { x: &'a T, y:
   Option<&'a L<'b, 'a, T>> }` has `T: 'a` and, from the swapped use,
   `T: 'b`; and `S_i { x: S_(i-1), y: S_(i-1) }` costs linear time.
   Before, a declaration met again on the walk added nothing (`T: 'b`

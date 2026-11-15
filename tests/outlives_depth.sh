@@ -4,7 +4,7 @@
 # declarations that name the one before twice. Before, each use walked the
 # declaration again, so `struct Si<'a, T> { x: S(i-1)<'a, T>, y:
 # S(i-1)<'a, T> }` cost 2^i (depth 25: 26 s to check; depth 32 never
-# ended). Three programs, each checked and built within LIMIT seconds
+# ended). Five programs, each checked and built within LIMIT seconds
 # (they take a tenth of a second; the exponential never ends at depth 60,
 # so the limit needs no care for the machine's load):
 #
@@ -13,6 +13,13 @@
 #        that needs `T: 'b`, which only the swapped uses imply: accepted
 #   e60  s60 with a function that needs `T: 'static`: refused
 #        (borrowck.outlives)
+#   g24  24 such declarations, the first naming the last: one recursive
+#        group, solved as a unit (each member walked once a round), and a
+#        function that needs `T: 'a`: accepted (before: each member walked
+#        again at every use, 20 s at depth 24)
+#   f24  g24 with a function that needs `T: 'static`: refused
+# (g24 takes 0.6 s: the front's holds_formatter, as in 0.30.0, is still
+# exponential over such a group; depth 28 takes 8 s)
 #
 # usage: tests/outlives_depth.sh [-c COMPILER] [-t LIMIT]
 set -u
@@ -58,7 +65,22 @@ swapped() {
     echo "fn conv<'a, 'b, 'c>(s: &S$1<'a, 'b, &'c i64>, r: &'c i64) -> $2 { let _ = s; r }"
     echo "fn main() { println(\"{}\", 1); }"
 }
+# group DEPTH RESULT: the same nest, its first declaration naming the last
+# (one recursive group of DEPTH + 1 declarations); conv returns the
+# `&'c i64` its T holds as RESULT
+group() {
+    echo "struct S0<'a, T> { r: &'a T, z: Option<&'a S$1<'a, T>> }"
+    i=1
+    while [ $i -le "$1" ]; do
+        echo "struct S$i<'a, T> { x: S$((i - 1))<'a, T>, y: S$((i - 1))<'a, T> }"
+        i=$((i + 1))
+    done
+    echo "fn conv<'a, 'c>(s: &S$1<'a, &'c i64>, r: &'c i64) -> $2 { let _ = s; r }"
+    echo "fn main() { println(\"{}\", 1); }"
+}
 dag 60 >"$W/d60.vl"
+group 24 "&'a i64" >"$W/g24.vl"
+group 24 "&'static i64" >"$W/f24.vl"
 swapped 60 "&'b i64" >"$W/s60.vl"
 swapped 60 "&'static i64" >"$W/e60.vl"
 
@@ -86,9 +108,10 @@ run() {
         echo "ok outlives-depth $name"
     fi
 }
-for p in d60 s60; do
+for p in d60 s60 g24; do
     run "check $p" ok check "$p.vl"
     run "build $p" ok "$p.vl" -o "$p"
 done
 run "check e60" refused check e60.vl
+run "check f24" refused check f24.vl
 exit $FAILED
