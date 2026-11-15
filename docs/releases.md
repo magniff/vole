@@ -342,8 +342,12 @@ the bytes of a cold one when a function's number of calls changes.
   set) `ulimit -v` under about 1.2 GiB, or overcommit turned off
   (`vm.overcommit_memory=2`) with little memory, may make no such
   thread, and the compiler then compiles on the first thread's 8 MB,
-  saying so once, `warning[thread.main-stack]` (JSON under `--json`),
-  when it compiles a program. A worker or the assembler's thread that
+  saying so once on stderr, `warning thread.main-stack: ...` (a JSON
+  line under `--json`), the moment a command starts to read a program
+  (a build, check, query, fmt, fix, test, try, the LSP; not
+  `--version`, `explain` or `guide`), so that it is there before a deep
+  expression overflows that stack; the volecs a command starts do not
+  say it again. A worker or the assembler's thread that
   cannot be made leaves the build on fewer threads (the main thread's
   at the least), where 0.30.0 stopped it (`try -j1`)
   (tests/main_stack.sh plants each). A stack
