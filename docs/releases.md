@@ -229,11 +229,23 @@ the bytes of a cold one when a function's number of calls changes.
   recurse over an expression, about 1.2 KB a level, and the process's
   main thread has 8 MB. The compilation now runs on a thread of its own
   with a 1 GiB stack, reserved and used only as deep as it goes: a chain
-  of 60000 terms builds at -O0 and -O2. A far deeper one (some 800 000
+  of 60000 terms builds at -O0 and -O2. When the system makes no such
+  thread, it says so and compiles where it did. A far deeper one (some 800 000
   levels) still overflows it with no error. Such a function is also one
   whose body the borrow checker's liveness holds in memory quadratic in
   its statements (a chain of 60000 terms takes 8.5 GB; a flat body of
   30000 statements took 3.3 GB on 0.30.0 too).
+- A read through an alias of an alias (RT-32): `let r = &d; let rr =
+  &r; zap(*rr); x / d` was accepted under `#[no_panic]` and panicked
+  (0.30.0 too), as were `&**rr`, `let r2 = *rr`, `let &r2 = rr` and a
+  counted loop whose counter `(**rr).zap()` zeroed. A read through a
+  reference whose value may be an address is now a use of what the
+  alias reaches, for the effect walk and for the places IR's check of
+  it alike (E1.8, "What a read through an alias is").
+- A source that is not UTF-8 (RT-24): a byte that begins no character,
+  in a string literal or a comment, was accepted, a `&str` held it, and
+  an error that quoted it panicked the compiler. It is now `lex.utf8`,
+  an error at the byte, as rustc refuses such a file.
 - E1.8 and the borrow checker's hidden bindings: a format argument (`{}`
   and `{i}`) became a borrow of its place, which the effect walk did not
   see, so a counted loop that printed its counter, or a guarded divisor
@@ -242,8 +254,8 @@ the bytes of a cold one when a function's number of calls changes.
   where each borrow's reference goes, from the built body: one only read
   through gives the place's value and needs no site of the walk's (E1.8,
   "Where the reference goes, from the IR"). `tests/e18_loans.sh` counts
-  every borrow, reports a crash of the check with its file, and has a
-  `--self-test`.
+  every borrow, reports a crash or a panic of the check with its file,
+  and has a `--self-test` that plants a fault in each of its rules.
 
 #### The safety nets
 
@@ -302,6 +314,16 @@ the bytes of a cold one when a function's number of calls changes.
 
 #### Known issues
 
+- The compiler's own thread (RT-28) reserves 1 GiB of address space for
+  its stack. It is not memory used: pages are touched only as deep as
+  the passes recurse. But a limit on address space counts it: on Linux
+  (not tried on this release's macOS runs, where `ulimit -v` cannot be
+  set) `ulimit -v` under about 1.2 GiB, or overcommit turned off
+  (`vm.overcommit_memory=2`) with little memory, may make no such
+  thread, and the compiler then compiles on the first thread's 8 MB,
+  saying so once on stderr (tests/main_stack.sh plants it). A stack
+  overflow, at some 800 000 levels, now ends the compiler by SIGBUS,
+  exit status 138 (the thread's guard page), not by SIGSEGV, 139.
 - A struct assigned field by field before it is initialized (`let mut
   p: P; p.a = 1;`) is accepted; rustc refuses it (E0381). A census
   XFAIL, `rust_b_err_mv_assign_part_uninit`.
