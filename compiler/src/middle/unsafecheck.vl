@@ -3,15 +3,25 @@
 // Unsafe code's raw-pointer accesses (a dereference, an index, a field
 // through a raw pointer, a slice made from one) are checked at run time
 // against the heap blocks the program has allocated: the calls of C's
-// malloc, calloc, realloc and free made by vole code (std's included)
-// go to wrappers in the runtime (the module __check, whose source is built
-// in below and added to the program), which record the live blocks and
-// the last freed ones. An access is an error, reported with its place in
-// the source and exit code 101, when it
+// malloc, calloc, realloc, posix_memalign and free made by vole code
+// (std's included: Gpa's) go to wrappers in the runtime (the module
+// __check, whose source is built in below and added to the program),
+// which record the live blocks and the last freed ones. (0.30.1) A C
+// function is the symbol it links to: std's `#[link_name = "malloc"] fn
+// gpa_c_malloc` is malloc, and a program's extern named malloc that links
+// to its own allocator is not. An access is an error, reported with its
+// place in the source and exit code 101, when it
 //
 // - starts in a live block and runs past its end (out of bounds),
 // - starts before a live block and runs into it,
 // - falls in a block freed since (use after free), or frees a freed one.
+//
+// (0.30.1) An address computed from a raw pointer (`&p[i]`, std's
+// ptr::add and sub) is not an access: when the pointer is in a live
+// block, the address must be in it or one past its end (Rust's add), and
+// only a read or write through it is checked as an access. The runtime's
+// tables are behind a lock: a program's threads (the compiler's own) can
+// be checked.
 //
 // Memory the program did not allocate itself (the stack, statics, what C
 // allocates) is not checked: the check knows the heap blocks only.
@@ -21,62 +31,228 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::stdalloc::get_check_alloc_mode;
 
-// The runtime, as vole source.
+// The runtime, as vole source. (0.30.1) Its tables are behind a lock
+// when the program has std (and so threads).
 pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
-    buf_str(out, c"// The checking mode's runtime (0.10): see compiler/src/unsafecheck.vl.\n");
+    buf_str(out,
+        c"// The checking mode's runtime (0.10): see compiler/src/middle/unsafecheck.vl.\n");
     buf_str(out, c"extern \"C\" {\n");
     buf_str(out, c"    fn malloc(size: u64) -> *mut u8;\n");
     buf_str(out, c"    fn calloc(count: u64, size: u64) -> *mut u8;\n");
     buf_str(out, c"    fn realloc(p: *mut u8, size: u64) -> *mut u8;\n");
     buf_str(out, c"    fn free(p: *mut u8);\n");
-    buf_str(out, c"    fn memmove(dst: *mut u8, src: *const u8, n: u64) -> *mut u8;\n");
+    buf_str(out, c"    fn posix_memalign(out: *mut *mut u8, align: u64, size: u64) -> i32;\n");
     buf_str(out, c"    fn dprintf(fd: i32, format: *const u8, ...) -> i32;\n");
+    buf_str(out, c"    fn sched_yield() -> i32;\n");
     buf_str(out, c"    fn exit(code: i32) -> !;\n");
     buf_str(out, c"}\n");
-    buf_str(out, c"// The live blocks: [STARTS[i], ENDS[i]), sorted.\n");
-    buf_str(out, c"// The freed ones: the last FREED freed, in a ring, with the range they\n");
-    buf_str(out, c"// span (FLO, FHI) to pass most addresses by at once.\n");
-    buf_str(out, c"static mut STARTS: *mut u64 = 0 as *mut u64;\n");
-    buf_str(out, c"static mut ENDS: *mut u64 = 0 as *mut u64;\n");
-    buf_str(out, c"static mut COUNT: i64 = 0;\n");
-    buf_str(out, c"static mut CAP: i64 = 0;\n");
-    buf_str(out, c"const FREED: i64 = 4096;\n");
-    buf_str(out, c"static mut FSTARTS: *mut u64 = 0 as *mut u64;\n");
-    buf_str(out, c"static mut FENDS: *mut u64 = 0 as *mut u64;\n");
-    buf_str(out, c"static mut FNEXT: i64 = 0;\n");
-    buf_str(out, c"static mut FLO: u64 = 18446744073709551615;\n");
-    buf_str(out, c"static mut FHI: u64 = 0;\n");
+    buf_str(out, c"// (0.30.1) The blocks, in two trees (treaps on their starts, the nodes in\n");
+    buf_str(out, c"// arrays grown by C's realloc): LIVE, the program's live blocks, and\n");
+    buf_str(out, c"// FREED, the last FREED it freed (RING holds their starts, oldest first,\n");
+    buf_str(out, c"// to forget the oldest). A node n is the block [KEY[n], END[n]); 0 is no\n");
+    buf_str(out, c"// node. Every table is read and written holding LOCK: the program's\n");
+    buf_str(out, c"// threads allocate, free and check at once. O(log n) a call, the\n");
+    buf_str(out, c"// compiler's own hundreds of thousands of blocks included.\n");
+    buf_str(out, c"static mut KEY: *mut u64 = 0 as *mut u64;\n");
+    buf_str(out, c"static mut END: *mut u64 = 0 as *mut u64;\n");
+    buf_str(out, c"static mut LEFT: *mut u64 = 0 as *mut u64;\n");
+    buf_str(out, c"static mut RIGHT: *mut u64 = 0 as *mut u64;\n");
+    buf_str(out, c"static mut PRIO: *mut u64 = 0 as *mut u64;\n");
+    buf_str(out, c"static mut NODES: u64 = 0;\n");
+    buf_str(out, c"static mut CAP: u64 = 0;\n");
+    buf_str(out, c"static mut SPARE: u64 = 0;\n");
+    buf_str(out, c"static mut SEED: u64 = 88172645463325252;\n");
+    buf_str(out, c"static mut LIVE: u64 = 0;\n");
+    buf_str(out, c"static mut FREED_ROOT: u64 = 0;\n");
+    buf_str(out, c"const FREED: u64 = 4096;\n");
+    buf_str(out, c"static mut RING: *mut u64 = 0 as *mut u64;\n");
+    buf_str(out, c"static mut RING_NEXT: u64 = 0;\n");
+    buf_str(out, c"static mut LOCK: i64 = 0;\n");
+    buf_str(out, c"// The live block check found last, [HIT_S, HIT_E) (none: 0, 0): checked\n");
+    buf_str(out, c"// first; forgotten whenever a live block is.\n");
+    buf_str(out, c"static mut HIT_S: u64 = 0;\n");
+    buf_str(out, c"static mut HIT_E: u64 = 0;\n");
+    buf_str(out, c"// Element i of a table. (Arithmetic on the address, not std's ptr::add:\n");
+    buf_str(out, c"// the runtime's own code is not checked, and add's is.)\n");
+    buf_str(out, c"unsafe fn slot(p: *mut u64, i: u64) -> *mut u64 {\n");
+    buf_str(out, c"    (p as u64 + i * 8) as *mut u64\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"unsafe fn get(t: *mut u64, n: u64) -> u64 {\n");
+    buf_str(out, c"    *slot(t, n)\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"unsafe fn set(t: *mut u64, n: u64, v: u64) {\n");
+    buf_str(out, c"    *slot(t, n) = v;\n");
+    buf_str(out, c"}\n");
+    if pcx.std_module >= 0 {
+        buf_str(out,
+            c"// The tables' lock: a spin lock on LOCK, as an atomic (test and test and\n");
+        buf_str(out, c"// set: a waiting thread reads it, and yields now and then).\n");
+        buf_str(out, c"unsafe fn lock() {\n");
+        buf_str(out, c"    let a = &*(&raw mut LOCK as *const std::sync::atomic::Atomic<i64>);\n");
+        buf_str(out, c"    loop {\n");
+        buf_str(out, c"        if a.swap(1, std::sync::atomic::Ordering::Acquire) == 0 {\n");
+        buf_str(out, c"            return;\n");
+        buf_str(out, c"        }\n");
+        buf_str(out, c"        let mut n = 0;\n");
+        buf_str(out, c"        while a.load(std::sync::atomic::Ordering::Relaxed) != 0 {\n");
+        buf_str(out, c"            n += 1;\n");
+        buf_str(out, c"            if n > 256 {\n");
+        buf_str(out, c"                sched_yield();\n");
+        buf_str(out, c"                n = 0;\n");
+        buf_str(out, c"            }\n");
+        buf_str(out, c"        }\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"unsafe fn unlock() {\n");
+        buf_str(out, c"    let a = &*(&raw mut LOCK as *const std::sync::atomic::Atomic<i64>);\n");
+        buf_str(out, c"    a.store(0, std::sync::atomic::Ordering::Release);\n");
+        buf_str(out, c"}\n");
+    } else {
+        buf_str(out, c"// The tables' lock: none without std (no threads).\n");
+        buf_str(out, c"unsafe fn lock() {\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"unsafe fn unlock() {\n");
+        buf_str(out, c"}\n");
+    }
+    buf_str(out, c"// (Called holding the lock, which it gives up: exit's handlers free.)\n");
     buf_str(out,
         c"unsafe fn fail(what: *const u8, p: u64, size: u64, start: u64, end: u64, site: *const u8) -> ! {\n");
+    buf_str(out, c"    unlock();\n");
     buf_str(out,
         c"    dprintf(2, c\"unsafe access %s: %llu bytes at offset %lld of a block of %llu bytes\\n --> %s\\n\", what, size, p as i64 - start as i64, end - start, site);\n");
     buf_str(out, c"    exit(101)\n");
     buf_str(out, c"}\n");
-    buf_str(out, c"// The index of the last live block starting at or before p, or -1.\n");
-    buf_str(out, c"unsafe fn find(p: u64) -> i64 {\n");
-    buf_str(out, c"    let mut lo = 0;\n");
-    buf_str(out, c"    let mut hi = COUNT;\n");
-    buf_str(out, c"    while lo < hi {\n");
-    buf_str(out, c"        let mid = (lo + hi) / 2;\n");
-    buf_str(out, c"        if *STARTS.add(mid as usize) <= p {\n");
-    buf_str(out, c"            lo = mid + 1;\n");
-    buf_str(out, c"        } else {\n");
-    buf_str(out, c"            hi = mid;\n");
+    buf_str(out, c"// A node for block [s, e).\n");
+    buf_str(out, c"unsafe fn node(s: u64, e: u64) -> u64 {\n");
+    buf_str(out, c"    let mut n = SPARE;\n");
+    buf_str(out, c"    if n != 0 {\n");
+    buf_str(out, c"        SPARE = get(LEFT, n);\n");
+    buf_str(out, c"    } else {\n");
+    buf_str(out, c"        if NODES + 1 >= CAP {\n");
+    buf_str(out, c"            CAP = if CAP == 0 { 4096 } else { CAP * 2 };\n");
+    buf_str(out, c"            KEY = realloc(KEY as *mut u8, CAP * 8) as *mut u64;\n");
+    buf_str(out, c"            END = realloc(END as *mut u8, CAP * 8) as *mut u64;\n");
+    buf_str(out, c"            LEFT = realloc(LEFT as *mut u8, CAP * 8) as *mut u64;\n");
+    buf_str(out, c"            RIGHT = realloc(RIGHT as *mut u8, CAP * 8) as *mut u64;\n");
+    buf_str(out, c"            PRIO = realloc(PRIO as *mut u8, CAP * 8) as *mut u64;\n");
+    buf_str(out,
+        c"            if KEY == 0 as *mut u64 || END == 0 as *mut u64 || LEFT == 0 as *mut u64\n");
+    buf_str(out, c"                || RIGHT == 0 as *mut u64 || PRIO == 0 as *mut u64 {\n");
+    buf_str(out, c"                unlock();\n");
+    buf_str(out,
+        c"                dprintf(2, c\"--check-unsafe: out of memory for its tables\\n\");\n");
+    buf_str(out, c"                exit(101);\n");
+    buf_str(out, c"            }\n");
     buf_str(out, c"        }\n");
+    buf_str(out, c"        NODES += 1;\n");
+    buf_str(out, c"        n = NODES;\n");
     buf_str(out, c"    }\n");
-    buf_str(out, c"    lo - 1\n");
+    buf_str(out, c"    SEED ^= SEED << 13;\n");
+    buf_str(out, c"    SEED ^= SEED >> 7;\n");
+    buf_str(out, c"    SEED ^= SEED << 17;\n");
+    buf_str(out, c"    set(KEY, n, s);\n");
+    buf_str(out, c"    set(END, n, e);\n");
+    buf_str(out, c"    set(LEFT, n, 0);\n");
+    buf_str(out, c"    set(RIGHT, n, 0);\n");
+    buf_str(out, c"    set(PRIO, n, SEED);\n");
+    buf_str(out, c"    n\n");
     buf_str(out, c"}\n");
-    buf_str(out, c"// The freed block holding p, or -1.\n");
-    buf_str(out, c"unsafe fn find_freed(p: u64) -> i64 {\n");
-    buf_str(out, c"    if p < FLO || p >= FHI {\n");
-    buf_str(out, c"        return -1;\n");
+    buf_str(out, c"// Tree t with node n in it: its root.\n");
+    buf_str(out, c"unsafe fn insert(t: u64, n: u64) -> u64 {\n");
+    buf_str(out, c"    if t == 0 {\n");
+    buf_str(out, c"        return n;\n");
     buf_str(out, c"    }\n");
-    buf_str(out, c"    for k in 0..FREED {\n");
-    buf_str(out, c"        if p >= *FSTARTS.add(k as usize) && p < *FENDS.add(k as usize) {\n");
-    buf_str(out, c"            return k;\n");
+    buf_str(out, c"    if get(KEY, n) < get(KEY, t) {\n");
+    buf_str(out, c"        let l = insert(get(LEFT, t), n);\n");
+    buf_str(out, c"        set(LEFT, t, l);\n");
+    buf_str(out, c"        if get(PRIO, l) > get(PRIO, t) {\n");
+    buf_str(out, c"            set(LEFT, t, get(RIGHT, l));\n");
+    buf_str(out, c"            set(RIGHT, l, t);\n");
+    buf_str(out, c"            return l;\n");
+    buf_str(out, c"        }\n");
+    buf_str(out, c"    } else {\n");
+    buf_str(out, c"        let r = insert(get(RIGHT, t), n);\n");
+    buf_str(out, c"        set(RIGHT, t, r);\n");
+    buf_str(out, c"        if get(PRIO, r) > get(PRIO, t) {\n");
+    buf_str(out, c"            set(RIGHT, t, get(LEFT, r));\n");
+    buf_str(out, c"            set(LEFT, r, t);\n");
+    buf_str(out, c"            return r;\n");
     buf_str(out, c"        }\n");
     buf_str(out, c"    }\n");
-    buf_str(out, c"    -1\n");
+    buf_str(out, c"    t\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"// Trees a and b as one (a's starts all below b's): its root.\n");
+    buf_str(out, c"unsafe fn merge(a: u64, b: u64) -> u64 {\n");
+    buf_str(out, c"    if a == 0 {\n");
+    buf_str(out, c"        return b;\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"    if b == 0 {\n");
+    buf_str(out, c"        return a;\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"    if get(PRIO, a) > get(PRIO, b) {\n");
+    buf_str(out, c"        set(RIGHT, a, merge(get(RIGHT, a), b));\n");
+    buf_str(out, c"        a\n");
+    buf_str(out, c"    } else {\n");
+    buf_str(out, c"        set(LEFT, b, merge(a, get(LEFT, b)));\n");
+    buf_str(out, c"        b\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"// Tree t without its node starting at s (made spare): its root.\n");
+    buf_str(out, c"unsafe fn remove(t: u64, s: u64) -> u64 {\n");
+    buf_str(out, c"    if t == 0 {\n");
+    buf_str(out, c"        return 0;\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"    if s < get(KEY, t) {\n");
+    buf_str(out, c"        set(LEFT, t, remove(get(LEFT, t), s));\n");
+    buf_str(out, c"        return t;\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"    if s > get(KEY, t) {\n");
+    buf_str(out, c"        set(RIGHT, t, remove(get(RIGHT, t), s));\n");
+    buf_str(out, c"        return t;\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"    let m = merge(get(LEFT, t), get(RIGHT, t));\n");
+    buf_str(out, c"    set(LEFT, t, SPARE);\n");
+    buf_str(out, c"    SPARE = t;\n");
+    buf_str(out, c"    m\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"// The node of tree t's last block starting at or before p, or 0.\n");
+    buf_str(out, c"unsafe fn find(t: u64, p: u64) -> u64 {\n");
+    buf_str(out, c"    let mut at = t;\n");
+    buf_str(out, c"    let mut best: u64 = 0;\n");
+    buf_str(out, c"    while at != 0 {\n");
+    buf_str(out, c"        if get(KEY, at) <= p {\n");
+    buf_str(out, c"            best = at;\n");
+    buf_str(out, c"            at = get(RIGHT, at);\n");
+    buf_str(out, c"        } else {\n");
+    buf_str(out, c"            at = get(LEFT, at);\n");
+    buf_str(out, c"        }\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"    best\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"// The node of tree t's first block starting after p, or 0.\n");
+    buf_str(out, c"unsafe fn find_after(t: u64, p: u64) -> u64 {\n");
+    buf_str(out, c"    let mut at = t;\n");
+    buf_str(out, c"    let mut best: u64 = 0;\n");
+    buf_str(out, c"    while at != 0 {\n");
+    buf_str(out, c"        if get(KEY, at) > p {\n");
+    buf_str(out, c"            best = at;\n");
+    buf_str(out, c"            at = get(LEFT, at);\n");
+    buf_str(out, c"        } else {\n");
+    buf_str(out, c"            at = get(RIGHT, at);\n");
+    buf_str(out, c"        }\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"    best\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"// Tree t without the blocks [s, e) overlaps: its root.\n");
+    buf_str(out, c"unsafe fn forget_overlapping(t: u64, s: u64, e: u64) -> u64 {\n");
+    buf_str(out, c"    let mut root = t;\n");
+    buf_str(out, c"    loop {\n");
+    buf_str(out, c"        let n = find(root, e - 1);\n");
+    buf_str(out, c"        if n == 0 || get(END, n) <= s {\n");
+    buf_str(out, c"            return root;\n");
+    buf_str(out, c"        }\n");
+    buf_str(out, c"        root = remove(root, get(KEY, n));\n");
+    buf_str(out, c"    }\n");
     buf_str(out, c"}\n");
     buf_str(out, c"unsafe fn record(p: *mut u8, size: u64) {\n");
     buf_str(out, c"    if p == 0 as *mut u8 {\n");
@@ -84,63 +260,51 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"    }\n");
     buf_str(out, c"    let s = p as u64;\n");
     buf_str(out, c"    let e = s + (if size == 0 { 1 } else { size });\n");
-    buf_str(out, c"    // Freed blocks the new one reuses are forgotten.\n");
-    buf_str(out, c"    if FSTARTS != 0 as *mut u64 && s < FHI && e > FLO {\n");
-    buf_str(out, c"        for k in 0..FREED {\n");
-    buf_str(out, c"            if *FSTARTS.add(k as usize) < e && s < *FENDS.add(k as usize) {\n");
-    buf_str(out, c"                *FSTARTS.add(k as usize) = 0;\n");
-    buf_str(out, c"                *FENDS.add(k as usize) = 0;\n");
-    buf_str(out, c"            }\n");
-    buf_str(out, c"        }\n");
+    buf_str(out, c"    lock();\n");
+    buf_str(out, c"    // Freed blocks the new one reuses are forgotten; so are live blocks it\n");
+    buf_str(out, c"    // overlaps (0.30.1): C freed them without a call the check saw (the\n");
+    buf_str(out, c"    // allocator returns no memory that is live).\n");
+    buf_str(out, c"    FREED_ROOT = forget_overlapping(FREED_ROOT, s, e);\n");
+    buf_str(out, c"    LIVE = forget_overlapping(LIVE, s, e);\n");
+    buf_str(out, c"    if s < HIT_E && HIT_S < e {\n");
+    buf_str(out, c"        HIT_S = 0;\n");
+    buf_str(out, c"        HIT_E = 0;\n");
     buf_str(out, c"    }\n");
-    buf_str(out, c"    if COUNT == CAP {\n");
-    buf_str(out, c"        CAP = if CAP == 0 { 256 } else { CAP * 2 };\n");
-    buf_str(out, c"        STARTS = realloc(STARTS as *mut u8, (CAP * 8) as u64) as *mut u64;\n");
-    buf_str(out, c"        ENDS = realloc(ENDS as *mut u8, (CAP * 8) as u64) as *mut u64;\n");
-    buf_str(out, c"    }\n");
-    buf_str(out, c"    let at = (find(s) + 1) as usize;\n");
-    buf_str(out,
-        c"    memmove(STARTS.add(at + 1) as *mut u8, STARTS.add(at) as *const u8, ((COUNT - at as i64) * 8) as u64);\n");
-    buf_str(out,
-        c"    memmove(ENDS.add(at + 1) as *mut u8, ENDS.add(at) as *const u8, ((COUNT - at as i64) * 8) as u64);\n");
-    buf_str(out, c"    *STARTS.add(at) = s;\n");
-    buf_str(out, c"    *ENDS.add(at) = e;\n");
-    buf_str(out, c"    COUNT += 1;\n");
+    buf_str(out, c"    LIVE = insert(LIVE, node(s, e));\n");
+    buf_str(out, c"    unlock();\n");
     buf_str(out, c"}\n");
-    buf_str(out, c"// Forgets block p (when it is one), into the freed ring.\n");
+    buf_str(out, c"// Forgets block p (when it is one), into the freed ones.\n");
     buf_str(out, c"unsafe fn unrecord(p: *mut u8, site: *const u8) {\n");
     buf_str(out, c"    if p == 0 as *mut u8 {\n");
     buf_str(out, c"        return;\n");
     buf_str(out, c"    }\n");
     buf_str(out, c"    let s = p as u64;\n");
-    buf_str(out, c"    let found = find(s);\n");
-    buf_str(out, c"    if found < 0 || *STARTS.add(found as usize) != s {\n");
-    buf_str(out, c"        let k = find_freed(s);\n");
-    buf_str(out, c"        if k >= 0 && *FSTARTS.add(k as usize) == s {\n");
-    buf_str(out,
-        c"            fail(c\"(a block freed twice)\", s, 0, *FSTARTS.add(k as usize), *FENDS.add(k as usize), site);\n");
+    buf_str(out, c"    lock();\n");
+    buf_str(out, c"    let n = find(LIVE, s);\n");
+    buf_str(out, c"    if n == 0 || get(KEY, n) != s {\n");
+    buf_str(out, c"        let k = find(FREED_ROOT, s);\n");
+    buf_str(out, c"        if k != 0 && get(KEY, k) == s {\n");
+    buf_str(out, c"            fail(c\"(a block freed twice)\", s, 0, s, get(END, k), site);\n");
     buf_str(out, c"        }\n");
+    buf_str(out, c"        unlock();\n");
     buf_str(out, c"        return;\n");
     buf_str(out, c"    }\n");
-    buf_str(out, c"    let i = found as usize;\n");
-    buf_str(out, c"    if FSTARTS == 0 as *mut u64 {\n");
-    buf_str(out, c"        FSTARTS = calloc(FREED as u64, 8) as *mut u64;\n");
-    buf_str(out, c"        FENDS = calloc(FREED as u64, 8) as *mut u64;\n");
+    buf_str(out, c"    let e = get(END, n);\n");
+    buf_str(out, c"    LIVE = remove(LIVE, s);\n");
+    buf_str(out, c"    HIT_S = 0;\n");
+    buf_str(out, c"    HIT_E = 0;\n");
+    buf_str(out, c"    if RING == 0 as *mut u64 {\n");
+    buf_str(out, c"        RING = calloc(FREED, 8) as *mut u64;\n");
     buf_str(out, c"    }\n");
-    buf_str(out, c"    *FSTARTS.add(FNEXT as usize) = s;\n");
-    buf_str(out, c"    *FENDS.add(FNEXT as usize) = *ENDS.add(i);\n");
-    buf_str(out, c"    FNEXT = (FNEXT + 1) % FREED;\n");
-    buf_str(out, c"    if s < FLO {\n");
-    buf_str(out, c"        FLO = s;\n");
+    buf_str(out, c"    // (the oldest freed block, when it is still there, is forgotten)\n");
+    buf_str(out, c"    let old = get(RING, RING_NEXT);\n");
+    buf_str(out, c"    if old != 0 {\n");
+    buf_str(out, c"        FREED_ROOT = remove(FREED_ROOT, old);\n");
     buf_str(out, c"    }\n");
-    buf_str(out, c"    if *ENDS.add(i) > FHI {\n");
-    buf_str(out, c"        FHI = *ENDS.add(i);\n");
-    buf_str(out, c"    }\n");
-    buf_str(out,
-        c"    memmove(STARTS.add(i) as *mut u8, STARTS.add(i + 1) as *const u8, ((COUNT - found - 1) * 8) as u64);\n");
-    buf_str(out,
-        c"    memmove(ENDS.add(i) as *mut u8, ENDS.add(i + 1) as *const u8, ((COUNT - found - 1) * 8) as u64);\n");
-    buf_str(out, c"    COUNT -= 1;\n");
+    buf_str(out, c"    set(RING, RING_NEXT, s);\n");
+    buf_str(out, c"    RING_NEXT = (RING_NEXT + 1) % FREED;\n");
+    buf_str(out, c"    FREED_ROOT = insert(FREED_ROOT, node(s, e));\n");
+    buf_str(out, c"    unlock();\n");
     buf_str(out, c"}\n");
     buf_str(out, c"pub unsafe fn malloc_(size: u64) -> *mut u8 {\n");
     buf_str(out, c"    let p = malloc(size);\n");
@@ -158,9 +322,40 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
     buf_str(out, c"    record(p, size);\n");
     buf_str(out, c"    p\n");
     buf_str(out, c"}\n");
+    buf_str(out,
+        c"pub unsafe fn posix_memalign_(out: *mut *mut u8, align: u64, size: u64) -> i32 {\n");
+    buf_str(out, c"    let r = posix_memalign(out, align, size);\n");
+    buf_str(out, c"    if r == 0 {\n");
+    buf_str(out, c"        record(*out, size);\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"    r\n");
+    buf_str(out, c"}\n");
     buf_str(out, c"pub unsafe fn free_(p: *mut u8) {\n");
     buf_str(out, c"    unrecord(p, c\"free\");\n");
     buf_str(out, c"    free(p);\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"// (0.30.1) An address computed from base (`&p[i]`, std's ptr::add): when\n");
+    buf_str(out, c"// base is in a live block (or one past its end), at is in it or one past\n");
+    buf_str(out, c"// its end, as Rust's add. An address is no access: at may be its end.\n");
+    buf_str(out, c"pub unsafe fn check_addr(base: u64, at: u64, site: *const u8) {\n");
+    buf_str(out, c"    lock();\n");
+    buf_str(out, c"    let n = find(LIVE, base);\n");
+    buf_str(out, c"    if n != 0 && base <= get(END, n) {\n");
+    buf_str(out, c"        let s = get(KEY, n);\n");
+    buf_str(out, c"        let e = get(END, n);\n");
+    buf_str(out, c"        // (a base one past a block's end that is the next block's start\n");
+    buf_str(out, c"        // too: either block's)\n");
+    buf_str(out, c"        let b = if base == s { find(LIVE, s - 1) } else { 0 };\n");
+    buf_str(out,
+        c"        let before = b != 0 && get(END, b) == base && at >= get(KEY, b) && at <= base;\n");
+    buf_str(out, c"        if (at < s || at > e) && !before {\n");
+    buf_str(out, c"            unlock();\n");
+    buf_str(out,
+        c"            dprintf(2, c\"unsafe address out of bounds: offset %lld of a block of %llu bytes (an address from offset %lld)\\n --> %s\\n\", at as i64 - s as i64, e - s, base as i64 - s as i64, site);\n");
+    buf_str(out, c"            exit(101);\n");
+    buf_str(out, c"        }\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"    unlock();\n");
     buf_str(out, c"}\n");
     buf_str(out, c"// The access of `size` bytes at p.\n");
     buf_str(out, c"pub unsafe fn check(p: u64, size: u64, site: *const u8) {\n");
@@ -174,30 +369,36 @@ pub fn check_runtime_source(out: i64, pcx: &Ctx<Comp>) {
         buf_str(out, c"        return;\n");
         buf_str(out, c"    }\n");
     }
-    buf_str(out, c"    let found = find(p);\n");
-    buf_str(out, c"    if found >= 0 && p < *ENDS.add(found as usize) {\n");
-    buf_str(out, c"        let i = found as usize;\n");
-    buf_str(out, c"        if size > *ENDS.add(i) - p {\n");
-    buf_str(out,
-        c"            fail(c\"out of bounds\", p, size, *STARTS.add(i), *ENDS.add(i), site);\n");
-    buf_str(out, c"        }\n");
+    buf_str(out, c"    lock();\n");
+    buf_str(out, c"    if p >= HIT_S && p < HIT_E && size <= HIT_E - p {\n");
+    buf_str(out, c"        unlock();\n");
     buf_str(out, c"        return;\n");
     buf_str(out, c"    }\n");
-    buf_str(out, c"    if found >= 0 && p == *ENDS.add(found as usize) {\n");
-    buf_str(out, c"        let i = found as usize;\n");
+    buf_str(out, c"    let n = find(LIVE, p);\n");
+    buf_str(out, c"    if n != 0 && p < get(END, n) {\n");
+    buf_str(out, c"        if size > get(END, n) - p {\n");
     buf_str(out,
-        c"        fail(c\"out of bounds (just past the end)\", p, size, *STARTS.add(i), *ENDS.add(i), site);\n");
+        c"            fail(c\"out of bounds\", p, size, get(KEY, n), get(END, n), site);\n");
+    buf_str(out, c"        }\n");
+    buf_str(out, c"        HIT_S = get(KEY, n);\n");
+    buf_str(out, c"        HIT_E = get(END, n);\n");
+    buf_str(out, c"        unlock();\n");
+    buf_str(out, c"        return;\n");
     buf_str(out, c"    }\n");
-    buf_str(out, c"    if found + 1 < COUNT && *STARTS.add((found + 1) as usize) - p < size {\n");
-    buf_str(out, c"        let n = (found + 1) as usize;\n");
+    buf_str(out, c"    if n != 0 && p == get(END, n) {\n");
     buf_str(out,
-        c"        fail(c\"out of bounds (into the next block)\", p, size, *STARTS.add(n), *ENDS.add(n), site);\n");
+        c"        fail(c\"out of bounds (just past the end)\", p, size, get(KEY, n), get(END, n), site);\n");
     buf_str(out, c"    }\n");
-    buf_str(out, c"    let k = find_freed(p);\n");
-    buf_str(out, c"    if k >= 0 {\n");
+    buf_str(out, c"    let m = find_after(LIVE, p);\n");
+    buf_str(out, c"    if m != 0 && get(KEY, m) - p < size {\n");
     buf_str(out,
-        c"        fail(c\"after free\", p, size, *FSTARTS.add(k as usize), *FENDS.add(k as usize), site);\n");
+        c"        fail(c\"out of bounds (into the next block)\", p, size, get(KEY, m), get(END, m), site);\n");
     buf_str(out, c"    }\n");
+    buf_str(out, c"    let k = find(FREED_ROOT, p);\n");
+    buf_str(out, c"    if k != 0 && p < get(END, k) {\n");
+    buf_str(out, c"        fail(c\"after free\", p, size, get(KEY, k), get(END, k), site);\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"    unlock();\n");
     buf_str(out, c"}\n");
 }
 
@@ -222,17 +423,21 @@ pub fn check_fn(name: *const u8, pcx: &mut Ctx<Comp>) -> i64 {
 }
 
 // The wrapper a call of C function f, from a function of module `from`,
-// goes to instead (malloc, calloc, realloc and free), or f. (The runtimes'
-// own calls are not redirected.)
+// goes to instead (malloc, calloc, realloc, posix_memalign and free), or f.
+// (The runtimes' own calls are not redirected.) (0.30.1) A C function is
+// the symbol it links to (its FNS name, its #[link_name] when it has one):
+// std's Gpa calls `#[link_name = "malloc"] fn gpa_c_malloc`, which is
+// malloc, and an extern named malloc that links elsewhere is not.
 pub fn redirect_alloc(f: i64, from: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if !pcx.check_unsafe || f < 0 || !pcx.fns[f as usize].is_extern || from == pcx.check_module
         || from == pcx.profile_module {
         return f;
     }
-    let name = sym_name(pcx.fns[f as usize].name, pcx);
-    let names: [*const u8; 4] = [c"malloc", c"calloc", c"realloc", c"free"];
-    let wrappers: [*const u8; 4] = [c"malloc_", c"calloc_", c"realloc_", c"free_"];
-    for i in 0..4 {
+    let name = sym_name(crate::front::effects::builtin::c_symbol(f, pcx), pcx);
+    let names: [*const u8; 5] = [c"malloc", c"calloc", c"realloc", c"posix_memalign", c"free"];
+    let wrappers: [*const u8; 5] = [c"malloc_", c"calloc_", c"realloc_", c"posix_memalign_",
+        c"free_"];
+    for i in 0..5 {
         if crate::base::streq(name, names[i as usize]) {
             let w = check_fn(wrappers[i as usize], pcx);
             return if w >= 0 { w } else { f };
