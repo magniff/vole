@@ -63,8 +63,8 @@ use crate::front::modules::lookup::std_item_key;
 use crate::front::threadlocal::is_thread_local;
 use crate::front::traits::{impl_of_fn, std_trait};
 use crate::front::types::{
-    REF_MUT, REF_SHARED, TY_BOOL, TY_NEVER, TyKind, int_bits, is_integer, is_signed, struct_field,
-    struct_type, vec_lanes,
+    REF_MUT, REF_SHARED, TY_BOOL, TY_NEVER, TyKind, int_bits, is_integer, is_raw_view, is_signed,
+    struct_field, struct_type, vec_lanes,
 };
 use crate::middle::lower::atomic::atomic_intrinsic;
 use crate::middle::lower::ssa::HMap;
@@ -605,7 +605,7 @@ fn node_locals(f: i64, pcx: &mut Ctx<Comp>) -> Effects {
     pcx.loops.clear();
     pcx.fmt_touch = 0;
     pcx.fmt_made = false;
-    walk(pcx.nodes[pcx.fns[f as usize].node as usize].c, pcx);
+    walk_body(f, pcx);
     if is_cell_root(f, pcx) {
         // (0.26.1: the address UnsafeCell::get gives is written through
         // a shared reference)
@@ -870,6 +870,9 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
             // written through once cast: a counted loop's variable so
             // borrowed loses its proof, local_used; a static's `&raw
             // const` stays a read)
+            if pcx.nodes[n as usize].op == Tok::Amp {
+                note_address(n, pcx);
+            }
             if lends {
                 pcx.static_write += 1;
             }
@@ -888,6 +891,7 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
         NodeKind::Cast => {
             let operand = pcx.nodes[n as usize].a;
             walk(operand, pcx);
+            note_cast_address(n, pcx);
             let from = pcx.nodes[operand as usize].ty;
             if from > 0 && pcx.types[from as usize].kind == TyKind::Prim
                 && pcx.types[pcx.nodes[n as usize].ty as usize].kind == TyKind::Ptr
@@ -896,10 +900,18 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
                 local(n, EFF_UNSAFE, 0, pcx);
             }
         }
-        NodeKind::Call => walk_call(n, pcx),
-        NodeKind::MethodCall => {
-            walk(pcx.nodes[n as usize].a, pcx);
-            walk_list(n, pcx);
+        NodeKind::Call | NodeKind::MethodCall => {
+            if pcx.nodes[n as usize].kind == NodeKind::Call {
+                walk_call(n, pcx);
+            } else {
+                walk(pcx.nodes[n as usize].a, pcx);
+                walk_list(n, pcx);
+            }
+            // (0.30.1: a raw pointer a call makes may be of any local
+            // borrowed, settle_addresses)
+            if is_raw_pointer(pcx.nodes[n as usize].ty, pcx) {
+                pcx.fx_ref_cast = true;
+            }
         }
         NodeKind::Index => walk_index(n, pcx),
         NodeKind::FieldAccess => {
@@ -983,19 +995,143 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
 }
 
 // (0.30.1, RT-20) Scrutinee e of a `match` (an `if let`, a `while let`)
-// or the value of a `let`: when a pattern binds by `ref mut`, the binding
-// is a `&mut` of e's place, so e is walked as a written place (as an
-// `&mut e` is): a counted `while`'s variable matched so loses its proof
-// (local_used), a static matched so is written (static_access). Before,
-// `match i { ref mut r => *r = 0 }` was no write, and the loop ended.
+// or the value of a `let`: when a pattern binds by `ref mut` and e is a
+// place (is_place), the binding is a `&mut` of that place, so e is walked
+// as a written place (as an `&mut e` is): a counted `while`'s variable
+// matched so loses its proof (local_used), a static matched so is written
+// (static_access). Before, `match i { ref mut r => *r = 0 }` was no write,
+// and the loop ended. A value (a call's result, a tuple or a literal) is
+// a temporary the binding writes: `if let Some(ref mut x) = wrap(i)` and
+// `let (ref mut a, _) = (i, 0)` read i.
 fn walk_scrutinee(e: i64, lends: bool, pcx: &mut Ctx<Comp>) {
-    if lends {
+    let place = lends && is_place(e, pcx);
+    if place {
         pcx.static_write += 1;
     }
     walk(e, pcx);
-    if lends {
+    if place {
         pcx.static_write -= 1;
     }
+}
+
+// Whether e names a place (Rust's place expression): a variable, a
+// static, a deref, or a field or an element of a place.
+fn is_place(e: i64, pcx: &Ctx<Comp>) -> bool {
+    if e <= 0 {
+        return false;
+    }
+    let k = pcx.nodes[e as usize].kind;
+    if k == NodeKind::Ident {
+        return true;
+    }
+    if k == NodeKind::Unary {
+        return pcx.nodes[e as usize].op == Tok::Star;
+    }
+    if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
+        return is_place(pcx.nodes[e as usize].a, pcx);
+    }
+    false
+}
+
+// (0.30.1) Unary `&` n of a local x: a raw borrow (`&raw const x`, `&raw
+// mut x`), or a borrow the checker typed as a raw pointer, puts x's
+// address where a write through it changes x unseen (settle_addresses);
+// any other borrow of x is noted, for a reference made a raw pointer
+// later (fx_ref_cast).
+fn note_address(n: i64, pcx: &mut Ctx<Comp>) {
+    let o = pcx.nodes[n as usize].b;
+    if o <= 0 || pcx.nodes[o as usize].kind != NodeKind::Ident
+        || pcx.nodes[o as usize].res != Res::Local {
+        return;
+    }
+    let y = pcx.nodes[o as usize].y;
+    if (pcx.nodes[n as usize].p & NODE_RAW_BORROW) != 0
+        || is_raw_pointer(pcx.nodes[n as usize].ty, pcx) {
+        pcx.fx_addressed.push(y);
+    } else {
+        pcx.fx_borrowed.push(y);
+    }
+}
+
+// (0.30.1) Cast n to a raw pointer type: `&x as *const T` (`&mut x as
+// *mut T`) puts local x's address in it; a cast of any other reference
+// (`r as *mut T`, r a `&mut` of who knows which local) may hold the
+// address of any local borrowed in the function.
+fn note_cast_address(n: i64, pcx: &mut Ctx<Comp>) {
+    if !is_raw_pointer(pcx.nodes[n as usize].ty, pcx) {
+        return;
+    }
+    let o = pcx.nodes[n as usize].a;
+    if o <= 0 {
+        return;
+    }
+    if pcx.nodes[o as usize].kind == NodeKind::Unary && pcx.nodes[o as usize].op == Tok::Amp {
+        let x = pcx.nodes[o as usize].b;
+        if x > 0 && pcx.nodes[x as usize].kind == NodeKind::Ident
+            && pcx.nodes[x as usize].res == Res::Local {
+            pcx.fx_addressed.push(pcx.nodes[x as usize].y);
+            return;
+        }
+    }
+    let t = pcx.nodes[o as usize].ty;
+    if t > 0 && (pcx.types[t as usize].kind == TyKind::Ptr && pcx.types[t as usize].b != 0
+        || pcx.types[t as usize].kind == TyKind::Slice) {
+        pcx.fx_ref_cast = true;
+    }
+}
+
+// Whether t is a raw pointer type (`*const T`, `*mut T`, a fat one).
+fn is_raw_pointer(t: i64, pcx: &Ctx<Comp>) -> bool {
+    t > 0 && (pcx.types[t as usize].kind == TyKind::Ptr && pcx.types[t as usize].b == 0
+        || is_raw_view(t, pcx))
+}
+
+// (0.30.1) Proof n (its effect bit taken away) read local y: a divisor
+// proven not 0, a counted loop's variable (settle_addresses).
+fn rely_on(y: i64, n: i64, bit: i64, pcx: &mut Ctx<Comp>) {
+    if y >= 0 {
+        pcx.fx_relied.push(y);
+        pcx.fx_relied.push(n);
+        pcx.fx_relied.push(bit);
+    }
+}
+
+// RULE: E1.8 (0.30.1) A proof that reads a local holds only while nothing
+// unseen writes the local: after a function's walk, each proof (rely_on)
+// whose local's address a raw pointer may hold (note_address,
+// note_cast_address; a call that returns a raw pointer makes every
+// borrowed local so) gets its effect back. `let p = &raw mut i; while i
+// < n { *p = 0; i += 1 }` is `diverge`; `if d != 0 { (&raw const d as
+// *mut u64).write(0); x / d }` is `panic`.
+fn settle_addresses(pcx: &mut Ctx<Comp>) {
+    let mut k: usize = 0;
+    while k + 2 < pcx.fx_relied.len() {
+        let y = pcx.fx_relied[k];
+        if address_taken(y, pcx) {
+            let n = pcx.fx_relied[k + 1];
+            let bit = pcx.fx_relied[k + 2];
+            local(n, bit, 0, pcx);
+        }
+        k += 3;
+    }
+}
+
+fn address_taken(y: i64, pcx: &Ctx<Comp>) -> bool {
+    if pcx.fx_addressed.contains(&y) {
+        return true;
+    }
+    pcx.fx_ref_cast && pcx.fx_borrowed.contains(&y)
+}
+
+// The walk of function f's body (node_locals, find_step), its proofs
+// settled.
+fn walk_body(f: i64, pcx: &mut Ctx<Comp>) {
+    pcx.fx_addressed.clear();
+    pcx.fx_borrowed.clear();
+    pcx.fx_relied.clear();
+    pcx.fx_ref_cast = false;
+    walk(pcx.nodes[pcx.fns[f as usize].node as usize].c, pcx);
+    settle_addresses(pcx);
 }
 
 // Whether pattern p binds something by `ref mut` (a PatBind whose c is
@@ -1052,6 +1188,10 @@ fn arith_panic(n: i64, pcx: &mut Ctx<Comp>) {
     if op == Tok::Slash || op == Tok::SlashEq || op == Tok::Percent || op == Tok::PercentEq {
         if !safe_divisor(n, ty, pcx) {
             local(n, EFF_PANIC, 0, pcx);
+        } else {
+            // (the locals the proof read, settle_addresses)
+            rely_on(fact_local(pcx.nodes[n as usize].c, pcx), n, EFF_PANIC, pcx);
+            rely_on(fact_local(lhs, pcx), n, EFF_PANIC, pcx);
         }
         return;
     }
@@ -2032,6 +2172,9 @@ fn walk_while(n: i64, pcx: &mut Ctx<Comp>) {
     pcx.loops.truncate(mark as usize);
     if broken {
         local(n, EFF_DIVERGE, 0, pcx);
+    } else {
+        // (its variable, settle_addresses)
+        rely_on(pcx.nodes[step as usize].y, n, EFF_DIVERGE, pcx);
     }
 }
 
@@ -2434,12 +2577,15 @@ fn signature_of(m: i64, pcx: &mut Ctx<Comp>) {
                 pp = effects_union(pp, edge_through(e, pcx));
             }
         } else if made {
+            // (E3.3c: a listed type's own methods' part, type_part; a
+            // drop's, all of it)
+            pcx.fx_part_stamp += 1;
+            let part = if dropped { if track { (pcx.fx_fixed[w as usize]) }
+                else { (pcx.node_fx[w as usize]) } } else { type_part(w, at, 0, pcx) };
+            pf = effects_union(pf, edge_pass(e, part, pcx));
             if track {
-                pf = effects_union(pf, edge_pass(e, (pcx.fx_fixed[w as usize]), pcx));
                 pd = effects_union(pd, edge_pass(e, (pcx.fx_dyn[w as usize]), pcx));
                 pp = effects_union(pp, edge_pass(e, (pcx.fx_dyn[w as usize]), pcx));
-            } else {
-                pf = effects_union(pf, edge_through(e, pcx));
             }
         } else if track {
             pd = effects_union(pd, edge_pass(e, (pcx.fx_dyn[w as usize]), pcx));
@@ -2543,6 +2689,85 @@ fn made_for(w: i64, at: i64, pcx: &Ctx<Comp>) -> bool {
     for j in 0..(pcx.fx_decl_tps[at as usize]) {
         if node_made_for(w, (pcx.fx_decl_tps[(at + 1 + j) as usize]), pcx) {
             return true;
+        }
+    }
+    false
+}
+
+// RULE: E3.3c (0.30.1) What an edge to graph node w, made for a listed
+// type of the declaration at FX_DECL_TPS[at] (made_for), brings to the
+// declaration: a listed type stands for its own methods' effects, nothing
+// more. All of w's set (its fixed part when tracked) when w is one of a
+// listed type's own methods (own_method: its self type is the type, or
+// it is the body of the closure the type is); else, w being generic over
+// the type (`W<T>::helper`, `g::<T>`, a Vec<T>'s method), only what w's
+// own edges made for it bring, so on down (a dispatch, a fn value's
+// call, passes as E3.3a's), each node once per walk (a second way to it
+// brings no more: less passes, never more). Before, all of such a w's set
+// passed: `#[effects(T)]` let a panic of W<T>::helper's own through that
+// `#[effects()]` refused (HashMap's insert, reserve, entry).
+fn type_part(w: i64, at: i64, depth: i64, pcx: &mut Ctx<Comp>) -> Effects {
+    if own_method(w, at, pcx) {
+        return if pcx.fx_fixed.len() > 0 { (pcx.fx_fixed[w as usize]) }
+            else { (pcx.node_fx[w as usize]) };
+    }
+    if depth > 64 || w < 0 || w >= pcx.graph_fns {
+        return effects_none();
+    }
+    if pcx.fx_part_seen.len() < pcx.graph_fns as usize {
+        pcx.fx_part_seen.resize(pcx.graph_fns as usize, 0);
+    }
+    if (pcx.fx_part_seen[w as usize]) == pcx.fx_part_stamp {
+        return effects_none();
+    }
+    (pcx.fx_part_seen[w as usize]) = pcx.fx_part_stamp;
+    let mut out = effects_none();
+    // (the allocators w's body names through a listed type: E3.3a's, as
+    // signature_of's for the declaration's own body)
+    if (w as usize) < pcx.local_fx.len() {
+        for j in 0..(pcx.fx_decl_tps[at as usize]) {
+            out.allocs |= allocs_through((pcx.local_fx[w as usize]).allocs,
+                (pcx.fx_decl_tps[(at + 1 + j) as usize]), pcx);
+        }
+    }
+    for e in (pcx.edge_start[w as usize])..(pcx.edge_start[(w + 1) as usize]) {
+        let w2 = edge_to(e, pcx);
+        if dispatch_edge(w2, pcx) {
+            out = effects_union(out, edge_through(e, pcx));
+        } else if ((pcx.edges[e as usize]) & 3) == E_DROP {
+            // (a drop is taken as one of a listed type's value or of its
+            // fields', its own, as signature_of's `dropped`: a field's type
+            // is not in the listed type's, ty_mentions)
+            let all = if pcx.fx_fixed.len() > 0 { (pcx.fx_fixed[w2 as usize]) }
+                else { (pcx.node_fx[w2 as usize]) };
+            out = effects_union(out, edge_pass(e, all, pcx));
+        } else if made_for(w2, at, pcx) {
+            let part = type_part(w2, at, depth + 1, pcx);
+            out = effects_union(out, edge_pass(e, part, pcx));
+        }
+    }
+    out
+}
+
+// Whether graph node w is a method of a listed type of the declaration at
+// FX_DECL_TPS[at] (type_part): its self type is the type, or it is the
+// body of the closure the type is (or a `&mut` of).
+fn own_method(w: i64, at: i64, pcx: &Ctx<Comp>) -> bool {
+    if w < 0 || w >= pcx.graph_fns {
+        return false;
+    }
+    for j in 0..(pcx.fx_decl_tps[at as usize]) {
+        let tau = (pcx.fx_decl_tps[(at + 1 + j) as usize]);
+        if pcx.fns[w as usize].self_ty > 0 && pcx.fns[w as usize].self_ty == tau {
+            return true;
+        }
+        for c in 0..pcx.closures.len() as i64 {
+            if pcx.closures[c as usize].f == w
+                && (pcx.closures[c as usize].ty == tau
+                    || pcx.types[tau as usize].kind == TyKind::Ptr
+                    && pcx.types[tau as usize].a == pcx.closures[c as usize].ty) {
+                return true;
+            }
         }
     }
     false
@@ -2757,7 +2982,7 @@ pub fn find_step(f: i64, bit: i64, alloc: i64, pcx: &mut Ctx<Comp>) {
     }
     pcx.fmt_touch = 0;
     pcx.fmt_made = false;
-    walk(pcx.nodes[pcx.fns[f as usize].node as usize].c, pcx);
+    walk_body(f, pcx);
     fmt_settle(f, pcx);
     drop_edges(f, pcx);
     pcx.search = false;
