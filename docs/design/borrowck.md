@@ -428,11 +428,18 @@ kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
   and front/closures/kinds.vl scan_body counts the same uses as writes of
   the capture, so a closure whose kind is inferred is FnMut whenever its
   body would be refused as `Fn`; only a bound (`F: Fn()`) fixes a kind
-  the body does not have, and then its body is refused. Before, the
+  the body does not have, and then its body is refused. Kinds are
+  inferred innermost first, as rustc's upvar analysis: an inner
+  closure's write through a capture of the outer one is the unique
+  borrow its env takes in the outer body, so the outer one is FnMut
+  (`|| { let mut g = || *r += 1; g(); }`); one given where `F: Fn` is
+  bound is then rustc's E0525 at the closure (closure.kind), and no body
+  is borrow-checked with a kind it lacks. Before, the
   closure's part always counted as mutable, and two threads given `&F`
   with `F: Fn() + Sync` raced on `*r += 1`. *Cases:*
   `rust_b_err_closure_through_shared`, `rust_b_closure_capture_write_ok`,
-  `rust_b_err_fn_closure_*`, `rust_b_closure_through_mut_kinds_ok`;
+  `rust_b_err_fn_closure_*`, `rust_b_closure_through_mut_kinds_ok`,
+  `rust_b_nested_closure_write_ok`, `rust_b_err_nested_closure_fn_bound`;
 - (0.30.1, RT-33) a `&mut` of a view's *referent*, what a slicing
   borrows: `&mut s[..]`, `&mut s[a..b]`, `&mut *s` (the front makes it
   the slicing `&mut s[..]`), a `&mut self` method of `[T]` or `str`
@@ -458,7 +465,9 @@ kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
   `if`'s or a call's shared view, is never retyped: it stays shared (a
   `&mut` of a call's view, `&mut w[0..3]` of a W with Index only, is the
   slicing of that view, refused at the borrow with rustc's "data in an
-  index of `W`", "data in dereference of `D`"; one with IndexMut or
+  index of `W`", "data in dereference of `D`", known by the trait of
+  the call's impl, not its name: an inherent `fn index` is "data in a
+  `&` reference"; one with IndexMut or
   DerefMut is that call, place_to_mut, also where a view's deref was
   read as the view, Z4.1: `w[0..3].reverse()`, `d[..2].reverse()`),
   and (3) the call check refuses any operand of a shared view type, a
