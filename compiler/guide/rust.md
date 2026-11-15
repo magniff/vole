@@ -117,6 +117,16 @@ fn main() {
   `f64` does too. `i64::from(a)` is accepted as in Rust.
   An index is not widened to: it is a `usize`, as in Rust (`v[i as
   usize]` of an `i: u32`).
+- **Not an i32 computed from untyped literals** (0.30.1,
+  `type.widen_i32`): an integer literal nothing gives a type is i32,
+  and Rust types it from the later use instead. So `let a = [2000000000,
+  2]; let s = a[0] + a[0];` passed to an `i64` parameter is an error,
+  not an i32 sum widened after it overflowed: write the type where the
+  value is made (`let a: [i64; 2]`, `let mut n: i64 = 0`,
+  `s.parse::<i64>()`), or `i64::from(s)` when i32 is meant. A literal,
+  an element, a loop's binding and an i32 whose type is written (a
+  parameter, a field, a function's result) widen as before: their value
+  is the same in either type.
 - **Overflow** panics at `-O0` (`attempt to add with overflow`) and
   wraps at `-O2`, as Rust's debug and release builds do; `wrapping_add`
   and its family always wrap.

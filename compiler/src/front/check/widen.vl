@@ -84,6 +84,25 @@ pub fn try_widen(n: i64, actual: i64, expected: i64, pcx: &mut Ctx<Comp>) -> boo
     true
 }
 
+// RULE: F29.3 (0.30.1) error type.widen_i32: value n, an i32, where the
+// wider integer type `to` goes.
+fn i32_widen_error(n: i64, to: i64, pcx: &mut Ctx<Comp>) {
+    // (not after an earlier error: a type it left unknown, an i32 it made)
+    if crate::base::diag::error_count(pcx) > pcx.widen_errors {
+        return;
+    }
+    pcx.widen_errors += 1;
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"type.widen_i32";
+    err_begin(pcx.nodes[n as usize].start, pcx);
+    err_str(c"this 'i32' is not widened to '", pcx);
+    err_type(to, pcx);
+    err_str(c"' implicitly: it is computed in i32, the integer literals' default type, as nothing written gives its operands a type", pcx);
+    err_help(c"Rust types such a literal from this use, and widening after the arithmetic would compute another value: write the type where the value is made (`let s: i64 = ...`, `2000000000i64`), or convert it, `i64::from(x)`", pcx);
+    crate::base::diag::err_end_soft(pcx);
+    pcx.err_kind = saved;
+}
+
 // The join of integer types a and b: the wider when one widens to the
 // other (a when they are the same), 0 otherwise.
 pub fn join_int(a: i64, b: i64) -> i64 {
@@ -265,11 +284,486 @@ pub fn widen_value(n: i64, to: i64, pcx: &mut Ctx<Comp>) {
             }
         }
         _ => {
+            // RULE: F29.3 (0.30.1: an i32 a literal's default made is not
+            // widened: an error that names the type to write)
+            if t == TY_I32 && computed_default(n, 0, pcx) {
+                i32_widen_error(n, to, pcx);
+            }
             widen_node(n, to, pcx);
             return;
         }
     }
     pcx.nodes[n as usize].ty = to;
+}
+
+// RULE: F29.3 (0.30.1, RT-10) Whether checked value n, an i32, has its
+// type from something the program writes (a parameter's, an annotated
+// `let`'s, a field's, a function's result, a cast, a suffix), not only
+// from an integer literal's default: Rust types such a literal from the
+// use that widens it here, so the widening would change what the
+// arithmetic before it computes. What it cannot tell is not written
+// (0.30.1, the review: a form it does not know is no yes).
+fn written_int(n: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if n <= 0 || depth > 32 {
+        return false;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    // (a constant's or a static's path, a field, a cast: their types written)
+    if k == NodeKind::Path || k == NodeKind::FieldAccess && !capture_field(n, pcx)
+        || k == NodeKind::Cast && (pcx.nodes[n as usize].p & NODE_IMPLICIT) == 0 {
+        return true;
+    }
+    if k == NodeKind::Block {
+        return written_int(pcx.nodes[n as usize].a, depth + 1, pcx);
+    }
+    // (a loop's value: written when each `break` value is)
+    if k == NodeKind::Loop {
+        return breaks_written(pcx.nodes[n as usize].b, pcx.nodes[n as usize].a, false, depth + 1,
+            pcx) == 1;
+    }
+    if k == NodeKind::If {
+        return written_int(pcx.nodes[n as usize].b, depth + 1, pcx)
+            && written_int(pcx.nodes[n as usize].c, depth + 1, pcx);
+    }
+    if k == NodeKind::Int {
+        return pcx.nodes[n as usize].b != SUF_NONE;
+    }
+    if k == NodeKind::Ident {
+        if pcx.nodes[n as usize].res != Res::Local {
+            return true;
+        }
+        let l = pcx.nodes[n as usize].y;
+        // (0.30.1: a parameter by its written type, not a closure's whose
+        // type its argument gave, `|x| x + x`; `self` by its impl's)
+        if l < 0 || l >= pcx.locals.len() as i64 || pcx.locals[l as usize].tnode != 0
+            || pcx.locals[l as usize].is_param && pcx.locals[l as usize].name == pcx.self_sym {
+            return true;
+        }
+        // (an unannotated `let`'s: its value's; a binding of a pattern or
+        // a loop, none: not known to be written)
+        let value = pcx.locals[l as usize].value;
+        return value != 0 && written_int(value, depth + 1, pcx);
+    }
+    // (an array's or a tuple's literal: written when an element is)
+    if k == NodeKind::Array || k == NodeKind::Tuple {
+        for i in 0..pcx.nodes[n as usize].count {
+            if written_int(child(n, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == NodeKind::Repeat {
+        return written_int(pcx.nodes[n as usize].a, depth + 1, pcx);
+    }
+    if k == NodeKind::Index || k == NodeKind::TupleField {
+        return written_int(pcx.nodes[n as usize].a, depth + 1, pcx);
+    }
+    if k == NodeKind::Binary {
+        return written_int(pcx.nodes[n as usize].b, depth + 1, pcx)
+            || written_int(pcx.nodes[n as usize].c, depth + 1, pcx);
+    }
+    if k == NodeKind::Unary {
+        return written_int(pcx.nodes[n as usize].b, depth + 1, pcx);
+    }
+    if k == NodeKind::Cast && (pcx.nodes[n as usize].p & NODE_IMPLICIT) != 0 {
+        return written_int(pcx.nodes[n as usize].a, depth + 1, pcx);
+    }
+    if k == NodeKind::Call {
+        // (a generic function's result: written when the arguments of its
+        // type are, `max(a, 3)`; `i32::min(7, 3)`, `(7).min(3)` not)
+        // (the function called: X - 1, as places::build reads it; none, a
+        // call through a value: its type is written)
+        let f = pcx.nodes[n as usize].x - 1;
+        // (0.30.1: a closure's result, its type from its body, is not)
+        if f >= 0 && f < pcx.fns.len() as i64 && pcx.fns[f as usize].node > 0
+            && pcx.nodes[pcx.fns[f as usize].node as usize].kind == NodeKind::Closure {
+            return false;
+        }
+        if f < 0 || f >= pcx.fns.len() as i64 || pcx.fns[f as usize].tmpl == 0
+            && pcx.fns[f as usize].self_ty != TY_I32 {
+            return true;
+        }
+        // (written when an i32 argument is, the one its type is likely
+        // bound by; `v[0]` of a `Vec::new_in` the literals filled, whose
+        // `index` takes no i32, not)
+        for i in 0..pcx.nodes[n as usize].count {
+            let a = child(n, i, pcx);
+            if pcx.nodes[a as usize].ty == TY_I32 && written_int(a, depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    false
+}
+
+// Whether field access n reads a closure's capture (its type the captured
+// local's, which may be a literal's default: not written).
+fn capture_field(n: i64, pcx: &Ctx<Comp>) -> bool {
+    let base = pcx.nodes[n as usize].a;
+    if base <= 0 {
+        return false;
+    }
+    let mut t = pcx.nodes[base as usize].ty;
+    while t > 0 && pcx.types[t as usize].kind == crate::front::types::TyKind::Ptr {
+        t = pcx.types[t as usize].a;
+    }
+    t > 0 && pcx.types[t as usize].kind == crate::front::types::TyKind::Struct
+        && pcx.structs[pcx.types[t as usize].a as usize].closure != 0
+}
+
+// RULE: F29.3 (0.30.1, RT-10) Whether checked value n, an i32, may have
+// been computed in i32 only because of an integer literal's default: an
+// operator (or an i32 method) none of whose i32 operands has a written
+// type, directly or as the value of an unannotated local. Rust types such
+// a literal from the use that widens n, so the arithmetic before it is
+// i64 there: widening after it would give another value on overflow. A
+// literal, an element, a parameter or anything typed by what is written
+// is widened as before (the same value in either type). (0.30.1, the
+// review) A form not known here is taken as computed: a match's arm, a
+// loop's `break`, a closure's result, an element of a computed array or
+// tuple, an Option's unwrap: no yes from what it cannot tell.
+fn computed_default(n: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if n <= 0 {
+        return false;
+    }
+    if depth > 32 {
+        return true;
+    }
+    if written_int(n, 0, pcx) {
+        return false;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    // (a literal alone: the same value in either type)
+    if k == NodeKind::Int {
+        return false;
+    }
+    // (an element of an array's or a tuple's literal: its own; of another
+    // value, that value's)
+    if k == NodeKind::Index || k == NodeKind::TupleField {
+        let base = pcx.nodes[n as usize].a;
+        let bk = pcx.nodes[base as usize].kind;
+        if k == NodeKind::TupleField && bk == NodeKind::Tuple {
+            let e = pcx.nodes[n as usize].b;
+            return e < 0 || e >= pcx.nodes[base as usize].count
+                || computed_default(child(base, e, pcx), depth + 1, pcx);
+        }
+        if bk == NodeKind::Array || bk == NodeKind::Tuple {
+            for i in 0..pcx.nodes[base as usize].count {
+                if computed_default(child(base, i, pcx), depth + 1, pcx) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if bk == NodeKind::Repeat {
+            return computed_default(pcx.nodes[base as usize].a, depth + 1, pcx);
+        }
+        // (of a local: its value's elements, `let t = (a + a, 1); t.0`; of
+        // a container filled elsewhere, `v.push(x)`, its element's type
+        // is the pushed value's, checked there)
+        if bk == NodeKind::Ident && pcx.nodes[base as usize].res == Res::Local
+            && pcx.nodes[base as usize].y >= 0
+            && pcx.nodes[base as usize].y < pcx.locals.len() as i64 {
+            let local = pcx.locals[pcx.nodes[base as usize].y as usize];
+            let v = local.value;
+            if local.tnode != 0 || v <= 0 {
+                return false;
+            }
+            let vk = pcx.nodes[v as usize].kind;
+            if k == NodeKind::TupleField && vk == NodeKind::Tuple {
+                let e = pcx.nodes[n as usize].b;
+                return e < 0 || e >= pcx.nodes[v as usize].count
+                    || computed_default(child(v, e, pcx), depth + 1, pcx);
+            }
+            if vk == NodeKind::Array || vk == NodeKind::Tuple {
+                for i in 0..pcx.nodes[v as usize].count {
+                    if computed_default(child(v, i, pcx), depth + 1, pcx) {
+                        return true;
+                    }
+                }
+            }
+            if vk == NodeKind::Repeat {
+                return computed_default(pcx.nodes[v as usize].a, depth + 1, pcx);
+            }
+            return false;
+        }
+        return computed_default(base, depth + 1, pcx);
+    }
+    // (a loop's `break` values: computed when one is)
+    if k == NodeKind::Loop {
+        return breaks_computed(pcx.nodes[n as usize].b, pcx.nodes[n as usize].a, false, depth + 1,
+            pcx);
+    }
+    // (a match's arms: computed when one is)
+    if k == NodeKind::Match {
+        for i in 0..pcx.nodes[n as usize].count {
+            let arm = child(n, i, pcx);
+            if computed_default(pcx.nodes[arm as usize].c, depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == NodeKind::Array || k == NodeKind::Tuple || k == NodeKind::VariantLit {
+        for i in 0..pcx.nodes[n as usize].count {
+            if computed_default(child(n, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == NodeKind::Ident {
+        if pcx.nodes[n as usize].res != Res::Local {
+            return false;
+        }
+        let l = pcx.nodes[n as usize].y;
+        if l < 0 || l >= pcx.locals.len() as i64 {
+            return false;
+        }
+        let local = pcx.locals[l as usize];
+        if local.tnode != 0 || local.value == 0 {
+            return false;
+        }
+        // (a `let mut`: its later values are computed in its type too,
+        // unless that type is written where it is made)
+        if local.mutable && local.ty == TY_I32 {
+            return !written_int(local.value, depth + 1, pcx);
+        }
+        return computed_default(local.value, depth + 1, pcx);
+    }
+    if k == NodeKind::Binary {
+        let op = pcx.nodes[n as usize].op;
+        if op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash
+            || op == Tok::Percent || op == Tok::Shl || op == Tok::Shr {
+            return !written_int(pcx.nodes[n as usize].b, depth + 1, pcx)
+                && !written_int(pcx.nodes[n as usize].c, depth + 1, pcx);
+        }
+        return computed_default(pcx.nodes[n as usize].b, depth + 1, pcx)
+            || computed_default(pcx.nodes[n as usize].c, depth + 1, pcx);
+    }
+    if k == NodeKind::Unary {
+        return computed_default(pcx.nodes[n as usize].b, depth + 1, pcx);
+    }
+    if k == NodeKind::Cast && (pcx.nodes[n as usize].p & NODE_IMPLICIT) != 0 {
+        return computed_default(pcx.nodes[n as usize].a, depth + 1, pcx);
+    }
+    if k == NodeKind::Block {
+        return computed_default(pcx.nodes[n as usize].a, depth + 1, pcx);
+    }
+    if k == NodeKind::If {
+        return computed_default(pcx.nodes[n as usize].b, depth + 1, pcx)
+            || computed_default(pcx.nodes[n as usize].c, depth + 1, pcx);
+    }
+    if k == NodeKind::Call && pcx.nodes[n as usize].x <= 0 {
+        // (a call through a value: a closure's result is computed in its
+        // body, a `fn` value's is written in its type)
+        let callee = pcx.nodes[n as usize].a;
+        let mut c = callee;
+        if c > 0 && pcx.nodes[c as usize].kind == NodeKind::Ident
+            && pcx.nodes[c as usize].res == Res::Local && pcx.nodes[c as usize].y >= 0
+            && pcx.nodes[c as usize].y < pcx.locals.len() as i64 {
+            c = pcx.locals[pcx.nodes[c as usize].y as usize].value;
+        }
+        return c <= 0 || pcx.nodes[c as usize].kind == NodeKind::Closure;
+    }
+    if k == NodeKind::Call {
+        // (an i32's own method, `x.pow(2)`, `x.abs()`, of operands none
+        // written; a generic function's result whose i32 an untyped
+        // literal argument gives, `s.parse().unwrap_or(0)`, which Rust
+        // types from the use: parse::<i64> there; `o.unwrap()` of an
+        // Option of a literal, an element, not)
+        let f = pcx.nodes[n as usize].x - 1;
+        if f < 0 || f >= pcx.fns.len() as i64 {
+            return false;
+        }
+        // (0.30.1: a closure's result, computed in its body)
+        if pcx.fns[f as usize].node > 0
+            && pcx.nodes[pcx.fns[f as usize].node as usize].kind == NodeKind::Closure {
+            return true;
+        }
+        if pcx.fns[f as usize].tmpl == 0 {
+            return pcx.fns[f as usize].self_ty == TY_I32 && !written_int(n, depth + 1, pcx);
+        }
+        for i in 0..pcx.nodes[n as usize].count {
+            let a = child(n, i, pcx);
+            if pcx.nodes[a as usize].ty == TY_I32
+                && (pcx.nodes[a as usize].kind == NodeKind::Int
+                    && pcx.nodes[a as usize].b == SUF_NONE
+                    || computed_default(a, depth + 1, pcx)) {
+                return true;
+            }
+        }
+        // (its i32 from no argument of that type, `o.unwrap()` of an
+        // `Option<i32>`: the value the argument holds, as computed as it)
+        // (0.30.1, review 2: only arithmetic it holds, not a literal it
+        // holds, `Cell::new(1).get()`: the same value in either type)
+        for i in 0..pcx.nodes[n as usize].count {
+            if holds_arith(child(n, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+// Whether value n (an argument a generic function's i32 comes from, not
+// itself an i32) holds an i32 computed by an operator on untyped literals
+// (computed_default's Binary): through references, locals' values,
+// variants, arrays, tuples and calls' arguments.
+fn holds_arith(n: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if n <= 0 {
+        return false;
+    }
+    if depth > 32 {
+        return true;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    if k == NodeKind::Binary {
+        return pcx.nodes[n as usize].ty == TY_I32 && computed_default(n, depth + 1, pcx);
+    }
+    if k == NodeKind::Unary {
+        return holds_arith(pcx.nodes[n as usize].b, depth + 1, pcx);
+    }
+    if k == NodeKind::Ident {
+        if pcx.nodes[n as usize].res != Res::Local || pcx.nodes[n as usize].y < 0
+            || pcx.nodes[n as usize].y >= pcx.locals.len() as i64 {
+            return false;
+        }
+        let local = pcx.locals[pcx.nodes[n as usize].y as usize];
+        if local.tnode != 0 || local.value == 0 {
+            return false;
+        }
+        return holds_arith(local.value, depth + 1, pcx);
+    }
+    // (review 3: a closure argument with no written result: its body's
+    // arithmetic on its parameters, whose i32 the call gives them,
+    // `Some(a).map(|x| x + x)`)
+    if k == NodeKind::Closure {
+        return pcx.nodes[n as usize].b == 0
+            && closure_arith(pcx.nodes[n as usize].a, depth + 1, pcx);
+    }
+    if k == NodeKind::VariantLit || k == NodeKind::Array || k == NodeKind::Tuple
+        || k == NodeKind::Call {
+        for i in 0..pcx.nodes[n as usize].count {
+            if holds_arith(child(n, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Whether closure body e computes an i32 by an operator of operands none
+// written (computed_default's Binary: its parameters', unannotated, given
+// their i32 by the call); a block by its last expression; else what
+// holds_arith finds in it.
+fn closure_arith(e: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if e <= 0 || depth > 32 {
+        return e > 0;
+    }
+    let k = pcx.nodes[e as usize].kind;
+    if k == NodeKind::Block {
+        let c = pcx.nodes[e as usize].count;
+        return c > 0 && closure_arith(child(e, c - 1, pcx), depth + 1, pcx);
+    }
+    if k == NodeKind::Binary {
+        return pcx.nodes[e as usize].ty == TY_I32 && computed_default(e, depth + 1, pcx);
+    }
+    holds_arith(e, depth + 1, pcx)
+}
+
+// Whether a `break` value in node n (the body of a loop labelled own, 0:
+// none) that ends that loop is computed (computed_default): its own
+// unlabelled breaks and those `break 'own`, and in a loop inside it
+// (inner) the `break 'own` alone (review 2; review 3: the label compared,
+// `break 'i` of an inner loop `'i` ends that one); not in a closure or a
+// function inside it.
+fn breaks_computed(n: i64, own: i64, inner: bool, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if n <= 0 {
+        return false;
+    }
+    if depth > 64 {
+        return true;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    if k == NodeKind::Break {
+        let v = pcx.nodes[n as usize].b;
+        let l = pcx.nodes[n as usize].a;
+        if !(l == 0 && !inner || l != 0 && l == own) {
+            return false;
+        }
+        return v > 0 && computed_default(v, depth + 1, pcx);
+    }
+    if k == NodeKind::Closure || k == NodeKind::Fn {
+        return false;
+    }
+    let deeper = inner || k == NodeKind::Loop || k == NodeKind::While || k == NodeKind::For;
+    if crate::front::generics::instantiate::node_field_a(k)
+        && breaks_computed(pcx.nodes[n as usize].a, own, deeper, depth + 1, pcx)
+        || crate::front::generics::instantiate::node_field_b(k)
+        && breaks_computed(pcx.nodes[n as usize].b, own, deeper, depth + 1, pcx)
+        || crate::front::generics::instantiate::node_field_c(k)
+        && breaks_computed(pcx.nodes[n as usize].c, own, deeper, depth + 1, pcx) {
+        return true;
+    }
+    for i in 0..pcx.nodes[n as usize].count {
+        if breaks_computed(child(n, i, pcx), own, deeper, depth + 1, pcx) {
+            return true;
+        }
+    }
+    false
+}
+
+// Of the `break` values in node n (a loop's body, as breaks_computed's,
+// labelled ones of inner loops too): 1 when there is one and each is
+// written, 0 when there is none, -1 when one is not.
+fn breaks_written(n: i64, own: i64, inner: bool, depth: i64, pcx: &Ctx<Comp>) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    if depth > 64 {
+        return -1;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    if k == NodeKind::Break {
+        let l = pcx.nodes[n as usize].a;
+        if !(l == 0 && !inner || l != 0 && l == own) {
+            return 0;
+        }
+        let v = pcx.nodes[n as usize].b;
+        return if v > 0 && written_int(v, depth + 1, pcx) { 1 } else { -1 };
+    }
+    if k == NodeKind::Closure || k == NodeKind::Fn {
+        return 0;
+    }
+    let deeper = inner || k == NodeKind::Loop || k == NodeKind::While || k == NodeKind::For;
+    let mut r: i64 = 0;
+    let mut parts = Vec::<i64, Comp>::new_in(Comp {});
+    if crate::front::generics::instantiate::node_field_a(k) {
+        parts.push(pcx.nodes[n as usize].a);
+    }
+    if crate::front::generics::instantiate::node_field_b(k) {
+        parts.push(pcx.nodes[n as usize].b);
+    }
+    if crate::front::generics::instantiate::node_field_c(k) {
+        parts.push(pcx.nodes[n as usize].c);
+    }
+    for i in 0..pcx.nodes[n as usize].count {
+        parts.push(child(n, i, pcx));
+    }
+    for &p in parts.as_slice() {
+        let w = breaks_written(p, own, deeper, depth + 1, pcx);
+        if w < 0 {
+            return -1;
+        }
+        if w > 0 {
+            r = 1;
+        }
+    }
+    r
 }
 
 // Two values that meet without an expected type (the branches of an `if`,

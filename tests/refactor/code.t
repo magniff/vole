@@ -113,17 +113,17 @@ inlined crate::calc::twice at 3 calls, deleted it	calc.vl	+2 -6 lines
 // calc.vl:54: 4 lines removed after line 54
 // calc.vl:68-69
 68	    let y = x + x;
-69	    y + y + (1 + 1) * square_plus(x + 1, 2) + clamp(x, 0, 9)
+69	    y + y + (1i64 + 1i64) * square_plus(x + 1, 2) + clamp(x, 0, 9)
 ## Statements and an argument that is not a name: a block; the parameter
 ## renamed (the argument names x).
 $ refactor inline square_plus --show
 inlined crate::calc::square_plus at 1 call, deleted it	calc.vl	+5 -6 lines
 // calc.vl:61: 5 lines removed after line 61
 // calc.vl:64-68
-64	    y + y + (1 + 1) * {
+64	    y + y + (1i64 + 1i64) * {
 65	        let x_2 = x + 1;
 66	        let s = x_2 * x_2;
-67	        s + 2
+67	        s + 2i64
 68	    } + clamp(x, 0, 9)
 $ main.vl -o prog
 ok: built prog
@@ -144,12 +144,12 @@ inlined crate::calc::quad at 1 call, deleted it	2 files	+10 -12 lines
  fn main() -> i32 {
 -    let s = sum_to(3) + mean_to(5) + first_big(10, 20) + quad(2) + bytes(4);
 +    let s = sum_to(3) + mean_to(5) + first_big(10, 20) + {
-+        let y = 2 + 2;
-+        y + y + (1 + 1) * {
-+            let x_2 = 2 + 1;
++        let y = 2i64 + 2i64;
++        y + y + (1i64 + 1i64) * {
++            let x_2 = 2i64 + 1;
 +            let s = x_2 * x_2;
-+            s + 2
-+        } + clamp(2, 0, 9)
++            s + 2i64
++        } + clamp(2i64, 0, 9)
 +    } + bytes(4);
      if s == 78 { 0 } else { 1 }
  }
@@ -177,7 +177,7 @@ $ refactor inline sum_to --at main.vl:7 --dry-run
 +        let mut total: i64 = 0;
 +        let mut squares: i64 = 0;
 +        let mut i: i64 = 1;
-+        while i <= 3 {
++        while i <= 3i64 {
 +            total += i;
 +            squares += i * i;
 +            i += 1;
