@@ -467,12 +467,20 @@ rustc's format_args evaluates them: `println("{s} {}", { s.clear(); 0
 A contract message keeps its holes' order (they are values passed to
 `contract_check`). Before 0.30.1 the hidden binding was a bit copy of
 `P` under no loan (RT-25): `println("{} {:?}", s, drop(s))` and `s == {
-s.clear(); s.shrink_to_fit(); t }` read a freed block. Not covered: a
-`format_args("{s}")` value kept past its statement (`let a =
-format_args("{}", t); drop(t); println("{a}")`, rustc E0505): the
-`Interp` closure captures the hole's copy and its type has no region
-(case `rust_b_hidden_format_args_kept`, XFAIL). *Anchor:*
-`places/build.vl: hidden_borrow`. *Cases:* `rt_025_*`, `rust_b_hidden_*`.
+s.clear(); s.shrink_to_fit(); t }` read a freed block. A `format_args`
+value (an `Interp` whose closure holds the holes) lives past the
+desugaring's block, so its holes that are places owning memory (reached
+from a local or a static by fields, indexes and derefs; a type with
+glue) are bound to their borrow, `let =fK = &P`, which the closure
+captures and reads through (front/check/interp.vl hole_by_ref): the
+value's type has the loan's region, as rustc's `Arguments<'a>`, and `let
+b = format_args("{}", t); drop(t); println("{b}")` or `show(format_args(
+"{}", s), { drop(s); 0 })` is E0505. Divergence (R-class, kept): a Copy
+place in a kept format_args value is a copy (`let a =
+format_args("{x}"); x += 1;` is accepted and shows the old x; rustc
+E0506); no memory is at stake. *Anchor:* `places/build.vl:
+hidden_borrow`, `front/check/interp.vl: hole_by_ref`. *Cases:*
+`rt_025_*`, `rust_b_hidden_*`.
 
 ## 3. Regions (S3)
 
