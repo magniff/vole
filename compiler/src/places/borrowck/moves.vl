@@ -106,6 +106,21 @@ fn uses(s: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
                 report(M_MOVED_HERE, s, l, p, q1, bck, pbody, pcx);
                 continue;
             }
+            // RULE: M3 (0.30.1) a by-value read of a static's place whose
+            // type is not Copy is a move out of the static (rustc E0507),
+            // whatever made the read: a `let`, a pattern's binder (`let (a, b)
+            // = ST;`, a `match` arm's, `if let`, `let-else`), an argument, a
+            // field or an element of an aggregate. The builder copies a
+            // static's part into a pattern's borrowed binder, so the check is
+            // on the operand, OK_COPY as OK_MOVE, not on the builder's choice
+            // (what a raw pointer reaches is unsafe's, R1).
+            if (ok == OK_COPY || ok == OK_MOVE) && l >= 0 && has_flag(l, LF_STATIC, pbody)
+                && !crate::places::regions::rust_copy(
+                    crate::places::ir::full_place_type(l, p, pbody, pcx), pcx)
+                && !through_raw(l, p, pbody, pcx) {
+                report(M_MOVE_OUT, s, l, p, -1, bck, pbody, pcx);
+                continue;
+            }
             if ok == OK_MOVE {
                 moved.push(l);
                 moved.push(p);
@@ -136,7 +151,7 @@ fn uses(s: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
                     // RULE: R1 (what is behind a raw pointer, a closure's
                     // env included, is unsafe's, D10.4: moved out of by
                     // ptr::read's bitwise copy, no path follows it)
-                } else if ok == OK_MOVE && for_seq(l, pbody, pcx) {
+                } else if ok == OK_MOVE && for_seq(l, pbody) {
                     // (a `for` over an owned sequence moves each element out of
                     // the lowering's own temporary, once: not the user's move)
                 } else if ok == OK_MOVE {
@@ -151,13 +166,56 @@ fn uses(s: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
             assigned_prefixes(s, st.a, st.b, bck, pbody, pcx);
         }
     } else if k == SK_MENTION {
-        // (a place mentioned is not read: `let _ = x;` of an x not assigned
-        // yet is accepted, as rustc's PlaceMention; a moved one stays
-        // refused, the builder's `x;` and `let _ = x;` being one statement)
-        let q = path_of(st.a, st.b, false, pbody, pcx);
-        if q >= 0 && some_in_tree(1, q, pcx) && reaching_move(st.a, q, s, bck, pbody, pcx) >= 0 {
-            report(M_USE_MOVED, s, st.a, st.b, q, bck, pbody, pcx);
+        mention(s, st, bck, pbody, pcx);
+    }
+}
+
+// RULE: M1 (0.30.1) A mention of place (st.a, st.b): `x;` (MENTION_READ)
+// reads it as an operand is read, and moves a static's value that is not
+// Copy (rustc E0381, E0382, E0507); `let _ = x;`, a match's scrutinee, a
+// hidden borrow's mention read nothing but the base of an index in the
+// place (rustc's PlaceMention: `let _ = x;` of an x never assigned or
+// moved passes, `let _ = a[i];` of an a never assigned is E0381).
+fn mention(s: i64, st: crate::places::ir::PStmt, bck: &mut Bck<Comp>, pbody: &Body<Comp>,
+    pcx: &mut Ctx<Comp>) {
+    let l = st.a;
+    if l < 0 {
+        return;
+    }
+    if st.c == crate::places::ir::MENTION_READ {
+        if has_flag(l, LF_STATIC, pbody)
+            && !crate::places::regions::rust_copy(
+                crate::places::ir::full_place_type(l, st.b, pbody, pcx), pcx)
+            && !through_raw(l, st.b, pbody, pcx) {
+            report(M_MOVE_OUT, s, l, st.b, -1, bck, pbody, pcx);
+            return;
         }
+        let q = path_of(l, st.b, false, pbody, pcx);
+        if q >= 0 {
+            if some_in_tree(1, q, pcx) {
+                report(M_USE_MOVED, s, l, st.b, q, bck, pbody, pcx);
+            }
+            return;
+        }
+        let base = base_path(l, st.b, pbody, pcx);
+        if base >= 0 && bit_get(1, base, pcx) {
+            report(M_USE_MOVED, s, l, st.b, base, bck, pbody, pcx);
+        }
+        return;
+    }
+    let mut c = st.b;
+    while c != 0 {
+        let k = proj_kind(c, pbody);
+        let parent = proj_parent(c, pbody);
+        if k == PJ_INDEX || k == crate::places::ir::PJ_CONST {
+            let q = path_of(l, parent, false, pbody, pcx);
+            let qb = if q >= 0 { q } else { base_path(l, parent, pbody, pcx) };
+            if q >= 0 && some_in_tree(1, q, pcx) || q < 0 && qb >= 0 && bit_get(1, qb, pcx) {
+                report(M_USE_MOVED, s, l, parent, qb, bck, pbody, pcx);
+                return;
+            }
+        }
+        c = parent;
     }
 }
 
@@ -221,9 +279,14 @@ fn whole_only(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> bool {
 // RULE: M2, M1 (0.30.1, rustc's get_moved_indexes) A move that reaches
 // location s of path q of local l, of a path above it or under it: met on
 // a path back from s through the predecessors before an assignment of q
-// or of a path above it, and before l's StorageLive. -1 when none: the
-// place is not initialized there because it was never assigned (E0381),
-// not because it moved (E0382).
+// or of a path above it. The edges into a loop's head from its body (back
+// edges: a predecessor not before the block in the reverse postorder) are
+// followed only when no other path back reaches the start of the body (or
+// l's StorageLive) with no move or assignment on it, or l is a parameter,
+// and none found a move: a place that may be unassigned since its `let` is
+// E0381, not "moved in a previous iteration". -1 when none: the place is
+// not initialized there because it was never assigned (E0381), not
+// because it moved (E0382).
 fn reaching_move(l: i64, q: i64, s: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>,
     pcx: &mut Ctx<Comp>) -> i64 {
     let b0 = crate::places::borrowck::loc_block(s, pbody);
@@ -236,9 +299,14 @@ fn reaching_move(l: i64, q: i64, s: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>
     for _ in 0..nb {
         bck.tmp.push(0);
     }
+    // (bck.queue: the forward blocks; back: the blocks reached by a back
+    // edge, for the second phase)
+    let mut back = Vec::<i64, Comp>::new_in(Comp {});
+    let mut reached_start = false;
     let mut b = b0;
     let mut from = s - 1;
     let mut head: i64 = 0;
+    let mut phase2 = false;
     loop {
         let start = block_start(b, pbody);
         let mut stopped = false;
@@ -248,36 +316,61 @@ fn reaching_move(l: i64, q: i64, s: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>
             if r == 1 {
                 return t;
             }
-            stopped = r == 2;
+            if r == 3 {
+                reached_start = true;
+            }
+            stopped = r != 0;
             t -= 1;
         }
         if !stopped {
-            for j in 0..crate::places::cfg::pred_count(b, pbody) {
+            let np = crate::places::cfg::pred_count(b, pbody);
+            if np == 0 {
+                reached_start = true;
+            }
+            for j in 0..np {
                 let pb = crate::places::cfg::pred(b, j, pbody);
-                if pbody.rpo_index[pb as usize] >= 0 && bck.tmp[pb as usize] == 0 {
-                    bck.tmp[pb as usize] = 1;
+                if pbody.rpo_index[pb as usize] < 0 || bck.tmp[pb as usize] != 0 {
+                    continue;
+                }
+                bck.tmp[pb as usize] = 1;
+                if !phase2 && pbody.rpo_index[pb as usize] >= pbody.rpo_index[b as usize] {
+                    back.push(pb);
+                } else if phase2 {
+                    back.push(pb);
+                } else {
                     bck.queue.push(pb);
                 }
             }
         }
-        if head >= bck.queue.len() as i64 {
-            return -1;
+        if !phase2 && head >= bck.queue.len() as i64 {
+            if reached_start && !has_flag(l, LF_PARAM, pbody) {
+                return -1;
+            }
+            phase2 = true;
         }
-        b = bck.queue[head as usize];
-        head += 1;
+        if phase2 {
+            if back.len() == 0 {
+                return -1;
+            }
+            b = back.pop().unwrap();
+        } else {
+            b = bck.queue[head as usize];
+            head += 1;
+        }
         from = block_start(b, pbody) + block_len(b, pbody) - 1;
     }
     -1
 }
 
 // Statement t, seen going back for reaching_move: 1 it moves a path
-// related to q, 2 it assigns q or a path above it (or begins l's
-// storage), 0 neither. (Its assignment is later than its operands' moves.)
+// related to q, 2 it assigns q or a path above it, 3 it begins l's storage
+// (unassigned from there, as from the body's start), 0 none of these. (Its
+// assignment is later than its operands' moves.)
 fn back_step(t: i64, l: i64, q: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     let st = pbody.stmts[t as usize];
     let k = st.kind;
     if k == crate::places::ir::SK_LIVE && st.a == l {
-        return 2;
+        return 3;
     }
     if (k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC) && st.a == l {
         let m = path_of(l, st.b, false, pbody, pcx);
@@ -349,14 +442,13 @@ fn opened_drop(l: i64, pbody: &Body<Comp>) -> bool {
     false
 }
 
-// Whether local l is a `for` lowering's sequence temporary (`__for_seq`).
-fn for_seq(l: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> bool {
-    let lc = pbody.locals[l as usize];
-    if lc.src < 0 {
-        return false;
-    }
-    let name = pcx.locals[lc.src as usize].name;
-    crate::base::sym_text(name, pcx) == b"__for_seq"
+// Whether local l is a `for` lowering's sequence temporary (LF_FOR_SEQ,
+// the desugaring's mark: never its name, `__for_seq`, which a program may
+// write too; 0.30.1: before, the name was read through `src` as a LOCALS
+// index, which for a static is its symbol: an index out of bounds, or a
+// static taken for the sequence and moved out of unchecked).
+fn for_seq(l: i64, pbody: &Body<Comp>) -> bool {
+    has_flag(l, crate::places::ir::LF_FOR_SEQ, pbody)
 }
 
 // Whether place (l, p) passes a deref of a raw pointer.
@@ -548,9 +640,7 @@ fn immutable_why(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64
         else { lt };
     // (the env only: a `&F` parameter of a closure type is a reference
     // like any, D19.5's call through it)
-    let src = pbody.locals[l as usize].src;
-    let env = src >= 0 && (pbody.locals[l as usize].flags & crate::places::ir::LF_PARAM) != 0
-        && pcx.locals[src as usize].name == pcx.env_sym;
+    let env = crate::places::borrowck::diag::is_env(l, pbody, pcx);
     // RULE: D2.7 (0.30.1) a closure body's place under its env: the env's
     // own deref and a capture's (a by-reference capture, D19.6's mode) are
     // the closure's, mutable as its kind makes them; what the path reaches
@@ -832,6 +922,11 @@ fn unassigned_reads(bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>
                         }
                     }
                 }
+                // (0.30.1: `x;` reads x, MENTION_READ)
+                if checking && k == SK_MENTION && st.c == crate::places::ir::MENTION_READ
+                    && st.a > 0 && (bck.tmp[(st.a >> 6) as usize] >> (st.a & 63)) & 1 != 0 {
+                    report_unassigned(loc, st.a, bck, pbody, pcx);
+                }
                 if k == crate::places::ir::SK_LIVE {
                     let f = pbody.locals[st.a as usize].flags;
                     if (f & crate::places::ir::LF_DEFERRED) != 0
@@ -1043,7 +1138,9 @@ fn report(what0: i64, s: i64, l: i64, p: i64, q: i64, bck: &mut Bck<Comp>, pbody
             // it is assigned, rustc E0381, not "after it moved")
             code = c"borrowck.use_uninit";
             buf_str(m, c"used binding '");
-            crate::places::borrowck::diag::buf_place(m, l, p, 0, pbody, pcx);
+            // (0.30.1: the binding, as rustc names it, not the place read
+            // through it, `*x` or `p.a`)
+            crate::places::borrowck::diag::buf_place(m, l, 0, 0, pbody, pcx);
             buf_str(m, c"' is possibly-uninitialized (rustc E0381)");
             help = c"give it its value where it is declared, or assign it on every path before this use";
         } else {

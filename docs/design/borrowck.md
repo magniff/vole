@@ -1367,10 +1367,17 @@ its cut-offs.)
   the path alone (shallow, as D2.2 says). What a raw pointer reaches
   (a deferred closure body's env, D10.4; none from 0.27.2, D19.4) is not
   checked (R1); the pointer itself is (0.30.1: before, `let p: *const
-  i64; unsafe { *p }` read p unassigned). An `SK_MENTION` (`let _ = x;`)
-  is checked only for a move that reaches it (rustc's PlaceMention reads
-  nothing: `let _ = x;` of an x never assigned passes; the builder lowers
-  `x;` the same, which rustc refuses, E0381).
+  i64; unsafe { *p }` read p unassigned). An `SK_MENTION` (0.30.1): an
+  expression statement's place, `x;` (`MENTION_READ`), is read as an
+  operand is (E0381, E0382; a static's value not Copy, E0507); a place
+  only mentioned, `let _ = x;`, a match's scrutinee, a hidden borrow's,
+  reads nothing but the base of an index in it (rustc's PlaceMention:
+  `let _ = *p;` of a p never assigned passes, `let _ = a[i];` of an a
+  never assigned is E0381). Open: front/drops.vl makes `let _ = x;` of an
+  owned place `let _ = &x;`, a borrow, refused after x moved where rustc
+  accepts (`rust_b_ok_mention_after_move`, XFAIL); and `s;` of a value
+  not Copy reads s in place where rustc moves it into a temporary
+  dropped at the statement's end (`rust_b_err_stmt_moves`, XFAIL).
 - (M2) `SK_ASSIGN`/`SK_CALL`/`SK_INTRINSIC` with destination `Q =
   L.π`, `π ≠ ∅` (0.30.1: rustc's check_if_assigned_path_is_moved, from
   the last projection in): a field's (a variant's, a union's) base
@@ -1389,15 +1396,27 @@ its cut-offs.)
   exception: it assigns the union anew). Then the assignment
   initializes. `Q = (L, 0)`: no requirement (reinitialization), and it
   kills `L`'s loans through a deref (D2.3). One E0381 per local, its
-  first (rustc's `uninitialized_error_reported`).
+  first (rustc's `uninitialized_error_reported`), naming the binding, not
+  the place read through it. The walk back for the reaching move follows
+  a loop's back edges only when no other path back reaches the body's
+  start (or the local's StorageLive) unmoved and unassigned, or the local
+  is a parameter (rustc's get_moved_indexes): a value that may be
+  unassigned since its `let` is E0381 though the loop moves it.
 - (M3) An `OK_MOVE Q` whose path does not exist because `Q` goes
   through a `*` (a reference, a raw pointer, a `Box`'s deref call:
   R8), an index on a view, array or `Vec`, a static, or an
-  `LF_BORROWED` local: `borrowck.move_out` (rustc E0507/E0508). A
-  user `let` of a static's place, `let t = SN;`, takes it (0.30.1: the
-  binding is a borrowed copy, never dropped, and its value was copied
-  before the builder's `place_operand` decided; now an `OK_MOVE` unless
-  the type is Copy). MVS
+  `LF_BORROWED` local: `borrowck.move_out` (rustc E0507/E0508). (0.30.1)
+  Any by-value read (`OK_COPY` or `OK_MOVE`, or `x;`) of a static's place
+  whose type is not Copy is `move_out`, whatever made it: a `let`, a
+  pattern's binder (the builder copies a static's part into a borrowed
+  binder: `let (a, b) = ST;`, `let W { d, k } = SW;`, a match's or an `if
+  let`'s), an argument, an aggregate's part. Before, those binders took the
+  one static value and dropped it at each call. A `for` loop's sequence
+  temporary, the one place the lowering moves out of itself, is
+  `LF_FOR_SEQ`, set from the desugaring's `PAT_FOR_SEQ` mark (before: its
+  name, `__for_seq`, read through `src` as a LOCALS index, which for a
+  static is its symbol: out of bounds, or a static taken for it and moved
+  out of unchecked; and a program's own `let __for_seq` was exempt). MVS
   keeps `own.move_out` (`diff.vl`'s backstop) unchanged.
 - (M4) An `OK_MOVE` of a strict sub-place of a value whose type has
   `impl Drop` (whole-only): `borrowck.move_from_drop` (E0509).
