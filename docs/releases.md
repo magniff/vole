@@ -90,8 +90,111 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.28.0 | `v0.28.0` | 0.27.8 | aarch64-macos | one language: the MVS edition, the translator, the own pass and the old std removed (compiler/std2 is compiler/std); no default arguments; an index is a `usize`; a panic is only `panic`, `#[terminates]`, `Hash::hash` `#[pure]`, the tools name `static`; six bugs of 0.27.8 fixed (an endless loop compiled away, a `&mut` field written through `&self`); the tools' cache bounded |
 | 0.29.0 | `v0.29.0` | 0.28.0 | aarch64-macos | the safety release: the compiler's unsafe sites 3281 to 316, each justified, none unneeded, no `static mut` (its tables are `Vec`s, the global ones a compilation context's), and unjustified unsafe an error for its source (`check --deny=unsafe`); `*const T` and `*mut T` two types, a slice without fields; `~x` refused; a map's hasher written (`FixedState` in the prelude); if-let temporaries by Rust 2024's rule; a generic call's temporary dropped (a leak) and three checker holes closed; `--edition` and the std2 name gone; the inliner's room per caller, std's block copies; the gate schedules itself, fuzz-sem back; the self-build dearer than 0.28.0's |
 | 0.30.0 | `v0.30.0` | 0.29.0 | aarch64-macos | the speed release: the self-build a sixth cheaper than 0.29.0's with every check kept (-O2 within 1% of 0.28.0's), iterator chains the loops written by hand, std's text by blocks, `sort` an introsort; `*p = v` through a raw pointer drops the old value, as in Rust (`ptr::write` does not), and through a `Box`, a guard or `DerefMut` too (a leak); two use-after-frees in safe code closed; a union field's borrow is `unsafe` (E0133), two indexes of a place may alias, a captured `FnMut` called must be `mut`; `use.redundant` a tools' warning; `println` one write a line; edits in batches, `check --std`, `refactor fold`; XFAIL 730 to 717, unsafe 316 to 299; a hello world's compile +31% |
+| 0.30.1 | `v0.30.1` | 0.30.0 | aarch64-macos | the safety nets: `--check-unsafe` sees std's allocator (every Vec, String and Box), checks an address as Rust's `add` and locks its tables; a C function is the symbol it links to, never its vole name (-O2 removed the calls of an allocator named `malloc`); `--trace` reports a stack overflow; a warm -O2 build the bytes of a cold one when a call count changes; every gate row has a floor, every safety net a canary |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.30.1
+
+The safety nets' release: checks that passed without looking, found
+after `--check-unsafe` turned out to be blind to std's allocator. Each
+net now has a case that it must catch (a canary), and each gate row a
+count below which it fails. `--check-unsafe` sees every Vec, String
+and Box, and the compiler builds itself under it with no report. A C
+function is known by the symbol it links to and never by its vole name:
+-O2 removed the calls of a program's own allocator declared as
+`malloc`. `--trace` reports a stack overflow, and a warm -O2 build has
+the bytes of a cold one when a function's number of calls changes.
+
+#### What changes for a program
+
+- **`--check-unsafe` checks std's memory.** From 0.28.0 to 0.30.0 it
+  saw only blocks a program got from C's `malloc` by that name. It
+  missed every block of std's `Gpa` (`#[link_name = "malloc"] fn
+  gpa_c_malloc`), so a raw pointer into a Vec, String or Box read freed
+  memory, or past the end, unchecked. Such reads are now stopped. A
+  program that ran clean under `--check-unsafe` may now stop with
+  `unsafe access after free` or `unsafe access out of bounds`, naming
+  the line. Blocks aligned above 16 (`posix_memalign`) are recorded too.
+- **An address is not an access** under `--check-unsafe`, as in Rust:
+  `&p[i]`, `p.add(i)` and `p.sub(i)` of a pointer into a live block must
+  stay in that block or one past its end (`unsafe address out of
+  bounds: offset 800 of a block of 32 bytes (an address from offset
+  0)`), and only a read or a write through the pointer is checked as an
+  access. 0.30.0 checked `NonNull::add`'s one-past-the-end address as a
+  read of the element there. std's `*const T::add` and `sub` are now
+  that address (`&p[count]`) and not integer arithmetic.
+- **`#[link_name]` names the C function** for every check and
+  optimization, both ways. `#[link_name = "my_alloc"] fn malloc` is not
+  C's malloc: -O2 kept its calls (0.30.0 removed them as a heap
+  allocation it could put on the stack). `#[link_name = "exit"] fn
+  leave` is C's exit: `#[no_io]` refuses it. The same holds for libm's
+  functions (sin, sqrt: their calls kept or made libcalls by the
+  symbol), `setjmp` (returns twice by its symbol) and a C static's
+  symbol. An extern named like a C function the compiler itself calls
+  (`memcpy`, `fmod`) with a `#[link_name]` no longer takes over those
+  calls (RT-6).
+- **`--trace` reports a stack overflow** (RT-14): its SIGSEGV handler
+  runs on a stack of its own (`sigaltstack`), and prints `stopped by
+  signal 11` and the frames where it printed nothing.
+
+#### Bugs fixed
+
+- The code cache (RT-CG-3): a warm -O2 build after an edit that
+  changed a function's number of calls (a call added, removed, or made
+  unreachable) reused code optimized for the other count. The code was
+  right in every case seen, but its bytes were not a cold build's. A
+  function's own one-call fact is now in its key. tests/incremental.sh
+  missed this because its edits never changed a call count. It now has
+  three edit kinds that do (a call made twice, taken out, copied into
+  `if false { }`). Before its series it builds pairs of programs warm
+  after each other and compares them with cold builds:
+  tests/incremental/*.vl.txt, both orders, -O1 and -O2, -S and -c.
+  0.30.0 fails 8 of the 24.
+- `--check-unsafe`'s tables were sorted arrays, unlocked, moved by
+  `memmove` on every block: quadratic in the number of live blocks, and
+  raced by a program's threads. They are treaps behind a lock, with the
+  last hit kept. A block that C freed unseen (`realloc`, a library's
+  own free) is forgotten when a new block overlaps it, and is not
+  reported.
+- Two more places in the compiler computed addresses with a checked
+  `+`, like `middle::lsr`'s fixed at 0.30.0's tag: `middle::fold`'s
+  address offsets and `back::isel`'s pairing of loads and stores. They
+  now add modulo 2^64 (`wrapping_add`). Found by reading the source: a
+  compiler built at -O0, whose arithmetic is checked, would panic there
+  on an offset near 2^63, where one built at -O2 wraps.
+
+#### The safety nets
+
+- **Gate floors** ("The gate"): `bootstrap/gate-floors.sh` reads the
+  log of every row that passed. A row whose count is missing, or is
+  below its floor (0.30.0's counts less a margin), fails. The SKIPs a
+  release accepts are listed there with what each leaves unverified.
+  `tests/gate_floors.sh` checks every floor against a zero count, a
+  quarter of the count, and a missing line.
+- **Canaries**: a case for every net that must catch it.
+  - Bounds of a slice, a Vec, a String and an array:
+    `canary_bounds_*`, at every level.
+  - `#[no_panic]`, `#[no_alloc]`, `#[no_io]`, `#[pure]`: seven
+    violations each, each reported (`canary_effects_*`), and a program
+    that keeps them all, accepted.
+  - `--check-alloc`'s leak report: `canary_checkalloc_leak`, live where
+    `checkalloc_leaks` is XFAIL.
+  - `--check-unsafe` on Gpa's memory: `check_unsafe_gpa_*`.
+  - The unsafe audit (`tests/unsafe_audit.sh`) first audits a program
+    with planted sites. It must report 4 unjustified and 1 unneeded,
+    each at its line, before it reads the compiler's count.
+- `chain-diverse` prints its same-output count, which its floor reads.
+- The red team's cases are tracked apart from the XFAIL census
+  (docs/xfail.md). RT-6, RT-14 and RT-CG-3 are fixed here.
+
+#### Known issues
+
+- A struct assigned field by field before it is initialized (`let mut
+  p: P; p.a = 1;`) is accepted; rustc refuses it (E0381). A census
+  XFAIL, `rust_b_err_mv_assign_part_uninit`.
+- `volec FILE --deny=unsafe` (a build) ignores `--deny=unsafe`: only
+  `volec check` honours it.
 
 ### What's new in 0.30.0
 
