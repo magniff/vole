@@ -264,7 +264,14 @@ no index); and an assignment's right side when the assigned place
 evaluates with no statement of its own (a name, and `*`, `.f`, `.0` of
 one: `*b += *a`). Moves are unchanged (D8.5's in-order rule; a
 rust-edition argument moved out of a place already gets its own `_t =
-move P`). MVS keeps the deferred read. Consequences: `x = &mut *x`
+move P`). MVS keeps the deferred read. (0.30.1, RT-26) An aggregate's part that
+moves a place (a tuple's, an array's, a struct literal's, a variant's)
+is moved where it is evaluated, `_t = move P`, as a call's argument is
+(places/build.vl settle_move), but the last part, which nothing follows:
+`(s, { s = t; 0 })` holds the old `s`, `[w, { w = new; x }]` leaves `w`
+the new value, and `[w, w.clone()]` is E0382 at the clone; before, every
+part was moved at the aggregate, after the later parts had run.
+Consequences: `x = &mut *x`
 (`x: &'x mut T`):
 (2) borrows `*x` with the supporting-prefix constraint `'x : 'new`; (3)
 the shallow write to `x` meets other loans of `*x…` as `Extends` through
@@ -403,7 +410,16 @@ kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
 - a place whose type is or lies inside `UnsafeCell<T>` (`Cell`,
   `RefCell`, the atomics) is changed through `&self` methods only,
   never by a write here, so it needs no exception: its methods write
-  through a raw pointer (`UnsafeCell::get`).
+  through a raw pointer (`UnsafeCell::get`);
+- in a closure body (0.30.1), the closure's own projections of a
+  capture, the env's deref, the capture's field and a by-`&`/`&mut`
+  capture's deref (D19.4), are mutable as its kind makes them (D19.2,
+  D19.3); the path beyond them is the program's and is read as above,
+  so a `&mut` behind a captured `&` is not mutable there either
+  (`|| { *r.p = 9; }` with `r: &P`, `|| clobber(r.s, gpa)`: E0594,
+  E0596; moves.vl env_inner). Before, every place under the env counted
+  as mutable: a write under a live `&i64` and a use after free. *Cases:*
+  `rust_b_err_closure_through_shared`, `rust_b_closure_capture_write_ok`.
 The `static mut` and `static` cases are D6.2.5's. A write to a place
 that is not mutable is `borrowck.assign_immutable` (rustc E0594,
 "cannot assign to `*s`, which is behind a `&` reference"); an exclusive
@@ -435,6 +451,85 @@ outlives the function (`fn g() -> &'static [i64] { &[1, 2] }`) is still
 `borrowck.return_local`. A loop that holds the last iteration's
 reference while it evaluates the borrow again is
 `borrowck.assign_borrowed`, where rustc has a single static.
+
+**D2.9 (the checker's hidden bindings of a place; 0.30.1).** The checker
+desugars a format call's holes into hidden `let =fK = e;` bindings
+(front/check/interp.vl, format.vl), an overloaded comparison into `{ let
+==l = a; let ==r = b; ==l.eq(&==r) }` (front/traits.vl operator_call,
+front/check/equality.vl structural_eq), a `p as NonNull<T>` into `{ let
+==nn = p; .. }`. When `e` is a place `P`, the builder (places/build.vl
+rust_let_place, hidden_borrow) first borrows it, `_k = &'k P`
+(`BK_SHARED`), then reads the binding through the borrow, `_b = copy
+(*_k)` (a whole `&mut T`: `_b = &(**_k)`), and the scope that holds the
+desugaring's `let`s ends with `mention _k` before the binding's
+`StorageDead`: the loan is in scope to the end of the call or the
+comparison, rustc's `format_args` taking `&arg` for each argument and
+`PartialEq::eq(&a, &b)`. So a later hole or the other operand that moves,
+writes or lends `P` mutably is `move_borrowed` (E0505), `assign_borrowed`
+(E0506) or `conflict` (E0502) at its position, the loan the hole's; a
+read of `P` while it is lent mutably is one access, the borrow's (E0502,
+`conflict`; before, the copy's E0503). The names a format string
+captures (`{s}`) are bound after the explicit arguments (format.vl
+build's eval form when such a hole comes before an argument's), as
+rustc's format_args evaluates them: `println("{s} {}", { s.clear(); 0
+})` is accepted and `println("{s} {:?}", drop(s))` is E0382 at the hole.
+A contract message keeps its holes' order (they are values passed to
+`contract_check`). Before 0.30.1 the hidden binding was a bit copy of
+`P` under no loan (RT-25): `println("{} {:?}", s, drop(s))` and `s == {
+s.clear(); s.shrink_to_fit(); t }` read a freed block. A `format_args`
+value (an `Interp` whose closure holds the holes) lives past the
+desugaring's block, so its holes that are places owning memory (reached
+from a local or a static by fields, indexes and derefs; a type with
+glue) are bound to their borrow, `let =fK = &P`, which the closure
+captures and reads through (front/check/interp.vl hole_by_ref): the
+value's type has the loan's region, as rustc's `Arguments<'a>`, and `let
+b = format_args("{}", t); drop(t); println("{b}")` or `show(format_args(
+"{}", s), { drop(s); 0 })` is E0505. Divergence (R-class, kept): a Copy
+place in a kept format_args value is a copy (`let a =
+format_args("{x}"); x += 1;` is accepted and shows the old x; rustc
+E0506); no memory is at stake. *Anchor:* `places/build.vl:
+hidden_borrow`, `front/check/interp.vl: hole_by_ref`. *Cases:*
+`rt_025_*`, `rust_b_hidden_*`.
+The paths a format call takes, each with its hidden borrows: print,
+println, eprint, eprintln, format_in, fmt::write and writeln
+(interp.vl direct_call: `=fK` lets, D2.9's borrow); format_args, assert's
+and debug_assert's message (expand, a value: `=fK = &P`); panic's message
+(written in place, F16.3; its last call never returns, so the scope's
+`mention _k` is never reached, and each open hidden borrow whose copy has
+been read is mentioned just before a call of a function returning `!`,
+build.vl mention_open, copy_read_yet; an exit, `return` or `break` out of
+the desugaring, mentions only those too: a borrow whose copy is not read
+on the way, `println("{} {}", s, { drop(s); exit(0) })`, keeps nothing
+alive, as rustc accepts; case `rust_b_hidden_diverge_ok`); a contract's
+message (its holes are integers, Copy: nothing to borrow). A
+`format_args` value's hole is borrowed when it is a place of any type
+that is not Copy (0.30.1 review: a struct holding a `&mut`, which the
+value's copy aliased, is one), and an element of a slice or through a
+reference (`v[0]`, which the checker writes `v.as_slice()[0]`) is a place
+of its block, not a temporary's. *Cases:* `rust_b_err_format_paths`,
+`rust_b_err_format_args_index`, `rust_b_err_format_args_mut_struct`,
+`rust_b_hidden_cmp_ok`.
+
+**D2.10 (a reference to a packed struct's field; 0.30.1, RT-M2-12).** A
+reference made by the builder (`RV_REF` of `BK_SHARED`, `BK_MUT`,
+`BK_MUT2`: `&p.x`, `&mut p.x`, an autoref'd `&self` or `&mut self`
+receiver, a hidden binding's borrow, D2.9) to a place that may be
+unaligned is `borrowck.packed_ref` (rustc E0793), as rustc's
+`is_disaligned`: on the place's way to its local, before any deref, a
+field of a `#[repr(C, packed(N))]` struct or union with N below the
+alignment of the place's type. A raw borrow (`&raw const p.x`), a copy
+(`let x = p.x;`), a field whose type the packing aligns (`u8`, `[u8;
+N]`, any type with `packed(N)` and alignment at most N) and a place behind a
+deref (`&(*p.r).y`) are not. The fake loans of a match guard (D2.6) are
+not references. Before, every such reference was accepted, and an
+atomic through one stopped the program with SIGBUS. A slice made of a
+packed array field in place (`RV_SLICE`: `&p.arr[..]`, `&p.arr[0..1]`,
+the autoref of a slice method `p.arr.first()`, `.iter()`, `.len()`, the
+coercion `let r: &[T] = &p.arr`) is such a reference too (lower_slicing);
+a slice of a view or a pointer's value is not. *Anchor:*
+`places/build.vl: disaligned, lower_slicing`. *Cases:* `rt_m2_012_*`,
+`rust_b_packed_ref_ok`, `rust_b_err_packed_ref_hole`,
+`rust_b_err_packed_slice`, `rust_b_packed_scalar_ok`.
 
 ## 3. Regions (S3)
 
@@ -514,6 +609,57 @@ type (D4.2's parallel walk) and each slot whose region it names
 outlives it (`'r : 'static`, `'r : 'a` for a named `'a` of the
 function); an elided region adds nothing. With the assignment's `sub`,
 the initializer's regions outlive the annotation's.
+
+**D3.6a (a view argument; 0.30.1).** A mutable view place (`&mut [T]`,
+`&mut str`) given to a call is reborrowed, `_t = slice 'r mut2 s[..]`
+(places/build.vl lower_arg, implicit_reslice; a shared view of it, `'r
+s[..]`, where the parameter is shared, a receiver's `&self` of `len`):
+the slicing node is marked NODE_IMPLICIT, and constraints.vl makes its
+exclusive loan two-phase (`BK_MUT2`), as rustc's implicit `&mut *s`, so
+a later argument may read the view (`g(s, s.len())`,
+`s.split_at_mut(s.len() / 2)`) and none may write it (`g(s, { s[0] = 5;
+0 })`, E0506). Two such loans activated by one call (`f(s, s)`) are one
+`mut_twice` (E0499), reported for the later. A contract's binding of a
+view argument, `?aI = &mut s[..]` (desugar.vl reborrowed_view), is the
+same implicit reborrow, by the parameter's type: a shared view's, `?aI =
+&s[..]`, for a `&[T]` parameter (0.30.1, the third review: one view given
+to `f(a: &mut [T], b: &[T])` with a `requires`, and std's
+`t.copy_from_slice(t)`, bound the shared one as a copy with no loan: a
+use after free, and copy_nonoverlapping on one range; now E0502). Before, the view was copied into the call
+(I7 read the copy as its reborrow from the call on), and `f(s, s)`
+passed one `&mut [T]` twice: a use after free under `--check-alloc`, a
+result that differed between -O0 and -O2. A mutable slice of a place
+behind a shared reference (`&mut r.s[..]`, `two(r1.s, r2.s)` of `r1,
+r2: &W`) is `borrow_immutable` (E0596, moves.vl mutability). *Cases:*
+`rust_b_err_view_arg_twice`, `rust_b_err_view_arg_written`,
+`rust_b_err_view_through_shared`, `rust_b_tp_view_reborrow_ok`,
+`rust_b_err_contract_view_mixed`, `rust_b_contract_view_mixed_ok`.
+
+*The other coercion sites (0.30.1).* An exclusive reference read where a
+shared one goes and no call takes it, a `let` with a type, an
+assignment, a struct's or a variant's field, an array element, a result
+(`let b: &[T] = s;`, `b = s;`, `H { b: s }`, `let u: &str = t;`, `let
+k: &i64 = r;`), is its shared reborrow, `_t = &(*Q)` or `_t = slice
+Q[..]` (build.vl operand, shared_coercion). Before, the place was copied
+with no loan, Copy as its shared type is: a write through `s` while `b`
+lived was accepted (a use after free; a live `&str` changed by
+`make_ascii_uppercase`). A `let` with a type whose initializer is a place
+of the exclusive reference it declares (`let t: &mut [T] = s;`, `let u:
+&mut W = r;`) is its reborrow, `&mut (*Q)` or `slice mut Q[..]`, not
+two-phase (build.vl annotated_reborrow), as rustc's coercion site: `s`
+is used again once `t` is done; without a type the place moves. A field
+given where a `&mut T` or a mutable view goes (`fill(b.s)`, `fill(v[0].s)`)
+(and `fill(vs[0])`, a `let` with its type, a method's receiver that
+is such a place) has its path made mutable in the front, IndexMut and
+DerefMut (front/check/rust.vl reborrow_to_mut, place_to_mut), as rustc's
+is: a Vec's IndexMut and a user DerefMut need the container mutable
+(rustc E0596), a Box's does not (rustc's Box deref is built in, and a
+reborrow through the `&mut` it holds is LocalMutationIsAllowed::Yes:
+pcx.box_unique, calls/mod.vl box_unique_deref). Still refused, open for
+0.30.2: a write through a `&mut` field of a non-`mut` Box (`b.s[0] = 7`,
+rt_b301_009) and a stored view as a method's receiver through a container
+(`b.s.reverse()`, rt_b301_012). *Cases:* `rust_b_err_view_coerce_shared`,
+`rust_b_err_view_reborrow_let`, `rust_b_view_reborrow_let_ok`.
 
 **D3.6 (constraints per statement and terminator).** One pass over
 `P_STMTS` in RPO after elaboration (so `DS_*` decisions and flags
@@ -881,6 +1027,21 @@ D3.6).
   Wherever `S<..>` appears in a parameter or result type, `Req(S)`
   instantiated joins `⊒`: `T: 'b` as `'s ⊒ 'b` for every `'s ∈
   slots(τ_T)`, with `τ_T` the type at `T`'s position.
+  *Implementation (0.30.1).* `Req` is a least fixpoint over the
+  declarations that name each other (regions.vl adt_reqs, ReqMemo): each
+  declaration's set is found once per type read (decl_pairs); a group of
+  declarations that name each other (a strongly connected component,
+  found by Tarjan's walk) is solved as one unit, its root walking the
+  group in rounds, each member once a round (one walked this round read as
+  its set so far), until a round adds nothing; then every member is
+  final. (Before the fourth review a member found from a partial set was
+  walked again at every use: 2^depth inside one group, 20 s at depth 24.) So `struct L<'a, 'b, T> { x: &'a T, y:
+  Option<&'a L<'b, 'a, T>> }` has `T: 'a` and, from the swapped use,
+  `T: 'b`; and `S_i { x: S_(i-1), y: S_(i-1) }` costs linear time.
+  Before, a declaration met again on the walk added nothing (`T: 'b`
+  was lost: a false `borrowck.outlives`), and each use walked its
+  declaration again: 2^depth (depth 25: 26 s; tests/outlives_depth.sh).
+  *Cases:* `rust_b_outlives_swapped_ok`, `rust_b_err_outlives_unswapped`.
 - (b) *The impl header's lifetimes.* An elided lifetime in an impl's
   self type (`impl Ord for str`, `impl<T> Tr for &[T]`) is a lifetime
   parameter of the impl (rustc's `impl<'_>`): every `Self` of a
@@ -1136,10 +1297,17 @@ project's rule: every error of a compilation), deduped by §14.3.
 **D7.1 (reservation and activation).** A `BK_MUT2` loan `ℓ` created at
 `loc₀` into a temporary `t` (`(a,b) = (t, 0)`; verified shape: `_11 =
 &'r45 mut2 _10` … `_4 = call Fmt::display(move _11, ..)`) has
-*activation location* `loc_a` = the first location after `loc₀` in the
-same block with an operand `move t` or `copy t`; if there is none, the
-loan is never activated and stays class `S`. The builder guarantees
-`loc₀` dominates `loc_a` within one block (`lower_arg`). Its access
+*activation location* `loc_a` = the first location after `loc₀` (in
+statement order, which is evaluation order: the blocks an argument's
+`&&` or `if` makes come between the reservation and the call) with an
+operand that mentions `t`: `move t`, `copy t`, or a place through it,
+`&mut2 (*t)` (a writer's `__r` passed on as a reborrow); if there is
+none, `loc_a = loc₀`, an ordinary `&mut` from its creation. (0.30.1:
+before, only a whole `move t` or `copy t` in `loc₀`'s block counted and
+a loan with none stayed class `S` to its end, so a writer's reservation,
+`__r = &mut2 emsg`, passed on as `&mut2 (*__r)`, was never activated:
+`let r = &emsg[0]; write(emsg, "..").unwrap(); println("{}", *r)` was
+accepted and read the freed block, rustc E0502.) Its access
 `(Deep, Activate ℓ, P)` is performed at `loc_a` as D2.4a says.
 
 **D7.2 (the reservation window).** For points `p` with `2·loc₀+1 ≤ p ≤
@@ -1174,6 +1342,26 @@ desugaring's receiver binding `__r` is the two-phase reborrow `__r =
 &'r mut2 *w`, not a move of `w`, so the arguments read `w` in its
 reservation window (`write(f, "{}", f.width())`) and `w` is usable after
 the call, as rustc's.
+(0.30.1) So is the receiver of a call to a function with a `requires`:
+the contract's desugaring (front/contracts/desugar.vl requires_call)
+binds every argument, once and in its order, `let ?aI = argI;`, before
+its `$pre` companion's call and the call, as a call without a contract
+evaluates them; the autoref'd receiver `let ?a0 = &mut v` is lowered as
+`?a0 = &'r mut2 v`, a `&mut T` place given is its reborrow `?aI = &'r
+mut2 *r` (writer_reborrow, as lower_arg's), and a mutable view place
+`s` is bound to `&mut s[..]` (desugar.vl reborrowed_view). So
+`v.insert(0, { v.clear(); 9 })` is E0499 as `v.push({ v.clear(); 9 })`
+is, `v.insert(0, v.len())` and `g(r, r.len())` are accepted, and
+`Vec::insert(&mut v, 0, { v.clear(); 0 })` (an explicit `&mut`) is
+E0499. Before, an argument that was a simple read (a local, a literal,
+`&place`) was read again at each of the two calls, after the later
+arguments had run: `v.swap(i, { i = 2; 1 })` swapped other elements than
+rustc's, `f(x, { x = 7; 2 })` passed the new x, `f(&x, { x = 7; 2 })`
+was accepted, and `f(s, { s = t; 1 }); s` was refused. A contract never
+changes the order of evaluation. Seen, not fixed: a mutable view given
+to an ordinary call is copied into it, read as its reborrow from the
+call on (I7), so a later argument that writes through it is accepted
+(rustc E0506; case `rust_b_err_view_arg_written`, XFAIL).
 (0.27.6) So is a writer place that is no reference, `write(self.emsg,
 "{}", self.name())`: F16.3 makes it `&mut self.emsg`, an autoref whose
 span is the place's, and that `__r = &'r mut2 self.emsg` is two-phase,
@@ -1211,7 +1399,23 @@ struct is moved too), so the paths are built for the body when elab
 skipped them.
 
 **D8.3 (rules).** Each an `error borrowck.use_moved` (rustc E0382)
-unless named, at the access's statement.
+unless named, at the access's statement. (0.30.1: whether a type is Copy,
+regions.vl copy_in, is decided all the way down it: past depth 16 the
+walk answered Copy, and 17 one-element arrays or one-tuples around a
+String were copied twice, `rust_b_err_copy_deep`. The other walks of a
+type or a type node in regions.vl lost their depth cut-offs too,
+slots_in, decl_pairs, bind_walk, slot_variances_in, var_walk, req_walk,
+bound_at, header_param_type, impl_bound_ties, proj_again, proj_bound:
+each follows a finite tree. adt_reqs, which reads the declarations a
+field names and so may come back to one, finds each declaration's set
+once, a fixpoint over the ones that name each other (D4.6), instead of
+its depth 8; raw_in, which follows fields, walks each struct and enum
+once (a set of the ones seen) instead of answering "holds a raw pointer"
+past depth 16, which made `old(*p)` of a plain struct 16 deep a false
+contract.old (`rust_b_contract_old_deep_ok`). Open for 0.30.2: the
+walks over a type's tree are exponential over a DAG of tuple aliases,
+`T_i = (T_(i-1), T_(i-1))`: depth 24 takes 2.3 s, 0.30.0 0.9 s with
+its cut-offs.)
 - (M1) A `Read`, a `WB`/`Reserve`/`Read` by a borrow, an `OK_MOVE`, or
   an `SK_MENTION` of `Q` at `p` with `path(Q) = m` requires `DefInit(m',
   2·loc(p))` for `m` and every descendant `m'` (deep); when `Q` has no
@@ -1326,11 +1530,20 @@ must be live when a value of type `T` is dropped:
   of the type (rustc's rule without `#[may_dangle]`, L1), **except the
   compiler-known containers** (the table: MVS std's `Vec`, `String`,
   `HashMap`, `HashSet`, `BTreeMap`, `BTreeSet`, `BinaryHeap`,
-  `MinHeap`, `VecDeque`, `Box`, keyed by the std item; std2's of the
+  `MinHeap`, `Box`, keyed by the std item; std2's of the
   same names), for which it is `∪ dropck(τ)` over the *element* type
   arguments plus `set(slots(A))` of the allocator argument (an
   allocator reference must be live to free). `Allocator::FREES` does
-  not change it: a non-freeing allocator's container still has glue;
+  not change it: a non-freeing allocator's container still has glue.
+  (Until 0.30.1 the allocator argument went through `dropck(A)` like an
+  element's, and `dropck(&'a Arena) = ∅`, a reference having no glue:
+  `ar.reset()` while a `Vec<Box<T>, &Arena>` lived was accepted and the
+  drop freed what the arena had handed out again, RT-M2-14. The
+  allocator is the argument `container_alloc` reads from the
+  template's declaration, the type parameter bounded by `Allocator`
+  (`String`'s first, a map's third, the others' second; never by name);
+  a map's hasher `S` is an element in this sense, dropped by its own
+  `dropck`.);
 - a closure type: `∪ dropck(type(xₖ))` over its by-value captures (a
   struct without `impl Drop`, D3.3).
 
@@ -1458,7 +1671,16 @@ closure the region is instantiated fresh (D3.6, D4.3), as it should be.
   ir271 M2: the builder emits) the reborrow `&'new mut (*Q)`, a loan
   subject to I3′; so no two `&mut` values to one place exist without one
   being a reborrow of the other, and the reborrow's region is bounded
-  by the outer reference's (`'q : 'new`).
+  by the outer reference's (`'q : 'new`). (0.30.1) Nor a whole mutable
+  view, with no exception: given to a call, into a shared view or
+  `&T` (shared_coercion, the hidden binding of a format hole, a typed
+  `let`), it is reborrowed; only a copy into a raw pointer (R1, a cast
+  or a coercion, an access of the reference's kind) and a `requires`
+  companion's read (C3.2) are no reborrow. verify_mut_copies asserts
+  it of every body the runner builds (`--verify-places`); the
+  exemptions it had for views (a call's argument, an intrinsic's, a
+  shared destination) hid `f(s, s)`, `let b: &[T] = s;` with a write
+  under b, and a write under a format hole's view.
 
 - (I8, closure bodies; 0.27.2) §19's soundness paragraph: with the
   env a reference or a value (D19.4) and the requirements (D19.10),
@@ -1789,6 +2011,7 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.move_from_drop` | M4 | E0509 | none; the help names `mem::take`/`Option::take` |
 | `borrowck.guard_write` | D2.5 vs a `fake` loan; L6 | E0510, E0594 | none; the help says to write after the match |
 | `borrowck.static_mut_ref` | D6.2.5 (ir271) | the `static_mut_refs` lint (no E-code in 1.98) | `&raw mut S` |
+| `borrowck.packed_ref` (0.30.1) | D2.10 | E0793 | none; the help says to copy the field out or take `&raw const` |
 | `borrowck.unchecked` (warning) | D10.4 only | — | kept from 0.27.0; the message names the closure. Retired in 0.27.2 (D19.4): fires on no body |
 | `closure.kind` (0.27.2, the front) | D19.6; D19.3(c) | E0525; E0594, E0596 | none; the help names the bound to relax, or `.clone()` before the closure |
 | `closure.sig` (0.27.2, the front) | D20.3, D20.5 | E0631 | none |

@@ -160,6 +160,9 @@ if [ $SAME -eq 1 ] && [ $FAILED -eq 0 ]; then
     else
         echo "  same-output: no difference"
     fi
+    # (0.30.1) what it compared, for the gate's floor (a corpus of
+    # nothing compares no difference)
+    echo "  same-output: $(tail -1 "$W/same-output.log" | tr '\t' ' ')"
 fi
 if [ $FAILED -ne 0 ]; then
     echo "chain-diverse: the paths diverge (kept in $W)"

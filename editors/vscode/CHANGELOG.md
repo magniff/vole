@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.30.1 (vole 0.30.1)
+
+- No change to the grammar: the version follows the compiler's. The
+  release fixes run-time checks (`--check-unsafe`, `--trace`) and how a
+  `#[link_name]` is read; neither changes how a file is highlighted.
+
 ## 0.30.0 (vole 0.30.0)
 
 - No change to the grammar: the version follows the compiler's. A

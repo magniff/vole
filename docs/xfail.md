@@ -7,6 +7,31 @@ which is a failure in `tests/run.sh`, and its XFAIL line is removed. So the
 census has no stale class: every XFAIL case was failing at -O0 and at -O2
 when the census was taken.
 
+## The red team's cases (0.30.1)
+
+The cases named `rt_NNN_*.vl` (and `rt_cg_NNN_*.vl`) in `tests/run`, and
+`rt_NNN_*` in `tests/refactor`, are not in the census and not under its rule.
+Each is an open bug found by the standing red team, made a case the day it
+was found: its first line is `// XFAIL: RT-N: what is wrong (open)`, and a
+case that only fails at -O2 says `// FLAGS: -O2` on its second line (the
+runner has no XFAIL per level). Their count goes up as the red team finds
+bugs and down as releases fix them. Each is fixed in a named release, and
+the fix takes the XFAIL line out in the same commit (the case then passes
+and stays in the suite), with a line in the case saying which release fixed
+it. The release notes list the ones still open as known issues.
+
+Fixed in 0.30.1 so far: RT-6 (`rt_006_link_name_memcpy`,
+`rt_006_link_name_fmod`: an extern named like a C function the compiler
+calls, with a `#[link_name]`, redirected the compiler's own calls), RT-14
+(`rt_014_trace_stack_overflow`: `--trace` printed nothing on a stack
+overflow), RT-CG-3 (a warm -O2 build differed from a cold one when a
+function's number of calls changed; it has no `rt_cg` case: its programs
+are tests/incremental's pairs, which the `incremental` row builds warm and
+cold), and RT-TL-2 (`tests/refactor/rt_tl_002_cache_link_name`: a warm
+build reused code calling an extern's old `#[link_name]`). The other
+0.30.1 branches fix RT-1, 2, 3, 4, 5, 8, 10, 11, 19, 20,
+21, 22, 25, 26 and CG-1; the rest are 0.30.2's.
+
 ## How it was taken
 
 The census was taken on 2026-11-14 on release-0.30.0, before this branch's

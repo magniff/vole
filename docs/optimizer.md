@@ -1644,7 +1644,9 @@ did not do before.
 (new information: the IR loses `willreturn` on any cycle, while the
 front end knows a counted `for` ends), no raw `panic` is `nopanic`, and
 a C function whose effects have no `alloc`, `io` or `global` and whose
-parameters are all numbers is `readnone`. A C function the program
+parameters are all numbers is `readnone` (0.30.1: no longer; only the
+table's C_PURE class is, see "0.30.1: the panics and the memory the
+effects missed"). A C function the program
 declares nothing about has the builtin table's effects
 (`front/effects/builtin.vl`, `known_c_effects`): libm none (so
 `readnone`, as 0.6's `PURE_LIBM` list had it, now the whole of libm),
@@ -3506,3 +3508,97 @@ optimizer:
   `param_written` looks only at the instructions made since.
 - A function with no loop runs the ranges and the dead code only
   (`optimize_loops`); the dead functions are found with one walk.
+
+## 0.30.1: the panics and the memory the effects missed
+
+The optimizer takes `nopanic` and `willreturn` from the front end's
+effects (`ipo::front_attrs`, "0.16: calls the effects make pure"): a
+`readnone willreturn nopanic` call whose result is unused is deleted,
+two equal ones are one, and LICM may run one where the program would
+not. Each attribute is a promise about every run, so each source of a
+panic the lowering emits must be a `panic` (or a raw panic) in the
+effects. 0.30.0 broke that promise in four places (the red team's RT-3,
+RT-4, RT-5, RT-19 and RT-20; the cases are tests/run/rt_00[345]_*,
+rt_019_*, rt_020_*).
+
+**Division** (RULE E1.7, `infer::arith_panic`). The lowering checks an
+integer `/`, `%`, `/=` and `%=` at every level
+(`lower_division_checks`, gen0's `gen_division_checks`): the divisor is
+not 0 and, signed, not -1 while the dividend is MIN. The check is left
+out only for a divisor that is a literal or a constant. The effect is
+`panic` unless the front end proves the check never fires:
+
+- the divisor is a constant whose value, as written and wrapped to the
+  type, is not 0 and, signed, not -1 (`int_value`: a literal, a negated
+  literal, `i64::MIN`, a computed `const`, an integer cast of one);
+  this is the lowering's own test, and a negated literal or a cast,
+  which the lowering checks at run time, is a constant all the same;
+- or it is an immutable integer local and the facts at the division say
+  it is not 0 and, signed, either not -1 or not -1 while the dividend,
+  an immutable local too, is MIN.
+
+The facts (`push_facts`, `pcx.loops` entries LOOP_NONZERO and
+LOOP_NO_MIN_NEG1) come from an `if`: its condition holds in the first
+branch and fails in the second, through `&&` (holds), `||` (fails) and
+a bool `!`; and after `if c { .. }` whose branch never completes
+(`return`, `break`, `continue`, a `!` value: `never_completes`) the rest
+of the block has c failed. A comparison gives a fact when one side is
+such a local and the other a constant, read at the local's type
+(`side_fact`: `d != 0`, `d == k` with k not 0, `d > k` with k >= 0,
+`d >= 1`, `d < k` with k <= 0, ...; an unsigned constant of 2^63 or
+more is not compared as a negative number), or the local is unsigned
+and greater than anything (`x < d`); `!(x == MIN && d == -1)` is the
+MIN fact. Why each is sound: the local is immutable, so what the
+condition said of it is still true wherever the branch runs (a closure
+is walked as its own function and sees no fact; a mutable local, a
+field, a `/=`'s place get none); facts are popped when the branch, or
+the block, ends. std's `checked_div`, `checked_rem`, `wrapping_div`
+(`if rhs == -1 { .. } else { self / rhs }`: still `panic`, for 0, as
+Rust's) and `Xoshiro256pp::below_u64` (`if lo < n { .. % n }`) are
+proven by exactly these rules; what is not proven keeps the `panic`
+(tests/run/err_effect_div_unproven.vl: 21 forms, each refused by
+`#[no_panic]`).
+
+**Overflow** (E1.7). `+ - * << >>`, their assignments and `-x` (but of a
+literal) panic only where the overflow checks are on (`checks_here`:
+-O0's default, `--overflow-checks=on`, and -O1 under `--trace`, which
+keeps the level's checks; never in std::num::wrapping). The effects say
+so with the raw panic only (EFF_RAW_PANIC, which `effects_attrs` reads),
+set when `pcx.overflow_checks` holds for the build: the attribute is
+true for the code this build makes. The visible `panic`, which
+`#[no_panic]` and `#[effects]` are checked against, does not depend on
+the level (effects-allocation.md: effects never depend on `-O`), so it
+does not count overflow (a proposal: a visible `overflow` effect, or
+`#[no_panic]` counting it, would refuse most arithmetic in std's 1200
+declarations; it needs the owner's word).
+
+**std's panic** (E1.6) adds the raw panic too: an allocator's edge
+(E_ALLOC) passes only the raw bits, and a panic called in an allocator
+method (an arena lent to a scope) reached its callers as nothing.
+
+**Counted loops** (E2.1). `for i in 0..N` proves `a[i]` in bounds for an
+array of length at least N; N is read as the type reads it, and one of
+2^63 or more (negative as an i64) or `0..=i64::MAX` (whose end does not
+fit) proves nothing (RT-19: u64::MAX was -1, "at most" every length). A
+counted `while`'s variable loses its proof to any write: an assignment,
+a `&mut` (an `&mut self` receiver too), a raw borrow (`&raw const i`
+may be written through a cast), a capture, and (RT-20) a `ref mut`
+binding of it in a `match`, `if let`, `while let` or `let` pattern
+(`walk_scrutinee`: the scrutinee is walked as a written place).
+
+**C functions' memory** (RT-5). A C function was `readnone` when its
+effects had no memory bit and its parameters were all numbers; a number
+can be a pointer in C's ABI, and memset and strlen declared with usize
+parameters were deleted and folded. Effects never describe the memory a
+function reaches through its arguments (`#[pure]` may write through its
+pointers), so `readnone` now comes only from the table's class C_PURE
+(libm, `abs`, `labs`, `llabs`: a result of the argument values alone),
+by the symbol the function links to, for a declaration and for the
+lowering's own `callc` alike; a `#[effects()]` declaration gives none.
+
+Tests: effect_div_proofs.vl (every proven form, #[no_panic], run at
+-O0 and -O2), err_effect_div_unproven.vl, opt_effects_div_min_kept.vl
+(MIN / -1 through `/=` kept at -O2), opt_effects_overflow_checked.vl
+(-O2 --overflow-checks=on keeps `+`, `<<` and `-x` calls),
+err_effect_range_bound_limits.vl, err_effect_counted_while_ref_mut.vl,
+err_effect_panic_call_text.vl, and the red team's cases.

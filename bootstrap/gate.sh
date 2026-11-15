@@ -61,6 +61,12 @@
 #                    (bootstrap/selftest-prune.sh: their directories in
 #                    $TMPDIR, a day old, and nothing else)
 #
+# (0.30.1) A step that passes must also have counted what it exists to
+# count: bootstrap/gate-floors.sh reads its log, and one whose count is
+# missing or below its floor (0.30.0's count less a margin, or the
+# programs asked of a fuzz row) fails. tests/gate_floors.sh shows each
+# floor catching a zero and a low count.
+#
 # Steps: chain; suite-O0, suite-O1, suite-O2; fuzz-plain, fuzz-loops,
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
 # fuzz-div, fuzz-range, fuzz-arch (0.19: intrinsics), fuzz-guard (0.25:
@@ -909,7 +915,8 @@ run_step() {
         abi-plain) sh "$ROOT/tests/abi/run.sh" -c "$C" -n "$AB" -k "$k" ;;
         abi-import) sh "$ROOT/tests/abi/run.sh" -c "$C" -n "$AB" -k "$k" -i ;;
         abi-header) sh "$ROOT/tests/abi/run.sh" -c "$C" -n "$AB" -k "$k" -H ;;
-        objcheck) sh "$ROOT/tests/objcheck.sh" -c "$C" ;;
+        objcheck) rm -f "$RUN/$1.results"
+            VOLE_OBJCHECK_RESULTS="$RUN/$1.results" sh "$ROOT/tests/objcheck.sh" -c "$C" ;;
         # (0.19: x86-64's intrinsics are encoded and checked against cc on
         # any host; no x86 CPU needed, so --no-x86 keeps it)
         objcheck-x86-arch) sh "$ROOT/tests/objcheck.sh" -c "$C" -t x86_64-macos arch_ ;;
@@ -985,7 +992,9 @@ run_step() {
                     printf "std-tests: %d passed at -O0 and -O2 under --check-alloc (gate 1: 1000); -O0 %d passed, %d xfail, %d failed; -O2 %d passed, %d xfail, %d failed\n", n, a[1], a[2], a[3], b[1], b[2], b[3]
                 }'
             return $rc ;;
-        voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -k "$k" ;;
+        # (0.30.1: and at least 200 scripts, its floor, however loaded the
+        # machine is)
+        voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -n 200 -k "$k" ;;
         stress-grow)
             # (0.14) The compiler with VOLE_STRESS_GROW=1 (base::grow):
             # every growth of its tables moves them and poisons the old
@@ -1158,6 +1167,19 @@ start() { # <step>
         s=$(now)
         run_step "$1" </dev/null >"$RUN/$1.log" 2>&1
         rc=$?
+        # (0.30.1) a row that passed has counted what it exists to count:
+        # its floor (bootstrap/gate-floors.sh), or it fails. Not in the
+        # self-test's gates: their compiler is /bin/sh and their tools
+        # fakes, which count nothing (a stubbed gate's neither)
+        if [ $rc -eq 0 ] && [ -z "${VOLE_GATE_STUB:-}" ] && [ -z "${VOLE_GATE_SELFTEST:-}" ]; then
+            case "$1" in
+                selftest-*) ;;
+                *) sh "$ROOT/bootstrap/gate-floors.sh" "$1" "$RUN/$1.log" "$FZ" "$AB" "$SFZ" "$HOST" \
+                    >>"$RUN/$1.log" 2>&1
+                   # (77: the row skipped what it counts, saying why: a SKIP)
+                   case $? in 0) ;; 77) rc=77 ;; *) rc=1 ;; esac ;;
+            esac
+        fi
         echo "$rc $(( $(now) - s ))" >"$RUN/$1.status"
     ) &
     echo $! >"$RUN/$1.pid"

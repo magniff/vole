@@ -170,9 +170,9 @@ fn main() {
 ```
 
 ```err
-error[borrowck.use_borrowed]: cannot use 'count' because it is mutably borrowed (mutably borrowed at main.vl: line 3, column 20)
+error[borrowck.conflict]: cannot borrow 'count' as immutable because it is also borrowed as mutable (mutably borrowed at main.vl: line 3, column 20)
  --> main.vl: line 7, column 15
-  = help: use it after the mutable borrow's last use
+  = help: use the shared borrow before the mutable one, or take it again after
 ```
 
 `count` is mutably borrowed from line 3 until `bump`'s last use on line
