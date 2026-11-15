@@ -151,6 +151,33 @@ that keeps few values live is unlikely to make such moves.
   edge there; the review's vector programs fail on both). A
   location is now a range of cells everywhere the moves are ordered
   and checked.
+- **RT-CG-7: an AArch64 save lost to an address.** x17 is both the
+  integer cycle register of the moves and the scratch register for an
+  address an instruction cannot encode. An f32 slot's offset is
+  encodable below 16 KB, while spill slots reach 32760 bytes, so in a
+  frame past 16 KB an f32 move between slots computed its address into
+  x17 while x17 held an integer saved for a cycle of the same edge, and
+  the address was stored instead (`ldr x17, [sp, #16928]`, `movz x17,
+  #17024`, `add x17, sp, x17`, ..., `str x17, [sp, #17000]`); 0.30.0
+  has it too. An f32 slot from 16 KB on is now read and written as its
+  8 bytes, so no spill access needs a scratch register, and x17 as a
+  scratch is taken in one place (`ma_scratch`), which refuses it while
+  a plan's steps run. `--verify-regalloc` now also follows the code of
+  every plan, instruction by instruction (the destinations' values, the
+  registers and frame bytes written, the instructions' forms), and
+  `VOLE_PLANT_RT_CG_7` plants a fault for each of its rules
+  (`tests/refactor/movecode0301.t`). The cases `rt_cg_007_*` (4, at -O1
+  and -O2, -O0's output as EXPECT); `tests/fuzz/run.sh -F` and the gate's
+  rows `fuzz-moves-frame` and `fuzz-moves-frame-x86` make such frames.
+- **x86-64 frames past 2 GB.** The x86-64 assembler wrote a
+  displacement or a 64-bit operation's immediate beyond 32 bits with its
+  low 32 bits: a frame past 2 GB (`[0u8; 3000000000usize]` on the stack)
+  was `subq $-1294965552, %rsp`, the stack pointer moved up, the array's
+  addresses below it. It now refuses those, and any immediate its field
+  cannot hold, as cc does (an internal error, not code); AArch64's
+  assembler refuses a pair's offset outside its 7 bits and a movz or
+  movk part over 16 bits, which it masked. `tests/arch/enc.sh` has each
+  form refused and the limits encoded as cc encodes them.
 - One function orders an edge's moves, and `--verify-regalloc` checks
   the steps it gives, cell by cell, with each value's width: a plan
   that overwrites a value before it is moved, or reads one location as

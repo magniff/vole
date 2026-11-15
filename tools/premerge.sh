@@ -10,7 +10,7 @@
 #            block of compiler/src with nothing unsafe inside: each one named, with
 #            its position (tests/unsafe_audit.sh, the gate's unsafe-audit row;
 #            `volec check --deny=unsafe` reports them as errors)
-#   fmt      every changed .vl outside tests/ is in the standard style
+#   fmt      every changed .vl outside tests/, and in tests/run, is in the standard style
 #            (by the branch's own target/volec when the last tested build
 #            cannot read it: 0.27.0, a rust-edition file)
 #   check    every program a changed file belongs to (a .vl, a shader it embeds,
@@ -99,7 +99,16 @@ if [ -z "$VOLEC" ]; then
     row fmt SKIP "no volec (bootstrap/bootstrap.sh --dev)"
 else
     : > "$TMP/fmt"
-    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v -e '^tests/' -e '^editors/vscode/test/samples/' | grep -v 'front/stdsrc\.vl$'); do
+    # tests/run is in: the fmt suite's round trip formats it, so a case that
+    # came in unformatted fails there after the merge. A case fmt cannot lex
+    # (fmt.unreadable: a lexer-error case) is left as it is, as there.
+    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | awk '!/^tests\// || /^tests\/run\//' | grep -v -e '^editors/vscode/test/samples/' | grep -v 'front/stdsrc\.vl$'); do
+        case "$f" in
+            tests/run/*)
+                "$VOLEC" fmt --check "$f" 2>&1 | grep -q 'fmt\.unformatted' \
+                    && echo "  $f: not formatted (try: volec fmt $f, then move its ERROR lines)" >> "$TMP/fmt"
+                continue ;;
+        esac
         # (or by the branch's own build: a build before 0.28.0 reads a
         # module of compiler/src alone as the old edition's)
         "$VOLEC" fmt --check "$f" > /dev/null 2>&1 \

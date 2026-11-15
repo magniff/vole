@@ -232,7 +232,10 @@ registers and stack slots and its results out (pieces), the entry's
 parameters from the ABI's places to their locations (a parameter is
 taken to be where the allocation has it), and the return value into its
 register. Those are checked only by the class checks of `m_check_reg`
-and by the tests. `--print-regalloc` shows the blocks' positions and
+and by the tests. (0.30.1, RT-CG-7: the code of every plan `pm_resolve` emits,
+the location moves of a call's arguments and of the entry's parameters
+among them, is followed instruction by instruction; see "The moves'
+scratch registers" below.) `--print-regalloc` shows the blocks' positions and
 every value's intervals and locations.
 
 **Registers and their classes** (0.30.1, RT-CG-5). A spill slot is
@@ -296,6 +299,77 @@ with every class and width rotated through shared slots around a loop
 under pressure: `tests/fuzz/run.sh -M` (scalars and a struct) and `-M
 -V` (vectors), the gate's rows `fuzz-moves` and `fuzz-moves-vec`, and
 `tests/affected.map` runs both for a change under compiler/src/back.
+
+**The moves' scratch registers** (0.30.1, RT-CG-7). The steps of a plan
+hold values in registers no value is allocated to: the cycle registers
+(AArch64 x17 and v31, x86-64 r10 and xmm15) from a save until its last
+reader, and the moves' temporaries (x16 and v30, r11 and xmm14) from the
+load of a move between slots to its store. An instruction of a step may
+use no other scratch register that one of these is. 0.30.0's AArch64
+emitter computed an address it could not encode into x17, the integer
+cycle register: an f32 slot's offset is encodable below 16 KB, while
+`layout_frame` lets spill slots reach 32760 bytes, so in a frame past
+16 KB an f32 move between slots wrote its address over an integer saved
+in x17 (`ldr x17, [sp, #16928]`, `movz x17, #17024`, `add x17, sp,
+x17`, `ldr s30, [x17]`, ..., `str x17, [sp, #17000]`: the address
+stored). The scratch registers of both emitters, and why none is held:
+- AArch64 x17 (`ma_address`, `ma_lea` for an offset over 4095,
+  `ma_load_fimm`, `ma_copy`): taken only through `ma_scratch`, which is
+  an internal error while `cx.scratch_held` says x17 holds a value (the
+  steps of every plan, and a stack argument's piece between its load
+  and store). No step asks for it: every spill access goes through
+  `m_spill_load`/`m_spill_store`, whose type (`spill_access_type`) makes
+  its offset encodable. Spill offsets are below 32760 (`layout_frame`,
+  an error past it) and multiples of 8 (16 for a 16-byte value): `x`
+  (integers spill as u64) and `d` (f64, 8-byte vectors) reach 32760 at
+  8 bytes a unit, `q` 65520 at 16, and `s` only 16380 at 4, so an f32
+  slot from 16 KB on is read and written as its 8 bytes, with `ldr d` /
+  `str d` (the slot is 8 bytes; the s register is the d register's low
+  half). No value spills as `b` or `h`.
+- AArch64 x16 and x86-64 r11, the integer temporaries: a destination
+  only of a call's moves (the callee of an indirect call), whose
+  destinations are all registers, so no move between slots, the only
+  step that uses the temporary, is in such a plan (`move_loc` makes it
+  an internal error). v30 and xmm14 are no move's destination.
+- x86-64: a step's instructions are `mov`s with a 32-bit displacement
+  from rsp, below 32760; no scratch. `mx_load_fimm` (r10) and `mx_copy`
+  (r11) are never called by a step. x86-64 has no scratch for an offset
+  beyond 32 bits at all: a frame past 2 GB (a large array on the stack)
+  was written `subq $3000001744, %rsp`, `leaq 3000000032(%rsp)`, and the
+  assembler kept the low 32 bits (rsp moved up). It now refuses a
+  displacement or a 64-bit operation's immediate outside signed 32 bits,
+  and an immediate its field cannot hold, as cc refuses them
+  (`tests/arch/enc.sh`); AArch64's assembler likewise a pair's offset
+  outside -64 to 63 units and a movz or movk part over 16 bits, which it
+  masked too (the emitter makes neither; AArch64's frames past 2 GB are
+  right, through movz/movk and a register).
+- The instructions of a step are those of `move_loc`: `m_mov`,
+  `m_spill_load`, `m_spill_store` and the machine layer's moves, loads
+  and stores under them; the other scratch uses (ops.vl, atomic.vl,
+  arch.vl, vector.vl: temporaries inside one instruction) are not
+  reachable from it, and the check below refuses any instruction that is
+  not of the moves' forms, so a new path that puts one among the steps
+  is an error under `--verify-regalloc`, not code.
+
+`--verify-regalloc` now also follows the code of every plan as it is
+emitted (`regalloc/movecode.vl`, from `pm_resolve`: the edges' and the
+gaps' moves, and the location moves of a call's arguments and of the
+entry's parameters): every register and frame byte starts with a token,
+each instruction moves tokens (an address must be one the code computed
+from sp), and then every destination must hold its source's tokens, no
+register but the destinations, the cycle registers and the temporaries
+may have been written, and no frame byte but a destination's and the
+save cells'. The peepholes that use the instruction before the plan
+(m_load's forwarding of a store, m_mov's skip of a move back, a pair
+of accesses) are seeded with what they know. `VOLE_PLANT_RT_CG_7`
+(tests only, under `--verify-regalloc`) plants a fault in the steps, one
+per rule: `x17` RT-CG-7 itself, `temp` a move through an allocated
+register, `insn` a nop after each step, `frame` a store to the save
+area; `tests/refactor/movecode0301.t` shows each reported.
+`tests/fuzz/run.sh -F` (`-M` in a frame past 16 KB: main first defines
+2048 to 3071 f32 values live to its end) and the gate's rows
+`fuzz-moves-frame` and `fuzz-moves-frame-x86` make these frames; the
+cases are `rt_cg_007_*`.
 
 **The assemblers' registers** (0.30.1). On AArch64 register number 31
 is sp in some fields and xzr in others; the assembler keeps them apart:

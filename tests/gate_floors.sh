@@ -52,6 +52,8 @@ check fuzz-loops 60 "fuzz: @N@ programs for aarch64-macos, 0 failing"
 check fuzz-seed 60 "fuzz: @N@ programs for aarch64-macos, 0 failing"
 check fuzz-moves-vec 60 "fuzz: @N@ programs for aarch64-macos, 0 failing"
 check fuzz-moves-vec-x86 60 "fuzz: @N@ programs for x86_64-macos, 0 failing"
+check fuzz-moves-frame 60 "fuzz: @N@ programs for aarch64-macos, 0 failing"
+check fuzz-moves-frame-x86 60 "fuzz: @N@ programs for x86_64-macos, 0 failing"
 check abi-plain 100 "abi: @N@ programs (992 signatures) for aarch64-macos, 0 failing"
 # (objcheck's programs by name, from tests/objcheck.sh --list itself: the
 # floor's own greps must give the same set)

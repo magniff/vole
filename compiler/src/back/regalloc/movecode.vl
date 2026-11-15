@@ -1,0 +1,675 @@
+// (0.30.1, RT-CG-7) --verify-regalloc's check of the code of each parallel
+// move: the instructions pm_resolve emitted for its steps, followed one by
+// one. check.vl simulates the steps (which location gets which value); it
+// cannot see what the instructions of a step do besides, and RT-CG-7 was
+// there: on AArch64 an f32 slot past 16 KB took x17 for its address while
+// x17, the integer cycle register, held a save, and the save was lost.
+//
+// The code is read back from CODE: every register and every byte of the
+// frame starts with a token of its own (what it held when the moves
+// began), and each instruction moves tokens. Then every move's destination
+// must hold its source's tokens of the start, a register no move writes
+// must not have been written (the cycle registers and the moves'
+// temporaries excepted), and a byte of the frame may be written only in a
+// destination slot or in the cells of the saves. An address must be one
+// the code computed from sp, and an instruction must be one of the moves'
+// forms (moves, loads, stores, pairs, and the constants and additions of
+// an address): any other is an error, so no path of the emitter can put
+// another instruction among the steps unseen. Peepholes that rely on the
+// instruction just before the moves (m_load's forwarding of the last
+// store, m_mov's skip of a move back, pair_with_last's pair) are seeded:
+// what they know is a fact at the start.
+
+use std::alloc::Allocator;
+
+use crate::back::emit::machine::{reg_cycle, reg_move_temp, spill_offset, spill_type};
+use crate::back::emit::operands::{PM_FIELDS, PM_LOC, loc_cells, pm_dst, pm_kind, pm_src, pm_ty};
+use crate::base::{buf_copy_range, buf_fmt, buf_len, buf_new, buf_write_fd, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::target::get_x86;
+use crate::front::types::type_size;
+use crate::middle::ctx::FnCtx;
+
+// Tokens: byte i of register r as it was at the start, byte o of the
+// frame (sp + o) as it was, and a byte of no value of the start (a
+// constant, an address, a lane a narrower write left).
+const TOK_REG: i64 = 1 << 40;
+
+const TOK_MEM: i64 = 1 << 42;
+
+const JUNK: i64 = -1;
+
+// Register kinds: its bytes hold tokens, or it holds sp + val, or val.
+const K_BYTES: i64 = 0;
+
+const K_ADDR: i64 = 1;
+
+const K_CONST: i64 = 2;
+
+const RBYTES: i64 = 32;
+
+struct Sim<A: Allocator> {
+    regs: Vec<i64, A>,
+    kind: Vec<i64, A>,
+    val: Vec<i64, A>,
+    written: Vec<bool, A>,
+    // (offset, token) pairs in the order written; the first `seeded` are
+    // the start's
+    mem: Vec<i64, A>,
+    seeded: i64,
+    init_regs: Vec<i64, A>,
+}
+
+fn mc_fail(cx: &mut FnCtx<Comp>, what: &str, line: &[u8], pcx: &Ctx<Comp>) -> ! {
+    let out = buf_new();
+    let name = sym_text(pcx.fns[pcx.ir_fn[cx.irf as usize] as usize].name, pcx);
+    let text = str::from_utf8(line).unwrap();
+    buf_fmt(out,
+        { let name = str::from_utf8(name).unwrap();
+            format_args("internal error: register allocation of {name}: the code of a parallel move {what}: `{text}`\n") });
+    buf_write_fd(out, 2);
+    std::process::exit(1);
+}
+
+fn mem_get(sim: &Sim<Comp>, o: i64, upto: i64) -> i64 {
+    let mut i = upto - 2;
+    while i >= 0 {
+        if sim.mem[i as usize] == o {
+            return sim.mem[(i + 1) as usize];
+        }
+        i -= 2;
+    }
+    TOK_MEM + o
+}
+
+fn mem_set(sim: &mut Sim<Comp>, o: i64, tok: i64) {
+    sim.mem.push(o);
+    sim.mem.push(tok);
+}
+
+// The token of byte i of register r now.
+fn reg_tok(sim: &Sim<Comp>, r: i64, i: i64) -> i64 {
+    if sim.kind[r as usize] != K_BYTES {
+        return JUNK;
+    }
+    sim.regs[(r * RBYTES + i) as usize]
+}
+
+// Register r gets the bytes of register s (w of them; the rest is junk).
+fn reg_copy(sim: &mut Sim<Comp>, r: i64, s: i64, w: i64) {
+    let kind = sim.kind[s as usize];
+    let val = sim.val[s as usize];
+    let mut bytes: [i64; 32] = [JUNK; 32];
+    for i in 0..w {
+        bytes[i as usize] = sim.regs[(s * RBYTES + i) as usize];
+    }
+    for i in 0..RBYTES {
+        sim.regs[(r * RBYTES + i) as usize] = bytes[i as usize];
+    }
+    sim.kind[r as usize] = if kind == K_BYTES || w >= 8 { kind } else { K_BYTES };
+    sim.val[r as usize] = val;
+    sim.written[r as usize] = true;
+}
+
+fn reg_value(sim: &mut Sim<Comp>, r: i64, kind: i64, val: i64) {
+    for i in 0..RBYTES {
+        sim.regs[(r * RBYTES + i) as usize] = JUNK;
+    }
+    sim.kind[r as usize] = kind;
+    sim.val[r as usize] = val;
+    sim.written[r as usize] = true;
+}
+
+fn load(sim: &mut Sim<Comp>, r: i64, at: i64, w: i64) {
+    for i in 0..RBYTES {
+        let t = if i < w { mem_get(sim, at + i, sim.mem.len() as i64) } else { JUNK };
+        sim.regs[(r * RBYTES + i) as usize] = t;
+    }
+    sim.kind[r as usize] = K_BYTES;
+    sim.written[r as usize] = true;
+}
+
+fn store(sim: &mut Sim<Comp>, r: i64, at: i64, w: i64) {
+    for i in 0..w {
+        let t = reg_tok(sim, r, i);
+        mem_set(sim, at + i, t);
+    }
+}
+
+// ---- Operands ----
+
+fn is_digit(c: u8) -> bool {
+    c >= b'0' && c <= b'9'
+}
+
+// A decimal number (a sign allowed) at s[a..b], or None.
+fn number(s: &[u8], a: i64, b: i64) -> Option<i64> {
+    let mut i = a;
+    let mut neg = false;
+    if i < b && s[i as usize] == b'-' {
+        neg = true;
+        i += 1;
+    }
+    if i >= b {
+        return None;
+    }
+    let mut n: i64 = 0;
+    while i < b {
+        let c = s[i as usize];
+        if !is_digit(c) || n > (1 << 50) {
+            return None;
+        }
+        n = n * 10 + (c - b'0') as i64;
+        i += 1;
+    }
+    Some(if neg { 0 - n } else { n })
+}
+
+// The operands of the instruction at line[a..]: their [start, end) pairs,
+// split at the commas outside brackets and parentheses.
+fn operands(line: &[u8], a: i64) -> Vec<i64, Comp> {
+    let mut out: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let n = line.len() as i64;
+    let mut i = a;
+    while i < n {
+        while i < n && line[i as usize] == b' ' {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let start = i;
+        let mut depth: i64 = 0;
+        while i < n && (depth > 0 || line[i as usize] != b',') {
+            let c = line[i as usize];
+            if c == b'[' || c == b'(' {
+                depth += 1;
+            } else if c == b']' || c == b')' {
+                depth -= 1;
+            }
+            i += 1;
+        }
+        let mut end = i;
+        while end > start && line[(end - 1) as usize] == b' ' {
+            end -= 1;
+        }
+        out.push(start);
+        out.push(end);
+        i += 1;
+    }
+    out
+}
+
+// AArch64: the register at s[a..b] and its width in bytes (x 8, d 8, s 4,
+// q 16, v<n>.16b 16; sp is 31, width 8), or (-1, 0).
+fn a64_reg(s: &[u8], a: i64, b: i64) -> (i64, i64) {
+    if b - a == 2 && s[a as usize] == b's' && s[(a + 1) as usize] == b'p' {
+        return (31, 8);
+    }
+    if b - a < 2 {
+        return (-1, 0);
+    }
+    let c = s[a as usize];
+    let mut e = a + 1;
+    while e < b && is_digit(s[e as usize]) {
+        e += 1;
+    }
+    let n = match number(s, a + 1, e) {
+        Some(n) => n,
+        None => return (-1, 0),
+    };
+    if n > 31 {
+        return (-1, 0);
+    }
+    if c == b'v' {
+        // only v<n>.16b
+        if b - e == 4 && s[e as usize] == b'.' && s[(e + 1) as usize] == b'1'
+            && s[(e + 2) as usize] == b'6' && s[(e + 3) as usize] == b'b' {
+            return (32 + n, 16);
+        }
+        return (-1, 0);
+    }
+    if e != b {
+        return (-1, 0);
+    }
+    if c == b'x' && n < 31 {
+        return (n, 8);
+    }
+    if c == b'd' {
+        return (32 + n, 8);
+    }
+    if c == b's' {
+        return (32 + n, 4);
+    }
+    if c == b'q' {
+        return (32 + n, 16);
+    }
+    (-1, 0)
+}
+
+// x86-64: the register at s[a..b] (%r.. 64-bit, %xmm 16 bytes, %ymm 32).
+fn x86_reg(s: &[u8], a: i64, b: i64) -> (i64, i64) {
+    if b - a < 3 || s[a as usize] != b'%' {
+        return (-1, 0);
+    }
+    let names: [&str; 16] = [
+        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
+        "r13", "r14", "r15",
+    ];
+    let t = &s[(a + 1) as usize..b as usize];
+    for k in 0..16 {
+        if t == names[k as usize].as_bytes() {
+            return (k, 8);
+        }
+    }
+    if t.len() > 3 && (t[0] == b'x' || t[0] == b'y') && t[1] == b'm' && t[2] == b'm' {
+        let n = match number(t, 3, t.len() as i64) {
+            Some(n) => n,
+            None => return (-1, 0),
+        };
+        if n < 0 || n > 15 {
+            return (-1, 0);
+        }
+        return (32 + n, if t[0] == b'x' { 16 } else { 32 });
+    }
+    (-1, 0)
+}
+
+// The address of a memory operand at s[a..b] (AArch64 `[base{, #n}]`,
+// x86-64 `{n}(%rsp)`), as an offset from sp, when the code knows it.
+fn address(sim: &Sim<Comp>, s: &[u8], a: i64, b: i64) -> Option<i64> {
+    if get_x86() {
+        let mut p = a;
+        while p < b && s[p as usize] != b'(' {
+            p += 1;
+        }
+        if p >= b || s[(b - 1) as usize] != b')' {
+            return None;
+        }
+        let (base, _) = x86_reg(s, p + 1, b - 1);
+        if base != 4 {
+            return None;
+        }
+        if p == a {
+            return Some(0);
+        }
+        return number(s, a, p);
+    }
+    if b - a < 3 || s[a as usize] != b'[' || s[(b - 1) as usize] != b']' {
+        return None;
+    }
+    let mut c = a + 1;
+    while c < b - 1 && s[c as usize] != b',' {
+        c += 1;
+    }
+    let (base, _) = a64_reg(s, a + 1, c);
+    let from = if base == 31 { 0 }
+        else if base >= 0 && base < 31 && sim.kind[base as usize] == K_ADDR {
+            sim.val[base as usize]
+        } else {
+            return None;
+        };
+    if c == b - 1 {
+        return Some(from);
+    }
+    let mut i = c + 1;
+    while i < b - 1 && s[i as usize] == b' ' {
+        i += 1;
+    }
+    if s[i as usize] != b'#' {
+        return None;
+    }
+    match number(s, i + 1, b - 1) {
+        Some(n) => Some(from + n),
+        None => None,
+    }
+}
+
+// An AArch64 immediate `#n` at s[a..b].
+fn imm(s: &[u8], a: i64, b: i64) -> Option<i64> {
+    if b - a < 2 || s[a as usize] != b'#' {
+        return None;
+    }
+    number(s, a + 1, b)
+}
+
+// The value of an addition's operand: sp (an address), a register holding
+// an address or a constant, or an immediate: (kind, value), kind -1 when
+// unknown.
+fn a64_term(sim: &Sim<Comp>, s: &[u8], a: i64, b: i64) -> (i64, i64) {
+    match imm(s, a, b) {
+        Some(n) => return (K_CONST, n),
+        None => {}
+    }
+    let (r, _) = a64_reg(s, a, b);
+    if r == 31 {
+        return (K_ADDR, 0);
+    }
+    if r >= 0 && r < 31 && sim.kind[r as usize] != K_BYTES {
+        return (sim.kind[r as usize], sim.val[r as usize]);
+    }
+    (-1, 0)
+}
+
+// ---- Instructions ----
+
+fn a64_exec(sim: &mut Sim<Comp>, line: &[u8], m: &[u8], ops: &[i64], skip_first: bool) -> bool {
+    let n = ops.len() as i64 / 2;
+    let (r0, w0) = if n > 0 { a64_reg(line, ops[0], ops[1]) } else { (-1, 0) };
+    if m == b"mov" || m == b"fmov" {
+        if n != 2 || r0 < 0 || r0 == 31 {
+            return false;
+        }
+        match imm(line, ops[2], ops[3]) {
+            Some(v) => {
+                if m != b"mov" || r0 >= 32 {
+                    return false;
+                }
+                reg_value(sim, r0, K_CONST, v);
+                return true;
+            }
+            None => {}
+        }
+        let (r1, w1) = a64_reg(line, ops[2], ops[3]);
+        if r1 < 0 || r1 == 31 || (r0 >= 32) != (r1 >= 32) || w0 != w1 {
+            return false;
+        }
+        // mov x/x, mov v.16b/v.16b; fmov d/d
+        if (m == b"fmov") != (r0 >= 32 && w0 == 8) {
+            return false;
+        }
+        reg_copy(sim, r0, r1, w0);
+        return true;
+    }
+    if m == b"movz" || m == b"movk" {
+        if (n != 2 && n != 3) || r0 < 0 || r0 >= 31 || w0 != 8 {
+            return false;
+        }
+        let part = match imm(line, ops[2], ops[3]) {
+            Some(v) => v,
+            None => return false,
+        };
+        let mut shift: i64 = 0;
+        if n == 3 {
+            let a = ops[4];
+            let b = ops[5];
+            if b - a < 6 || &line[a as usize..(a + 5) as usize] != b"lsl #" {
+                return false;
+            }
+            shift = match number(line, a + 5, b) {
+                Some(v) => v,
+                None => return false,
+            };
+            if shift != 16 && shift != 32 && shift != 48 {
+                return false;
+            }
+        }
+        if part < 0 || part > 65535 {
+            return false;
+        }
+        if m == b"movz" {
+            reg_value(sim, r0, K_CONST, part << shift as u64);
+            return true;
+        }
+        if sim.kind[r0 as usize] != K_CONST {
+            return false;
+        }
+        let old = sim.val[r0 as usize];
+        let mask: i64 = 65535 << shift as u64;
+        reg_value(sim, r0, K_CONST, (old & !mask) | (part << shift as u64));
+        return true;
+    }
+    if m == b"add" || m == b"sub" {
+        if n != 3 || r0 < 0 || r0 >= 31 || w0 != 8 {
+            return false;
+        }
+        let (ka, va) = a64_term(sim, line, ops[2], ops[3]);
+        let (kb, vb) = a64_term(sim, line, ops[4], ops[5]);
+        if ka < 0 || kb != K_CONST || (m == b"sub" && imm(line, ops[4], ops[5]).is_none()) {
+            return false;
+        }
+        let v = if m == b"add" { va + vb } else { va - vb };
+        reg_value(sim, r0, ka, v);
+        return true;
+    }
+    let pair = m == b"ldp" || m == b"stp";
+    if m == b"ldr" || m == b"str" || pair {
+        let k: i64 = if pair { 2 } else { 1 };
+        if n != k + 1 {
+            return false;
+        }
+        let at = match address(sim, line, ops[(2 * k) as usize], ops[(2 * k + 1) as usize]) {
+            Some(v) => v,
+            None => return false,
+        };
+        let mut offset = at;
+        for j in 0..k {
+            let (r, w) = a64_reg(line, ops[(2 * j) as usize], ops[(2 * j + 1) as usize]);
+            if r < 0 || r == 31 || (pair && w != w0) {
+                return false;
+            }
+            if !(skip_first && j == 0) {
+                if m == b"ldr" || m == b"ldp" {
+                    load(sim, r, offset, w);
+                } else {
+                    store(sim, r, offset, w);
+                }
+            }
+            offset += w;
+        }
+        return true;
+    }
+    false
+}
+
+fn x86_exec(sim: &mut Sim<Comp>, line: &[u8], m: &[u8], ops: &[i64]) -> bool {
+    if ops.len() != 4 {
+        return false;
+    }
+    let width: i64 = if m == b"movq" { 8 } else if m == b"movss" { 4 } else if m == b"movsd" { 8 }
+        else if m == b"movups" || m == b"movapd" { 16 }
+        else if m == b"vmovdqu" || m == b"vmovdqa" { 32 } else { 0 };
+    if width == 0 {
+        return false;
+    }
+    let (rs, ws) = x86_reg(line, ops[0], ops[1]);
+    let (rd, wd) = x86_reg(line, ops[2], ops[3]);
+    if rs >= 0 && rd >= 0 {
+        // movq between general registers, movapd and vmovdqa between
+        // vector ones
+        if (rs >= 32) != (rd >= 32) || rs == 4 || rd == 4 || ws != wd
+            || (m == b"movq") == (rs >= 32) || m == b"movss" || m == b"movsd" || m == b"movups"
+            || m == b"vmovdqu" {
+            return false;
+        }
+        reg_copy(sim, rd, rs, width);
+        return true;
+    }
+    if m == b"movapd" || m == b"vmovdqa" {
+        return false;
+    }
+    if rd >= 0 {
+        let at = match address(sim, line, ops[0], ops[1]) {
+            Some(v) => v,
+            None => return false,
+        };
+        if rd == 4 || (rd >= 32) != (m != b"movq") {
+            return false;
+        }
+        load(sim, rd, at, width);
+        return true;
+    }
+    if rs >= 0 {
+        let at = match address(sim, line, ops[2], ops[3]) {
+            Some(v) => v,
+            None => return false,
+        };
+        if rs == 4 || (rs >= 32) != (m != b"movq") {
+            return false;
+        }
+        store(sim, rs, at, width);
+        return true;
+    }
+    false
+}
+
+// The token location loc (a register or a spill slot) held at the start,
+// byte i.
+fn init_tok(cx: &mut FnCtx<Comp>, sim: &Sim<Comp>, loc: i64, i: i64) -> i64 {
+    if loc >= 0 {
+        return sim.init_regs[(loc * RBYTES + i) as usize];
+    }
+    let o = spill_offset(cx, loc);
+    mem_get(sim, o + i, sim.seeded)
+}
+
+fn now_tok(cx: &mut FnCtx<Comp>, sim: &Sim<Comp>, loc: i64, i: i64) -> i64 {
+    if loc >= 0 {
+        return reg_tok(sim, loc, i);
+    }
+    let o = spill_offset(cx, loc);
+    mem_get(sim, o + i, sim.mem.len() as i64)
+}
+
+// What the code before the moves leaves for the checker: where the moves'
+// code begins, and the peepholes' memory of the instruction just before
+// (m_load's last store: register, offset, type; m_mov's last move:
+// destination, source), -1 where it is not that instruction.
+pub fn moves_code_begin(cx: &mut FnCtx<Comp>) -> [i64; 6] {
+    let start = buf_len(cx.code);
+    let mut pre: [i64; 6] = [start, -1, -1, -1, -1, -1];
+    if cx.last_store_end == start && cx.mem_index < 0 {
+        pre[1] = cx.last_store_reg;
+        pre[2] = cx.last_store_offset;
+        pre[3] = cx.last_store_type;
+    }
+    if cx.last_mov_end == start {
+        pre[4] = cx.last_mov_dst;
+        pre[5] = cx.last_mov_src;
+    }
+    pre
+}
+
+// Checks the code of the steps just emitted (pre: moves_code_begin's,
+// before them) against the pending moves of PM.
+pub fn check_moves_code(cx: &mut FnCtx<Comp>, pre: &[i64], pcx: &Ctx<Comp>) {
+    let start = cx.pm_code_start;
+    let text = buf_copy_range(cx.code, start, buf_len(cx.code));
+    let mut sim = Sim {
+        regs: Vec::new_in(Comp {}),
+        kind: Vec::new_in(Comp {}),
+        val: Vec::new_in(Comp {}),
+        written: Vec::new_in(Comp {}),
+        mem: Vec::new_in(Comp {}),
+        seeded: 0,
+        init_regs: Vec::new_in(Comp {}),
+    };
+    for r in 0..64 {
+        for i in 0..RBYTES {
+            sim.regs.push(TOK_REG + r * 64 + i);
+        }
+        sim.kind.push(K_BYTES);
+        sim.val.push(0);
+        sim.written.push(false);
+    }
+    // the facts of the instruction just before
+    if pre[1] >= 0 {
+        let w = type_size(pre[3], pcx);
+        for i in 0..w {
+            let t = reg_tok(&sim, pre[1], i);
+            mem_set(&mut sim, pre[2] + i, t);
+        }
+    }
+    if pre[4] >= 0 && pre[5] >= 0 {
+        for i in 0..8 {
+            sim.regs[(pre[4] * RBYTES + i) as usize] = sim.regs[(pre[5] * RBYTES + i) as usize];
+        }
+    }
+    sim.seeded = sim.mem.len() as i64;
+    for i in 0..sim.regs.len() {
+        let t = sim.regs[i];
+        sim.init_regs.push(t);
+    }
+    // the instructions
+    let mut first = true;
+    let mut a: usize = 0;
+    while a < text.len() {
+        let mut b = a;
+        while b < text.len() && text[b] != b'\n' {
+            b += 1;
+        }
+        let line = &text[a..b];
+        let mut i: usize = 0;
+        while i < line.len() && line[i] == b' ' {
+            i += 1;
+        }
+        let mut e = i;
+        while e < line.len() && line[e] != b' ' {
+            e += 1;
+        }
+        let m = &line[i..e];
+        let ops = operands(line, e as i64);
+        let skip_first = first && cx.pm_code_paired;
+        let known = if get_x86() { !skip_first && x86_exec(&mut sim, line, m, ops.as_slice()) }
+            else { a64_exec(&mut sim, line, m, ops.as_slice(), skip_first) };
+        if !known {
+            mc_fail(cx, "has an instruction the check does not follow", line, pcx);
+        }
+        first = false;
+        a = b + 1;
+    }
+    // every move's destination holds its source's value of the start
+    let n = cx.pm.len() as i64 / PM_FIELDS;
+    for k in 0..n {
+        if pm_kind(cx, k) != PM_LOC {
+            continue;
+        }
+        let d = pm_dst(cx, k);
+        let s = pm_src(cx, k);
+        let w = type_size(spill_type(pm_ty(cx, k), pcx), pcx);
+        for i in 0..w {
+            if now_tok(cx, &sim, d, i) != init_tok(cx, &sim, s, i) {
+                mc_fail(cx, "leaves a destination without its source's value",
+                    format_in("move {s} -> {d}, byte {i}", Comp {}).as_bytes(), pcx);
+            }
+        }
+    }
+    // no other register written, but the moves' own
+    for r in 0..64 {
+        if !sim.written[r as usize] || r == reg_cycle(false) || r == reg_cycle(true)
+            || r == reg_move_temp(false) || r == reg_move_temp(true) {
+            continue;
+        }
+        let mut dst = false;
+        for k in 0..n {
+            if pm_kind(cx, k) == PM_LOC && pm_dst(cx, k) == r {
+                dst = true;
+            }
+        }
+        if !dst {
+            mc_fail(cx, "writes a register no move writes",
+                format_in("register {r}", Comp {}).as_bytes(), pcx);
+        }
+    }
+    // no byte of the frame written but a destination's or a save's
+    let saves_from = cx.spill_base + 8 * cx.pm_save_base;
+    let saves_to = saves_from + 8 * cx.pm_save_cells;
+    let mut j = sim.seeded;
+    while j < sim.mem.len() as i64 {
+        let o = sim.mem[j as usize];
+        let mut ok = o >= saves_from && o < saves_to;
+        for k in 0..n {
+            let d = pm_dst(cx, k);
+            if !ok && pm_kind(cx, k) == PM_LOC && d < 0 {
+                let from = spill_offset(cx, d);
+                ok = o >= from && o < from + 8 * loc_cells(d, pm_ty(cx, k), pcx);
+            }
+        }
+        if !ok {
+            mc_fail(cx, "writes a byte of the frame no move writes",
+                format_in("sp + {o}", Comp {}).as_bytes(), pcx);
+        }
+        j += 2;
+    }
+}
