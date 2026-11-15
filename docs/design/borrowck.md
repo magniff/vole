@@ -1359,21 +1359,40 @@ its cut-offs.)
   is not checked: elaboration's opened drops read the tag of a
   partially moved enum, and a `match` on a moved enum is caught at its
   payload's read; a length read (`RV_LEN`) requires `DefInit(m)` of
-  the path alone (shallow, as D2.2 says). A place reached through a raw
-  pointer (a deferred closure body's env, D10.4; none from 0.27.2,
-  D19.4) is not checked (R1).
+  the path alone (shallow, as D2.2 says). What a raw pointer reaches
+  (a deferred closure body's env, D10.4; none from 0.27.2, D19.4) is not
+  checked (R1); the pointer itself is (0.30.1: before, `let p: *const
+  i64; unsafe { *p }` read p unassigned). An `SK_MENTION` (`let _ = x;`)
+  is checked only for a move that reaches it (rustc's PlaceMention reads
+  nothing: `let _ = x;` of an x never assigned passes; the builder lowers
+  `x;` the same, which rustc refuses, E0381).
 - (M2) `SK_ASSIGN`/`SK_CALL`/`SK_INTRINSIC` with destination `Q =
-  L.π`, `π ≠ ∅`: requires `DefInit` of every strict-prefix path of `Q`;
-  a prefix that was initialized and then moved (`MaybeUninit` by a move,
-  `let q = p; p.a = 1;`) is `borrowck.use_moved` (E0382), a prefix never
-  initialized on some path (`let p: P; p.a = 1;`) is
-  `borrowck.assign_moved_part` (E0381 "partially assigned"); then
+  L.π`, `π ≠ ∅` (0.30.1: rustc's check_if_assigned_path_is_moved, from
+  the last projection in): a field's (a variant's, a union's) base
+  requires `DefInit` of its own path, and the outermost such base that
+  lacks it is named; a base whose type has `impl Drop` requires all of
+  it (deep), and nothing further in is asked; the base of a `*` requires
+  `DefInit` of its path (or nearest ancestor's), of an index (a constant
+  one too) all of it, and nothing further in. A base not initialized
+  because a move of it reaches the assignment (`let q = p; p.a = 1;`,
+  found by a walk back from it to the move before an assignment of the
+  base or its StorageLive) is `borrowck.use_moved` (E0382); else it was
+  never assigned on some path (`let p: P; p.a = 1;`,
+  `borrowck.assign_moved_part`, rustc E0381 "partially assigned
+  binding"; through an index or a `*`, `borrowck.use_uninit`). A union's
+  field assigned after the union moved is not an error (rustc's
+  exception: it assigns the union anew). Then the assignment
   initializes. `Q = (L, 0)`: no requirement (reinitialization), and it
-  kills `L`'s loans through a deref (D2.3).
+  kills `L`'s loans through a deref (D2.3). One E0381 per local, its
+  first (rustc's `uninitialized_error_reported`).
 - (M3) An `OK_MOVE Q` whose path does not exist because `Q` goes
   through a `*` (a reference, a raw pointer, a `Box`'s deref call:
   R8), an index on a view, array or `Vec`, a static, or an
-  `LF_BORROWED` local: `borrowck.move_out` (rustc E0507/E0508). MVS
+  `LF_BORROWED` local: `borrowck.move_out` (rustc E0507/E0508). A
+  user `let` of a static's place, `let t = SN;`, takes it (0.30.1: the
+  binding is a borrowed copy, never dropped, and its value was copied
+  before the builder's `place_operand` decided; now an `OK_MOVE` unless
+  the type is Copy). MVS
   keeps `own.move_out` (`diff.vl`'s backstop) unchanged.
 - (M4) An `OK_MOVE` of a strict sub-place of a value whose type has
   `impl Drop` (whole-only): `borrowck.move_from_drop` (E0509).
@@ -1381,15 +1400,22 @@ its cut-offs.)
   (`MaybeUninit` at the loop head by the back edge); the message adds
   "in a previous iteration of the loop" when the move's location is
   reachable from the use's.
-- (M8, 0.28.0) A read of a deferred `let y: T;` whose local has no move
-  path (a plain value: an integer, a reference, which M1's paths do not
-  follow) requires it assigned on every path to the read: a forward
-  dataflow of the deferred locals maybe unassigned, set at the local's
-  StorageLive, cleared by an assignment to it or to a part of it
-  (`borrowck.use_uninit`, rustc E0381 "used binding isn't
-  initialized"). Before it `let y: i64; println("{y}")` printed 0.
-  *Anchor:* `places/borrowck/moves.vl: unassigned_reads`. *Case:*
-  `rust_b_err_use_uninit`.
+- (M8, 0.28.0; 0.30.1) Every deferred `let y: T;` has a move path of
+  its own, whatever its type (`deferred_paths`): M1 and M2 follow it as
+  they follow a moved value, so a read of it or of a part requires it
+  assigned on every path to the read (`borrowck.use_uninit`, rustc E0381
+  "used binding isn't initialized"), and an assignment to a part of it
+  not assigned whole is M2's E0381. Before 0.30.1 a deferred local
+  without a path (no `Drop` in it, never moved) was followed by a
+  whole-local flag that any assignment to a part cleared: `let mut p:
+  P; p.a = 1;` then read `*p.b`, a stack word, as a reference (RT-31;
+  SIGSEGV at -O2). The flag (`unassigned_reads`) is left for a deferred
+  local that can have no path (a borrowed copy's), and is cleared only
+  by an assignment to the whole; to a part it is E0381. Before 0.28.0
+  `let y: i64; println("{y}")` printed 0. *Anchor:*
+  `places/borrowck/moves.vl: deferred_paths, assigned_prefixes,
+  unassigned_reads`. *Cases:* `rust_b_err_use_uninit`,
+  `rust_b_err_init_*`, `rust_b_ok_init_parts`.
 - (M7) An assignment (`WA`) to a whole local `L` (`(L, 0)`) that is
   not `mut` (no `LF_MUT`) requires `¬MaybeInit(path(L), 2·loc)`: a
   deferred `let x;` / `let x: T;` is assigned once on every path
