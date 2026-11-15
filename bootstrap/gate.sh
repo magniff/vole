@@ -991,7 +991,9 @@ run_step() {
                     printf "std-tests: %d passed at -O0 and -O2 under --check-alloc (gate 1: 1000); -O0 %d passed, %d xfail, %d failed; -O2 %d passed, %d xfail, %d failed\n", n, a[1], a[2], a[3], b[1], b[2], b[3]
                 }'
             return $rc ;;
-        voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -k "$k" ;;
+        # (0.30.1: and at least 200 scripts, its floor, however loaded the
+        # machine is)
+        voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -n 200 -k "$k" ;;
         stress-grow)
             # (0.14) The compiler with VOLE_STRESS_GROW=1 (base::grow):
             # every growth of its tables moves them and poisons the old
@@ -1171,8 +1173,10 @@ start() { # <step>
         if [ $rc -eq 0 ] && [ -z "${VOLE_GATE_STUB:-}" ] && [ -z "${VOLE_GATE_SELFTEST:-}" ]; then
             case "$1" in
                 selftest-*) ;;
-                *) sh "$ROOT/bootstrap/gate-floors.sh" "$1" "$RUN/$1.log" "$FZ" "$AB" "$SFZ" \
-                    >>"$RUN/$1.log" 2>&1 || rc=1 ;;
+                *) sh "$ROOT/bootstrap/gate-floors.sh" "$1" "$RUN/$1.log" "$FZ" "$AB" "$SFZ" "$HOST" \
+                    >>"$RUN/$1.log" 2>&1
+                   # (77: the row skipped what it counts, saying why: a SKIP)
+                   case $? in 0) ;; 77) rc=77 ;; *) rc=1 ;; esac ;;
             esac
         fi
         echo "$rc $(( $(now) - s ))" >"$RUN/$1.status"

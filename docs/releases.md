@@ -7878,18 +7878,34 @@ and one whose count line is missing, or whose count is below its floor,
 fails (`floor STEP: ...`, the last line of its log). The floors are 0.30.0's
 release gate's counts less a margin for cases that come and go (the suite
 rows 6000 cases passed, objcheck 12000 compilations, threads 14000,
-incremental 150 edit series and its 24 warm builds of the pairs, cachediff
-150 transcripts, compiler-memcheck 700, std-check 3500 bodies, std-tests
-1400, borrowck-twin 420, examples-checkalloc 175, stdtools 38, layout 100
-records, chain-fresh 52 releases, chain-diverse 50000 compilations of the
-corpus; voltty-fuzz runs what fits in a minute, 1610 scripts in 0.30.0's
-gate, and its floor is 100), or what the step was asked for (each
-fuzz row's and ABI row's programs, all of them: `-n`; fuzz-sem's five runs);
-`unsafe-audit` must report its canary caught, `debug` both levels,
-`compile-cost` its four programs, `chain` the fixpoint. A row whose
-input changed under it once passed on 4 records of 111 (layout, 0.28.0,
-which then got its own floor): this is such a floor for every row. `tests/gate_floors.sh` shows each floor
-failing a zero count, a quarter of it and a log without its line.
+incremental 150 edit series, cachediff 150 transcripts, compiler-memcheck
+700, std-check 3500 bodies, std-tests 1400, borrowck-twin 420,
+examples-checkalloc 175, stdtools 38, layout 100 records, chain-fresh 52
+releases, chain-diverse 50000 compilations of the corpus), or what the
+step was asked for (each fuzz row's and ABI row's programs, all of them:
+`-n`; fuzz-sem's five runs; voltty-fuzz's 200 scripts, which the row asks
+for on top of its minute, so that no load lowers the count; incremental's
+48 warm builds of its pairs); `unsafe-audit` must report its canary
+caught, `debug` both levels, `compile-cost` its four programs, `chain`
+the fixpoint. A row whose input changed under it once passed on 4
+records of 111 (layout, 0.28.0, which then got its own floor): this is
+such a floor for every row. A row that skips what it counts and says so
+(voltty-fuzz's `skip oracle` without cargo) is a SKIP (the floor exits
+77), not a pass and not a failure. A gate of the self-test or of stubs is
+not judged.
+
+The counts are aarch64-macos's, the only host 0.30.0's gate ran on. In
+the Linux containers (`gate.sh --inside`: the suite rows, fuzz, ABI,
+layout, objcheck, debug, valgrind and the smoke rows) each floor that is
+one of those counts is a quarter of it, and layout's is its row's own 30.
+The containers run the same corpora less what is the platform's own (the
+8 cases of `// REQUIRES: metal` or `clang`, the examples of std::gpu and
+std::window, x86-64's own intrinsics' programs, glibc's headers), which
+no count of macOS's gives exactly, and a quarter still fails a row that
+ran next to nothing. The floors that are what a row was asked for, or a
+line it prints, hold on every host. `tests/gate_floors.sh` shows each
+floor failing a zero count, a quarter of it and a log without its line,
+a Linux row passing at a quarter, and the skipped oracle a SKIP.
 
 (0.30.1) **The SKIPs a release accepts**, and what each leaves unverified:
 

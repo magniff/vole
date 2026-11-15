@@ -2,8 +2,9 @@
 # (0.30.1) The gate's floors (bootstrap/gate-floors.sh) are shown to catch:
 # for each row with a floor, its line from 0.30.0's release gate passes,
 # and the same line with its count made zero, and made a quarter of it,
-# fails (voltty-fuzz, whose count is what fits in a minute: one below its
-# floor); a log with no count line fails too. (The fuzz and ABI rows are
+# fails (voltty-fuzz, whose count is at least what the gate asks: one
+# below its floor); a log with no count line fails too, and voltty-fuzz's
+# skipped oracle is a SKIP (77). (The fuzz and ABI rows are
 # asked for 60 and 100 programs, value semantics for 300, as --release
 # asks.) Prints `gate-floors: N rows, each caught at zero, at a quarter and
 # without its line`; exits 1 when a floor passes what it must not.
@@ -64,11 +65,30 @@ check compiler-memcheck 783 "compiler-memcheck: @N@ of @N@ compilations clean (c
 check examples-checkalloc 196 "examples-checkalloc: @N@ passed, 0 failed with --check-alloc"
 check chain-fresh 52 "chain-fresh: @N@ releases rebuilt from the seed, each the same bytes as recorded and as cached"
 check chain-diverse 63420 "  same-output: identical @N@ compilations 5285 programs 4 targets -O0 -O1 -O2"
-# (a count of what fits in 60 s: its floor is 100, checked one below it)
-LOW=99
+# (its floor is the 200 scripts the gate asks for, checked one below it)
+LOW=199
 check voltty-fuzz 1610 "pass oracle (@N@ scripts from seed 672166)"
 unset LOW
-check incremental 172 "incremental pairs: 24 of 24 warm builds the same as clean builds" "incremental: @N@ of @N@ edit series rebuilt the same as clean builds (aarch64-macos, hits 86%)"
+# (a skipped oracle is a SKIP, exit 77: not a pass, not a failure)
+rows=$((rows + 1))
+printf 'pass build\npass seeds\nskip oracle (no cargo, or the oracle does not build offline)\nvoltty: all passed\n' >"$W/voltty.skip.log"
+out=$(sh "$F" voltty-fuzz "$W/voltty.skip.log" 60 100 300 2>&1)
+rc=$?
+[ $rc -eq 77 ] || { echo "FAIL voltty-fuzz: a skipped oracle exits $rc, not 77: $out"; failed=1; }
+check incremental 172 "incremental pairs: 48 of 48 warm builds the same as clean builds" "incremental: @N@ of @N@ edit series rebuilt the same as clean builds (aarch64-macos, hits 86%)"
+# (on another host than aarch64-macos, 0.30.0's counts are floors at a
+# quarter: a Linux suite that passed 1600 cases passes, 0 or 1400 fail;
+# layout's floor there is 30 records)
+for c in 1600:0 0:1 1400:1; do
+    rows=$((rows + 1))
+    printf '  total       %s    0     0     0\n' "${c%:*}" >"$W/linux.log"
+    sh "$F" suite-O2 "$W/linux.log" 60 100 300 aarch64-linux >/dev/null 2>&1
+    rc=$?
+    [ $rc -eq "${c#*:}" ] || { echo "FAIL suite-O2 on aarch64-linux: ${c%:*} cases passed exits $rc"; failed=1; }
+done
+printf 'layout: 40 records, 200 fields agree\n' >"$W/linuxl.log"
+sh "$F" layout "$W/linuxl.log" 60 100 300 x86_64-linux >/dev/null 2>&1 \
+    || { echo "FAIL layout on x86_64-linux: 40 records fails"; failed=1; }
 # (the rows that count lines: their line repeated, or missing)
 for step in debug fuzz-sem compile-cost unsafe-audit chain stress-grow; do
     rows=$((rows + 1))
