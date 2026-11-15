@@ -17,8 +17,9 @@
 # walk's sites and the IR's settling not used) must report the borrows of
 # effect_format_arg_kept.vl, a compiler that dies by SIGSEGV must fail the
 # run naming its file, and VOLE_E18_CHECK=all must list the forms of
-# err_effect_format_arg_escapes.vl as settled (the read-through borrows,
-# an alias's use, the walk's sites).
+# effect_format_arg_kept.vl and err_effect_format_arg_escapes.vl as they
+# are settled, each line whole (the holes only read through, a reference
+# only read through, an alias's use, borrows that go on).
 #
 # usage: tests/e18_loans.sh [-c COMPILER] [-j N] [--self-test] [PATTERN]
 set -u
@@ -62,12 +63,16 @@ if [ "$SELF" -eq 1 ]; then
         "$f:57:27: error[type error] E1.8: a borrow the walk saw" \
         "$f:68:17: error[type error] E1.8: a borrow the walk saw" \
         "$f:69:17: error[type error] E1.8: an alias's use the walk saw, only read through"; do
-        if ! grep -qF "$want" "$T/o3"; then
+        if ! grep -qxF "$want" "$T/o3"; then
             echo "e18-loans: self-test FAIL: not listed: $want"; bad=1
         fi
     done
     f=tests/run/effect_format_arg_kept.vl
     VOLE_CACHE=off VOLE_E18_CHECK=all "$C" check --each --max-errors=0 $f > "$T/o4" 2>&1
+    want="$f:60:17: error[type error] E1.8: a borrow the walk saw, only read through"
+    if ! grep -qxF "$want" "$T/o4"; then
+        echo "e18-loans: self-test FAIL: not listed: $want"; bad=1
+    fi
     if [ "$(grep -c 'E1.8: a borrow only read through$' "$T/o4")" -ne 8 ]; then
         echo "e18-loans: self-test FAIL: effect_format_arg_kept.vl's 8 holes are not all read through"
         bad=1
