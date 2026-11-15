@@ -34,7 +34,8 @@ pub fn check_fn_value(f: i64, e: i64, pcx: &mut Ctx<Comp>) {
     let self_node = pcx.nodes[node as usize].h;
     for p in 0..pcx.nodes[node as usize].count {
         let pn = child(node, p, pcx);
-        if needs_static(pcx.nodes[pn as usize].b, f, node, self_node, &statics, 0, pcx) {
+        let param_ty = crate::front::types::fn_param(f, p, pcx);
+        if needs_static(pcx.nodes[pn as usize].b, f, node, self_node, &statics, param_ty, 0, pcx) {
             report(f, pn, e, pcx);
             return;
         }
@@ -81,7 +82,7 @@ pub fn is_static(sym: i64, statics: &Vec<i64, Comp>, pcx: &Ctx<Comp>) -> bool {
 // instance), needs a lifetime to be 'static. A `fn` type or bound inside
 // is not looked into: its references are what the item gives.
 fn needs_static(n: i64, f: i64, fnode: i64, self_node: i64, statics: &Vec<i64, Comp>,
-    depth: i64, pcx: &Ctx<Comp>) -> bool {
+    param_ty: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
     // (no depth limit: a type node is a finite tree; a limit would be a
     // yes)
     if n <= 0 {
@@ -93,18 +94,22 @@ fn needs_static(n: i64, f: i64, fnode: i64, self_node: i64, statics: &Vec<i64, C
             && is_static(pcx.nodes[n as usize].c, statics, pcx) {
             return true;
         }
-        return needs_static(pcx.nodes[n as usize].a, f, fnode, self_node, statics, depth + 1, pcx);
+        return needs_static(pcx.nodes[n as usize].a, f, fnode, self_node, statics, param_ty,
+            depth + 1, pcx);
     }
     if k == NodeKind::TySlice {
         return is_static(pcx.nodes[n as usize].c, statics, pcx)
-            || needs_static(pcx.nodes[n as usize].a, f, fnode, self_node, statics, depth + 1, pcx);
+            || needs_static(pcx.nodes[n as usize].a, f, fnode, self_node, statics, param_ty,
+                depth + 1, pcx);
     }
     if k == NodeKind::TyArray {
-        return needs_static(pcx.nodes[n as usize].a, f, fnode, self_node, statics, depth + 1, pcx);
+        return needs_static(pcx.nodes[n as usize].a, f, fnode, self_node, statics, param_ty,
+            depth + 1, pcx);
     }
     if k == NodeKind::TyTuple {
         for e in 0..pcx.nodes[n as usize].count {
-            if needs_static(child(n, e, pcx), f, fnode, self_node, statics, depth + 1, pcx) {
+            if needs_static(child(n, e, pcx), f, fnode, self_node, statics, param_ty, depth + 1,
+                pcx) {
                 return true;
             }
         }
@@ -119,13 +124,39 @@ fn needs_static(n: i64, f: i64, fnode: i64, self_node: i64, statics: &Vec<i64, C
     // (`Self`: the impl's type as its header writes it)
     if bare && text == b"Self" {
         return self_node > 0
-            && needs_static(self_node, f, fnode, 0, statics, depth + 1, pcx);
+            && needs_static(self_node, f, fnode, 0, statics, param_ty, depth + 1, pcx);
     }
     if text == b"str" && is_static(pcx.nodes[n as usize].c, statics, pcx) {
         return true;
     }
     if bare && param_static(n, f, fnode, pcx) {
         return true;
+    }
+    // (0.30.1, review 7: an alias is read as its definition, `type Si =
+    // &'static i64`, its arguments below; a projection, `<X as Tr>::A`,
+    // `T::A`, whose text says nothing of what it is, needs one when the
+    // parameter's type holds any region: never a yes from the text alone)
+    if (pcx.nodes[n as usize].p & crate::front::ast::NODE_QPATH) != 0 {
+        return f >= 0 && slot_count(param_ty, pcx) > 0;
+    }
+    if text != b"str" && !(bare && names_param(n, fnode, pcx)) {
+        if depth >= 64 {
+            return true;
+        }
+        let saved = pcx.cur_mod;
+        pcx.cur_mod = crate::front::modules::module_of(n, pcx);
+        let key = crate::front::check::resolve::type_name_key(n, pcx);
+        pcx.cur_mod = saved;
+        let alias = if key >= 0 { pcx.sym_alias[key as usize] } else { 0 };
+        if alias > 0 && pcx.nodes[alias as usize].kind == NodeKind::TypeAlias {
+            if needs_static(pcx.nodes[alias as usize].b, f, fnode, self_node, statics, param_ty,
+                depth + 1, pcx) {
+                return true;
+            }
+        } else if key < 0 || pcx.sym_struct[key as usize] == 0 && pcx.sym_enum[key as usize] == 0 {
+            // (`T::A`, `Self::A`, or what names no struct or enum)
+            return f >= 0 && slot_count(param_ty, pcx) > 0;
+        }
     }
     let lts = lifetimes_of(n, pcx);
     if lts > 0 {
@@ -138,7 +169,8 @@ fn needs_static(n: i64, f: i64, fnode: i64, self_node: i64, statics: &Vec<i64, C
     let g = pcx.nodes[n as usize].g;
     if g > 0 {
         for e in 0..pcx.nodes[g as usize].count {
-            if needs_static(child(g, e, pcx), f, fnode, self_node, statics, depth + 1, pcx) {
+            if needs_static(child(g, e, pcx), f, fnode, self_node, statics, param_ty, depth + 1,
+                pcx) {
                 return true;
             }
         }
@@ -173,6 +205,18 @@ fn param_static(n: i64, f: i64, fnode: i64, pcx: &Ctx<Comp>) -> bool {
                 return true;
             }
             i += 1;
+        }
+    }
+    false
+}
+
+// Whether bare name n is a type parameter of function node fnode (its
+// generics, the impl's with them).
+fn names_param(n: i64, fnode: i64, pcx: &Ctx<Comp>) -> bool {
+    let g = pcx.nodes[fnode as usize].g;
+    for k in 0..(if g > 0 { pcx.nodes[g as usize].count } else { 0 }) {
+        if pcx.nodes[child(g, k, pcx) as usize].a == pcx.nodes[n as usize].a {
+            return true;
         }
     }
     false

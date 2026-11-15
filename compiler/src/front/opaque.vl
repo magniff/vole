@@ -628,6 +628,10 @@ pub fn omega_of(param: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // omegas, its generics' order): a bound by a lifetime that is 'static
 // (`'a: 'static, T: 'a`), or one a parameter's type implies, rustc's
 // implied bounds (`t: &'static T`: a reference outlives its referent).
+// (review 7: what a type implies is read from the type resolved, its
+// aliases and projections expanded, never from its text: `&'static
+// K<T>` with `type K<T> = <T as Tr>::A` resolving to `&'static u8`
+// implies nothing of T)
 pub fn implied_statics(item: i64, omegas: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
     let g = pcx.nodes[item as usize].g;
     if g <= 0 {
@@ -635,16 +639,29 @@ pub fn implied_statics(item: i64, omegas: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) 
     }
     let mut statics = Vec::<i64, Comp>::new_in(Comp {});
     crate::places::fn_values::static_lifetimes(item, &mut statics, pcx);
-    let mut named = Vec::<i64, Comp>::new_in(Comp {});
-    for p in 0..pcx.nodes[item as usize].count {
-        implied_in(pcx.nodes[child(item, p, pcx) as usize].b, false, &statics, &mut named, 0, pcx);
+    let count = pcx.nodes[g as usize].count;
+    let mark = pcx.tscratch.len() as i64;
+    for k in 0..count {
+        let o = if k < omegas.len() as i64 { omegas[k as usize] } else { 0 };
+        pcx.tscratch.push(o);
     }
-    for k in 0..pcx.nodes[g as usize].count {
+    let targs = crate::front::generics::take_targs(mark, pcx);
+    let mut found = Vec::<i64, Comp>::new_in(Comp {});
+    if omegas.len() as i64 >= count {
+        let module = crate::front::modules::module_of(item, pcx);
+        let env = crate::front::generics::env_enter(g, targs, count, pcx);
+        for p in 0..pcx.nodes[item as usize].count {
+            implied_in(pcx.nodes[child(item, p, pcx) as usize].b, false, &statics, &mut found,
+                module, 0, pcx);
+        }
+        crate::front::generics::env_leave(env, pcx);
+    }
+    for k in 0..count {
         if k >= omegas.len() as i64 {
             return;
         }
         let p = child(g, k, pcx);
-        let mut st = named.contains(&pcx.nodes[p as usize].a);
+        let mut st = found.contains(&omegas[k as usize]);
         let mut i: i64 = 0;
         loop {
             let lt = crate::front::parser::rust::outlives_of(p, i, pcx);
@@ -661,43 +678,86 @@ pub fn implied_statics(item: i64, omegas: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) 
     }
 }
 
-// The bare names in type node n (a parameter's type) under a reference or
-// view of a 'static lifetime (under), into named. A type nested deeper
-// than 32 implies nothing (no bound: the error stays).
-fn implied_in(n: i64, under: bool, statics: &Vec<i64, Comp>, named: &mut Vec<i64, Comp>,
-    depth: i64, pcx: &Ctx<Comp>) {
+// The Ωs type node n (a parameter's type) holds under a reference or view
+// of a 'static lifetime (under), into found: a written reference's
+// lifetime read from n, the type under it resolved (an alias or a
+// projection expanded, what it names; omegas_in). Not under one, a type
+// written by a struct's or enum's own name is read into, its arguments'
+// references implied by its well-formedness; an alias or a projection is
+// not (what it expands to may hold none). Deeper than 32: nothing (no
+// bound: the error stays).
+fn implied_in(n: i64, under: bool, statics: &Vec<i64, Comp>, found: &mut Vec<i64, Comp>,
+    module: i64, depth: i64, pcx: &mut Ctx<Comp>) {
     if n <= 0 || depth > 32 {
         return;
     }
     let k = pcx.nodes[n as usize].kind;
+    if under {
+        let t = crate::front::check::alloc_rules::resolve_scoped_quietly(n, module, pcx);
+        omegas_in(t, found, 0, pcx);
+        return;
+    }
     if k == NodeKind::TyPtr || k == NodeKind::TySlice {
-        let s = under || (k == NodeKind::TySlice
+        let s = (k == NodeKind::TySlice
             || (pcx.nodes[n as usize].p & crate::front::ast::NODE_REF) != 0)
             && crate::places::fn_values::is_static(pcx.nodes[n as usize].c, statics, pcx);
-        implied_in(pcx.nodes[n as usize].a, s, statics, named, depth + 1, pcx);
+        implied_in(pcx.nodes[n as usize].a, s, statics, found, module, depth + 1, pcx);
         return;
     }
     if k == NodeKind::TyArray {
-        implied_in(pcx.nodes[n as usize].a, under, statics, named, depth + 1, pcx);
+        implied_in(pcx.nodes[n as usize].a, false, statics, found, module, depth + 1, pcx);
         return;
     }
     if k == NodeKind::TyTuple {
         for e in 0..pcx.nodes[n as usize].count {
-            implied_in(child(n, e, pcx), under, statics, named, depth + 1, pcx);
+            implied_in(child(n, e, pcx), false, statics, found, module, depth + 1, pcx);
         }
         return;
     }
-    if k != NodeKind::TyName {
+    if k != NodeKind::TyName || (pcx.nodes[n as usize].p & crate::front::ast::NODE_QPATH) != 0 {
         return;
     }
-    if under && pcx.nodes[n as usize].list == 0 && pcx.nodes[n as usize].g == 0
-        && pcx.nodes[n as usize].count == 0 {
-        named.push(pcx.nodes[n as usize].a);
+    let saved = pcx.cur_mod;
+    pcx.cur_mod = module;
+    let key = crate::front::check::resolve::type_name_key(n, pcx);
+    pcx.cur_mod = saved;
+    if key < 0 || pcx.sym_struct[key as usize] == 0 && pcx.sym_enum[key as usize] == 0 {
+        return;
     }
     let gs = pcx.nodes[n as usize].g;
     if gs > 0 {
         for e in 0..pcx.nodes[gs as usize].count {
-            implied_in(child(gs, e, pcx), under, statics, named, depth + 1, pcx);
+            implied_in(child(gs, e, pcx), false, statics, found, module, depth + 1, pcx);
+        }
+    }
+}
+
+// The Ωs resolved type t holds, through structs', enums', tuples',
+// arrays', slices' and pointers' parts (not a projection's or any other
+// type's: they imply nothing), into found.
+fn omegas_in(t: i64, found: &mut Vec<i64, Comp>, depth: i64, pcx: &Ctx<Comp>) {
+    if t <= 0 || depth > 32 {
+        return;
+    }
+    if is_omega(t, pcx) {
+        found.push(t);
+        return;
+    }
+    let k = pcx.types[t as usize].kind;
+    if k == TyKind::Ptr || k == TyKind::Slice || k == TyKind::Array {
+        omegas_in(pcx.types[t as usize].a, found, depth + 1, pcx);
+        return;
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[t as usize].count {
+            omegas_in(crate::front::types::type_elem(t, i, pcx), found, depth + 1, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].closure == 0
+        || k == TyKind::Enum {
+        for i in 0..crate::places::regions::adt_targ_count(t, pcx) {
+            omegas_in(crate::places::regions::adt_targ(t, i, pcx), found, depth + 1, pcx);
         }
     }
 }
