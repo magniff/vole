@@ -277,14 +277,166 @@ fn plan_reader(cx: &mut FnCtx<Comp>, src: &[i64], done: &[bool], loc: i64, ty: i
     -1
 }
 
+// (0.30.1) A pending move's width as storage: the bytes of its spill type.
+fn plan_width(cx: &mut FnCtx<Comp>, i: i64, pcx: &Ctx<Comp>) -> i64 {
+    type_size(spill_type(pm_ty(cx, i), pcx), pcx)
+}
+
+// (0.30.1) Whether saving the source of pending move c (its readers then
+// read the save, which no destination overlaps) lets every move reading
+// that source be made before the moves stall again: the save's storage is
+// then free for the next stall.
+fn plan_save_frees(cx: &mut FnCtx<Comp>, src: &[i64], done: &[bool], c: i64, n: i64,
+    pcx: &Ctx<Comp>) -> bool {
+    let s = src[c as usize];
+    // a register number no move writes: the save
+    let saved: i64 = 1 << 40;
+    let mut src2: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut done2: Vec<bool, Comp> = Vec::new_in(Comp {});
+    for j in 0..n {
+        src2.push(if !done[j as usize] && src[j as usize] == s { saved } else { src[j as usize] });
+        done2.push(done[j as usize]);
+    }
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for i in 0..n {
+            if done2[i as usize] {
+                continue;
+            }
+            let d = pm_dst(cx, i);
+            let ty = pm_ty(cx, i);
+            if plan_reader(cx, src2.as_slice(), done2.as_slice(), d, ty, i, n, pcx) < 0 {
+                done2[i as usize] = true;
+                progress = true;
+            }
+        }
+    }
+    for j in 0..n {
+        if !done[j as usize] && src[j as usize] == s && !done2[j as usize] {
+            return false;
+        }
+    }
+    true
+}
+
+// (0.30.1) Whether saving the source of pending move c makes a pending
+// move ready at once (its readers then read the save, which no destination
+// overlaps).
+fn plan_save_progresses(cx: &mut FnCtx<Comp>, src: &[i64], done: &[bool], c: i64, n: i64,
+    pcx: &Ctx<Comp>) -> bool {
+    let s = src[c as usize];
+    let saved: i64 = 1 << 40;
+    let mut src2: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for j in 0..n {
+        src2.push(if !done[j as usize] && src[j as usize] == s { saved } else { src[j as usize] });
+    }
+    for i in 0..n {
+        if !done[i as usize] {
+            let d = pm_dst(cx, i);
+            let ty = pm_ty(cx, i);
+            if plan_reader(cx, src2.as_slice(), done, d, ty, i, n, pcx) < 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// (0.30.1, RT-CG-6) When every pending move waits for another, the move
+// whose source is saved (in the cycle register, or the 4 cells kept at the
+// end of the spill area when that register holds an earlier save that a
+// pending move still reads; a third save pending is an internal error).
+//
+// How many saves are pending at once. Moves write disjoint locations, and
+// a slot's value takes 1, 2 or 4 cells, aligned, so two slot locations
+// that overlap are one inside the other. Without values wider than a cell
+// (a function without vectors), a move waits for the one value its
+// destination holds and a value is overwritten by one move: the stalled
+// moves are disjoint simple cycles, any save on a cycle frees the move
+// before it, and so on around to the move that reads the save, so one
+// save is pending at a time. With wider values a move can wait for
+// several narrower values and a value be overwritten by several narrower
+// moves, and two cycles can be joined so that no value is on both: for
+// example `i: 8 -> 5`, `f: 10 -> 2`, `f: xmm2 -> 0`, `f: xmm2 -> 4`, `y:
+// 0-3 -> 8-11`, `y: 4-7 -> xmm2` (cells; y 32 bytes) has the cycles 0-3 ->
+// 10 -> 0-3 and 4-7 -> xmm2 -> 4-7, and 0-3 -> 8 -> 4-7 -> xmm2 -> 0-3
+// through both, and needs two saves pending whatever is chosen. So, in
+// this order: the widest value whose save lets all its readers be made
+// before the next stall (plan_save_frees), whose storage is then free
+// again at the next stall; else the widest value whose save makes a move
+// ready (plan_save_progresses); else the value the destination of a
+// narrowest pending move overlaps, which always makes progress: that
+// destination is inside it (a value narrower than the move would have
+// pending readers narrower still), so the move waits only for it. That
+// two saves pending always suffice is not proven: it is measured, on
+// 1,000,000 random edges for each target, half of them dense
+// (tests/fuzz/pm_model.py, these functions line for line, which also
+// fails on a plan that needs more); choosing the third rule's value
+// instead of the second's needed a third save in 2 of a million x86-64
+// edges.
+fn plan_break(cx: &mut FnCtx<Comp>, src: &[i64], done: &[bool], n: i64, pcx: &Ctx<Comp>) -> i64 {
+    for rule in 0..2 {
+        let mut c: i64 = -1;
+        let mut c_width: i64 = -1;
+        for j in 0..n {
+            if done[j as usize] {
+                continue;
+            }
+            let s = src[j as usize];
+            let ty = pm_ty(cx, j);
+            // each value once: its first pending reader
+            let mut first = true;
+            for k in 0..j {
+                if !done[k as usize] && src[k as usize] == s {
+                    first = false;
+                }
+            }
+            // a value some pending move waits for
+            let mut waited = false;
+            for i in 0..n {
+                if !done[i as usize] && locs_overlap(pm_dst(cx, i), pm_ty(cx, i), s, ty, pcx) {
+                    waited = true;
+                }
+            }
+            let w = plan_width(cx, j, pcx);
+            if first && waited && w > c_width
+                && (if rule == 0 {
+                    plan_save_frees(cx, src, done, j, n, pcx)
+                } else {
+                    plan_save_progresses(cx, src, done, j, n, pcx)
+                }) {
+                    c = j;
+                    c_width = w;
+                }
+        }
+        if c >= 0 {
+            return c;
+        }
+    }
+    let mut m: i64 = -1;
+    for i in 0..n {
+        if !done[i as usize] && (m < 0 || plan_width(cx, i, pcx) < plan_width(cx, m, pcx)) {
+            m = i;
+        }
+    }
+    let d = pm_dst(cx, m);
+    let ty = pm_ty(cx, m);
+    let c = plan_reader(cx, src, done, d, ty, m, n, pcx);
+    if c < 0 {
+        die(c"internal error: a parallel move waits for no move");
+    }
+    c
+}
+
 // (0.30.1, RT-CG-5, RT-CG-6) The order of the pending location moves,
 // as steps of three (destination, source, type), each made by move_loc:
 // what pm_resolve emits and what the allocation's check simulates. A move
 // is made once no other pending move reads any cell of its destination.
-// When only cycles are left, one move on a cycle has its source saved in
-// the cycle register (of the class of its own type: the value's) and the
-// moves reading that source read the register instead; that frees the
-// move before it on the cycle. A source that other pending moves read
+// When only cycles are left, the source of one move (plan_break chooses
+// it) is saved in the cycle register of its type's class (or the cells
+// kept for a second save), and the moves reading that source read the
+// save instead; that frees the moves waiting for it. A source that other pending moves read
 // only in part, or as another kind of value, is an internal error (two
 // values never share a cell while both are live).
 pub fn pm_plan(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) -> Vec<i64, Comp> {
@@ -339,20 +491,9 @@ pub fn pm_plan(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) -> Vec<i64, Comp> {
         if progress {
             continue;
         }
-        // Every pending move waits for another: after n steps along the
-        // waits, c is on a cycle.
-        let mut c: i64 = 0;
-        while done[c as usize] {
-            c += 1;
-        }
-        for _ in 0..n {
-            let d = pm_dst(cx, c);
-            let ty = pm_ty(cx, c);
-            c = plan_reader(cx, src.as_slice(), done.as_slice(), d, ty, c, n, pcx);
-            if c < 0 {
-                die(c"internal error: a parallel move waits for no move");
-            }
-        }
+        // Every pending move waits for another: c is the move whose source
+        // is saved (plan_break).
+        let c = plan_break(cx, src.as_slice(), done.as_slice(), n, pcx);
         let s = src[c as usize];
         let ty = pm_ty(cx, c);
         for j in 0..n {
