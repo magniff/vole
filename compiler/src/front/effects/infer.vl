@@ -839,6 +839,9 @@ fn walk(n: i64, pcx: &mut Ctx<Comp>) {
         if pcx.fx_alias.len() > 0 && is_alias(pcx.nodes[n as usize].y, pcx) {
             pcx.fx_borrow_sites.push(pcx.nodes[n as usize].y);
             pcx.fx_borrow_sites.push(n);
+            // (-n: a use of an alias's value seen at n, which an IR borrow
+            // only read through at n is, LOAN_READ: ir_unseen)
+            pcx.fx_seen.push(-n);
         }
         // (E1.8: a closure's capture of a local is a borrow kept beyond
         // the expression, settle_addresses)
@@ -1365,12 +1368,12 @@ fn index_ir_loans(pcx: &mut Ctx<Comp>) {
     pcx.fx_ir_start.resize(n + 1, 0);
     pcx.fx_ir_index.clear();
     let mut k: usize = 0;
-    while k + 3 < pcx.fx_ir_loans.len() {
+    while k + crate::places::ir::IR_LOAN_WORDS <= pcx.fx_ir_loans.len() {
         let f = pcx.fx_ir_loans[k];
         if f >= 0 && (f as usize) < n {
             (pcx.fx_ir_start[(f + 1) as usize]) += 1;
         }
-        k += 4;
+        k += crate::places::ir::IR_LOAN_WORDS;
     }
     for i in 0..n {
         (pcx.fx_ir_start[i + 1]) += pcx.fx_ir_start[i];
@@ -1379,14 +1382,14 @@ fn index_ir_loans(pcx: &mut Ctx<Comp>) {
     let mut fill: Vec<i64, Comp> = Vec::new_in(Comp {});
     fill.resize(n, 0);
     k = 0;
-    while k + 3 < pcx.fx_ir_loans.len() {
+    while k + crate::places::ir::IR_LOAN_WORDS <= pcx.fx_ir_loans.len() {
         let f = pcx.fx_ir_loans[k];
         if f >= 0 && (f as usize) < n {
             let at = pcx.fx_ir_start[f as usize] + fill[f as usize];
             (pcx.fx_ir_index[at as usize]) = k as i64;
             (fill[f as usize]) += 1;
         }
-        k += 4;
+        k += crate::places::ir::IR_LOAN_WORDS;
     }
 }
 
@@ -1396,7 +1399,8 @@ fn index_ir_loans(pcx: &mut Ctx<Comp>) {
 // IR's borrows are every borrow made, whatever the syntax
 // (places::build::emit_ref): a form the walk does not know still makes
 // one, and goes anywhere (settle_addresses: the function's own set
-// decides). A closure's environment given to its call is the walk's
+// decides), unless the built body only reads through its reference
+// (LOAN_READ, places::build::settle_loans: it gives no one an address). A closure's environment given to its call is the walk's
 // (closure_env_arg). With VOLE_E18_CHECK set, each is an error: the walk
 // is to be as complete as the IR's borrows (tests/e18_loans.sh).
 fn ir_unseen(m: i64, set: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> i64 {
@@ -1411,21 +1415,39 @@ fn ir_unseen(m: i64, set: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> i64 {
         if !set.contains(&(pcx.fx_ir_loans[k + 1])) {
             continue;
         }
-        let seen = pcx.fx_seen.contains(&node);
+        let seen = check != 3 && pcx.fx_seen.contains(&node);
+        // (a borrow whose reference only the body reads through,
+        // places::build::settle_loans, gives the place's value at the node:
+        // none of an address when the value holds none; else it is the use
+        // of the local's value there, seen when the walk saw one, an
+        // alias's use, walk: -node)
+        let form = pcx.fx_ir_loans[k + 5];
+        let read = check != 3
+            && (form == crate::places::ir::LOAN_READ_PLAIN
+                || form == crate::places::ir::LOAN_READ && node > 0
+                && pcx.nodes[node as usize].kind == NodeKind::Ident
+                && pcx.nodes[node as usize].res == Res::Local
+                && pcx.nodes[node as usize].y == pcx.fx_ir_loans[k + 1]
+                && pcx.fx_seen.contains(&(-node)));
         if check == 2 && !pcx.search && !pcx.eval && node > 0 {
             // (VOLE_E18_CHECK=all: every borrow of the proof's locals)
+            let alias = form == crate::places::ir::LOAN_READ;
+            let msg = if seen && read { c"E1.8: a borrow the walk saw, only read through" }
+                else if seen { c"E1.8: a borrow the walk saw" }
+                else if read && alias { c"E1.8: an alias's use the walk saw, only read through" }
+                else if read { c"E1.8: a borrow only read through" }
+                else { c"internal: E1.8: a borrow of a local the effect walk did not see" };
             crate::base::diag::err_begin(pcx.nodes[node as usize].start, pcx);
-            crate::base::diag::err_str(if seen { c"E1.8: a borrow the walk saw" }
-                else { c"internal: E1.8: a borrow of a local the effect walk did not see" }, pcx);
+            crate::base::diag::err_str(msg, pcx);
             crate::base::diag::err_end_soft(pcx);
         }
-        if seen {
+        if seen || read {
             continue;
         }
         let kind = pcx.fx_ir_loans[k + 3];
         let raw = kind == crate::places::ir::BK_RAW || kind == crate::places::ir::BK_RAW_MUT;
         out = if raw { 2 } else if out == 0 { 1 } else { out };
-        if check == 1 && !pcx.search && !pcx.eval && node > 0 {
+        if (check == 1 || check == 3) && !pcx.search && !pcx.eval && node > 0 {
             crate::base::diag::err_begin(pcx.nodes[node as usize].start, pcx);
             crate::base::diag::err_str(
                 c"internal: E1.8: a borrow of a local the effect walk did not see", pcx);
@@ -1437,10 +1459,15 @@ fn ir_unseen(m: i64, set: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> i64 {
 
 // (E1.8) VOLE_E18_CHECK: 1 when set, ir_unseen's borrows are errors; 2
 // when `all`, every IR borrow of a proof's locals is reported, seen or
-// not (the list itself checked); 0 unset.
+// not (the list itself checked), with what the IR made of it; 3 when
+// `blind`, the walk's sites and the IR's settling are not used, so each
+// IR borrow of a proof's locals is reported unseen and goes anywhere (a
+// planted fault: tests/e18_loans.sh --self-test shows the check reports
+// one); 0 unset.
 fn e18_check() -> i64 {
     let v = crate::base::env_var(c"VOLE_E18_CHECK");
-    if v.len() == 0 { 0 } else if v.as_slice() == b"all" { 2 } else { 1 }
+    if v.len() == 0 { 0 } else if v.as_slice() == b"all" { 2 }
+    else if v.as_slice() == b"blind" { 3 } else { 1 }
 }
 
 // (E1.8) The locals a borrow of local `root` may be reached through, in

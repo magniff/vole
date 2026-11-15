@@ -268,6 +268,11 @@ code generators' agent (0.26.1) sees what moved.
   temporary leaked when lent or read (`obs(&dup(&t))`, `dup(&t).v`), and
   never held for a `let` of the same call. Code that reads a second owner
   out of a raw pointer forgets it itself (`mem::forget`, `ManuallyDrop`).
+- 0.30.1 (E1.8): Ctx.fx_ir_loans' entries are IR_LOAN_WORDS words, the
+  two new ones the IR local the reference is written to and where it
+  goes (LOAN_ANY, LOAN_READ, LOAN_READ_PLAIN), decided from the built
+  body (build.vl settle_loans) and read by the effect inference
+  (front/effects/infer.vl ir_unseen).
 
 ## `--places-diff`
 
