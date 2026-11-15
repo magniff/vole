@@ -793,7 +793,8 @@ pub fn buf_type(out: i64, t: i64, pcx: &Ctx<Comp>) {
         buf_byte(out, b'[');
         buf_type(out, pcx.types[t as usize].a, pcx);
         buf_str(out, c"; ");
-        buf_int(out, pcx.types[t as usize].b);
+        // (0.30.1: a usize length, past i64::MAX one from `0 - 1`)
+        crate::base::buf_uint(out, pcx.types[t as usize].b as u64);
         buf_byte(out, b']');
     } else if kind == Struct {
         buf_str(out, sym_name(pcx.structs[pcx.types[t as usize].a as usize].name, pcx));
@@ -1146,6 +1147,55 @@ pub fn align_to(offset: i64, align: i64) -> i64 {
     (offset + align - 1) & !(align - 1)
 }
 
+// (0.30.1) A type's size must be below TYPE_SIZE_LIMIT, 2^61 bytes:
+// rustc's bound for a 64-bit target (TargetDataLayout::obj_size_bound),
+// far past any address space, and low enough that the compiler's own sums
+// of a few sizes (a frame's slots, a size rounded up) stay in i64. A
+// layout past it, or one whose sum or product of its parts' overflows,
+// has the size TYPE_TOO_BIG: refused where the type is written
+// (check::refuse_too_big), at a struct's or an enum's declaration or
+// instance (check::too_big_error), and for any other before code is made
+// (lay_out_types). Never a size wrapped modulo 2^64, which gave
+// `[u64; 1 << 61]` the size 0 (RT-M2-9).
+pub const TYPE_SIZE_LIMIT: i64 = 2305843009213693952;
+pub const TYPE_TOO_BIG: i64 = 9223372036854775807;
+
+// a + b for sizes, TYPE_TOO_BIG when either is or the sum reaches the
+// limit.
+fn size_add(a: i64, b: i64) -> i64 {
+    if a >= TYPE_SIZE_LIMIT || b >= TYPE_SIZE_LIMIT || a < 0 || b < 0 {
+        return TYPE_TOO_BIG;
+    }
+    // (both below 2^61: the sum is below 2^62, no overflow)
+    let s = a + b;
+    if s >= TYPE_SIZE_LIMIT { TYPE_TOO_BIG } else { s }
+}
+
+// size * n for an array's n elements of size bytes: n < 0 is a length
+// of 2^63 or more (a usize length read as i64), TYPE_TOO_BIG unless the
+// element is zero-sized (`[(); usize::MAX]` is 0 bytes, as Rust's).
+fn size_mul(size: i64, n: i64) -> i64 {
+    if size == 0 {
+        return 0;
+    }
+    if size >= TYPE_SIZE_LIMIT || size < 0 || n < 0 {
+        return TYPE_TOO_BIG;
+    }
+    match size.checked_mul(n) {
+        Option::Some(s) => if s >= TYPE_SIZE_LIMIT { TYPE_TOO_BIG } else { s },
+        Option::None => TYPE_TOO_BIG,
+    }
+}
+
+// align_to for sizes: TYPE_TOO_BIG when x is or its rounding overflows.
+fn size_align_to(x: i64, align: i64) -> i64 {
+    let up = size_add(x, align - 1);
+    if up == TYPE_TOO_BIG {
+        return TYPE_TOO_BIG;
+    }
+    up & !(align - 1)
+}
+
 // (0.27.0) A type's layout is read here and made by compute_layout, on
 // the main thread: every type's after checking (lay_out_types) and before
 // each phase of the code generator's tasks (middle::parallel's
@@ -1276,7 +1326,7 @@ fn layout_of(t: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
         payload = l.payload;
     } else if kind == Array {
         let (s, a) = size_align(pcx.types[t as usize].a, pcx);
-        size = s * pcx.types[t as usize].b;
+        size = size_mul(s, pcx.types[t as usize].b);
         align = a;
     } else if kind == Tuple {
         let mut offset: i64 = 0;
@@ -1284,9 +1334,9 @@ fn layout_of(t: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
             let elem = type_elem(t, i, pcx);
             let (s, a) = size_align(elem, pcx);
             align = max_i64(align, a);
-            offset = align_to(offset, a) + s;
+            offset = size_add(size_align_to(offset, a), s);
         }
-        size = align_to(offset, align);
+        size = size_align_to(offset, align);
     } else if kind == Struct {
         let l = struct_layout(pcx.types[t as usize].a, offsets, pcx);
         size = l.size;
@@ -1316,13 +1366,13 @@ fn enum_layout(e: i64, pcx: &Ctx<Comp>) -> Layout {
     }
     if ((pcx.enums[e as usize]).repr & REPR_C) != 0
         && (pcx.enums[e as usize]).has_fields {
-        payload = align_to(size, widest);
-        size = payload + largest;
+        payload = size_align_to(size, widest);
+        size = size_add(payload, largest);
     } else {
         size = max_i64(size, largest);
     }
     align = max_i64(align, widest);
-    size = align_to(size, align);
+    size = size_align_to(size, align);
     Layout { size, align, payload }
 }
 
@@ -1380,17 +1430,17 @@ fn struct_layout(s: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
             }
             offset = max_i64(offset, sizes[(order[k as usize]) as usize]);
         } else {
-            offset = align_to(offset, field_align);
+            offset = size_align_to(offset, field_align);
             if offsets.len() > 0 {
                 (offsets[(order[k as usize]) as usize]) = offset;
             }
-            offset += sizes[(order[k as usize]) as usize];
+            offset = size_add(offset, sizes[(order[k as usize]) as usize]);
         }
     }
     if (repr & REPR_PACKED) == 0 {
         align = max_i64(align, pcx.structs[s as usize].align);
     }
-    Layout { size: align_to(offset, align), align, payload: -1 }
+    Layout { size: size_align_to(offset, align), align, payload: -1 }
 }
 
 // (0.27.0) Lays out every type made so far: the main thread's, after
@@ -1399,6 +1449,25 @@ fn struct_layout(s: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
 pub fn lay_out_types(pcx: &mut Ctx<Comp>) {
     for t in 0..pcx.types.len() as i64 {
         compute_layout(t, pcx);
+    }
+    // (0.30.1) No code for a type that does not fit: one written is
+    // refused where it is (check::refuse_too_big); one made otherwise (a
+    // struct or enum holding two halves of 2^61, a tuple of an
+    // expression's values) is refused here, at its declaration when it
+    // has one. A size kept as TYPE_TOO_BIG never reaches the code
+    // generators.
+    for t in 0..pcx.types.len() as i64 {
+        if pcx.types[t as usize].size == TYPE_TOO_BIG {
+            let kind = pcx.types[t as usize].kind;
+            let node = if kind == Struct {
+                pcx.structs[pcx.types[t as usize].a as usize].node
+            } else if kind == Enum {
+                (pcx.enums[pcx.types[t as usize].a as usize]).node
+            } else {
+                0
+            };
+            crate::front::check::refuse_too_big(t, node, pcx);
+        }
     }
 }
 
