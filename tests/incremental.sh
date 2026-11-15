@@ -78,7 +78,8 @@ while [ $# -gt 0 ]; do
 done
 case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 TARGET=$("$COMPILER" --version | sed 's/.*host: \([a-z0-9_-]*\).*/\1/')
-WORK="$ROOT/target/incremental"
+# (0.30.1: $VOLE_INCREMENTAL_WORK, for tests/runner/run.sh's planted faults)
+WORK="${VOLE_INCREMENTAL_WORK:-$ROOT/target/incremental}"
 rm -rf "$WORK"
 mkdir -p "$WORK"
 cd "$ROOT" || exit 1
@@ -191,7 +192,19 @@ build() { # <tree> <root> <level> <threads> <out> <cache> <directives>
     (cd "$1" && VOLE_CODE_CACHE=on VOLE_CACHE="$1.cache" VOLE_CACHE_SYNC=1 \
         VOLE_CACHE_TRACE="$1.trace" \
         "$COMPILER" --target "$TARGET" "-O$3" "-j$4" $flags $no -c "$2" -o "$5") >"$5.out" 2>&1
-    echo $? >"$5.rc"
+    rc=$?
+    echo $rc >"$5.rc"
+    # (0.30.1: the status counts even when the object was written: a
+    # compiler that writes it and then crashes, storing to the cache say,
+    # made no object; every check below fails on the one missing)
+    [ $rc -eq 0 ] || rm -f "$5"
+}
+
+# (0.30.1) What the build into $1 did, for a message: it failed (its exit
+# and first line: no object), or its object differs from a clean build's.
+outcome() { # <out>
+    if [ -f "$1" ]; then echo "differs from a clean build"
+    else echo "failed (exit $(cat "$1.rc" 2>/dev/null), $(head -1 "$1.out" 2>/dev/null))"; fi
 }
 
 # (0.30.1) Whether the build into $1 failed as a compiler that works
@@ -216,17 +229,20 @@ check() { # <program> <level> <threads> <edits> <n>
     cp -R "$w/tree" "$w/orig"
     what="$1 -O$2 -j$3"
     build "$w/tree" "$root" "$2" "$3" "$w/ref.o" no "$dd"
-    if [ ! -f "$w/ref.o" ]; then
+    if [ ! -f "$w/ref.o" ] || [ "$(cat "$w/ref.o.rc")" != 0 ]; then
         if ! diagnosed "$w/ref.o"; then
             echo "FAIL $what: the compiler crashed on it: exit $(cat "$w/ref.o.rc"), $(head -1 "$w/ref.o.out")"
             return
         fi
-        echo "skip $what: it does not build ($(head -1 "$w/ref.o.out"))"
+        # (0.30.1: a program of the tree that does not build is the
+        # compiler's failure, not a skip: a compiler that refused most
+        # programs passed the row)
+        echo "FAIL $what: it does not build ($(head -1 "$w/ref.o.out"))"
         return
     fi
     build "$w/tree" "$root" "$2" "$3" "$w/cold.o" yes "$dd"
     if ! cmp -s "$w/ref.o" "$w/cold.o"; then
-        echo "FAIL $what: the cold build with the cache differs from the build without"
+        echo "FAIL $what: the cold build with the cache $(outcome "$w/cold.o")"
         return
     fi
     i=1
@@ -260,7 +276,7 @@ check() { # <program> <level> <threads> <edits> <n>
         kinds="$kinds ${e%% *}"
         build "$w/tree" "$root" "$2" "$3" "$w/warm.o" yes "$dd"
         if ! cmp -s "$w/ref.o" "$w/warm.o"; then
-            echo "FAIL $what: after edit $i ($e) the rebuild differs from a clean build; kept in $w"
+            echo "FAIL $what: after edit $i ($e) the rebuild $(outcome "$w/warm.o"); kept in $w"
             return
         fi
         i=$((i + 1))
@@ -270,7 +286,7 @@ check() { # <program> <level> <threads> <edits> <n>
     build "$w/tree" "$root" "$2" "$3" "$w/ref.o" no "$dd"
     build "$w/tree" "$root" "$2" "$3" "$w/warm.o" yes "$dd"
     if ! cmp -s "$w/ref.o" "$w/warm.o"; then
-        echo "FAIL $what: the tree put back rebuilds differently; kept in $w"
+        echo "FAIL $what: the tree put back: the rebuild $(outcome "$w/warm.o"); kept in $w"
         return
     fi
     real=0
@@ -314,16 +330,20 @@ for p in tests/incremental/*.vl.txt; do
                 f1=$first; [ "$f1" = - ] && f1=""
                 f2=$second; [ "$f2" = - ] && f2=""
                 sed "s|@V@|$f1|" "$p" >"$pw/main.vl"
+                # (an output of a build that did not exit 0 is none, 0.30.1)
                 (cd "$pw" && VOLE_CODE_CACHE=on VOLE_CACHE="$pw/cache" VOLE_CACHE_SYNC=1 \
-                    "$COMPILER" --target "$TARGET" "-O$opt" --cache=on $mode main.vl -o first.out) >"$pw/log" 2>&1
+                    "$COMPILER" --target "$TARGET" "-O$opt" --cache=on $mode main.vl -o first.out) >"$pw/log" 2>&1 \
+                    || rm -f "$pw/first.out"
                 sed "s|@V@|$f2|" "$p" >"$pw/main.vl"
                 (cd "$pw" && VOLE_CODE_CACHE=on VOLE_CACHE="$pw/cache" VOLE_CACHE_SYNC=1 \
-                    "$COMPILER" --target "$TARGET" "-O$opt" --cache=on $mode main.vl -o warm.out) >>"$pw/log" 2>&1
-                (cd "$pw" && VOLE_CACHE=off "$COMPILER" --target "$TARGET" "-O$opt" --no-cache $mode main.vl -o cold.out) >>"$pw/log" 2>&1
+                    "$COMPILER" --target "$TARGET" "-O$opt" --cache=on $mode main.vl -o warm.out) >>"$pw/log" 2>&1 \
+                    || rm -f "$pw/warm.out"
+                (cd "$pw" && VOLE_CACHE=off "$COMPILER" --target "$TARGET" "-O$opt" --no-cache $mode main.vl -o cold.out) >>"$pw/log" 2>&1 \
+                    || rm -f "$pw/cold.out"
                 if [ -f "$pw/cold.out" ] && cmp -s "$pw/warm.out" "$pw/cold.out"; then
                     pairs_ok=$((pairs_ok + 1))
                 else
-                    echo "FAIL $p: '$first' then '$second' at -O$opt $mode: the warm build differs from a build without the cache"
+                    echo "FAIL $p: '$first' then '$second' at -O$opt $mode: the warm build $([ -f "$pw/warm.out" ] && echo "differs from a build without the cache" || echo "failed: $(tail -1 "$pw/log")")"
                     pairs_failed=$((pairs_failed + 1))
                 fi
             done
