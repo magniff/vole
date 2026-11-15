@@ -1,0 +1,192 @@
+// (0.30.1) A function item used as a value (borrowck.md D4.7; rustc
+// E0308, "one type is more general than the other"). A call through a
+// `fn` value, or through a type parameter its bound reads (`F: Fn(&T)`),
+// is checked with the value's erased type (constraints::indirect_call,
+// R6): its references of any lifetime, the argument's. So the item may
+// need nothing of a parameter's lifetime that such a call does not give:
+// no `'static` (written, or a named lifetime bounded by it, or a type
+// parameter bounded by it whose argument holds a reference). Else a
+// reference to a local reaches a thread or a static through the item, a
+// use after free (RT-M2-2). Stricter than rustc where the value's type
+// says `'static` itself (`fn(&'static T)`), which its erased type cannot.
+
+use crate::base::sym_text;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{err_begin, err_end_soft, err_fmt, err_help};
+use crate::front::ast::{NODE_REF, NodeKind, child};
+use crate::front::parser::rust::{lifetimes_of, outlives_of, where_key};
+use crate::places::front::{fn_node, fn_template};
+use crate::places::regions::{B_NAMED, B_STATIC, lifetime_binding, slot_count};
+
+// RULE: D4.7 (0.30.1) Function f used as a value at expression e: the
+// first parameter whose type needs `'static` is the error.
+pub fn check_fn_value(f: i64, e: i64, pcx: &mut Ctx<Comp>) {
+    if f < 0 {
+        return;
+    }
+    let node = fn_node(fn_template(f, pcx), pcx);
+    if node <= 0 || pcx.nodes[node as usize].kind != NodeKind::Fn {
+        return;
+    }
+    let mut statics = Vec::<i64, Comp>::new_in(Comp {});
+    static_lifetimes(node, &mut statics, pcx);
+    let self_node = pcx.nodes[node as usize].h;
+    for p in 0..pcx.nodes[node as usize].count {
+        let pn = child(node, p, pcx);
+        if needs_static(pcx.nodes[pn as usize].b, f, node, self_node, &statics, 0, pcx) {
+            report(f, pn, e, pcx);
+            return;
+        }
+    }
+}
+
+// The named lifetimes of function node n (its own, its `where`'s, its
+// impl's) that must outlive 'static: bounded by it, or by one that is.
+fn static_lifetimes(n: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    let holders = [lifetimes_of(n, pcx), lifetimes_of(where_key(n), pcx), lifetimes_of(-n, pcx)];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &h in &holders {
+            if h <= 0 {
+                continue;
+            }
+            for k in 0..pcx.nodes[h as usize].count {
+                let ln = child(h, k, pcx);
+                let a = pcx.nodes[ln as usize].a;
+                let bounds = pcx.nodes[ln as usize].h;
+                if bounds <= 0 || lifetime_binding(a, pcx) != B_NAMED || out.contains(&a) {
+                    continue;
+                }
+                for j in 0..pcx.nodes[bounds as usize].count {
+                    let b = pcx.nodes[child(bounds, j, pcx) as usize].a;
+                    if is_static(b, out, pcx) {
+                        out.push(a);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_static(sym: i64, statics: &Vec<i64, Comp>, pcx: &Ctx<Comp>) -> bool {
+    let b = lifetime_binding(sym, pcx);
+    b == B_STATIC || b == B_NAMED && statics.contains(&sym)
+}
+
+// Whether type node n, a parameter's type of function node fnode (f its
+// instance), needs a lifetime to be 'static. A `fn` type or bound inside
+// is not looked into: its references are what the item gives.
+fn needs_static(n: i64, f: i64, fnode: i64, self_node: i64, statics: &Vec<i64, Comp>,
+    depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if n <= 0 || depth > 32 {
+        return false;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    if k == NodeKind::TyPtr {
+        if (pcx.nodes[n as usize].p & NODE_REF) != 0
+            && is_static(pcx.nodes[n as usize].c, statics, pcx) {
+            return true;
+        }
+        return needs_static(pcx.nodes[n as usize].a, f, fnode, self_node, statics, depth + 1, pcx);
+    }
+    if k == NodeKind::TySlice {
+        return is_static(pcx.nodes[n as usize].c, statics, pcx)
+            || needs_static(pcx.nodes[n as usize].a, f, fnode, self_node, statics, depth + 1, pcx);
+    }
+    if k == NodeKind::TyArray {
+        return needs_static(pcx.nodes[n as usize].a, f, fnode, self_node, statics, depth + 1, pcx);
+    }
+    if k == NodeKind::TyTuple {
+        for e in 0..pcx.nodes[n as usize].count {
+            if needs_static(child(n, e, pcx), f, fnode, self_node, statics, depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k != NodeKind::TyName {
+        return false;
+    }
+    let text = sym_text(pcx.nodes[n as usize].a, pcx);
+    let bare = pcx.nodes[n as usize].list == 0 && pcx.nodes[n as usize].g == 0
+        && pcx.nodes[n as usize].count == 0;
+    // (`Self`: the impl's type as its header writes it)
+    if bare && text == b"Self" {
+        return self_node > 0
+            && needs_static(self_node, f, fnode, 0, statics, depth + 1, pcx);
+    }
+    if text == b"str" && is_static(pcx.nodes[n as usize].c, statics, pcx) {
+        return true;
+    }
+    if bare && param_static(n, f, fnode, pcx) {
+        return true;
+    }
+    let lts = lifetimes_of(n, pcx);
+    if lts > 0 {
+        for e in 0..pcx.nodes[lts as usize].count {
+            if is_static(pcx.nodes[child(lts, e, pcx) as usize].a, statics, pcx) {
+                return true;
+            }
+        }
+    }
+    let g = pcx.nodes[n as usize].g;
+    if g > 0 {
+        for e in 0..pcx.nodes[g as usize].count {
+            if needs_static(child(g, e, pcx), f, fnode, self_node, statics, depth + 1, pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Whether bare name n is a type parameter of function node fnode bounded
+// `'static` whose argument in instance f holds a reference (a lifetime
+// the erased type cannot say is 'static).
+fn param_static(n: i64, f: i64, fnode: i64, pcx: &Ctx<Comp>) -> bool {
+    let g = pcx.nodes[fnode as usize].g;
+    if g <= 0 || pcx.fns[f as usize].tmpl == 0 {
+        return false;
+    }
+    for k in 0..pcx.nodes[g as usize].count {
+        let p = child(g, k, pcx);
+        if pcx.nodes[p as usize].a != pcx.nodes[n as usize].a {
+            continue;
+        }
+        if k >= pcx.fns[f as usize].targ_count {
+            return false;
+        }
+        let t = pcx.tlists[(pcx.fns[f as usize].targs + k) as usize];
+        let mut i: i64 = 0;
+        loop {
+            let lt = outlives_of(p, i, pcx);
+            if lt == 0 {
+                return false;
+            }
+            if lifetime_binding(lt, pcx) == B_STATIC && t > 0 && slot_count(t, pcx) > 0 {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+// RULE: D4.7 error borrowck.fn_value_static
+fn report(f: i64, pn: i64, e: i64, pcx: &mut Ctx<Comp>) {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"borrowck.fn_value_static";
+    let name = str::from_utf8(sym_text(pcx.nodes[fn_node(fn_template(f, pcx), pcx) as usize].a,
+        pcx)).unwrap();
+    let param = str::from_utf8(sym_text(pcx.nodes[pn as usize].a, pcx)).unwrap();
+    err_begin(pcx.nodes[e as usize].start, pcx);
+    err_fmt(format_args("'{}' cannot be used as a value: its parameter '{}' needs a 'static lifetime, and a call through a `fn` value or an `Fn` bound gives a reference of any lifetime",
+        name, param), pcx);
+    err_help(c"call the function by its name, or let it take a reference of any lifetime (`&T`, not `&'static T`): a `fn` type's lifetimes are erased, so `fn(&'static T)` is read as `fn(&T)` (rustc E0308: one type is more general than the other)", pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved;
+}

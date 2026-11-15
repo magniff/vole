@@ -957,6 +957,30 @@ D3.6).
   after free in safe code. *Cases:* `rust_b_err_adapter_item_copied`,
   `rust_b_err_adapter_item_map`, `rust_b_err_adapter_item_user`.
 
+**D4.7 (a function item used as a value; 0.30.1, RT-M2-2).** A call
+through a `fn` value, or through a type parameter its `Fn*` bound reads,
+is checked with the erased type (R6, `indirect_call`; D4.2 for a
+bound): every argument may be a reference of any lifetime. A function
+item used as a value (an `OK_FN` operand: a `let f: fn(&T) = item`, an
+argument `run(item)` for `F: Fn(&T)`, a field, a result) is therefore
+refused when a parameter's type needs a lifetime to be `'static`: a
+`'static` written in it (`&'static T`, `S<'static>`, `&'static str`, in
+`Self` as the impl's header writes it), a named lifetime bounded by
+`'static` (its own, its `where`'s, its impl's, transitively), or a type
+parameter bounded `T: 'static` whose argument has a region slot. Else
+the item keeps a borrow of the caller's local (a thread, a static)
+past its end, a use after free. The check reads the parameter types'
+AST nodes; a `fn` type or a bound inside one is not looked into (its
+references are what the item gives). It is stricter than rustc where
+the value's type itself says `'static` (`let f: fn(&'static T) =
+item`), which the erased type cannot say; rustc's E0308 ("one type is
+more general than the other") covers the rest. A result's lifetimes
+need nothing: a call through the value ties its result to every
+argument (R6). `error borrowck.fn_value_static`, at the value.
+*Anchor:* `places/fn_values.vl: check_fn_value`, `places/build.vl:
+operand`. *Cases:* `rt_m2_002_fn_static_param`,
+`rust_b_fn_value_static_err`, `rust_b_fn_value_static_ok`.
+
 ## 5. Variance (S5)
 
 **D5.1 (the lattice).** `V = {+, −, o, *}` (co-, contra-, in-,
@@ -1730,6 +1754,7 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.return_local` | D6.2.2 | E0515 | none; the help suggests returning an owned value |
 | `borrowck.outlives` | D6.2.1; D19.10 case 1 | E0621, E0623, E0521 | "add `'a: 'b`", or "name the lifetime `'a` on `x`" when the blame path ends at two parameters of elided regions (E2 failed): `fix --suggested` writes `<'a>` on both |
 | `borrowck.param_outlives` | D4.5 (0.30.1) | E0310 | "add `T: 'static`" |
+| `borrowck.fn_value_static` | D4.7 (0.30.1) | E0308 | "call it by name, or take `&T`" |
 | `borrowck.elision` | E4 at the signature (ir271) | E0106 | writes `<'a>` and `&'a` on the only reference parameter when there is one |
 | `borrowck.unused_param` | D5.3 (ir271) | E0392 | adds a `PhantomData<&'a ()>` field |
 | `borrowck.use_moved` | M1, M5 | E0382 | `.clone()` when `Clone` (as `own.moved`'s) |
