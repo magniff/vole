@@ -521,6 +521,28 @@ value, `&*p` in an unsafe block, `s.as_bytes()`. *Anchor:*
 inserted; an integer literal takes its type from its context (F18.3).
 There is no `u128`/`i128` in 0.27.2: the names are `syntax.later:
 u128 (0.29)`.
+(0.30.1, RT-10) FR5's widening is refused where it would change a
+Rust program's value: an `i32` *computed* from integer literals that
+nothing gives a type (an arithmetic operator, `+ - * / % << >>`, or an
+i32 method, none of whose i32 operands has a written type, directly or
+as the value of an unannotated `let`; a `let mut` whose first value's
+type is not written; a generic function's result whose i32 an untyped
+literal argument gives, `s.parse().unwrap_or(0)`, parse::<i64> in Rust)
+is not widened, `error type.widen_i32`. rustc types such literals from the use that widens
+here (`let a = [2000000000, 2]; let s = a[0] + a[0]; take(s)` of
+`take(x: i64)` is i64 arithmetic there, 4000000000), so the i32 sum
+widened after its overflow was another value (-O0 panicked, -O2 printed
+-294967296). A literal, an element, a pattern's or a loop's binding
+(their values are the same in either type) and an i32 whose type is
+written (a parameter, a field, an annotated `let`, a non-generic
+function's result, a cast, a suffix; a generic function's result when
+an i32 argument is written) widen as before. The fix is the
+annotation, `let a: [i64; 2]`, or `i64::from(s)`. *Anchor:*
+`check/widen.vl: widen_value, computed_default, written_int`. *Cases:*
+`rt_010_literal_i32_then_widened`, `rust_f_f293_widen_i32_err`,
+`rust_f_f293_widen_i32_ok`. Rustc's own answer, an integer variable
+unified with the use before any default, is 0.31's (F18.6's variables
+would need integer kinds and a default at the function's end).
 
 ### F30 Places through raw pointers
 
@@ -2315,6 +2337,7 @@ where a `try:` is named, a case in `tests/borrowck-try`'s shape under
 | `type.unsized` | F21.1, F21.2, F20.1 | E0277 | `&` the type, `?Sized` on the parameter, `Box<_>` |
 | `type.cast` | F1.3, F29.1, Z9.3, D22.3 | E0604, E0605, E0606 | `char::from_u32(x)` for `u32 as char`; none else |
 | `type.ref_cast` | F29.4 | E0605, E0606 | none (the help names `&*p`, `as_bytes`, a conversion) |
+| `type.widen_i32` | F29.3 (0.30.1) | none (rustc infers i64) | none: the help names the annotation and `i64::from` |
 | `type.transmute` | F19.5 | E0512 | none; names both sizes |
 | `generic.unbounded_use` | D22.3, F26.2 | E0599, E0369, E0609 | adds `T: Tr` when unique |
 | `generic.count` | F19.1 | E0107 | removes or completes the turbofish |
