@@ -420,6 +420,11 @@ kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
   E0596; moves.vl env_inner). Before, every place under the env counted
   as mutable: a write under a live `&i64` and a use after free. *Cases:*
   `rust_b_err_closure_through_shared`, `rust_b_closure_capture_write_ok`.
+  A capture by value is the binding moved into the env, mutable as that
+  binding is (rustc's upvar mutability; 0.30.1): `let x = 1; move || {
+  &mut x }` is E0596 (RT-B301-7; before, the env's own field was always
+  mutable, and `&mut x.f` too). *Anchor:* moves.vl by_value_fixed.
+  *Case:* `rust_b_err_closure_byvalue_mut`.
 The `static mut` and `static` cases are D6.2.5's. A write to a place
 that is not mutable is `borrowck.assign_immutable` (rustc E0594,
 "cannot assign to `*s`, which is behind a `&` reference"); an exclusive
