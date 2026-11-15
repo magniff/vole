@@ -13,7 +13,7 @@ crate::ext_pure	none
 $ effects plus bump address at part whole color sum same spin forever fact even odd
 crate::plus	none
 crate::bump	static
-Chunks::bump<Gpa>	alloc(Gpa) panic diverge unsafe
+Chunks::bump<Gpa>	alloc(Gpa) diverge unsafe
 crate::address	static
 crate::at	panic
 crate::part	panic
