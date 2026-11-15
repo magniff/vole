@@ -38,12 +38,18 @@
 #   named     it differs, and the case says why: `// RUSTC-DIFFERS: WHY`
 #             or, rustc rejecting it, tools/borrowck-twin.sh's `// RUSTC:
 #             rejects CLASS WHY`
-#             (in the case, plan-0271 Q8), or a line `NAME<TAB>WHY` of
+#             (in the case, plan-0271 Q8), or a line `KEY<TAB>WHY` of
 #             tools/rustc-twin/divergences.tsv (for a program that has no
-#             case of its own: a guide block, a translation)
+#             case of its own: a guide block, a translation); a guide
+#             block's KEY is `guide-TOPIC@HASH`, HASH the first 12 hex
+#             digits of the sha256 of its program's text, so adding or
+#             moving an example renames no entry (a `differ` line of a
+#             guide block prints its KEY)
 #   stale     it is named and agrees: the marker is wrong (not a reason
 #             that starts with `unordered:`: Rust's own output varies by
 #             run, a HashMap's iteration order)
+#             or, under --guide, a guide KEY of divergences.tsv names no
+#             block (its example changed or is gone)
 #   outside   the shim cannot make it Rust: a vole-only item is left, or
 #             rustc rejects the text (its first error), or the case says
 #             `// RUSTC: none WHY`, or its ERROR is vole's alone (an effect
@@ -85,6 +91,7 @@ if [ $GUIDE = 1 ]; then
     sh "$ROOT/tests/guide/run.sh" --split "$WORK/guide-blocks" || exit 2
 fi
 exec python3 -I - "$ROOT" "$RUSTC" "$V" "$J" "$GUIDE" "$ALLOC" "$@" <<'PY'
+import hashlib
 import os
 import re
 import subprocess
@@ -126,6 +133,17 @@ if GUIDE:
         progs.append(("guide-" + b, src, rd("out"), int(rd("exit", "0") or 0), rd("stdin"), [], True))
 
 
+def text_key(name, src):
+    """A guide block's divergences.tsv key: its topic and a hash of its
+    program's text, not its position (`guide-debug-00058` is renumbered
+    when an example is added before it)."""
+    topic = name.rsplit("-", 1)[0]
+    return topic + "@" + hashlib.sha256(src.encode("utf-8")).hexdigest()[:12]
+
+
+USED = set()
+
+
 def overflow_checks(src):
     """vole's: on at -O0 (a case's FLAGS level, else the suite's -O2-safe
     default, off), or as its --overflow-checks= says."""
@@ -142,7 +160,10 @@ VOLE_ONLY_ERROR = re.compile(r"error\[effect[\w.]*\]|' is #\[(effects\([^)]*\)|p
 def run(prog):
     name, src, want, wexit, stdin, args, merged = prog
     m = re.search(r"^\s*// RUSTC-DIFFERS:\s*(.*)$", src, re.M)
-    named = (m.group(1).strip() or "(no reason)") if m else SIDE.get(name)
+    key = text_key(name, src) if name.startswith("guide-") else name
+    if key in SIDE:
+        USED.add(key)
+    named = (m.group(1).strip() or "(no reason)") if m else SIDE.get(key)
     rs, why = to_rust(src, alloc_api=ALLOC)
     d = os.path.join(WORK, name)
     os.makedirs(d, exist_ok=True)
@@ -191,6 +212,8 @@ def run(prog):
     if not diff and p.returncode != wexit:
         diff = f"exit {p.returncode}, expected {wexit}"
     if diff:
+        if not named and key != name:
+            diff += f" (its divergences.tsv key: {key})"
         return name, ("named" if named else "differ"), diff + (f" (named: {named})" if named else "")
     # (0.28.0: a reason that starts with `unordered:` names an output Rust
     # itself varies from run to run, a HashMap's iteration order (its
@@ -214,6 +237,13 @@ for name, verdict, why in sorted(results):
         reasons[r] = reasons.get(r, 0) + 1
     if verdict in ("differ", "stale") or VERBOSE:
         print(f"{verdict:8} {name}: {why}" if why else f"{verdict:8} {name}")
+# (a guide key that names no block: the example changed or went, and the
+# entry names nothing; stale, as a marker that agrees)
+if GUIDE:
+    for k in sorted(SIDE):
+        if k.startswith("guide-") and k not in USED:
+            counts["stale"] += 1
+            print(f"stale    {k}: divergences.tsv names no guide block with this text")
 print(f"rustc-twin{' (allocator_api, RUSTC_BOOTSTRAP=1)' if ALLOC else ''}: {len(results)} programs: {counts['agree']} agree, {counts['differ']} differ, "
       f"{counts['named']} named, {counts['stale']} stale, {counts['outside']} outside")
 for r, n in sorted(reasons.items(), key=lambda x: -x[1])[:12]:

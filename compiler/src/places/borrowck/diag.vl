@@ -430,7 +430,35 @@ fn buf_src_place(m: i64, l: i64, p: i64, auto: bool, pbody: &Body<Comp>, pcx: &C
             crate::base::buf_bytes(m, &temp_name(l, pbody, pcx));
             return;
         }
-        crate::base::buf_bytes(m, sym_text(pcx.locals[src as usize].name, pcx));
+        let name = sym_text(pcx.locals[src as usize].name, pcx);
+        // RULE: D7.4 (0.30.1, RT-33) a requires call's binding of an
+        // argument, `?aI` (LF_CONTRACT_ARG, a flag), is named as the
+        // argument it binds, the text of its pattern's span (`*s`, not
+        // `*?a0`), its first 40 bytes and `..` for a longer one (a message
+        // is one line); report_immutable names its source place
+        // (named_source)
+        if (pbody.locals[l as usize].flags & crate::places::ir::LF_CONTRACT_ARG) != 0
+            && pbody.locals[l as usize].node > 0 {
+            let mut out = Vec::<u8, Comp>::new_in(Comp {});
+            span_text(pbody.locals[l as usize].node, &mut out, pcx);
+            if out.len() > 40 {
+                out.truncate(40);
+                // (at a character's start: a UTF-8 sequence is not cut)
+                while out.len() > 0 && (out[out.len() - 1] & 0xC0) == 0x80 {
+                    out.pop();
+                }
+                if out.len() > 0 && out[out.len() - 1] >= 0xC0 {
+                    out.pop();
+                }
+                out.push(b'.');
+                out.push(b'.');
+            }
+            if out.len() > 0 {
+                crate::base::buf_bytes(m, &out);
+                return;
+            }
+        }
+        crate::base::buf_bytes(m, name);
         return;
     }
     let k = proj_kind(p, pbody);
@@ -511,11 +539,29 @@ fn temp_name(l: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> Vec<u8, Comp> {
         }
         n = pcx.nodes[n as usize].a;
     }
+    span_text(n, &mut out, pcx);
+    if out.len() == 0 {
+        return out;
+    }
+    for _ in 0..indexes {
+        out.push(b'[');
+        out.push(b'_');
+        out.push(b']');
+    }
+    if out.len() > 40 {
+        out.clear();
+    }
+    out
+}
+
+// The source text of node n, its whitespace runs one space, appended to
+// out (nothing for a node of no span).
+fn span_text(n: i64, out: &mut Vec<u8, Comp>, pcx: &Ctx<Comp>) {
     let start = pcx.nodes[n as usize].start;
     let end = pcx.nodes[n as usize].end;
     let src = crate::base::get_src();
     if start < 0 || end <= start || end as usize > src.len() {
-        return out;
+        return;
     }
     let mut space = false;
     for i in start..end {
@@ -530,15 +576,120 @@ fn temp_name(l: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> Vec<u8, Comp> {
         space = false;
         out.push(c);
     }
-    for _ in 0..indexes {
-        out.push(b'[');
-        out.push(b'_');
-        out.push(b']');
+}
+
+// RULE: D7.4, D2.7 (0.30.1, RT-33) The place a message names for place
+// (l, p) (deref: its referent): a temporary, or a requires call's binding
+// of an argument (LF_CONTRACT_ARG), is named by what its one assignment
+// made it of: a copy or a move of a place is that place, a slicing of a
+// view is that view (`*s` for `?a0 = s[..]`), and the referent of a `&mut`
+// of a place is the place (`*?a0` for `?a0 = &mut2 v` is `v`). Returns the
+// place and its deref, or l = -1 (p: the callee of a call's value, else -1) when it is no place of the program's (a
+// call's value, a slicing a written `&` made, `(&v[..])`, an `if`'s
+// value, a binding of one): rustc's "data in a `&` reference". Each step
+// goes to a place assigned before; a chain longer than the body has
+// locals is no place, -1.
+pub fn named_source(l0: i64, p0: i64, deref0: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>)
+    -> (i64, i64, i64) {
+    let mut l = l0;
+    let mut p = p0;
+    let mut deref = deref0;
+    for _ in 0..pbody.locals.len() + 1 {
+        if l < 0 || p != 0 {
+            return (l, p, deref);
+        }
+        let f = pbody.locals[l as usize].flags;
+        let contract = (f & crate::places::ir::LF_CONTRACT_ARG) != 0;
+        if !contract && ((f & (LF_USER | LF_PARAM)) != 0 && pbody.locals[l as usize].src >= 0
+            || (f & crate::places::ir::LF_STATIC) != 0) {
+            return (l, p, deref);
+        }
+        let s = only_def(l, pbody);
+        let st = if s >= 0 { pbody.stmts[s as usize] } else { pbody.stmts[0] };
+        // (a call's value: the callee, in p, -1 for any other)
+        if s >= 0 && st.kind == crate::places::ir::SK_CALL {
+            return (-1, st.c, 0);
+        }
+        if s < 0 || st.kind != crate::places::ir::SK_ASSIGN || st.nops == 0
+            || !crate::places::ir::op_is_place(crate::places::ir::op_kind(st.ops, 0, pbody)) {
+            return (-1, 0, 0);
+        }
+        let l2 = crate::places::ir::op_a(st.ops, 0, pbody);
+        let p2 = crate::places::ir::op_b(st.ops, 0, pbody);
+        if st.c == crate::places::ir::RV_USE {
+            l = l2;
+            p = p2;
+        } else if st.c == crate::places::ir::RV_SLICE && l2 >= 0 && shared_slice(
+            crate::places::ir::full_place_type(l2, p2, pbody, pcx), pcx) {
+            l = l2;
+            p = p2;
+        } else if st.c == crate::places::ir::RV_REF && deref == 1 {
+            l = l2;
+            p = p2;
+            deref = 0;
+        } else {
+            return (-1, 0, 0);
+        }
     }
-    if out.len() > 40 {
-        out.clear();
+    (-1, -1, 0)
+}
+
+// (0.30.1) Whether function f is a method of an `impl Index` or `impl
+// Deref` (moves.vl report_immutable: the view a `&mut` cannot reach): 1
+// Index, 2 Deref, 0 another. By the trait of the impl it is resolved to
+// (its template's, for an instance), not its name: an inherent `fn index`
+// is no Index (rustc's "data in a `&` reference" then).
+pub fn overloaded_call(f: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if f < 0 || f >= pcx.fns.len() as i64 || pcx.fns[f as usize].param_count == 0 {
+        return 0;
     }
-    out
+    let mut im = crate::front::traits::impl_of_fn(f, pcx);
+    if im < 0 && pcx.fns[f as usize].tmpl > 0 {
+        im = crate::front::traits::impl_of_fn(pcx.fns[f as usize].tmpl - 1, pcx);
+    }
+    if im < 0 || im >= pcx.traits_impls.len() as i64 {
+        return 0;
+    }
+    let tr = pcx.traits_impls[im as usize].tr;
+    if tr >= 0 && tr == crate::front::traits::std_trait(c"Index", pcx) {
+        return 1;
+    }
+    if tr >= 0 && tr == crate::front::traits::std_trait(c"Deref", pcx) {
+        return 2;
+    }
+    0
+}
+
+// The type an overloaded_call indexes or derefs: its `&self`'s.
+pub fn overloaded_self(f: i64, pcx: &Ctx<Comp>) -> i64 {
+    let t = crate::front::types::fn_param(f, 0, pcx);
+    if t > 0 && pcx.types[t as usize].kind == TyKind::Ptr { pcx.types[t as usize].a } else { t }
+}
+
+// The one statement that assigns local l whole, or -1 (none, or several).
+fn only_def(l: i64, pbody: &Body<Comp>) -> i64 {
+    let mut found: i64 = -1;
+    for s in 0..pbody.stmts.len() as i64 {
+        let st = pbody.stmts[s as usize];
+        if (st.kind == crate::places::ir::SK_ASSIGN || st.kind == crate::places::ir::SK_CALL
+            || st.kind == crate::places::ir::SK_INTRINSIC) && st.a == l && st.b == 0 {
+            if found >= 0 {
+                return -1;
+            }
+            found = s;
+        }
+    }
+    found
+}
+
+// Whether type t is a shared view, `&[T]` or a `&str` (a slicing of one
+// is named as it: its referent is the view's; a `&` of a mutable view's
+// slicing made the shared one, "data in a `&` reference").
+fn shared_slice(t: i64, pcx: &Ctx<Comp>) -> bool {
+    let u = crate::places::ir::undistinct(t, pcx);
+    u > 0 && pcx.types[u as usize].kind == TyKind::Slice
+        && pcx.types[u as usize].b != crate::front::types::REF_MUT
+        && pcx.types[u as usize].b != crate::front::types::REF_RAW
 }
 
 // The struct (STRUCTS) place (l, p) is, through its derefs; -1 for any

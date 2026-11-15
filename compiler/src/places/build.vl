@@ -139,6 +139,10 @@ fn user_local(l: i64, node: i64, borrowed: bool, pbody: &mut Body<Comp>, pcx: &m
     if borrowed || ast_borrowed(l, pcx) {
         flags |= LF_BORROWED;
     }
+    if node > 0 && pcx.nodes[node as usize].kind == NodeKind::PatBind
+        && (pcx.nodes[node as usize].p & crate::front::ast::PAT_CONTRACT_ARG) != 0 {
+        flags |= crate::places::ir::LF_CONTRACT_ARG;
+    }
     let ir = new_local(ty, flags, l, node, pbody);
     map_local(l, ir, 0, pcx);
     ir
@@ -3852,15 +3856,16 @@ fn let_borrows(pat: i64, init: i64, pcx: &mut Ctx<Comp>) -> bool {
         return !pcx.rust_body || t <= 0 || pcx.types[t as usize].kind == TyKind::Array
             && crate::front::kinds::is_plain_type(pcx.types[t as usize].a, pcx);
     }
-    // (`let x = S;` of a static: it borrows, statics are never dropped;
-    // 0.30.1: of a value that needs no drop it is a copy the binding owns,
-    // which `let mut x = S; x.a = 1;` may write, as rustc's, since a
-    // borrowed copy is read as through `&T`, borrowck/moves.vl
-    // immutable_why)
-    if init != 0 && pcx.nodes[init as usize].kind == NodeKind::Ident
-        && pcx.nodes[init as usize].res == Res::Static {
-        return needs_drop(pcx.nodes[init as usize].ty, pcx);
-    }
+    // RULE: M3 (0.30.1) `let x = S;` of a static: the binding owns what
+    // it reads, a copy when S is Copy (`let mut x = S; x.a = 1;` writes it,
+    // as rustc's; a borrowed copy is read as through `&T`, borrowck/moves.vl
+    // immutable_why), else a move out of the static the borrow checker
+    // refuses at the operand (moves.vl uses, rustc E0507), so the binding
+    // never reaches code generation. Before that check a static's binding
+    // was a borrowed copy so that the static was never dropped; as one, its
+    // later moves were second errors. A hidden binding of a static, `=f0`
+    // of `println("{:?}", S)`, `==l` of `S == x`, borrows as any other
+    // (below: rustc's format_args and PartialEq take `&S`).
     // (a hidden binding of the checker's, `=fN` an f-string's hole, `==`
     // an operator's operand: a borrowed copy, as the own pass's let_drops)
     let text = sym_text(name, pcx);
@@ -3923,18 +3928,23 @@ fn writer_reborrow(pat: i64, init: i64, pcx: &Ctx<Comp>) -> bool {
     if init == 0 || !is_place_expr(init, pcx) {
         return false;
     }
-    let text = sym_text(pcx.nodes[pat as usize].a, pcx);
-    if text != b"__r" && !contract_arg_name(text) {
+    if !pat_flag(pat, crate::front::ast::PAT_WRITER_RECV, pcx) && !contract_arg(pat, pcx) {
         return false;
     }
     let t = pcx.nodes[init as usize].ty;
     t > 0 && pcx.types[t as usize].kind == TyKind::Ptr && pcx.types[t as usize].b == REF_MUT
 }
 
-// (0.30.1) Whether a binding's name is a requires check's argument's,
-// `?aI` (front/contracts/desugar.vl requires_call).
-fn contract_arg_name(text: &[u8]) -> bool {
-    text.len() > 2 && text[0] == b'?' && text[1] == b'a'
+// (0.30.1) Whether pattern pat is a requires check's binding of an
+// argument, `?aI`: front/contracts/desugar.vl requires_call marks it
+// (PAT_CONTRACT_ARG), a flag, not its name.
+fn contract_arg(pat: i64, pcx: &Ctx<Comp>) -> bool {
+    pat_flag(pat, crate::front::ast::PAT_CONTRACT_ARG, pcx)
+}
+
+// Whether pattern pat is a PatBind with flag f.
+fn pat_flag(pat: i64, f: i64, pcx: &Ctx<Comp>) -> bool {
+    pcx.nodes[pat as usize].kind == NodeKind::PatBind && (pcx.nodes[pat as usize].p & f) != 0
 }
 
 // RULE: D7.4 (0.27.6) Whether `let pat = init` is that binding with the
@@ -3948,8 +3958,7 @@ fn contract_arg_name(text: &[u8]) -> bool {
 // receiver_reserved): rustc's `v.insert(0, e)` reserves `&mut v` first.
 fn writer_autoref(pat: i64, init: i64, pcx: &Ctx<Comp>) -> bool {
     init != 0
-        && (sym_text(pcx.nodes[pat as usize].a, pcx) == b"__r"
-            || sym_text(pcx.nodes[pat as usize].a, pcx) == b"?a0")
+        && (pat_flag(pat, crate::front::ast::PAT_WRITER_RECV, pcx) || contract_arg(pat, pcx))
         && pcx.nodes[init as usize].kind == NodeKind::Unary
         && pcx.nodes[init as usize].op == Tok::Amp
         && (pcx.nodes[init as usize].p & NODE_REF_MUT) != 0

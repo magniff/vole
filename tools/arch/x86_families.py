@@ -1242,9 +1242,34 @@ def enc_corpus():
     return "\n".join(out) + "\n"
 
 
+def operand_classes(shapes):
+    """(0.30.1) The register class of each operand, AT&T order, as the
+    encoder checks it: x an xmm or ymm register (or memory), g a general
+    register (or memory), i an immediate; one string for every shape."""
+    out = None
+    for shape in shapes:
+        cls = ["i" if k == "i" else "g" if k in "gGqQhb" else "x" for k in shape.split()]
+        if out is None:
+            out = cls
+            continue
+        if len(out) != len(cls):
+            raise ValueError("shapes of other lengths: %s" % shapes)
+        for n, (a, b) in enumerate(zip(out, cls)):
+            if a == "i":
+                out[n] = b
+            elif b != "i" and a != b:
+                raise ValueError("shapes of other classes: %s" % shapes)
+    return "".join(out or [])
+
+
 def insn_lines():
     out = []
     for mn, cls, pfx, mp, op, flags, shapes in INSNS:
+        # (0.30.1, RT-CG-5) a mnemonic with a general register says which
+        # operands are general (`r:xg`); one without takes xmm and ymm only
+        regs = operand_classes(shapes)
+        if "g" in regs:
+            flags = ("r:" + regs) if flags == "-" else (flags + " r:" + regs)
         out.append(" | ".join([mn, cls, pfx or "-", mp, op, flags]))
     return "\n".join(out) + "\n"
 
