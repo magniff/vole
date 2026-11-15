@@ -21,14 +21,17 @@
 # host's count. The rows the Linux containers run (gate.sh --inside: the
 # suite rows, fuzz, ABI, layout, objcheck, debug, valgrind, smoke) are
 # judged by what they report against the tree, on every host:
-#   suite-O*   its plan is every case the tree lists (tests/run.sh -l),
-#              each passed, xfailed or skipped, none failed, and at most
-#              as many skipped as the tree has cases with a REQUIRES line
-#              (the only reason a case is skipped);
+#   suite-O*   one plan, every case the tree lists (tests/run.sh -l),
+#              and one `cases:` line: each passed, xfailed or skipped,
+#              none failed, and the skipped ones by name exactly those
+#              the tree's REQUIRES lines skip on HOST (`metal` off
+#              aarch64-macos, `macos` off macOS; `clang` either way, as
+#              cc is clang or not);
 #   objcheck   every compilation the same as cc's (N of N), and N at
-#              least two (-O0, -O2) of each program of tests/run the
-#              suite runs and compiles (no XFAIL, REQUIRES, ERROR,
-#              WARNING or FIX* directive);
+#              least four (-O0, -O2, with -g and without, as
+#              tests/objcheck.sh compiles each) of each program of
+#              tests/run the suite runs and compiles (no XFAIL,
+#              REQUIRES, ERROR, WARNING or FIX* directive);
 #   layout     its row's own floor for the host (100 macOS, 30 Linux);
 #   fuzz, ABI, value semantics, voltty: the count the row was asked for;
 #   debug, compile-cost, chain, stress-grow, unsafe-audit: their lines.
@@ -105,20 +108,54 @@ case "$STEP" in
     # the tree, the header)
     suite-O0|suite-O1|suite-O2)
         # (tests/run.sh's `cases:` line: the cases alone, not the suites'
-        # checks the table's total adds)
-        plan=$(grep -E '^plan: [0-9]+ cases' "$LOG" | tail -1 | awk '{print $2}')
-        tot=$(grep -E '^cases: [0-9]+ passed, [0-9]+ xfail, [0-9]+ failed, [0-9]+ skipped of [0-9]+$' "$LOG" | tail -1)
+        # checks the table's total adds; one plan and one cases line, or
+        # the log is two runs')
+        [ "$(grep -cE '^plan: [0-9]+ cases' "$LOG")" -le 1 ] || refuse "more than one plan in its log"
+        [ "$(grep -cE '^cases: ' "$LOG")" -le 1 ] || refuse "more than one cases line in its log"
+        plan=$(grep -E '^plan: [0-9]+ cases' "$LOG" | awk '{print $2}')
+        tot=$(grep -E '^cases: [0-9]+ passed, [0-9]+ xfail, [0-9]+ failed, [0-9]+ skipped of [0-9]+$' "$LOG")
         [ -n "$plan" ] && [ -n "$tot" ] || refuse "no plan or no cases line in its log: the row passed without saying what it checked"
         listed=$(sh "$ROOT/tests/run.sh" -l 2>/dev/null | grep -c '^case ')
-        req=$(grep -l '^// REQUIRES:' "$ROOT"/tests/run/*.vl 2>/dev/null | wc -l | tr -d ' ')
         set -- $(echo "$tot" | tr -dc '0-9 \n' | tr -s ' ')
         pass=$1; xf=$2; fl=$3; sk=$4; ran=$5
         [ "$plan" -eq "$listed" ] || refuse "it planned $plan cases of the tree's $listed"
         [ "$ran" -eq "$plan" ] && [ $((pass + xf + fl + sk)) -eq "$plan" ] \
             || refuse "$pass passed, $xf xfail, $fl failed and $sk skipped of $ran are not its $plan cases"
         [ "$fl" -eq 0 ] || refuse "$fl cases failed"
-        [ "$sk" -le "$req" ] || refuse "$sk cases skipped, more than the tree's $req with a REQUIRES line"
-        echo "floor $STEP: $pass passed, $xf xfail, $sk skipped of the tree's $plan cases (at most $req skipped)"
+        # (the skipped cases by name, `skip case NAME: REQUIRES ...`, are
+        # the ones the tree's REQUIRES lines skip on HOST, as tests/run.sh
+        # decides: `metal` off aarch64-macos and `macos` off macOS always;
+        # `clang` when cc is not clang, which the floor cannot see, so
+        # either way; no other case)
+        sed -n 's/^skip case \([^:]*\): .*/\1/p' "$LOG" | sort >"$LOG.skipped"
+        named=$(wc -l <"$LOG.skipped" | tr -d ' ')
+        [ "$named" -eq "$sk" ] || refuse "$sk cases skipped, $named of them named"
+        : >"$LOG.must"
+        : >"$LOG.may"
+        for file in "$ROOT"/tests/run/*.vl "$ROOT"/tests/run/*/main.vl "$ROOT"/tests/examples/*.test; do
+            [ -f "$file" ] || continue
+            words=$(sed -n 's|^// REQUIRES: *||p' "$file" | tr '\n' ' ')
+            [ -n "$words" ] || continue
+            base=${file##*/}
+            name=${base%.*}
+            case "$file" in
+                *.test) name="example_$name" ;;
+                */main.vl) name=${file%/main.vl}; name=${name##*/} ;;
+            esac
+            must=no
+            case " $words " in *" metal "*) [ "$HOST" = aarch64-macos ] || must=yes ;; esac
+            case " $words " in *" macos "*) case "$HOST" in *-macos) ;; *) must=yes ;; esac ;; esac
+            if [ $must = yes ]; then echo "$name" >>"$LOG.must"
+            else case " $words " in *" clang "*) echo "$name" >>"$LOG.may" ;; esac; fi
+        done
+        sort -o "$LOG.must" "$LOG.must"
+        missing=$(comm -23 "$LOG.must" "$LOG.skipped" | head -3 | tr '\n' ' ')
+        [ -z "$missing" ] || refuse "cases the tree skips on $HOST ran or were not named skipped: $missing"
+        sort "$LOG.must" "$LOG.may" >"$LOG.allowed"
+        extra=$(comm -23 "$LOG.skipped" "$LOG.allowed" | head -3 | tr '\n' ' ')
+        [ -z "$extra" ] || refuse "cases skipped that no REQUIRES skips on $HOST: $extra"
+        echo "floor $STEP: $pass passed, $xf xfail, $sk skipped of the tree's $plan cases (the $(wc -l <"$LOG.must" | tr -d ' ') its REQUIRES skips on $HOST$( [ -s "$LOG.may" ] && echo ", and of $(wc -l <"$LOG.may" | tr -d ' ') needing clang those skipped"))"
+        rm -f "$LOG.skipped" "$LOG.must" "$LOG.may" "$LOG.allowed"
         exit 0 ;;
     # (each program asked for is counted: -n FZ)
     fuzz-plain|fuzz-loops|fuzz-generics|fuzz-pressure|fuzz-calls|fuzz-lang06|fuzz-vector|fuzz-div|fuzz-range|fuzz-arch|fuzz-guard|fuzz-seed)
@@ -140,7 +177,7 @@ case "$STEP" in
         for f in "$ROOT"/tests/run/*.vl; do
             grep -qE '^// (XFAIL|REQUIRES|ERROR|WARNING|FIX)' "$f" || progs=$((progs + 1))
         done
-        judge "$all" $((2 * progs)) "compilations compared with cc -c (2 of each of the tree's $progs programs at least)" ;;
+        judge "$all" $((4 * progs)) "compilations compared with cc -c (4 of each of the tree's $progs programs at least: -O0 and -O2, with -g and without)" ;;
     # (0.30.0: 260)
     objcheck-x86-arch)
         judge "$(count 'objcheck: ')" "$(hfloor 230)" "compilations compared with cc -c" ;;
