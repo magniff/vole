@@ -304,11 +304,12 @@ else
     done
 fi
 n=0
-rm -f "$WORK"/*.file
+rm -f "$WORK"/*.file "$WORK"/*.setting
 while read -r f; do
     for og in 0 2 0g 2g; do
         n=$((n + 1))
         echo "$f" >"$WORK/$n.file"
+        echo "$og" >"$WORK/$n.setting"
         o=${og%g}
         g=""
         [ "$o" = "$og" ] || g=-g
@@ -321,19 +322,28 @@ exec 3>&-
 i=1
 ok=0
 failed=0
+occ=cc:other
+"$CC" --version 2>/dev/null | grep -qi clang && occ=cc:clang
+[ -z "${VOLE_OBJCHECK_RESULTS:-}" ] || : >"$VOLE_OBJCHECK_RESULTS"
 while [ "$i" -le "$n" ]; do
     if grep -q '^ok' "$WORK/$i.result"; then
         ok=$((ok + 1))
+        st=ok
     else
         failed=$((failed + 1))
         cat "$WORK/$i.result"
+        st=differ
     fi
+    [ -z "${VOLE_OBJCHECK_RESULTS:-}" ] || [ ! -f "$WORK/$i.file" ] \
+        || echo "$(cat "$WORK/$i.file") $(cat "$WORK/$i.setting") $st $occ" >>"$VOLE_OBJCHECK_RESULTS"
     i=$((i + 1))
 done
 echo "objcheck: $ok of $n compilations for $TARGET give the same program as cc -c, $failed differ"
 # (0.30.1) Each program of the corpus compiled at the four settings, and
-# the corpus's names as a digest (cksum of the sorted paths, `--list`'s),
-# which the gate's floor compares with the tree's.
+# the corpus's names as a digest (cksum of the sorted paths, `--list`'s).
+# $VOLE_OBJCHECK_RESULTS=FILE: one record per compilation, `PROGRAM
+# SETTING STATUS CC` (SETTING 0, 2, 0g, 2g; STATUS ok or differ; CC
+# cc:clang or cc:other), which the gate's floor judges the row from.
 cat "$WORK"/*.file 2>/dev/null | sort | uniq -c | awk '$1 != 4 { print "FAIL objcheck: " $2 " compiled " $1 " times, not 4"; bad = 1 } END { exit bad }' \
     || failed=$((failed + 1))
 grep '^tests/run/' "$WORK/corpus" | sort >"$WORK/corpus.run"

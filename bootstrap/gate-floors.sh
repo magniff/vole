@@ -21,20 +21,17 @@
 # host's count. The rows the Linux containers run (gate.sh --inside: the
 # suite rows, fuzz, ABI, layout, objcheck, debug, valgrind, smoke) are
 # judged by what they report against the tree, on every host:
-#   suite-O*   one plan, every case the tree lists (tests/run.sh -l),
-#              and one `cases:` line: each listed case run once (the
-#              digest of the names it ran, `-l`'s), passed, xfailed or
-#              skipped, none failed, the table's total at least as much,
-#              and the skipped ones by name exactly those the tree's
-#              REQUIRES lines skip on HOST (`metal` off aarch64-macos,
-#              `macos` off macOS, `clang` when the log's `cc:` line says
-#              cc is not clang);
-#   objcheck   every compilation the same as cc's (N of N), its tests/run
-#              programs by name the tree's (their digest), and N at
-#              least four (-O0, -O2, with -g and without, as
-#              tests/objcheck.sh compiles each) of each program of
-#              tests/run the suite runs and compiles (no XFAIL,
-#              REQUIRES, ERROR, WARNING or FIX* directive);
+#   suite-O*   from its records (STEP.results beside the log, one per
+#              case, `NAME STATUS BCK REASON CC`, tests/run.sh's): every
+#              case the tree lists has one and no other case has one,
+#              none failed, each skipped one for the REQUIRES word that
+#              does not hold on HOST (its REASON), and every case whose
+#              REQUIRES does not hold skipped;
+#   objcheck   from its records (STEP.results, one per compilation,
+#              `PROGRAM SETTING STATUS CC`, tests/objcheck.sh's): each ok,
+#              none twice, the programs of tests/run the tree's (those
+#              objcheck leaves out left out) each at the four settings
+#              (-O0, -O2, with -g and without);
 #   layout     its row's own floor for the host (100 macOS, 30 Linux);
 #   fuzz, ABI, value semantics, voltty: the count the row was asked for;
 #   debug, compile-cost, chain, stress-grow, unsafe-audit: their lines.
@@ -45,8 +42,9 @@
 # (aarch64-macos); on any other host such a row fails, `no floor for
 # HOST`, until it has one of its own (a gate there would otherwise pass
 # it on any count). What this cannot check without a Linux machine: that
-# the containers' logs print these lines as macOS's do (the same scripts
-# print them), and the corpus objcheck compiles there.
+# the containers' rows write their records (gate.sh sets the same files
+# for them) and print the other rows' lines as macOS's do (the same
+# scripts print them).
 # Prints one line, `floor STEP: ...`; exits 1 when the row is below its
 # floor, 77 when the row skipped what it counts and said so (a SKIP).
 #
@@ -110,48 +108,39 @@ case "$STEP" in
     # (0.30.0: 6556 passed of 7274 at each level; 0.30.1: judged against
     # the tree, the header)
     suite-O0|suite-O1|suite-O2)
-        # (tests/run.sh's `cases:` line: the cases alone, not the suites'
-        # checks the table's total adds; one plan and one cases line, or
-        # the log is two runs')
-        [ "$(grep -cE '^plan: [0-9]+ cases' "$LOG")" -le 1 ] || refuse "more than one plan in its log"
-        [ "$(grep -cE '^cases: ' "$LOG")" -le 1 ] || refuse "more than one cases line in its log"
-        plan=$(grep -E '^plan: [0-9]+ cases' "$LOG" | awk '{print $2}')
-        tot=$(grep -E '^cases: [0-9]+ passed, [0-9]+ xfail, [0-9]+ failed, [0-9]+ skipped of [0-9]+, names [0-9]+-[0-9]+$' "$LOG")
-        [ -n "$plan" ] && [ -n "$tot" ] || refuse "no plan or no cases line in its log: the row passed without saying what it checked"
-        sh "$ROOT/tests/run.sh" -l 2>/dev/null | sed -n 's/^case //p' | sort >"$LOG.listed"
-        listed=$(wc -l <"$LOG.listed" | tr -d ' ')
-        dlisted=$(cksum <"$LOG.listed" | tr ' ' -)
-        rm -f "$LOG.listed"
-        dran=${tot##*names }
-        set -- $(echo "${tot%, names *}" | tr -dc '0-9 \n' | tr -s ' ')
-        pass=$1; xf=$2; fl=$3; sk=$4; ran=$5
-        [ "$plan" -eq "$listed" ] || refuse "it planned $plan cases of the tree's $listed"
-        # (the names it ran, as a digest: each listed case once, none other)
-        [ "$dran" = "$dlisted" ] || refuse "the cases it ran (names $dran) are not the tree's (names $dlisted)"
-        # (the table's total counts the cases and the suites' checks: at
-        # least the cases' passes and xfails, and no failure)
-        ttot=$(grep -E '^ +total +[0-9]+ +[0-9]+ +[0-9]+ +[0-9]+' "$LOG" | tail -1)
-        [ -n "$ttot" ] || refuse "no table total in its log"
-        set -- $ttot
-        [ "$2" -ge "$pass" ] && [ "$3" -ge "$xf" ] && [ "$4" -eq 0 ] \
-            || refuse "its table's total ($2 passed, $3 xfail, $4 failed) is not its cases' and more"
-        set -- $(echo "${tot%, names *}" | tr -dc '0-9 \n' | tr -s ' ')
-        ccl=$(grep -E '^cc: (clang|not clang)$' "$LOG" | tail -1)
-        [ -n "$ccl" ] || refuse "no cc line in its log (whether REQUIRES: clang holds)"
-        [ "$ran" -eq "$plan" ] && [ $((pass + xf + fl + sk)) -eq "$plan" ] \
-            || refuse "$pass passed, $xf xfail, $fl failed and $sk skipped of $ran are not its $plan cases"
-        [ "$fl" -eq 0 ] || refuse "$fl cases failed"
-        # (the skipped cases by name, `skip case NAME: REQUIRES ...`, are
-        # the ones the tree's REQUIRES lines skip on HOST, as tests/run.sh
-        # decides: `metal` off aarch64-macos, `macos` off macOS, `clang`
-        # when its `cc:` line says cc is not clang; no other case)
-        sed -n 's/^skip case \([^:]*\): .*/\1/p' "$LOG" | sort >"$LOG.skipped"
-        named=$(wc -l <"$LOG.skipped" | tr -d ' ')
-        [ "$named" -eq "$sk" ] || refuse "$sk cases skipped, $named of them named"
-        # (one grep of the REQUIRES lines; NAME as tests/run.sh names it)
-        : >"$LOG.must"
+        # (0.30.1) Judged from the row's records, one per case (tests/run.sh
+        # writes them to $VOLE_TEST_RESULTS, which gate.sh gives as
+        # $RUN/STEP.results beside the log): `NAME STATUS BCK REASON CC`.
+        # Every case the tree lists has one record and no other case has
+        # one; none failed (fail, xpass); a skipped case's REASON is the
+        # REQUIRES word that does not hold on HOST (`requires:metal` off
+        # aarch64-macos, `requires:macos` off macOS, `requires:clang` where
+        # its CC, one for every record, is cc:other), and every case whose
+        # REQUIRES does not hold is skipped. No count is read from the log:
+        # a count cannot pass without its names.
+        R="${LOG%.log}.results"
+        [ -s "$R" ] || refuse "no records of its cases ($R): the row passed without saying what it ran"
+        T=$(mktemp -d "${TMPDIR:-/tmp}/vole-floor.XXXXXX") || exit 1
+        trap 'rm -rf "$T"' EXIT
+        bad=$(awk 'NF != 5 || $2 !~ /^(pass|xfail|fail|xpass|skip)$/ || $5 !~ /^cc:(clang|other)$/ \
+                || ($2 == "skip") != ($4 ~ /^requires:(clang|metal|macos)$/) || ($2 != "skip" && $4 != "-") { print; exit }' "$R")
+        [ -z "$bad" ] || refuse "a record not NAME STATUS BCK REASON CC: $bad"
+        [ "$(awk '{ print $5 }' "$R" | sort -u | wc -l | tr -d ' ')" -eq 1 ] || refuse "its records disagree on cc"
+        cc=$(awk 'NR == 1 { print $5 }' "$R")
+        awk '{ print $1 }' "$R" | sort >"$T/ran"
+        dup=$(uniq -d "$T/ran" | head -3 | tr '\n' ' ')
+        [ -z "$dup" ] || refuse "cases with two records: $dup"
+        sh "$ROOT/tests/run.sh" -l 2>/dev/null | sed -n 's/^case //p' | sort >"$T/listed"
+        missing=$(comm -23 "$T/listed" "$T/ran" | head -3 | tr '\n' ' ')
+        [ -z "$missing" ] || refuse "cases of the tree with no record: $missing"
+        extra=$(comm -13 "$T/listed" "$T/ran" | head -3 | tr '\n' ' ')
+        [ -z "$extra" ] || refuse "records of cases the tree does not list: $extra"
+        failed=$(awk '$2 == "fail" || $2 == "xpass" { print $1 }' "$R" | head -3 | tr '\n' ' ')
+        [ -z "$failed" ] || refuse "cases failed: $failed"
+        # (the skips the tree's REQUIRES lines make on HOST, by one grep:
+        # `NAME requires:WORD` for each word that does not hold)
         (cd "$ROOT" && grep -H '^// REQUIRES:' tests/run/*.vl tests/run/*/main.vl tests/examples/*.test 2>/dev/null) \
-            | awk -v host="$HOST" -v clang="$ccl" -v must="$LOG.must" '
+            | awk -v host="$HOST" -v cc="$cc" '
                 { f = $0; sub(/:\/\/ REQUIRES:.*/, "", f); w = $0; sub(/^[^:]*:\/\/ REQUIRES: */, "", w)
                   words[f] = words[f] " " w " " }
                 END {
@@ -161,20 +150,18 @@ case "$STEP" in
                         else if (f ~ /\/main\.vl$/) { n = f; sub(/\/main\.vl$/, "", n); sub(/^.*\//, "", n) }
                         else sub(/\.vl$/, "", n)
                         w = words[f]
-                        skip = 0
-                        if (w ~ / metal / && host != "aarch64-macos") skip = 1
-                        if (w ~ / macos / && host !~ /-macos$/) skip = 1
-                        if (w ~ / clang / && clang != "cc: clang") skip = 1
-                        if (skip) print n > must
+                        if (w ~ / metal / && host != "aarch64-macos") print n, "requires:metal"
+                        if (w ~ / macos / && host !~ /-macos$/) print n, "requires:macos"
+                        if (w ~ / clang / && cc != "cc:clang") print n, "requires:clang"
                     }
-                }'
-        sort -o "$LOG.must" "$LOG.must"
-        missing=$(comm -23 "$LOG.must" "$LOG.skipped" | head -3 | tr '\n' ' ')
-        [ -z "$missing" ] || refuse "cases the tree skips on $HOST ($ccl) ran or were not named skipped: $missing"
-        extra=$(comm -23 "$LOG.skipped" "$LOG.must" | head -3 | tr '\n' ' ')
-        [ -z "$extra" ] || refuse "cases skipped that no REQUIRES skips on $HOST ($ccl): $extra"
-        echo "floor $STEP: $pass passed, $xf xfail, $sk skipped of the tree's $plan cases, by name (the $(wc -l <"$LOG.must" | tr -d ' ') its REQUIRES skips on $HOST, $ccl)"
-        rm -f "$LOG.skipped" "$LOG.must"
+                }' | sort >"$T/allowed"
+        awk '{ print $1 }' "$T/allowed" | sort -u >"$T/must"
+        awk '$2 == "skip" { print $1 }' "$R" | sort >"$T/skipped"
+        unskipped=$(comm -23 "$T/must" "$T/skipped" | head -3 | tr '\n' ' ')
+        [ -z "$unskipped" ] || refuse "cases the tree skips on $HOST ($cc) not skipped: $unskipped"
+        wrong=$(awk '$2 == "skip" { print $1, $4 }' "$R" | sort | comm -23 - "$T/allowed" | head -3 | tr '\n' ';')
+        [ -z "$wrong" ] || refuse "cases skipped for no REQUIRES that fails on $HOST ($cc): $wrong"
+        echo "floor $STEP: $(awk '$2 == "pass"' "$R" | wc -l | tr -d ' ') passed, $(awk '$2 == "xfail"' "$R" | wc -l | tr -d ' ') xfail, $(wc -l <"$T/skipped" | tr -d ' ') skipped (each for its REQUIRES on $HOST, $cc) of the tree's $(wc -l <"$T/listed" | tr -d ' ') cases, each by its record"
         exit 0 ;;
     # (each program asked for is counted: -n FZ)
     fuzz-plain|fuzz-loops|fuzz-generics|fuzz-pressure|fuzz-calls|fuzz-lang06|fuzz-vector|fuzz-div|fuzz-range|fuzz-arch|fuzz-guard|fuzz-seed)
@@ -187,35 +174,43 @@ case "$STEP" in
         judge "$(count 'abi: ')" "$AB" "programs" ;;
     # (0.30.0: 13048 of 13048; 0.30.1: against the tree, the header)
     objcheck)
-        [ "$(grep -cE '^objcheck: [0-9]+ of [0-9]+ ' "$LOG")" -eq 1 ] || refuse "not one count of compilations in its log"
-        line=$(grep -E '^objcheck: [0-9]+ of [0-9]+ ' "$LOG")
-        ok=$(echo "$line" | awk '{print $2}')
-        all=$(echo "$line" | awk '{print $4}')
-        [ "$ok" -eq "$all" ] || refuse "$ok of $all compilations the same"
-        # (its programs by name: tests/objcheck.sh prints the digest of
-        # its corpus's tests/run programs, each compiled at 4 settings,
-        # which must be the tree's: the programs of tests/run but those
-        # objcheck leaves out, by one grep each, as it does)
-        [ "$(grep -c '^objcheck programs: ' "$LOG")" -eq 1 ] || refuse "not one line of its programs in its log"
-        pl=$(grep '^objcheck programs: ' "$LOG")
-        nrun=$(echo "$pl" | sed -nE 's/.*; of tests\/run ([0-9]+), names ([0-9]+-[0-9]+)$/\1/p')
-        drun=$(echo "$pl" | sed -nE 's/.*; of tests\/run ([0-9]+), names ([0-9]+-[0-9]+)$/\2/p')
-        [ -n "$nrun" ] && [ -n "$drun" ] || refuse "its programs' line has no names: $pl"
-        ccl=$(grep -E '^cc: (clang|not clang)$' "$LOG" | tail -1)
-        [ -n "$ccl" ] || refuse "no cc line in its log"
-        (cd "$ROOT" && ls tests/run/*.vl tests/run/*/main.vl 2>/dev/null) | sort >"$LOG.all"
+        # (0.30.1) Judged from the row's records, one per compilation
+        # (tests/objcheck.sh writes them to $VOLE_OBJCHECK_RESULTS, which
+        # gate.sh gives as $RUN/STEP.results): `PROGRAM SETTING STATUS CC`.
+        # Each is ok; no program and setting twice; the programs of
+        # tests/run are the tree's, each at all four settings (0, 2, 0g,
+        # 2g): the programs of tests/run but those objcheck leaves out, by
+        # one grep each, as it does (tests/gate_floors.sh shows the set is
+        # `tests/objcheck.sh --list`'s); and as many in all as four of each.
+        R="${LOG%.log}.results"
+        [ -s "$R" ] || refuse "no records of its compilations ($R)"
+        T=$(mktemp -d "${TMPDIR:-/tmp}/vole-floor.XXXXXX") || exit 1
+        trap 'rm -rf "$T"' EXIT
+        bad=$(awk 'NF != 4 || $2 !~ /^(0|2|0g|2g)$/ || $3 !~ /^(ok|differ)$/ || $4 !~ /^cc:(clang|other)$/ { print; exit }' "$R")
+        [ -z "$bad" ] || refuse "a record not PROGRAM SETTING STATUS CC: $bad"
+        [ "$(awk '{ print $4 }' "$R" | sort -u | wc -l | tr -d ' ')" -eq 1 ] || refuse "its records disagree on cc"
+        cc=$(awk 'NR == 1 { print $4 }' "$R")
+        differ=$(awk '$3 != "ok" { print $1 " " $2 }' "$R" | head -3 | tr '\n' ';')
+        [ -z "$differ" ] || refuse "compilations that differ from cc's: $differ"
+        dup=$(awk '{ print $1, $2 }' "$R" | sort | uniq -d | head -3 | tr '\n' ';')
+        [ -z "$dup" ] || refuse "compilations recorded twice: $dup"
+        (cd "$ROOT" && ls tests/run/*.vl tests/run/*/main.vl 2>/dev/null) | sort >"$T/all"
         (cd "$ROOT" && grep -l '// ERROR\|// CSOURCE\|// CHEADER\|// FIXIMPORTS\|// FIXUNSAFE' tests/run/*.vl tests/run/*/main.vl 2>/dev/null
          grep -lE "^[[:space:]]*// ?XFAIL(\\($HOST\\))?:" tests/run/*.vl tests/run/*/main.vl 2>/dev/null
-         [ "$ccl" = "cc: clang" ] || grep -lwE '^[[:space:]]*// ?REQUIRES:.*clang' tests/run/*.vl tests/run/*/main.vl 2>/dev/null
+         [ "$cc" = cc:clang ] || grep -lwE '^[[:space:]]*// ?REQUIRES:.*clang' tests/run/*.vl tests/run/*/main.vl 2>/dev/null
          case "$HOST" in *-macos) ;; *) grep -lwE '^[[:space:]]*// ?REQUIRES:.*metal' tests/run/*.vl tests/run/*/main.vl 2>/dev/null ;; esac) \
-            | sort -u >"$LOG.out"
-        comm -23 "$LOG.all" "$LOG.out" >"$LOG.want"
-        want=$(wc -l <"$LOG.want" | tr -d ' ')
-        dwant=$(cksum <"$LOG.want" | tr ' ' -)
-        rm -f "$LOG.all" "$LOG.out" "$LOG.want"
-        [ "$nrun" -eq "$want" ] && [ "$drun" = "$dwant" ] \
-            || refuse "its tests/run programs ($nrun, names $drun) are not the tree's ($want, names $dwant)"
-        judge "$all" $((4 * want)) "compilations compared with cc -c (4 of each of the tree's $want programs of tests/run at least, each by name: -O0 and -O2, with -g and without)" ;;
+            | sort -u >"$T/out"
+        comm -23 "$T/all" "$T/out" >"$T/want"
+        awk '$1 ~ /^tests\/run\// { n[$1]++ } END { for (p in n) print p, n[p] }' "$R" | sort >"$T/got"
+        short=$(awk '$2 != 4 { print $1 " " $2 }' "$T/got" | head -3 | tr '\n' ';')
+        [ -z "$short" ] || refuse "programs not compiled at the four settings: $short"
+        awk '{ print $1 }' "$T/got" >"$T/gotn"
+        missing=$(comm -23 "$T/want" "$T/gotn" | head -3 | tr '\n' ' ')
+        [ -z "$missing" ] || refuse "programs of the tree not compiled: $missing"
+        extra=$(comm -13 "$T/want" "$T/gotn" | head -3 | tr '\n' ' ')
+        [ -z "$extra" ] || refuse "programs compiled that it leaves out of the tree: $extra"
+        want=$(wc -l <"$T/want" | tr -d ' ')
+        judge "$(wc -l <"$R" | tr -d ' ')" $((4 * want)) "compilations the same as cc -c's, each by its record (the tree's $want programs of tests/run at four settings each, by name)" ;;
     # (0.30.0: 260)
     objcheck-x86-arch)
         judge "$(count 'objcheck: ')" "$(hfloor 230)" "compilations compared with cc -c" ;;

@@ -54,8 +54,6 @@ check abi-plain 100 "abi: @N@ programs (992 signatures) for aarch64-macos, 0 fai
 # (objcheck's programs by name, from tests/objcheck.sh --list itself: the
 # floor's own greps must give the same set)
 sh "$ROOT/tests/objcheck.sh" --list -t aarch64-macos | grep '^tests/run/' | sort >"$W/ocrun"
-OCR="of tests/run $(wc -l <"$W/ocrun" | tr -d ' '), names $(cksum <"$W/ocrun" | tr ' ' -)"
-check objcheck 13048 "cc: clang" "objcheck: @N@ of @N@ compilations for aarch64-macos give the same program as cc -c, 0 differ" "objcheck programs: 3245, each at 4 settings, names 1-1; $OCR"
 check objcheck-x86-arch 260 "objcheck: @N@ of @N@ compilations for x86_64-macos give the same program as cc -c, 0 differ"
 check layout 111 "layout: @N@ records, 582 fields agree"
 check threads 16015 "threads: @N@ of @N@ compilations the same at -j1 and -j8 (aarch64-macos)"
@@ -85,21 +83,19 @@ out=$(sh "$F" voltty-fuzz "$W/voltty.nobuild.log" 60 100 300 2>&1)
 rc=$?
 [ $rc -eq 1 ] || { echo "FAIL voltty-fuzz: an oracle that does not build exits $rc, not 1: $out"; failed=1; }
 check incremental 172 "incremental pairs: 48 of 48 warm builds the same as clean builds" "incremental: @N@ of @N@ edit series rebuilt the same as clean builds (aarch64-macos, hits 86%)"
-# (0.30.1's reviews: the suite rows are judged against the tree's cases
-# on every host, never a fraction of macOS's count: each case by name (the
-# digest of the names run), and the skipped ones by name. LX: the cases a
-# REQUIRES of metal or macos skips off macOS (the examples' included), CL
-# those needing clang, MT metal's alone. Each row: the host, cc's line,
-# the plan, the `cases:` line's pass, xfail and fail, the skipped names
-# (none; lx; lx-1: LX but one; lxcl: LX and CL; cl; any: as many
-# arbitrary cases as LX; metal), the names run (all; dup: one twice and
-# another left out), the table total's pass (+400: the suites' checks
-# too; or a number), the exit wanted.)
+# (0.30.1's reviews, the owner's rule: the suite rows are judged from
+# their records, one per case (STEP.results beside the log: `NAME STATUS
+# BCK REASON CC`), never from a count in the log. LX: the cases a REQUIRES
+# of metal or macos skips off macOS (the examples' included; MT those of
+# metal, MO of macos alone), CL those needing clang. Each row: the host,
+# the records' cc, the skipped (none; lx; lx-1: LX but one; lxcl: LX and
+# CL; cl; any: as many arbitrary cases; metal: MT), a change to the records
+# (ok; dup: one case twice, another none; extra: a case the tree does not
+# list; fail: one failed; why: a metal skip given clang's reason; form: a
+# field missing; mixcc: one record of the other cc), the exit wanted. 717
+# cases are xfail, the rest pass.)
 sh "$ROOT/tests/run.sh" -l 2>/dev/null | sed -n 's/^case //p' | sort >"$W/listed"
 L=$(wc -l <"$W/listed" | tr -d ' ')
-DL=$(cksum <"$W/listed" | tr ' ' -)
-{ sed 1d "$W/listed"; sed -n 2p "$W/listed"; } | sort >"$W/dup"
-DD=$(cksum <"$W/dup" | tr ' ' -)
 names() { # <word...>: the cases whose REQUIRES has one of the words
     for file in "$ROOT"/tests/run/*.vl "$ROOT"/tests/run/*/main.vl "$ROOT"/tests/examples/*.test; do
         [ -f "$file" ] || continue
@@ -110,77 +106,74 @@ names() { # <word...>: the cases whose REQUIRES has one of the words
         base=${file##*/}; name=${base%.*}
         case "$file" in *.test) name="example_$name" ;; */main.vl) name=${file%/main.vl}; name=${name##*/} ;; esac
         echo "$name"
-    done
+    done | sort
 }
-names metal macos >"$W/lx"
 names metal >"$W/mt"
+names macos | grep -vxF -f "$W/mt" >"$W/mo"
+sort "$W/mt" "$W/mo" >"$W/lx"
 names clang | grep -vxF -f "$W/lx" >"$W/cl"
 LX=$(wc -l <"$W/lx" | tr -d ' ')
 grep -vxF -f "$W/lx" "$W/listed" | grep -vxF -f "$W/cl" | head -"$LX" >"$W/any"
-while read -r host cc plan pass xf fl skips ran total want; do
+grep -vxF -f "$W/lx" "$W/listed" | grep -vxF -f "$W/cl" | head -717 >"$W/xf"
+while read -r host cc skips change want; do
     rows=$((rows + 1))
+    : >"$W/skips"
     case "$skips" in
-        none) : >"$W/skips" ;;
-        lx) cp "$W/lx" "$W/skips" ;;
-        lx-1) sed 1d "$W/lx" >"$W/skips" ;;
-        lxcl) cat "$W/lx" "$W/cl" >"$W/skips" ;;
-        cl) cp "$W/cl" "$W/skips" ;;
-        any) cp "$W/any" "$W/skips" ;;
-        metal) cp "$W/mt" "$W/skips" ;;
+        lx) sed 's/$/ requires:metal/' "$W/mt" >"$W/skips"; sed 's/$/ requires:macos/' "$W/mo" >>"$W/skips" ;;
+        lx-1) { sed 's/$/ requires:metal/' "$W/mt"; sed 's/$/ requires:macos/' "$W/mo"; } | sed 1d >"$W/skips" ;;
+        lxcl) { sed 's/$/ requires:metal/' "$W/mt"; sed 's/$/ requires:macos/' "$W/mo"; sed 's/$/ requires:clang/' "$W/cl"; } >"$W/skips" ;;
+        cl) sed 's/$/ requires:clang/' "$W/cl" >"$W/skips" ;;
+        any) sed 's/$/ requires:metal/' "$W/any" >"$W/skips" ;;
+        metal) sed 's/$/ requires:metal/' "$W/mt" >"$W/skips" ;;
     esac
-    sk=$(wc -l <"$W/skips" | tr -d ' ')
-    [ "$pass" = rest ] && pass=$((L - xf - fl - sk))
-    [ "$total" = more ] && total=$((pass + 400))
-    d=$DL; [ "$ran" = dup ] && d=$DD
-    { [ "$plan" = none ] || echo "plan: $plan cases, 26 suites (query), -j 4, $host"
-      echo "cc: $cc" | tr _ ' '
-      printf '  total       %s    %s     %s     %s\n' "$total" "$xf" "$fl" "$sk"
-      echo "cases: $pass passed, $xf xfail, $fl failed, $sk skipped of $((pass + xf + fl + sk)), names $d"
-      sed 's/^\(.*\)$/skip case \1: REQUIRES metal/' "$W/skips"; } >"$W/suite.log"
+    awk -v cc="cc:$cc" -v skips="$W/skips" -v xf="$W/xf" '
+        BEGIN { while ((getline l < skips) > 0) { split(l, a, " "); why[a[1]] = a[2] }
+                while ((getline l < xf) > 0) x[l] = 1 }
+        { if ($1 in why) print $1, "skip", 0, why[$1], cc
+          else if ($1 in x) print $1, "xfail", 0, "-", cc
+          else print $1, "pass", 0, "-", cc }' "$W/listed" >"$W/suite.results"
+    case "$change" in
+        dup) awk 'NR == 2 { print; print; next } NR == 3 { next } { print }' "$W/suite.results" >"$W/r" ;;
+        extra) { cat "$W/suite.results"; echo "no_such_case pass 0 - cc:$cc"; } >"$W/r" ;;
+        fail) awk -v n="$(sed -n 1p "$W/any")" '$1 == n { $2 = "fail" } { print }' "$W/suite.results" >"$W/r" ;;
+        why) awk -v n="$(sed -n 1p "$W/mt")" '$1 == n { $4 = "requires:clang" } { print }' "$W/suite.results" >"$W/r" ;;
+        form) awk 'NR == 5 { print $1, $2, $3, $4; next } { print }' "$W/suite.results" >"$W/r" ;;
+        mixcc) awk 'NR == 5 { $5 = ($5 == "cc:clang" ? "cc:other" : "cc:clang") } { print }' "$W/suite.results" >"$W/r" ;;
+        ok) cp "$W/suite.results" "$W/r" ;;
+    esac
+    mv "$W/r" "$W/suite.results"
+    # (the log a count: right, and never read)
+    echo "cases: $L passed, 0 xfail, 0 failed, 0 skipped of $L" >"$W/suite.log"
     out=$(sh "$F" suite-O2 "$W/suite.log" 60 100 300 "$host" 2>&1)
     rc=$?
-    [ $rc -eq "$want" ] || { echo "FAIL suite-O2 on $host ($cc), plan $plan, $pass $xf $fl, skipped $skips, ran $ran, total $total: exits $rc, not $want: $out"; failed=1; }
+    [ $rc -eq "$want" ] || { echo "FAIL suite-O2 on $host ($cc), skipped $skips, $change: exits $rc, not $want: $out"; failed=1; }
 done <<EOT
-aarch64-macos clang $L rest 717 0 none all more 0
-aarch64-linux not_clang $L rest 717 0 lxcl all more 0
-aarch64-linux clang $L rest 717 0 lx all more 0
-aarch64-linux clang $L rest 717 0 lxcl all more 1
-aarch64-linux not_clang $L rest 717 0 lx all more 1
-aarch64-linux clang $L rest 717 0 lx-1 all more 1
-aarch64-macos clang $L rest 717 0 any all more 1
-aarch64-macos clang $L rest 717 0 lx all more 1
-aarch64-macos clang $L rest 717 0 cl all more 1
-aarch64-macos not_clang $L rest 717 0 cl all more 0
-aarch64-macos clang $L rest 717 0 none dup more 1
-aarch64-macos clang $L rest 717 0 none all 3000 1
-aarch64-linux clang 1501 1501 0 0 none all more 1
-aarch64-macos clang $((L - 1)) rest 717 0 none all more 1
-aarch64-macos clang $L rest 717 1 none all more 1
-aarch64-macos clang none rest 717 0 none all more 1
-x86_64-macos clang $L rest 717 0 metal all more 0
-x86_64-macos clang $L rest 717 0 none all more 1
+aarch64-macos clang none ok 0
+aarch64-linux other lxcl ok 0
+aarch64-linux clang lx ok 0
+aarch64-linux clang lxcl ok 1
+aarch64-linux other lx ok 1
+aarch64-linux clang lx-1 ok 1
+aarch64-linux clang lx why 1
+aarch64-macos clang any ok 1
+aarch64-macos clang lx ok 1
+aarch64-macos clang cl ok 1
+aarch64-macos other cl ok 0
+aarch64-macos clang none dup 1
+aarch64-macos clang none extra 1
+aarch64-macos clang none fail 1
+aarch64-macos clang none form 1
+aarch64-macos clang none mixcc 1
+x86_64-macos clang metal ok 0
+x86_64-macos clang none ok 1
 EOT
-# (a log with the table and no `cases:` line fails; so do two cases lines,
-# the bad one first, and two plans)
+# (no records beside a log with every count right fails)
 rows=$((rows + 1))
-{ echo "plan: $L cases, 26 suites (query), -j 4, aarch64-macos"; echo "cc: clang"
-  printf '  total       %s    717     0     0\n' "$((L - 717 + 400))"; } >"$W/suite.log"
-sh "$F" suite-O2 "$W/suite.log" 60 100 300 >/dev/null 2>&1 \
-    && { echo "FAIL suite-O2: a log without its cases line passes"; failed=1; }
-rows=$((rows + 1))
-{ echo "plan: $L cases, 26 suites (query), -j 4, aarch64-macos"; echo "cc: clang"
-  printf '  total       %s    717     0     0\n' "$((L - 717 + 400))"
-  echo "cases: 100 passed, 0 xfail, $((L - 100)) failed, 0 skipped of $L, names $DL"
-  echo "cases: $((L - 717)) passed, 717 xfail, 0 failed, 0 skipped of $L, names $DL"; } >"$W/suite.log"
-sh "$F" suite-O2 "$W/suite.log" 60 100 300 >/dev/null 2>&1 \
-    && { echo "FAIL suite-O2: two cases lines, the bad one first, pass"; failed=1; }
-rows=$((rows + 1))
+rm -f "$W/suite.results"
 { echo "plan: $L cases, 26 suites (query), -j 4, aarch64-macos"
-  echo "plan: 3 cases, 0 suites, -j 2, aarch64-macos"; echo "cc: clang"
-  printf '  total       %s    717     0     0\n' "$((L - 717 + 400))"
-  echo "cases: $((L - 717)) passed, 717 xfail, 0 failed, 0 skipped of $L, names $DL"; } >"$W/suite.log"
+  echo "cases: $((L - 717)) passed, 717 xfail, 0 failed, 0 skipped of $L"; } >"$W/suite.log"
 sh "$F" suite-O2 "$W/suite.log" 60 100 300 >/dev/null 2>&1 \
-    && { echo "FAIL suite-O2: two plans pass"; failed=1; }
+    && { echo "FAIL suite-O2: a log with no records passes"; failed=1; }
 # (a row that runs on the macOS host only has no floor elsewhere: it fails)
 rows=$((rows + 1))
 printf 'threads: 16015 of 16015 compilations the same at -j1 and -j8 (aarch64-linux)\n' >"$W/threads.log"
@@ -195,24 +188,32 @@ sh "$F" incremental "$W/inc.log" 60 100 300 aarch64-linux >/dev/null 2>&1 \
 printf 'incremental pairs: 48 of 48 warm builds the same as clean builds\nskip a: 20 edits in a row at 2 do not build (x)\nskip b: 20 edits in a row at 2 do not build (x)\nskip c: 20 edits in a row at 2 do not build (x)\nskip d: 20 edits in a row at 2 do not build (x)\nincremental: 168 of 172 edit series rebuilt the same as clean builds (aarch64-linux, hits 86%%), 4 skipped\n' >"$W/inc4.log"
 sh "$F" incremental "$W/inc4.log" 60 100 300 aarch64-linux >/dev/null 2>&1 \
     || { echo "FAIL incremental: 168 of 172 with 4 named skips fails"; failed=1; }
-# (objcheck: 7000 of 7000 fails, fewer than 4 of each program; 0.30.0
-# made 13048)
-rows=$((rows + 1))
-printf 'cc: clang\nobjcheck: 7000 of 7000 compilations for aarch64-macos give the same program as cc -c, 0 differ\nobjcheck programs: 1750, each at 4 settings, names 1-1; %s\n' "$OCR" >"$W/obj.log"
-sh "$F" objcheck "$W/obj.log" 60 100 300 >/dev/null 2>&1 \
-    && { echo "FAIL objcheck: 7000 of 7000 passes"; failed=1; }
-# (objcheck: one compilation that differs fails)
-rows=$((rows + 1))
-printf 'objcheck: 13047 of 13048 compilations for aarch64-linux give the same program as cc -c, 1 differ\n' >"$W/obj.log"
-sh "$F" objcheck "$W/obj.log" 60 100 300 aarch64-linux >/dev/null 2>&1 \
-    && { echo "FAIL objcheck: 13047 of 13048 passes"; failed=1; }
-# (objcheck: the right count with its tests/run programs not the tree's,
-# one left out and another twice, fails)
-rows=$((rows + 1))
-{ sed 1d "$W/ocrun"; sed -n 2p "$W/ocrun"; } | sort >"$W/ocdup"
-printf 'cc: clang\nobjcheck: 21660 of 21660 compilations for aarch64-macos give the same program as cc -c, 0 differ\nobjcheck programs: 5415, each at 4 settings, names 1-1; of tests/run %s, names %s\n' "$(wc -l <"$W/ocdup" | tr -d ' ')" "$(cksum <"$W/ocdup" | tr ' ' -)" >"$W/obj.log"
-sh "$F" objcheck "$W/obj.log" 60 100 300 >/dev/null 2>&1 \
-    && { echo "FAIL objcheck: programs not the tree's pass"; failed=1; }
+# (objcheck, from its records, `PROGRAM SETTING STATUS CC`: the tree's
+# programs of tests/run, by tests/objcheck.sh --list itself, each at the
+# four settings, pass; a change fails: one setting missing, one differs,
+# one compilation twice, one program missing, one it leaves out (an XFAIL
+# case) compiled, only 1750 programs, a field missing)
+for change in ok noset differ twice missing extra few form; do
+    rows=$((rows + 1))
+    awk '{ for (i = 0; i < 4; i++) print $1, (i == 0 ? "0" : i == 1 ? "2" : i == 2 ? "0g" : "2g"), "ok", "cc:clang" }' "$W/ocrun" >"$W/obj.results"
+    case $change in
+        noset) sed 4d "$W/obj.results" >"$W/r" ;;
+        differ) sed '5s/ ok / differ /' "$W/obj.results" >"$W/r" ;;
+        twice) { cat "$W/obj.results"; sed -n 1p "$W/obj.results"; } >"$W/r" ;;
+        missing) sed 1,4d "$W/obj.results" >"$W/r" ;;
+        extra) { cat "$W/obj.results"; x=$(grep -l '^// XFAIL:' "$ROOT"/tests/run/*.vl | head -1 | sed "s|^$ROOT/||")
+                 for st in 0 2 0g 2g; do echo "$x $st ok cc:clang"; done; } >"$W/r" ;;
+        few) head -7000 "$W/obj.results" >"$W/r" ;;
+        form) sed '3s/ cc:clang$//' "$W/obj.results" >"$W/r" ;;
+        ok) cp "$W/obj.results" "$W/r" ;;
+    esac
+    mv "$W/r" "$W/obj.results"
+    echo "objcheck: 13048 of 13048 compilations for aarch64-macos give the same program as cc -c, 0 differ" >"$W/obj.log"
+    out=$(sh "$F" objcheck "$W/obj.log" 60 100 300 2>&1)
+    rc=$?
+    want=1; [ $change = ok ] && want=0
+    [ $rc -eq $want ] || { echo "FAIL objcheck, $change: exits $rc, not $want: $out"; failed=1; }
+done
 printf 'layout: 40 records, 200 fields agree\n' >"$W/linuxl.log"
 sh "$F" layout "$W/linuxl.log" 60 100 300 x86_64-linux >/dev/null 2>&1 \
     || { echo "FAIL layout on x86_64-linux: 40 records fails"; failed=1; }

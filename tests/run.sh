@@ -1159,16 +1159,19 @@ cpu_count() {
 run_case() {
     file=$1
     dir=$2
+    # (0.30.1: what a skip needed, for its record: requires:WORD)
     if grep -qw clang "$dir/requires" && [ $CC_IS_CLANG -eq 0 ]; then
         echo skip >"$dir/status"
+        echo requires:clang >"$dir/skipwhy"
         return
     fi
     if grep -qw metal "$dir/requires" && [ "$TARGET" != aarch64-macos ]; then
         echo skip >"$dir/status"
+        echo requires:metal >"$dir/skipwhy"
         return
     fi
     if grep -qw macos "$dir/requires"; then
-        case "$TARGET" in *-macos) ;; *) echo skip >"$dir/status"; return ;; esac
+        case "$TARGET" in *-macos) ;; *) echo skip >"$dir/status"; echo requires:macos >"$dir/skipwhy"; return ;; esac
     fi
     if check_case "$file" "$dir"; then
         if [ -s "$dir/xfail" ]; then echo xpass; else echo pass; fi
@@ -1456,6 +1459,7 @@ fi
 
 count=0
 : >"$WORK/casetally"
+: >"$WORK/records"
 : >"$WORK/caseskips"
 : >"$WORK/casenames"
 while read -r name file; do
@@ -1490,12 +1494,18 @@ while read -r name file; do
     # (pass, xfail, fail, xpass, skip) and how many borrowck errors its
     # compilation had at std's positions (`<std>:L:C`), one line each: the
     # gate's std-tests and std-check rows read the suite rows' builds of
-    # std's cases from it instead of building them again
-    if [ -n "${VOLE_TEST_RESULTS:-}" ]; then
-        bck=0
-        [ -f "$dir/compile.out" ] && bck=$(grep -c '^<std>:[0-9]*:[0-9]*: error\[borrowck' "$dir/compile.out")
-        echo "$name $status $bck" >>"$VOLE_TEST_RESULTS"
-    fi
+    # std's cases from it instead of building them again. (0.30.1) Each
+    # record also has why a skipped case was skipped (`requires:WORD`, the
+    # REQUIRES that does not hold; `-` for the others) and whether cc is
+    # clang (`cc:clang`, `cc:other`): the gate's floors judge the suite
+    # rows from these records, every case by name, and from nothing else.
+    bck=0
+    [ -f "$dir/compile.out" ] && bck=$(grep -c '^<std>:[0-9]*:[0-9]*: error\[borrowck' "$dir/compile.out")
+    why=-
+    [ "$status" = skip ] && [ -s "$dir/skipwhy" ] && why=$(cat "$dir/skipwhy")
+    record="$name $status $bck $why cc:$([ $CC_IS_CLANG -eq 1 ] && echo clang || echo other)"
+    echo "$record" >>"$WORK/records"
+    [ -z "${VOLE_TEST_RESULTS:-}" ] || echo "$record" >>"$VOLE_TEST_RESULTS"
     count=$((count + 1))
 done <"$CASES"
 

@@ -915,7 +915,8 @@ run_step() {
         abi-plain) sh "$ROOT/tests/abi/run.sh" -c "$C" -n "$AB" -k "$k" ;;
         abi-import) sh "$ROOT/tests/abi/run.sh" -c "$C" -n "$AB" -k "$k" -i ;;
         abi-header) sh "$ROOT/tests/abi/run.sh" -c "$C" -n "$AB" -k "$k" -H ;;
-        objcheck) sh "$ROOT/tests/objcheck.sh" -c "$C" ;;
+        objcheck) rm -f "$RUN/$1.results"
+            VOLE_OBJCHECK_RESULTS="$RUN/$1.results" sh "$ROOT/tests/objcheck.sh" -c "$C" ;;
         # (0.19: x86-64's intrinsics are encoded and checked against cc on
         # any host; no x86 CPU needed, so --no-x86 keeps it)
         objcheck-x86-arch) sh "$ROOT/tests/objcheck.sh" -c "$C" -t x86_64-macos arch_ ;;
