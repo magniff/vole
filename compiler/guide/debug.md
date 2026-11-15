@@ -45,9 +45,10 @@ The first frame is the line of the failing index (or `unwrap`, `panic`).
 The frames below it are the calls that led there, each at the line of its
 call. A program stopped by SIGALRM (`volec test --timeout`), SIGINT,
 SIGTERM, SIGSEGV or SIGBUS prints `stopped by signal N` and the frames,
-a stack overflow too, on the main thread or a spawned one (0.30.1: the
-handler has a stack of its own). A loop without calls shows its own
-line.
+a stack overflow too, on the main thread or one std::thread spawned
+(0.30.1: the handler has a stack of its own, 64 KB a thread, freed when
+the thread ends). A thread made by C's `pthread_create` has none: its
+stack overflow prints nothing. A loop without calls shows its own line.
 
 `--trace` builds at -O1 or -O2 (with -O0, at -O1). It costs a few
 instructions per call and per loop iteration: the compiler runs about
