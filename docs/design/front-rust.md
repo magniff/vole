@@ -1621,6 +1621,13 @@ E0740 for a field that is neither `Copy` nor `ManuallyDrop` (FL12).
 *Anchor:* `front/own/glue.vl: glue_of`, `places/elab.vl: path_of,
 rust_union`. Case `rust_f_f19_union_no_drop`.
 
+A pattern that matches a union's field by anything but `_` (`let U { r,
+.. } = u;`, a `match` arm, `if let`, a closure's parameter) reads the
+field, and is unsafe as `u.r` is (0.30.1, RT-M2-7; rustc E0133); `U {
+r: _, .. }` reads nothing and is safe. *Anchor:* `front/patterns/
+structs.vl: named_parts`. Cases `rt_m2_007_union_pattern`,
+`rust_f_f19_union_pattern_ok`.
+
 ### F22 `for` loops
 
 **F22.1 (desugaring).** In a rust-edition position
