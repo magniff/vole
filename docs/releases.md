@@ -223,6 +223,19 @@ the bytes of a cold one when a function's number of calls changes.
   now add modulo 2^64 (`wrapping_add`). Found by reading the source: a
   compiler built at -O0, whose arithmetic is checked, would panic there
   on an offset near 2^63, where one built at -O2 wraps.
+- Functions the compiler makes from a program's code (RT-34, unsound,
+  in 0.30.0): an `ensures`'s `f$body` (which holds f's body), a
+  `#[multiversion]` version and a derive's impl were lowered under
+  MVS's rules, where reading a place copies it, and were trusted to be
+  checked through their originals. A `for` over an owned sequence in a
+  function with an `ensures` freed the sequence twice, and a use after
+  a move in such a body passed the borrow checker. Every function with
+  a body is now lowered under Rust's rules and borrow-checked as itself.
+  In a `requires`, a move out of a parameter by a `let`, a `for`, a
+  field, a tuple or a `move` closure was a silent copy that both the
+  clause and the function dropped. It is now `contract.move`, and a move
+  out of a binding that borrows one is `borrowck.move_out`.
+  `query drops` shows the companions' drops too (tests/run/rt_034_*).
 
 #### The safety nets
 
