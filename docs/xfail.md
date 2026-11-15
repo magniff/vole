@@ -24,10 +24,12 @@ Fixed in 0.30.1 so far: RT-6 (`rt_006_link_name_memcpy`,
 `rt_006_link_name_fmod`: an extern named like a C function the compiler
 calls, with a `#[link_name]`, redirected the compiler's own calls), RT-14
 (`rt_014_trace_stack_overflow`: `--trace` printed nothing on a stack
-overflow) and RT-CG-3 (a warm -O2 build differed from a cold one when a
+overflow), RT-CG-3 (a warm -O2 build differed from a cold one when a
 function's number of calls changed; it has no `rt_cg` case: its programs
 are tests/incremental's pairs, which the `incremental` row builds warm and
-cold). The other 0.30.1 branches fix RT-1, 2, 3, 4, 5, 8, 10, 11, 19, 20,
+cold), and RT-TL-2 (`tests/refactor/rt_tl_002_cache_link_name`: a warm
+build reused code calling an extern's old `#[link_name]`). The other
+0.30.1 branches fix RT-1, 2, 3, 4, 5, 8, 10, 11, 19, 20,
 21, 22, 25, 26 and CG-1; the rest are 0.30.2's.
 
 ## How it was taken
