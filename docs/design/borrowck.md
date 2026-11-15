@@ -410,7 +410,16 @@ kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
 - a place whose type is or lies inside `UnsafeCell<T>` (`Cell`,
   `RefCell`, the atomics) is changed through `&self` methods only,
   never by a write here, so it needs no exception: its methods write
-  through a raw pointer (`UnsafeCell::get`).
+  through a raw pointer (`UnsafeCell::get`);
+- in a closure body (0.30.1), the closure's own projections of a
+  capture, the env's deref, the capture's field and a by-`&`/`&mut`
+  capture's deref (D19.4), are mutable as its kind makes them (D19.2,
+  D19.3); the path beyond them is the program's and is read as above,
+  so a `&mut` behind a captured `&` is not mutable there either
+  (`|| { *r.p = 9; }` with `r: &P`, `|| clobber(r.s, gpa)`: E0594,
+  E0596; moves.vl env_inner). Before, every place under the env counted
+  as mutable: a write under a live `&i64` and a use after free. *Cases:*
+  `rust_b_err_closure_through_shared`, `rust_b_closure_capture_write_ok`.
 The `static mut` and `static` cases are D6.2.5's. A write to a place
 that is not mutable is `borrowck.assign_immutable` (rustc E0594,
 "cannot assign to `*s`, which is behind a `&` reference"); an exclusive
@@ -612,14 +621,40 @@ a later argument may read the view (`g(s, s.len())`,
 0 })`, E0506). Two such loans activated by one call (`f(s, s)`) are one
 `mut_twice` (E0499), reported for the later. A contract's binding of a
 view argument, `?aI = &mut s[..]` (desugar.vl reborrowed_view), is the
-same implicit reborrow. Before, the view was copied into the call
+same implicit reborrow, by the parameter's type: a shared view's, `?aI =
+&s[..]`, for a `&[T]` parameter (0.30.1, the third review: one view given
+to `f(a: &mut [T], b: &[T])` with a `requires`, and std's
+`t.copy_from_slice(t)`, bound the shared one as a copy with no loan: a
+use after free, and copy_nonoverlapping on one range; now E0502). Before, the view was copied into the call
 (I7 read the copy as its reborrow from the call on), and `f(s, s)`
 passed one `&mut [T]` twice: a use after free under `--check-alloc`, a
 result that differed between -O0 and -O2. A mutable slice of a place
 behind a shared reference (`&mut r.s[..]`, `two(r1.s, r2.s)` of `r1,
 r2: &W`) is `borrow_immutable` (E0596, moves.vl mutability). *Cases:*
 `rust_b_err_view_arg_twice`, `rust_b_err_view_arg_written`,
-`rust_b_err_view_through_shared`, `rust_b_tp_view_reborrow_ok`.
+`rust_b_err_view_through_shared`, `rust_b_tp_view_reborrow_ok`,
+`rust_b_err_contract_view_mixed`, `rust_b_contract_view_mixed_ok`.
+
+*The other coercion sites (0.30.1).* An exclusive reference read where a
+shared one goes and no call takes it, a `let` with a type, an
+assignment, a struct's or a variant's field, an array element, a result
+(`let b: &[T] = s;`, `b = s;`, `H { b: s }`, `let u: &str = t;`, `let
+k: &i64 = r;`), is its shared reborrow, `_t = &(*Q)` or `_t = slice
+Q[..]` (build.vl operand, shared_coercion). Before, the place was copied
+with no loan, Copy as its shared type is: a write through `s` while `b`
+lived was accepted (a use after free; a live `&str` changed by
+`make_ascii_uppercase`). A `let` with a type whose initializer is a place
+of the exclusive reference it declares (`let t: &mut [T] = s;`, `let u:
+&mut W = r;`) is its reborrow, `&mut (*Q)` or `slice mut Q[..]`, not
+two-phase (build.vl annotated_reborrow), as rustc's coercion site: `s`
+is used again once `t` is done; without a type the place moves. A field
+given where a `&mut T` or a mutable view goes (`fill(b.s)`, `fill(v[0].s)`)
+is a place lent mutably in the front (generics/mod.vl check_call_arg),
+reached through the container's DerefMut and IndexMut as `&mut b.s[..]`
+is; vole's Box is std's DerefMut, so `b` must be `let mut`, as for
+`b.s[1] = 3` (rustc's built-in Box deref needs no `mut`: a strictness
+kept, as at 0.30.0). *Cases:* `rust_b_err_view_coerce_shared`,
+`rust_b_err_view_reborrow_let`, `rust_b_view_reborrow_let_ok`.
 
 **D3.6 (constraints per statement and terminator).** One pass over
 `P_STMTS` in RPO after elaboration (so `DS_*` decisions and flags
@@ -946,6 +981,18 @@ D3.6).
   Wherever `S<..>` appears in a parameter or result type, `Req(S)`
   instantiated joins `⊒`: `T: 'b` as `'s ⊒ 'b` for every `'s ∈
   slots(τ_T)`, with `τ_T` the type at `T`'s position.
+  *Implementation (0.30.1).* `Req` is a least fixpoint over the
+  declarations that name each other (regions.vl adt_reqs, ReqMemo): each
+  declaration's set is found once per type read (decl_pairs), its fields
+  walked again until nothing is new, a declaration still being found read
+  as its set so far (one found from such a partial set is found again
+  where it is named next). So `struct L<'a, 'b, T> { x: &'a T, y:
+  Option<&'a L<'b, 'a, T>> }` has `T: 'a` and, from the swapped use,
+  `T: 'b`; and `S_i { x: S_(i-1), y: S_(i-1) }` costs linear time.
+  Before, a declaration met again on the walk added nothing (`T: 'b`
+  was lost: a false `borrowck.outlives`), and each use walked its
+  declaration again: 2^depth (depth 25: 26 s; tests/outlives_depth.sh).
+  *Cases:* `rust_b_outlives_swapped_ok`, `rust_b_err_outlives_unswapped`.
 - (b) *The impl header's lifetimes.* An elided lifetime in an impl's
   self type (`impl Ord for str`, `impl<T> Tr for &[T]`) is a lifetime
   parameter of the impl (rustc's `impl<'_>`): every `Self` of a
@@ -1287,9 +1334,15 @@ type or a type node in regions.vl lost their depth cut-offs too,
 slots_in, decl_pairs, bind_walk, slot_variances_in, var_walk, req_walk,
 bound_at, header_param_type, impl_bound_ties, proj_again, proj_bound:
 each follows a finite tree. adt_reqs, which reads the declarations a
-field names and so may come back to one, keeps a stack of them instead
-of its depth 8; raw_in, which follows fields, answers "holds a raw
-pointer", the refusing answer, past depth 16.)
+field names and so may come back to one, finds each declaration's set
+once, a fixpoint over the ones that name each other (D4.6), instead of
+its depth 8; raw_in, which follows fields, walks each struct and enum
+once (a set of the ones seen) instead of answering "holds a raw pointer"
+past depth 16, which made `old(*p)` of a plain struct 16 deep a false
+contract.old (`rust_b_contract_old_deep_ok`). Open for 0.30.2: the
+walks over a type's tree are exponential over a DAG of tuple aliases,
+`T_i = (T_(i-1), T_(i-1))`: depth 24 takes 2.3 s, 0.30.0 0.9 s with
+its cut-offs.)
 - (M1) A `Read`, a `WB`/`Reserve`/`Read` by a borrow, an `OK_MOVE`, or
   an `SK_MENTION` of `Q` at `p` with `path(Q) = m` requires `DefInit(m',
   2·loc(p))` for `m` and every descendant `m'` (deep); when `Q` has no

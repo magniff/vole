@@ -509,6 +509,52 @@ fn raw_from_mut(l: i64, p: i64, ty: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>
         && pcx.types[from as usize].b == REF_MUT
 }
 
+// RULE: D3.6 (0.30.1) Place (l, p) of a rust body, read as a value of
+// type ty, when it is an exclusive reference coerced to a shared one (a
+// `&mut T` read as `&T`, a mutable view as a shared view): its shared
+// reborrow, `_t = &(*Q)` or `_t = slice Q[..]` (implicit_reslice, typed
+// ty), the operand. A coercion site that is no call argument (a `let`
+// with a type, an assignment, a field of a struct or a variant, an array
+// element, a result): before, the place was copied, Copy as its shared
+// type is, with no loan, and `let b: &[T] = s; s[0] = x;` with b live
+// was accepted (a write under a live shared view). Lowered here, the
+// operand of a call argument is the temporary, which lower_arg leaves.
+fn shared_coercion(l: i64, p: i64, ty: i64, e: i64, pbody: &mut Body<Comp>,
+    pcx: &mut Ctx<Comp>) -> bool {
+    let to = undistinct(ty, pcx);
+    if !pcx.rust_body || l < 0 || to <= 0 {
+        return false;
+    }
+    let from = undistinct(place_type(l, p, pbody, pcx), pcx);
+    if from <= 0 || pcx.types[from as usize].kind != pcx.types[to as usize].kind
+        || pcx.types[from as usize].b != REF_MUT {
+        return false;
+    }
+    if pcx.types[to as usize].kind == TyKind::Ptr && pcx.types[to as usize].b == REF_SHARED {
+        let t = new_temp(ty, e, false, pbody, pcx);
+        let dp = proj(p, PJ_DEREF, 0, pbody);
+        emit_ref(t, 0, l, dp, BK_SHARED, e, pbody, pcx);
+        set_op(OK_MOVE, t, 0, pcx);
+        return true;
+    }
+    if pcx.types[to as usize].kind == TyKind::Slice && pcx.types[to as usize].b != REF_MUT
+        && !crate::front::types::is_raw_view(to, pcx)
+        && !crate::front::types::is_raw_view(from, pcx) {
+        let t = new_temp(ty, e, false, pbody, pcx);
+        let ix = implicit_reslice(e, ty, pcx);
+        set_op(OK_PLACE, l, p, pcx);
+        let mut at = ops_add(ops_mark(pbody), 0, pbody, pcx);
+        set_op(OK_UNIT, 0, TY_UNIT, pcx);
+        at = ops_add(at, 1, pbody, pcx);
+        set_op(OK_UNIT, 0, TY_UNIT, pcx);
+        at = ops_add(at, 2, pbody, pcx);
+        emit(SK_ASSIGN, t, 0, RV_SLICE, ix, 0, at, 3, ix, pbody);
+        set_op(OK_MOVE, t, 0, pcx);
+        return true;
+    }
+    false
+}
+
 // RULE: D3.6 (0.27.7) Whether expression e was coerced to a written
 // `*mut T` (the checker's pcx.raw_mut_coerced): its raw reborrow is a
 // write, `&raw mut`; to `*const T` (or a type not written), a read.
@@ -572,6 +618,9 @@ fn operand(e: i64, moving: bool, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
                 emit_ref(t, 0, l, dp, if raw_mut_goal(e, pcx) { BK_RAW_MUT } else { BK_RAW }, e,
                     pbody, pcx);
                 set_op(OK_MOVE, t, 0, pcx);
+                return;
+            }
+            if shared_coercion(l, p, ty, e, pbody, pcx) {
                 return;
             }
             place_operand(l, p, ty, moving, pbody, pcx);
@@ -3336,6 +3385,9 @@ fn lower_let(st: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
                     let rl = pcx.pl_l;
                     let rp = pcx.pl_p;
                     emit_ref(ir, 0, rl, rp, BK_MUT2, init, pbody, pcx);
+                } else if pcx.rust_body && pcx.nodes[st as usize].b > 0
+                    && annotated_reborrow(init, ir, pbody, pcx) {
+                    // (`let t: &mut [T] = s;`: a reborrow, D3.6)
                 } else if borrowed && pcx.rust_body && is_place_expr(init, pcx) {
                     rust_let_place(pat, init, ir, s, pbody, pcx);
                 } else {
@@ -3359,6 +3411,57 @@ fn lower_let(st: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
     if s >= 0 {
         pop_scope_at(s, pbody, pcx);
     }
+}
+
+// RULE: D3.6 (0.30.1) A `let` with a type, `let t: &mut T = r;` or `let
+// t: &mut [T] = s;`, whose initializer is a place of the exclusive
+// reference the binding's type is: the binding is its reborrow, `ir =
+// &mut (*Q)` or `ir = slice mut Q[..]`, as rustc's coercion site makes it
+// (a later use of r is no use of a moved place). Not two-phase. Without a
+// type the place moves, as rustc's `let t = r;`. Before, both moved.
+// Whether it lowered init (so, or as expr_into would once its place is
+// lowered).
+fn annotated_reborrow(init: i64, ir: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) -> bool {
+    if !is_place_expr(init, pcx) {
+        return false;
+    }
+    let to = undistinct(pbody.locals[ir as usize].ty, pcx);
+    let nt = undistinct(pcx.nodes[init as usize].ty, pcx);
+    if to <= 0 || nt != to || pcx.types[to as usize].b != REF_MUT
+        || pcx.types[to as usize].kind != TyKind::Ptr
+        && (pcx.types[to as usize].kind != TyKind::Slice
+            || crate::front::types::is_raw_view(to, pcx)) {
+        return false;
+    }
+    if !place_of(init, pbody, pcx) {
+        return false;
+    }
+    let l = pcx.pl_l;
+    let p = pcx.pl_p;
+    let from = undistinct(place_type(l, p, pbody, pcx), pcx);
+    if l < 0 || from != to {
+        // (the place is lowered: its value written, as expr_into's operand
+        // and use would)
+        let moving = !has_flag(ir, LF_BORROWED, pbody);
+        place_operand(l, p, pcx.nodes[init as usize].ty, moving, pbody, pcx);
+        emit_use(ir, 0, init, pbody, pcx);
+        return true;
+    }
+    if pcx.types[to as usize].kind == TyKind::Ptr {
+        let dp = proj(p, PJ_DEREF, 0, pbody);
+        emit_ref(ir, 0, l, dp, BK_MUT, init, pbody, pcx);
+        return true;
+    }
+    let ix = implicit_reslice(init, pcx.nodes[init as usize].ty, pcx);
+    pcx.nodes[ix as usize].p -= crate::front::ast::NODE_IMPLICIT;
+    set_op(OK_PLACE, l, p, pcx);
+    let mut at = ops_add(ops_mark(pbody), 0, pbody, pcx);
+    set_op(OK_UNIT, 0, TY_UNIT, pcx);
+    at = ops_add(at, 1, pbody, pcx);
+    set_op(OK_UNIT, 0, TY_UNIT, pcx);
+    at = ops_add(at, 2, pbody, pcx);
+    emit(SK_ASSIGN, ir, 0, RV_SLICE, ix, 0, at, 3, ix, pbody);
+    true
 }
 
 // (0.27.1) `let pat = init` of a place into a borrowed copy, in a rust
