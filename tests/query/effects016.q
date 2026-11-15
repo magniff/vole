@@ -7,7 +7,7 @@ $ effects putchar malloc labs qsort mystery ext_pure
 crate::putchar	io
 crate::malloc	alloc(extern)
 crate::labs	none
-crate::qsort	alloc(Gpa, extern) io static panic diverge
+crate::qsort	alloc(Gpa, extern) io static sync panic diverge
 crate::mystery	io
 crate::ext_pure	none
 $ effects plus bump address at part whole color sum same spin forever fact even odd
@@ -44,8 +44,8 @@ crate::declared	io unsafe
 crate::heap	alloc(extern) unsafe
 crate::out	io unsafe
 crate::by_c	static
-crate::sorter	alloc(Gpa, extern) io static panic diverge unsafe
-crate::main	alloc(Gpa, extern) io static panic diverge unsafe
+crate::sorter	alloc(Gpa, extern) io static sync panic diverge unsafe
+crate::main	alloc(Gpa, extern) io static sync panic diverge unsafe
 crate::t0	none
 $ effects Bump::allocate Bump::deallocate fill_one in_scope apply double shout hof allocators
 <crate::Bump as Allocator>::allocate	unsafe
