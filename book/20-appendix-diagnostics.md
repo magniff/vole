@@ -127,6 +127,8 @@ $ volec explain --list | grep '^borrowck\.'
 borrowck.elision
 borrowck.unused_param
 borrowck.static_mut_ref
+borrowck.param_outlives
+borrowck.fn_value_static
 borrowck.mut_twice
 borrowck.conflict
 borrowck.use_borrowed

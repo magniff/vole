@@ -190,6 +190,11 @@ for case_ in "$@"; do
         if [ "$want" = opaque.mismatch ] && [ "$first" = E0308 ]; then
             gotcode=opaque.mismatch
         fi
+        # (0.30.1, D4.7: E0308, "one type is more general than the
+        # other", where a function needing a 'static parameter is a value)
+        if [ "$want" = fn_value_static ] && [ "$first" = E0308 ]; then
+            gotcode=fn_value_static
+        fi
     fi
     msg=$(awk '/^error/ && !/^error: aborting/ { print; exit }' "$WORK/out" | cut -c1-120)
     if [ -z "$want" ]; then wantv=accept; else wantv=reject; fi
