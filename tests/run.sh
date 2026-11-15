@@ -183,6 +183,9 @@
 #                        skipped, counted apart
 #   // REQUIRES: metal    (0.22) the case runs only on aarch64-macos (std::gpu
 #                        on Metal); elsewhere it is skipped, counted apart
+#   // REQUIRES: macos    (0.30.1) the case runs only on macOS (what it
+#                        tests is macOS's: a signal's number, an exit
+#                        code); elsewhere it is skipped, counted apart
 #   // NO-EXTRA-FLAGS: why (0.16) the case is built without
 #                        $VOLE_TEST_FLAGS (its output differs by design
 #                        with them)
@@ -1163,6 +1166,9 @@ run_case() {
     if grep -qw metal "$dir/requires" && [ "$TARGET" != aarch64-macos ]; then
         echo skip >"$dir/status"
         return
+    fi
+    if grep -qw macos "$dir/requires"; then
+        case "$TARGET" in *-macos) ;; *) echo skip >"$dir/status"; return ;; esac
     fi
     if check_case "$file" "$dir"; then
         if [ -s "$dir/xfail" ]; then echo xpass; else echo pass; fi
