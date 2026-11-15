@@ -222,7 +222,10 @@ awk -v n="$RLINE" 'NR == n - 1 && /^#\[effects\(unsafe, T\)\]$/ { print "#[effec
 (cd "$T" && sh tools/std-effects-diff.sh -c "$COMPILER" --check) >"$WORK/out" 2>&1
 rc=$?
 has effects_diff_changed "std::mem::replace	unsafe -> diverge unsafe"
-has effects_diff_caller "std::option::Option::take	none -> diverge"
+# (0.30.1, E3.3c: a caller declared over T, Option::take, no longer gets
+# replace's own diverge in its signature, its check refuses it; an
+# undeclared caller's set shows it)
+has effects_diff_caller "<std::slice::IterMut as Iterator>::next	panic -> panic diverge"
 if [ $rc -eq 1 ]; then ok effects_diff_check_status; else bad effects_diff_check_status; fi
 run query effects std::mem::replace --templates --std-tree compiler/std
 has effects_templates "std::mem::replace	diverge unsafe"
