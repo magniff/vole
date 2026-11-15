@@ -36,8 +36,9 @@ const DID_MOVE: i64 = 1;
 const DID_WRITE: i64 = 2;
 
 // RULE: D19.2, D19.3, D19.4, D19.6 Every rust-edition closure's kind, its
-// moved captures by value, its env parameter's type.
-pub fn infer_kinds(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
+// moved captures by value, its env parameter's type. Returns the closures
+// that do not meet their bound (closure.kind, reported).
+pub fn infer_kinds(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) -> Vec<i64, Comp> {
     // RULE: D19.1 (every closure's X_C first: its type's slots)
     for id in 0..pcx.closures.len() as i64 {
         let n = pcx.closures[id as usize].node;
@@ -45,31 +46,89 @@ pub fn infer_kinds(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
             crate::places::regions::closure_sig_slots(id, pcx);
         }
     }
-    // RULE: D19.2 (0.30.1) innermost first, as rustc's upvar analysis
-    // (closures are made outer first, an inner one while its outer body is
-    // checked): an inner closure's mutable use of a capture of the outer
-    // one is the unique borrow its env takes, `&mut` in the outer body
-    // (infer_kind), which makes the outer one FnMut in turn. Before, the
-    // outer one was inferred first, from the inner env's shared borrow,
-    // and was `Fn`: `|| { let mut g = || *r += 1; g(); }` was refused.
-    let mut id = pcx.closures.len() as i64 - 1;
-    while id >= 0 {
-        if pcx.closures[id as usize].kind == 0 && pcx.closures[id as usize].env_struct >= 0 {
-            infer_kind(id, pbody, pcx);
-        }
-        id -= 1;
+    // RULE: D19.2 (0.30.1) to a fixpoint, as rustc's upvar analysis: a
+    // closure's kind comes from its body's uses, and one use is a call of
+    // another closure (`g()` borrows g as its kind asks: `&mut g` for an
+    // FnMut) or an inner closure's env (its unique borrow of a capture,
+    // `&mut` in the outer body). So a kind depends on other closures'
+    // kinds, in any order: an inner one's, an earlier sibling's, the one
+    // given to a generic instance's parameter. Each pass infers every
+    // closure (innermost first, closures being made outer first) from the
+    // kinds and capture modes the last pass left; they only grow (`Fn` <
+    // FnMut < FnOnce, by `&` < by `&mut` < by value), so the passes stop,
+    // at most one per closure and one more. Before, one pass in creation
+    // order left a later closure `Fn` when its body called one not yet
+    // inferred, and its body was refused.
+    let count = pcx.closures.len() as i64;
+    let mut ours = Vec::<bool, Comp>::new_in(Comp {});
+    let mut moved = Vec::<i64, Comp>::new_in(Comp {});
+    for id in 0..count {
+        moved.push(-1);
+        ours.push(pcx.closures[id as usize].kind == 0 && pcx.closures[id as usize].env_struct >= 0);
     }
+    let mut pass: i64 = 0;
+    while pass <= count {
+        let mut changed = false;
+        let mut id = count - 1;
+        while id >= 0 {
+            if ours[id as usize] && infer_kind(id, &mut moved, pbody, pcx) {
+                changed = true;
+            }
+            id -= 1;
+        }
+        pass += 1;
+        if !changed {
+            break;
+        }
+    }
+    // RULE: D19.6 the kinds known, each checked against its bound
+    let mut failed = Vec::<i64, Comp>::new_in(Comp {});
+    for id in 0..count {
+        if !ours[id as usize] || pcx.closures[id as usize].expected != 0
+            || pcx.closures[id as usize].bound_kind == 0 {
+            continue;
+        }
+        let kind = pcx.closures[id as usize].kind;
+        if kind == KIND_FN_ONCE {
+            let mut did = Vec::<i64, Comp>::new_in(Comp {});
+            for k in 0..pcx.closures[id as usize].capture_count {
+                did.push(if k == moved[id as usize] { DID_MOVE } else { 0 });
+            }
+            kind_error(id, &did, pcx);
+            failed.push(id);
+        } else if kind == KIND_FN_MUT && pcx.closures[id as usize].bound_kind == KIND_FN {
+            // RULE: D19.6 (0.30.1) a closure that writes a capture (FnMut),
+            // checked against an `Fn` bound with no expectation, `race(&c)`
+            // of a `c` whose body (or an inner closure) writes through a
+            // captured `&mut`: rustc's E0525, at the closure. Before, it was
+            // taken as `Fn`
+            report_error_once(pcx.nodes[pcx.closures[id as usize].node as usize].start, 0,
+                c"closure.kind",
+                c"expected a closure that implements the `Fn` trait, but this closure only implements `FnMut`: it changes what it captures",
+                c"make the bound `FnMut`, or change the value through a `Cell`", b"", pcx);
+            failed.push(id);
+        }
+    }
+    failed
 }
 
-fn infer_kind(id: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
+// One pass's inference of closure id's kind (infer_kinds): from its body's
+// uses as built with the kinds and modes known now, never below the kind
+// it has. Whether a kind or a capture's mode grew past what a body using
+// the closure was built with (a kind past `Fn`, a capture by `&mut` or by
+// value).
+fn infer_kind(id: i64, moved: &mut Vec<i64, Comp>, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>)
+    -> bool {
     let count = pcx.closures[id as usize].capture_count;
     let expected = pcx.closures[id as usize].expected;
+    let old = pcx.closures[id as usize].kind;
     if count == 0 {
         // (no env parameter: what it is called by is all it is)
         pcx.closures[id as usize].kind = if expected != 0 { expected } else { KIND_FN };
-        return;
+        return false;
     }
     let did = scan_body(id, pbody, pcx);
+    let mut changed = false;
     let mut moves = false;
     let mut writes = pcx.closures[id as usize].writes;
     for k in 0..count {
@@ -77,6 +136,12 @@ fn infer_kind(id: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
         if (d & DID_MOVE) != 0 {
             if mode_of(id, k, pcx) != 0 {
                 by_value(id, k, pcx);
+                changed = true;
+            }
+            // (the first capture it moves, for kind_error: once by value,
+            // a later pass's body moves no capture's deref)
+            if moved[id as usize] < 0 {
+                moved[id as usize] = k;
             }
             moves = true;
         }
@@ -89,6 +154,7 @@ fn infer_kind(id: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
         // use while the closure lives)
         if (d & DID_WRITE) != 0 && (d & DID_MOVE) == 0 && mode_of(id, k, pcx) == 1 {
             pcx.capture_list[(pcx.closures[id as usize].captures + 2 * k + 1) as usize] = 2;
+            changed = true;
             let lit = pcx.nodes[pcx.closures[id as usize].node as usize].y;
             for j in 0..pcx.nodes[lit as usize].count {
                 let init = crate::front::ast::child(lit, j, pcx);
@@ -101,23 +167,14 @@ fn infer_kind(id: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
         }
     }
     let inferred = if moves { KIND_FN_ONCE } else if writes { KIND_FN_MUT } else { KIND_FN };
-    let kind = if expected != 0 { expected } else { inferred };
+    let kind = if expected != 0 { expected } else if inferred > old { inferred } else { old };
+    if kind != old && kind != KIND_FN {
+        changed = true;
+    }
     pcx.closures[id as usize].kind = kind;
-    if expected == 0 && kind == KIND_FN_ONCE && pcx.closures[id as usize].bound_kind != 0 {
-        kind_error(id, &did, pcx);
-    }
-    // RULE: D19.6 (0.30.1) a closure that writes a capture (FnMut), checked
-    // against an `Fn` bound with no expectation, `race(&c)` of a `c` whose
-    // body (or an inner closure) writes through a captured `&mut`: rustc's
-    // E0525, at the closure. Before, it was taken as `Fn`
-    if expected == 0 && kind == KIND_FN_MUT && pcx.closures[id as usize].bound_kind == KIND_FN {
-        report_error_once(pcx.nodes[pcx.closures[id as usize].node as usize].start, 0,
-            c"closure.kind",
-            c"expected a closure that implements the `Fn` trait, but this closure only implements `FnMut`: it changes what it captures",
-            c"make the bound `FnMut`, or change the value through a `Cell`", b"", pcx);
-    }
     set_env_type(id, kind, pcx);
     ref_fields(id, pcx);
+    changed
 }
 
 // The capture mode of capture k: 0 by value, 1 by `&`, 2 by `&mut`.

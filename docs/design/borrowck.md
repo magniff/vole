@@ -429,17 +429,25 @@ kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
   the capture, so a closure whose kind is inferred is FnMut whenever its
   body would be refused as `Fn`; only a bound (`F: Fn()`) fixes a kind
   the body does not have, and then its body is refused. Kinds are
-  inferred innermost first, as rustc's upvar analysis: an inner
-  closure's write through a capture of the outer one is the unique
-  borrow its env takes in the outer body, so the outer one is FnMut
-  (`|| { let mut g = || *r += 1; g(); }`); one given where `F: Fn` is
-  bound is then rustc's E0525 at the closure (closure.kind), and no body
-  is borrow-checked with a kind it lacks. Before, the
+  inferred to a fixpoint, as rustc's upvar analysis: a closure's kind
+  hangs on others' (an inner closure's write through a capture of the
+  outer one is the unique borrow its env takes in the outer body, so the
+  outer one is FnMut, `|| { let mut g = || *r += 1; g(); }`; a call
+  `g()` of a sibling borrows it as g's kind asks, so `|| g()` of a
+  FnMut g is FnMut, and of a FnOnce g FnOnce), so each pass infers every
+  closure from what the last one left, and the passes stop when no kind
+  or capture mode grows (they only grow: at most one pass per closure,
+  and one more). One given where `F: Fn` is bound is then rustc's E0525
+  at the closure (closure.kind), and only the bodies that hold a closure
+  whose kind failed (the closure's, the fn's that makes it, a generic
+  instance given it) are not borrow-checked, so none is checked with a
+  kind it lacks and every other body's errors are reported. Before, the
   closure's part always counted as mutable, and two threads given `&F`
   with `F: Fn() + Sync` raced on `*r += 1`. *Cases:*
   `rust_b_err_closure_through_shared`, `rust_b_closure_capture_write_ok`,
   `rust_b_err_fn_closure_*`, `rust_b_closure_through_mut_kinds_ok`,
-  `rust_b_nested_closure_write_ok`, `rust_b_err_nested_closure_fn_bound`;
+  `rust_b_nested_closure_write_ok`, `rust_b_err_nested_closure_fn_bound`,
+  `rust_b_closure_kinds_fixpoint_ok`;
 - (0.30.1, RT-33) a `&mut` of a view's *referent*, what a slicing
   borrows: `&mut s[..]`, `&mut s[a..b]`, `&mut *s` (the front makes it
   the slicing `&mut s[..]`), a `&mut self` method of `[T]` or `str`
