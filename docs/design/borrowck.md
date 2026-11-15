@@ -481,6 +481,21 @@ format_args("{x}"); x += 1;` is accepted and shows the old x; rustc
 E0506); no memory is at stake. *Anchor:* `places/build.vl:
 hidden_borrow`, `front/check/interp.vl: hole_by_ref`. *Cases:*
 `rt_025_*`, `rust_b_hidden_*`.
+The paths a format call takes, each with its hidden borrows: print,
+println, eprint, eprintln, format_in, fmt::write and writeln
+(interp.vl direct_call: `=fK` lets, D2.9's borrow); format_args, assert's
+and debug_assert's message (expand, a value: `=fK = &P`); panic's message
+(written in place, F16.3; its last call never returns, so the scope's
+`mention _k` is never reached, and each open hidden borrow is mentioned
+just before a call of type `!`, build.vl mention_open); a contract's
+message (its holes are integers, Copy: nothing to borrow). A
+`format_args` value's hole is borrowed when it is a place of any type
+that is not Copy (0.30.1 review: a struct holding a `&mut`, which the
+value's copy aliased, is one), and an element of a slice or through a
+reference (`v[0]`, which the checker writes `v.as_slice()[0]`) is a place
+of its block, not a temporary's. *Cases:* `rust_b_err_format_paths`,
+`rust_b_err_format_args_index`, `rust_b_err_format_args_mut_struct`,
+`rust_b_hidden_cmp_ok`.
 
 **D2.10 (a reference to a packed struct's field; 0.30.1, RT-M2-12).** A
 reference made by the builder (`RV_REF` of `BK_SHARED`, `BK_MUT`,
@@ -494,9 +509,14 @@ alignment of the place's type. A raw borrow (`&raw const p.x`), a copy
 N]`, any type with `packed(N)` and alignment at most N) and a place behind a
 deref (`&(*p.r).y`) are not. The fake loans of a match guard (D2.6) are
 not references. Before, every such reference was accepted, and an
-atomic through one stopped the program with SIGBUS. *Anchor:*
-`places/build.vl: disaligned`. *Cases:* `rt_m2_012_*`,
-`rust_b_packed_ref_ok`, `rust_b_err_packed_ref_hole`.
+atomic through one stopped the program with SIGBUS. A slice made of a
+packed array field in place (`RV_SLICE`: `&p.arr[..]`, `&p.arr[0..1]`,
+the autoref of a slice method `p.arr.first()`, `.iter()`, `.len()`, the
+coercion `let r: &[T] = &p.arr`) is such a reference too (lower_slicing);
+a slice of a view or a pointer's value is not. *Anchor:*
+`places/build.vl: disaligned, lower_slicing`. *Cases:* `rt_m2_012_*`,
+`rust_b_packed_ref_ok`, `rust_b_err_packed_ref_hole`,
+`rust_b_err_packed_slice`, `rust_b_packed_scalar_ok`.
 
 ## 3. Regions (S3)
 
@@ -1178,14 +1198,26 @@ desugaring's receiver binding `__r` is the two-phase reborrow `__r =
 &'r mut2 *w`, not a move of `w`, so the arguments read `w` in its
 reservation window (`write(f, "{}", f.width())`) and `w` is usable after
 the call, as rustc's.
-(0.30.1) So is the receiver of a call to a function with a `requires`
-when a later argument runs code: the contract's desugaring
-(front/contracts/desugar.vl requires_call) binds the arguments that are
-no simple read before its `$pre` companion's call, and now binds the
-autoref'd receiver first, `let ?a0 = &mut v` lowered as `?a0 = &'r mut2
-v`, so `v.insert(0, { v.clear(); 9 })` is E0499 as `v.push({ v.clear();
-9 })` is, and `v.insert(0, v.len())` is accepted (before, the receiver
-was borrowed after the arguments had run, and the first was accepted).
+(0.30.1) So is the receiver of a call to a function with a `requires`:
+the contract's desugaring (front/contracts/desugar.vl requires_call)
+binds every argument, once and in its order, `let ?aI = argI;`, before
+its `$pre` companion's call and the call, as a call without a contract
+evaluates them; the autoref'd receiver `let ?a0 = &mut v` is lowered as
+`?a0 = &'r mut2 v`, a `&mut T` place given is its reborrow `?aI = &'r
+mut2 *r` (writer_reborrow, as lower_arg's), and a mutable view place
+`s` is bound to `&mut s[..]` (desugar.vl reborrowed_view). So
+`v.insert(0, { v.clear(); 9 })` is E0499 as `v.push({ v.clear(); 9 })`
+is, `v.insert(0, v.len())` and `g(r, r.len())` are accepted, and
+`Vec::insert(&mut v, 0, { v.clear(); 0 })` (an explicit `&mut`) is
+E0499. Before, an argument that was a simple read (a local, a literal,
+`&place`) was read again at each of the two calls, after the later
+arguments had run: `v.swap(i, { i = 2; 1 })` swapped other elements than
+rustc's, `f(x, { x = 7; 2 })` passed the new x, `f(&x, { x = 7; 2 })`
+was accepted, and `f(s, { s = t; 1 }); s` was refused. A contract never
+changes the order of evaluation. Seen, not fixed: a mutable view given
+to an ordinary call is copied into it, read as its reborrow from the
+call on (I7), so a later argument that writes through it is accepted
+(rustc E0506; case `rust_b_err_view_arg_written`, XFAIL).
 (0.27.6) So is a writer place that is no reference, `write(self.emsg,
 "{}", self.name())`: F16.3 makes it `&mut self.emsg`, an autoref whose
 span is the place's, and that `__r = &'r mut2 self.emsg` is two-phase,
@@ -1338,7 +1370,7 @@ must be live when a value of type `T` is dropped:
   of the type (rustc's rule without `#[may_dangle]`, L1), **except the
   compiler-known containers** (the table: MVS std's `Vec`, `String`,
   `HashMap`, `HashSet`, `BTreeMap`, `BTreeSet`, `BinaryHeap`,
-  `MinHeap`, `VecDeque`, `Box`, keyed by the std item; std2's of the
+  `MinHeap`, `Box`, keyed by the std item; std2's of the
   same names), for which it is `∪ dropck(τ)` over the *element* type
   arguments plus `set(slots(A))` of the allocator argument (an
   allocator reference must be live to free). `Allocator::FREES` does
@@ -1347,9 +1379,11 @@ must be live when a value of type `T` is dropped:
   element's, and `dropck(&'a Arena) = ∅`, a reference having no glue:
   `ar.reset()` while a `Vec<Box<T>, &Arena>` lived was accepted and the
   drop freed what the arena had handed out again, RT-M2-14. The
-  allocator is the argument `container_alloc` names, `String`'s first,
-  a map's third, every other container's second; a map's hasher `S` is
-  an element in this sense, dropped by its own `dropck`.);
+  allocator is the argument `container_alloc` reads from the
+  template's declaration, the type parameter bounded by `Allocator`
+  (`String`'s first, a map's third, the others' second; never by name);
+  a map's hasher `S` is an element in this sense, dropped by its own
+  `dropck`.);
 - a closure type: `∪ dropck(type(xₖ))` over its by-value captures (a
   struct without `impl Drop`, D3.3).
 

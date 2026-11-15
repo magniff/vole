@@ -135,15 +135,15 @@ pub fn desugar_call(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
 }
 
 // Call n of a function with a requires, whose companion is `pre` (a FNS
-// index): `{ let ?aI = argI; ...; pre(SITE, ?a0, ..); f(?a0, ..) }`. An
-// argument that is a simple read (a local, a literal, `&place` of one) is
-// read again instead of bound: nothing runs between the two calls, and a
-// borrow stays a borrow (`&v` passed to `self: *Vec<T>`). But a receiver's
-// autoref `&mut v` is bound first, `let ?a0 = &mut v`, when a later
-// argument is bound (it runs code): rustc's receiver is reserved before
-// the arguments are evaluated, two-phase (places/build.vl writer_autoref),
-// so `v.insert(0, { v.clear(); 9 })` is E0499 as `v.push({ v.clear(); 9
-// })` is, and `v.insert(0, v.len())` is accepted.
+// index): `{ let ?aI = argI; ...; pre(SITE, ?a0, ..); f(?a0, ..) }`.
+// RULE: D7.4 (0.30.1) Every argument is bound, once, in its order, as a
+// call without a contract evaluates them: a contract never changes what
+// the call sees (`f(x, { x = 7; 2 })` passes the old x; before, a simple
+// read, a local or `&place`, was read again at each call, after the later
+// arguments had run). A receiver's autoref `&mut v` is bound first,
+// two-phase as rustc's is (places/build.vl writer_autoref reads `?a0`),
+// so `v.insert(0, v.len())` is accepted and `v.insert(0, { v.clear(); 9
+// })` is E0499.
 fn requires_call(n: i64, pre: i64, pcx: &mut Ctx<Comp>) {
     words(pcx);
     let start = pcx.nodes[n as usize].start;
@@ -163,7 +163,7 @@ fn requires_call(n: i64, pre: i64, pcx: &mut Ctx<Comp>) {
     }
     for i in 0..count {
         let arg = child(n, i, pcx);
-        if simple_read(arg, 0, pcx) && !(i == 0 && bind_recv) {
+        if constant_arg(arg, pcx) {
             continue;
         }
         buf_clear(pcx.text);
@@ -176,8 +176,8 @@ fn requires_call(n: i64, pre: i64, pcx: &mut Ctx<Comp>) {
         let s = new_node(NodeKind::Let, pcx.nodes[arg as usize].start, pcx.nodes[arg as usize].end,
             pcx);
         pcx.nodes[s as usize].a = bind;
-        pcx.nodes[s as usize].c = arg;
         exclusive_view_arg(n, arg, i, pcx);
+        pcx.nodes[s as usize].c = reborrowed_view(arg, pcx);
         check_pattern(bind, pcx.nodes[arg as usize].ty, pcx);
         list_push(s, pcx);
     }
@@ -193,12 +193,12 @@ fn requires_call(n: i64, pre: i64, pcx: &mut Ctx<Comp>) {
     let pm = list_begin(pcx);
     list_push(site, pcx);
     for i in 0..count {
-        list_push(arg_use(child(n, i, pcx), i, i == 0 && bind_recv, pcx), pcx);
+        list_push(arg_use(child(n, i, pcx), i, pcx), pcx);
     }
     list_end(pc, pm, pcx);
     let im = list_begin(pcx);
     for i in 0..count {
-        list_push(arg_use(child(n, i, pcx), i, i == 0 && bind_recv, pcx), pcx);
+        list_push(arg_use(child(n, i, pcx), i, pcx), pcx);
     }
     list_end(inner, im, pcx);
     pop_scope(pcx);
@@ -238,6 +238,34 @@ fn exclusive_view_arg(n: i64, arg: i64, i: i64, pcx: &mut Ctx<Comp>) {
         pcx.nodes[arg as usize].ty = pt;
         pcx.nodes[arg as usize].p |= crate::front::ast::NODE_REF_MUT;
     }
+}
+
+// RULE: D7.4 (0.30.1) Argument arg bound to `?aI`: a place of a mutable
+// view (`&mut [T]`, a local, a field or a deref; or the exclusive view
+// exclusive_view_arg made of a shared one) is bound to its reborrow
+// `&mut arg[..]` (an Index over the whole range, typed as the view, with
+// the `&mut` mark), as the call reborrows a view it is given; a move of
+// the place would end its use at the binding, and a copy of an
+// exclusive reference is none (I7). Any other argument is bound as it is.
+fn reborrowed_view(arg: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let t = pcx.nodes[arg as usize].ty;
+    let k = pcx.nodes[arg as usize].kind;
+    if t <= 0 || !crate::front::types::is_mut_slice(t, pcx)
+        || crate::front::types::is_raw_view(t, pcx)
+        || !(k == NodeKind::Ident && pcx.nodes[arg as usize].res == Res::Local
+            || k == NodeKind::FieldAccess || k == NodeKind::TupleField
+            || k == NodeKind::Unary && pcx.nodes[arg as usize].op == Tok::Star) {
+        return arg;
+    }
+    let start = pcx.nodes[arg as usize].start;
+    let end = pcx.nodes[arg as usize].end;
+    let range = new_node(NodeKind::Range, start, end, pcx);
+    let ix = new_node(NodeKind::Index, start, end, pcx);
+    pcx.nodes[ix as usize].a = arg;
+    pcx.nodes[ix as usize].b = range;
+    pcx.nodes[ix as usize].ty = t;
+    pcx.nodes[ix as usize].p |= NODE_CHECKED | crate::front::ast::NODE_REF_MUT;
+    ix
 }
 
 // (0.18.1) The `$pre` companion whose clauses function f may take as facts
@@ -346,11 +374,14 @@ pub fn requires_arg(n: i64, pcx: &Ctx<Comp>) -> i64 {
 }
 
 // Argument i of the call as passed to each of the two calls: a copy of a
-// simple read (unless `bound`: requires_call bound it), or an Ident of its
-// let (`?aI`), checked: it names the local.
-fn arg_use(arg: i64, i: i64, bound: bool, pcx: &mut Ctx<Comp>) -> i64 {
-    if simple_read(arg, 0, pcx) && !bound {
-        return copy_read(arg, pcx);
+// constant (constant_arg), or an Ident of its let (`?aI`, requires_call
+// bound it), checked: it names the local.
+fn arg_use(arg: i64, i: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if constant_arg(arg, pcx) {
+        let c = new_node(pcx.nodes[arg as usize].kind, pcx.nodes[arg as usize].start,
+            pcx.nodes[arg as usize].end, pcx);
+        pcx.nodes[c as usize] = pcx.nodes[arg as usize];
+        return c;
     }
     buf_clear(pcx.text);
     buf_str(pcx.text, c"?a");
@@ -363,79 +394,34 @@ fn arg_use(arg: i64, i: i64, bound: bool, pcx: &mut Ctx<Comp>) -> i64 {
     id
 }
 
-// RULE: D7.4 (0.30.1) Whether call n's receiver is an autoref `&mut P`
-// (its span the place's, as places/build.vl writer_autoref reads it) to be
-// reserved before its later arguments, one of which runs code (is no
-// simple read): requires_call then binds it first, `?a0`.
-fn receiver_reserved(n: i64, pcx: &Ctx<Comp>) -> bool {
-    let count = pcx.nodes[n as usize].count;
-    if count < 2 {
-        return false;
-    }
-    let a = child(n, 0, pcx);
-    let t = pcx.nodes[a as usize].ty;
-    if pcx.nodes[a as usize].kind != NodeKind::Unary || pcx.nodes[a as usize].op != Tok::Amp
-        || pcx.nodes[a as usize].start != pcx.nodes[pcx.nodes[a as usize].b as usize].start
-        || t <= 0 || pcx.types[t as usize].kind != TyKind::Ptr
-        || pcx.types[t as usize].b != crate::front::types::REF_MUT {
-        return false;
-    }
-    for i in 1..count {
-        if !simple_read(child(n, i, pcx), 0, pcx) {
-            return true;
-        }
-    }
-    false
-}
-
-// Whether checked node n is a read that may be repeated: a literal, a
-// local or parameter, a constant, `&` or `*` or a field of one.
-fn simple_read(n: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
-    if depth > 6 {
-        return false;
-    }
+// (0.30.1) Whether checked argument n is a constant, a literal or a
+// `const`'s name: it runs no code and no later argument changes it, so
+// reading it again at each call is evaluating it once (and the gpu lint
+// reads a buffer's size and usage there).
+fn constant_arg(n: i64, pcx: &Ctx<Comp>) -> bool {
     match pcx.nodes[n as usize].kind {
         NodeKind::Int | NodeKind::Bool | NodeKind::Char | NodeKind::Float
             | NodeKind::Unit => true,
-        NodeKind::Ident => pcx.nodes[n as usize].res == Res::Local
-            || pcx.nodes[n as usize].res == Res::Const,
-        NodeKind::Unary => (pcx.nodes[n as usize].op == Tok::Amp
-            || pcx.nodes[n as usize].op == Tok::Star)
-            && simple_read(pcx.nodes[n as usize].b, depth + 1, pcx),
-        NodeKind::FieldAccess
-            | NodeKind::TupleField => simple_read(pcx.nodes[n as usize].a, depth + 1, pcx),
+        NodeKind::Ident => pcx.nodes[n as usize].res == Res::Const,
         _ => false,
     }
 }
 
-// A copy of simple read n, with what the checker found.
-fn copy_read(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    if pcx.nodes[n as usize].kind == NodeKind::Ident && pcx.nodes[n as usize].res == Res::Local {
-        // (resolved again: a closure records its captured locals' uses;
-        // a constant is copied as resolved: its name may be a path
-        // resolved already, or one of the callee's module, from a default)
-        let id = new_node(NodeKind::Ident, pcx.nodes[n as usize].start, pcx.nodes[n as usize].end,
-            pcx);
-        pcx.nodes[id as usize].a = pcx.nodes[n as usize].a;
-        pcx.nodes[id as usize].g = pcx.nodes[n as usize].g;
-        synth_expr(id, pcx);
-        return id;
+// RULE: D7.4 (0.30.1) Whether call n's receiver is an autoref `&mut P`
+// (its span the place's, as places/build.vl writer_autoref reads it):
+// requires_call binds it first, `?a0`, reserved (two-phase) until the
+// call. An explicit `&mut v` argument is no autoref and is not reserved,
+// as in rustc.
+fn receiver_reserved(n: i64, pcx: &Ctx<Comp>) -> bool {
+    if pcx.nodes[n as usize].count < 2 {
+        return false;
     }
-    let c = new_node(pcx.nodes[n as usize].kind, pcx.nodes[n as usize].start,
-        pcx.nodes[n as usize].end, pcx);
-    pcx.nodes[c as usize] = pcx.nodes[n as usize];
-    match pcx.nodes[n as usize].kind {
-        NodeKind::Unary => {
-            let b = copy_read(pcx.nodes[n as usize].b, pcx);
-            pcx.nodes[c as usize].b = b;
-        }
-        NodeKind::FieldAccess | NodeKind::TupleField => {
-            let a = copy_read(pcx.nodes[n as usize].a, pcx);
-            pcx.nodes[c as usize].a = a;
-        }
-        _ => {}
-    }
-    c
+    let a = child(n, 0, pcx);
+    let t = pcx.nodes[a as usize].ty;
+    pcx.nodes[a as usize].kind == NodeKind::Unary && pcx.nodes[a as usize].op == Tok::Amp
+        && pcx.nodes[a as usize].start == pcx.nodes[pcx.nodes[a as usize].b as usize].start
+        && t > 0 && pcx.types[t as usize].kind == TyKind::Ptr
+        && pcx.types[t as usize].b == crate::front::types::REF_MUT
 }
 
 // Call n made `std::contract_check(cond, SITE, check)` (all checked).
