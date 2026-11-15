@@ -253,7 +253,20 @@ the bytes of a cold one when a function's number of calls changes.
 - A source that is not UTF-8 (RT-24): a byte that begins no character,
   in a string literal or a comment, was accepted, a `&str` held it, and
   an error that quoted it panicked the compiler. It is now `lex.utf8`,
-  an error at the byte, as rustc refuses such a file.
+  an error at the byte, as rustc refuses such a file. Its other forms:
+  a `\x80`..`\xFF` escape in a str literal, a text block or an
+  f-string made a `&str` that was not UTF-8, and `'\xFF'` was a char.
+  The one escape decoder refuses them now, as rustc (`out of range hex
+  escape`): a str's and a char's `\x` is ASCII; such bytes are a byte
+  string's (`b"\xFF"`) or a byte's, and a byte string takes no
+  `\u{...}` (**a program that used a str literal's `\xFF` as bytes
+  writes `b"..."`**; std's tables did). `volec fmt` names such a file
+  with the byte's line.
+- std's own `s[a..b]` of a str (RT-21) was its bytes' slice, unchecked:
+  `"é".split_at(1)` gave two strs that are not UTF-8, and
+  `String::remove` decoded half a character. std's str ranges go
+  through Index as a program's: they panic off a char boundary, as
+  Rust's.
 - E1.8 and the borrow checker's hidden bindings: a format argument (`{}`
   and `{i}`) became a borrow of its place, which the effect walk did not
   see, so a counted loop that printed its counter, or a guarded divisor
@@ -329,7 +342,11 @@ the bytes of a cold one when a function's number of calls changes.
   set) `ulimit -v` under about 1.2 GiB, or overcommit turned off
   (`vm.overcommit_memory=2`) with little memory, may make no such
   thread, and the compiler then compiles on the first thread's 8 MB,
-  saying so once on stderr (tests/main_stack.sh plants it). A stack
+  saying so once, `warning[thread.main-stack]` (JSON under `--json`),
+  when it compiles a program. A worker or the assembler's thread that
+  cannot be made leaves the build on fewer threads (the main thread's
+  at the least), where 0.30.0 stopped it (`try -j1`)
+  (tests/main_stack.sh plants each). A stack
   overflow, at some 800 000 levels, now ends the compiler by SIGBUS,
   exit status 138 (the thread's guard page), not by SIGSEGV, 139.
 - A struct assigned field by field before it is initialized (`let mut
