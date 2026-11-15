@@ -1367,31 +1367,21 @@ its cut-offs.)
   the path alone (shallow, as D2.2 says). What a raw pointer reaches
   (a deferred closure body's env, D10.4; none from 0.27.2, D19.4) is not
   checked (R1); the pointer itself is (0.30.1: before, `let p: *const
-  i64; unsafe { *p }` read p unassigned). A value a statement
-  evaluates and drops (0.30.1, rustc's `as_temp` of an expression
-  statement's value): a place it ends in, whatever way (`x;`, a block's
-  tail, `{ x };`, a branch's or an arm's, `if c { x } else { 0 };`, a
-  `break`'s value, an unsafe block's; set while the builder lowers the
-  statement's value, `Ctx.discard_read`, and cleared by a `let` in it),
-  is an operand: of a type not Copy it is moved into a temporary dropped
-  at the statement's end (build.vl expr_into: E0382 after it, E0507 out
-  of a reference or a static, whatever its Drop; it drops there, as
-  rustc's, not at the block's end), of a Copy type it is read
-  (`SK_MENTION` with `MENTION_READ`: E0381, E0382). `let _ = E;` of a
-  value E, not a place (`let _ = { x };`, `let _ = if c { x } else { y
-  };`), makes the value the same way (rustc's `as_place` of a value is
-  its temporary); `let _ = x;` of a place only mentions it. Before, each
-  was a mention read in place, never a move: `p; takep(p);`, `{ r }; *r
-  = 2;` of a `&mut` r, `{ *r };` of a `&P` r passed, and `let _ = { x
-  };` of an x never assigned. A place only mentioned, `let _ = x;`, a
-  match's scrutinee, a hidden borrow's, reads nothing but the base of an
-  index in it (rustc's PlaceMention: `let _ = *p;` of a p never assigned
-  passes, `let _ = a[i];` of an a never assigned is E0381). Open:
-  front/drops.vl makes `let _ = x;` of an owned place `let _ = &x;`, a
-  borrow, refused after x moved where rustc accepts
-  (`rust_b_ok_mention_after_move`, XFAIL). *Cases:*
-  `rust_b_err_discard_moves`, `rust_b_err_stmt_moves`,
-  `rust_b_ok_discard_drops`, `rust_b_err_init_let_wild_value`.
+  i64; unsafe { *p }` read p unassigned). An `SK_MENTION` (0.30.1): a
+  place an expression statement's value ends in, whatever way (`x;`, a
+  block's tail, `{ x };`, a branch's or an arm's, `if c { x } else { 0
+  };`, a `break`'s value; `MENTION_READ`, set while the builder lowers the
+  statement's value, `Ctx.discard_read`, and cleared by a `let` in it), is
+  read as an operand is (E0381, E0382; a static's value not Copy, E0507;
+  before, only the statement's own place, `x;`); a place
+  only mentioned, `let _ = x;`, a match's scrutinee, a hidden borrow's,
+  reads nothing but the base of an index in it (rustc's PlaceMention:
+  `let _ = *p;` of a p never assigned passes, `let _ = a[i];` of an a
+  never assigned is E0381). Open: front/drops.vl makes `let _ = x;` of an
+  owned place `let _ = &x;`, a borrow, refused after x moved where rustc
+  accepts (`rust_b_ok_mention_after_move`, XFAIL); and `s;` of a value
+  not Copy reads s in place where rustc moves it into a temporary
+  dropped at the statement's end (`rust_b_err_stmt_moves`, XFAIL).
 - (M2) `SK_ASSIGN`/`SK_CALL`/`SK_INTRINSIC` with destination `Q =
   L.π`, `π ≠ ∅` (0.30.1: rustc's check_if_assigned_path_is_moved, from
   the last projection in): a field's (a variant's, a union's) base
@@ -1413,16 +1403,7 @@ its cut-offs.)
   (`move_precedes`: `u.a = ..; let d = u.a;` in each iteration; before
   0.30.1's last change it was the reaching move of E0382, which does not
   pass the assignment, a false error there). Then the assignment
-  initializes what rustc's `gather_init` does (elab.vl `init_path`, the
-  one rule for the check's sets, drop elaboration's and its flags'):
-  its place's path, but a field of a union initializes the union, its
-  immediate base, and only when that base has a path of its own;
-  nothing under a union's field has one (a move out of it moves the
-  outermost union), so `o.i.a = 7`, i a union field of a union o,
-  initializes nothing (0.30.1: before, o, and `let w = o;` in a loop
-  read o's other field's uninitialized bytes; straight on or after a
-  branch's move it hid E0382; `rust_b_err_union_nested`,
-  `rust_b_ok_union_nested`). `Q = (L, 0)`: no requirement (reinitialization), and it
+  initializes. `Q = (L, 0)`: no requirement (reinitialization), and it
   kills `L`'s loans through a deref (D2.3). One E0381 per local, its
   first (rustc's `uninitialized_error_reported`), naming the binding, not
   the place read through it. The walk back for the reaching move follows
