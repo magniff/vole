@@ -3122,7 +3122,28 @@ fn bind_one(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: &mut Body<Com
         return;
     }
     let by_ref = binds_ref(pat, pcx);
-    let borrowed = !by_ref && (guard || ast_borrowed(al, pcx) || has_flag(l, LF_BORROWED, pbody));
+    let from_borrowed = !by_ref
+        && (guard || ast_borrowed(al, pcx) || has_flag(l, LF_BORROWED, pbody));
+    // (0.27.1: a rust-edition read of a referent or an element that is
+    // not Copy moves it, the borrow checker's move_out, D8.3; so does
+    // a `&mut` the own pass would lend, `for x in self`'s, I7; not under
+    // a pattern that matches through a reference: its bindings are `ref`
+    // ones, a read of the part)
+    let ut = undistinct(ty, pcx);
+    let exclusive = ut > 0 && pcx.types[ut as usize].b == REF_MUT
+        && (pcx.types[ut as usize].kind == TyKind::Ptr
+            || pcx.types[ut as usize].kind == TyKind::Slice);
+    // RULE: C3.4 (0.30.1) a by-value binding out of a borrowed copy is a
+    // move of what it binds, as one out of `*r` with `r: &T` is (rustc
+    // E0507): `let (a, _b) = t;`, `match o { Some(w) => .. }` and `if let`
+    // of a `$pre` parameter, as `let a = t.0;` and as `ensures` on
+    // `result`; `ref w` or a match through `&o` borrows. A binding that
+    // moves owns what it took, so its own later move is no second error
+    // (before, `if let Some(d) = w[0] { eat(d) }` reported `eat(d)` too).
+    // A guard's bindings borrow, its arm's take.
+    let rust_move = pcx.rust_body && pcx.pat_deref == 0
+        && (proj_indirect(p, pbody) || exclusive || !guard && has_flag(l, LF_BORROWED, pbody));
+    let borrowed = from_borrowed && (guard || !rust_move);
     // (the IR local: the phase's when an earlier alternative made it)
     let mut ir: i64 = -1;
     let mut i: i64 = 0;
@@ -3136,6 +3157,10 @@ fn bind_one(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: &mut Body<Com
     let first = ir < 0;
     if first {
         ir = user_local(al, pat, borrowed, pbody, pcx);
+        // (the front's BYREF mark of a binding that moves: it owns)
+        if !borrowed && has_flag(ir, LF_BORROWED, pbody) {
+            pbody.locals[ir as usize].flags -= LF_BORROWED;
+        }
         pcx.phase.push(al);
         pcx.phase.push(ir);
     }
@@ -3152,17 +3177,7 @@ fn bind_one(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: &mut Body<Com
             else { BK_SHARED };
         emit_ref(ir, 0, l, p, kind, pat, pbody, pcx);
     } else {
-        // (0.27.1: a rust-edition read of a referent or an element that is
-        // not Copy moves it, the borrow checker's move_out, D8.3; so does
-        // a `&mut` the own pass would lend, `for x in self`'s, I7)
-        let ut = undistinct(ty, pcx);
-        let exclusive = ut > 0 && pcx.types[ut as usize].b == REF_MUT
-            && (pcx.types[ut as usize].kind == TyKind::Ptr
-                || pcx.types[ut as usize].kind == TyKind::Slice);
-        // (not under a pattern that matches through a reference: its
-        // bindings are `ref` ones, a read of the part)
-        let moving = !borrowed
-            || pcx.rust_body && pcx.pat_deref == 0 && (proj_indirect(p, pbody) || exclusive);
+        let moving = !from_borrowed || rust_move;
         place_operand(l, p, ty, moving, pbody, pcx);
         emit_use(ir, 0, pat, pbody, pcx);
     }
@@ -3408,7 +3423,8 @@ fn lower_let(st: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
                     && annotated_reborrow(init, ir, pbody, pcx) {
                     // (`let t: &mut [T] = s;`: a reborrow, D3.6)
                 } else if borrowed && pcx.rust_body && is_place_expr(init, pcx) {
-                    rust_let_place(pat, init, ir, s, pbody, pcx);
+                    let view = (pcx.nodes[st as usize].p & crate::front::byref::CLAUSE_VIEW) != 0;
+                    rust_let_place(pat, init, ir, s, view, pbody, pcx);
                 } else {
                     expr_into(init, ir, 0, pbody, pcx);
                 }
@@ -3492,7 +3508,7 @@ fn annotated_reborrow(init: i64, ir: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<
 // `_k = &P`, held to the end of their desugaring (hidden_borrow, D2.9):
 // a copy `copy (*_k)`, a whole `&mut T` reborrowed shared `&(**_k)`. s is
 // the `let`'s statement scope (-1: none).
-fn rust_let_place(pat: i64, init: i64, ir: i64, s: i64, pbody: &mut Body<Comp>,
+fn rust_let_place(pat: i64, init: i64, ir: i64, s: i64, view: bool, pbody: &mut Body<Comp>,
     pcx: &mut Ctx<Comp>) {
     if !place_of(init, pbody, pcx) {
         return;
@@ -3517,11 +3533,19 @@ fn rust_let_place(pat: i64, init: i64, ir: i64, s: i64, pbody: &mut Body<Comp>,
         emit_ref(ir, 0, k, p, BK_SHARED, init, pbody, pcx);
         return;
     }
+    // RULE: C3.4 (0.30.1) a clause's view of a whole `&mut T` (a generic
+    // parameter's instance, contracts/expand.vl push_view): its shared
+    // reborrow `&*r`, never a second `&mut` copied (I7)
+    if !take && exclusive && pcx.types[ut as usize].kind == TyKind::Ptr && view {
+        let p = proj(pcx.pl_p, PJ_DEREF, 0, pbody);
+        emit_ref(ir, 0, pcx.pl_l, p, BK_SHARED, init, pbody, pcx);
+        return;
+    }
     // (a `&mut [T]`'s: the binding is typed `&[T]`, the mutable view's
     // shared reborrow `slice (*_k)[..]` (shared_coercion, the one
     // coercion of an exclusive reference to a shared one), until `*s` of a
     // slice view, Z9.1; before, the view was copied, I7)
-    if !take && exclusive && hidden {
+    if !take && exclusive && (hidden || view) {
         let vt = crate::front::types::slice_of(pcx.types[ut as usize].a, pcx);
         pbody.locals[ir as usize].ty = vt;
         let (bl, bp) = if k >= 0 { (k, proj(0, PJ_DEREF, 0, pbody)) }
@@ -3619,10 +3643,14 @@ fn let_borrows(pat: i64, init: i64, pcx: &mut Ctx<Comp>) -> bool {
         return !pcx.rust_body || t <= 0 || pcx.types[t as usize].kind == TyKind::Array
             && crate::front::kinds::is_plain_type(pcx.types[t as usize].a, pcx);
     }
-    // (`let x = S;` of a static: it borrows, statics are never dropped)
+    // (`let x = S;` of a static: it borrows, statics are never dropped;
+    // 0.30.1: of a value that needs no drop it is a copy the binding owns,
+    // which `let mut x = S; x.a = 1;` may write, as rustc's, since a
+    // borrowed copy is read as through `&T`, borrowck/moves.vl
+    // immutable_why)
     if init != 0 && pcx.nodes[init as usize].kind == NodeKind::Ident
         && pcx.nodes[init as usize].res == Res::Static {
-        return true;
+        return needs_drop(pcx.nodes[init as usize].ty, pcx);
     }
     // (a hidden binding of the checker's, `=fN` an f-string's hole, `==`
     // an operator's operand: a borrowed copy, as the own pass's let_drops)
@@ -3744,6 +3772,11 @@ pub fn build_body(f: i64, item: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>
     let body_scope = push_scope(SC_BODY, pcx.nodes[item as usize].c, true, pcx);
     // the parameters: _1.._n
     let keep = keep_params(f, pcx);
+    // RULE: C3.4 (0.30.1) a `$pre` companion's parameters are its call's
+    // arguments read in place, every one a borrowed copy, a Copy one too:
+    // the clause reads them as through `&T` and writes none (the front
+    // marks the owned ones, drops.vl param_drops)
+    let pre = is_pre_fn(f, pcx);
     for i in 0..count {
         let p = child(item, i, pcx);
         let l = pcx.nodes[p as usize].x;
@@ -3752,7 +3785,7 @@ pub fn build_body(f: i64, item: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>
         if l >= 0 && ast_local_mutable(l, pcx) {
             flags |= LF_MUT;
         }
-        if l >= 0 && ast_borrowed(l, pcx) {
+        if l >= 0 && (pre || ast_borrowed(l, pcx)) {
             flags |= LF_BORROWED;
         }
         let ir = new_local(ty, flags, l, p, pbody);
