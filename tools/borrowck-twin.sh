@@ -87,7 +87,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 map_code() {
     case "$1" in
         E0499) echo mut_twice ;;
-        E0501|E0502) echo conflict ;;  # (E0501: a closure's unique capture, D19.2)
+        E0500|E0501|E0502) echo conflict ;;  # (E0500, E0501: a closure's unique capture, D19.2)
         E0503) echo use_borrowed ;;
         E0506) echo assign_borrowed ;;
         E0505) echo move_borrowed ;;

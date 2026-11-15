@@ -413,14 +413,28 @@ fn buf_src_place(m: i64, l: i64, p: i64, auto: bool, pbody: &Body<Comp>, pcx: &C
         }
         let name = sym_text(pcx.locals[src as usize].name, pcx);
         // RULE: D7.4 (0.30.1, RT-33) a requires call's binding of an
-        // argument, `?aI` (contracts/desugar.vl requires_call; no name
-        // the parser reads has a `?`), is named as the argument it binds,
-        // the text of its pattern's span: `*s`, not `*?a0`
-        if name.len() > 2 && name[0] == b'?' && name[1] == b'a'
+        // argument, `?aI` (LF_CONTRACT_ARG, a flag), is named as the
+        // argument it binds, the text of its pattern's span (`*s`, not
+        // `*?a0`), its first 40 bytes and `..` for a longer one (a message
+        // is one line); report_immutable names its source place
+        // (named_source)
+        if (pbody.locals[l as usize].flags & crate::places::ir::LF_CONTRACT_ARG) != 0
             && pbody.locals[l as usize].node > 0 {
             let mut out = Vec::<u8, Comp>::new_in(Comp {});
             span_text(pbody.locals[l as usize].node, &mut out, pcx);
-            if out.len() > 0 && out.len() <= 40 {
+            if out.len() > 40 {
+                out.truncate(40);
+                // (at a character's start: a UTF-8 sequence is not cut)
+                while out.len() > 0 && (out[out.len() - 1] & 0xC0) == 0x80 {
+                    out.pop();
+                }
+                if out.len() > 0 && out[out.len() - 1] >= 0xC0 {
+                    out.pop();
+                }
+                out.push(b'.');
+                out.push(b'.');
+            }
+            if out.len() > 0 {
                 crate::base::buf_bytes(m, &out);
                 return;
             }
@@ -543,6 +557,84 @@ fn span_text(n: i64, out: &mut Vec<u8, Comp>, pcx: &Ctx<Comp>) {
         space = false;
         out.push(c);
     }
+}
+
+// RULE: D7.4, D2.7 (0.30.1, RT-33) The place a message names for place
+// (l, p) (deref: its referent): a temporary, or a requires call's binding
+// of an argument (LF_CONTRACT_ARG), is named by what its one assignment
+// made it of: a copy or a move of a place is that place, a slicing of a
+// view is that view (`*s` for `?a0 = s[..]`), and the referent of a `&mut`
+// of a place is the place (`*?a0` for `?a0 = &mut2 v` is `v`). Returns the
+// place and its deref, or l = -1 when it is no place of the program's (a
+// call's value, a slicing a written `&` made, `(&v[..])`, an `if`'s
+// value, a binding of one): rustc's "data in a `&` reference". Each step
+// goes to a place assigned before; a chain longer than the body has
+// locals is no place, -1.
+pub fn named_source(l0: i64, p0: i64, deref0: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>)
+    -> (i64, i64, i64) {
+    let mut l = l0;
+    let mut p = p0;
+    let mut deref = deref0;
+    for _ in 0..pbody.locals.len() + 1 {
+        if l < 0 || p != 0 {
+            return (l, p, deref);
+        }
+        let f = pbody.locals[l as usize].flags;
+        let contract = (f & crate::places::ir::LF_CONTRACT_ARG) != 0;
+        if !contract && ((f & (LF_USER | LF_PARAM)) != 0 && pbody.locals[l as usize].src >= 0
+            || (f & crate::places::ir::LF_STATIC) != 0) {
+            return (l, p, deref);
+        }
+        let s = only_def(l, pbody);
+        let st = if s >= 0 { pbody.stmts[s as usize] } else { pbody.stmts[0] };
+        if s < 0 || st.kind != crate::places::ir::SK_ASSIGN || st.nops == 0
+            || !crate::places::ir::op_is_place(crate::places::ir::op_kind(st.ops, 0, pbody)) {
+            return (-1, 0, 0);
+        }
+        let l2 = crate::places::ir::op_a(st.ops, 0, pbody);
+        let p2 = crate::places::ir::op_b(st.ops, 0, pbody);
+        if st.c == crate::places::ir::RV_USE {
+            l = l2;
+            p = p2;
+        } else if st.c == crate::places::ir::RV_SLICE && l2 >= 0 && shared_slice(
+            crate::places::ir::full_place_type(l2, p2, pbody, pcx), pcx) {
+            l = l2;
+            p = p2;
+        } else if st.c == crate::places::ir::RV_REF && deref == 1 {
+            l = l2;
+            p = p2;
+            deref = 0;
+        } else {
+            return (-1, 0, 0);
+        }
+    }
+    (-1, 0, 0)
+}
+
+// The one statement that assigns local l whole, or -1 (none, or several).
+fn only_def(l: i64, pbody: &Body<Comp>) -> i64 {
+    let mut found: i64 = -1;
+    for s in 0..pbody.stmts.len() as i64 {
+        let st = pbody.stmts[s as usize];
+        if (st.kind == crate::places::ir::SK_ASSIGN || st.kind == crate::places::ir::SK_CALL
+            || st.kind == crate::places::ir::SK_INTRINSIC) && st.a == l && st.b == 0 {
+            if found >= 0 {
+                return -1;
+            }
+            found = s;
+        }
+    }
+    found
+}
+
+// Whether type t is a shared view, `&[T]` or a `&str` (a slicing of one
+// is named as it: its referent is the view's; a `&` of a mutable view's
+// slicing made the shared one, "data in a `&` reference").
+fn shared_slice(t: i64, pcx: &Ctx<Comp>) -> bool {
+    let u = crate::places::ir::undistinct(t, pcx);
+    u > 0 && pcx.types[u as usize].kind == TyKind::Slice
+        && pcx.types[u as usize].b != crate::front::types::REF_MUT
+        && pcx.types[u as usize].b != crate::front::types::REF_RAW
 }
 
 // The struct (STRUCTS) place (l, p) is, through its derefs; -1 for any
