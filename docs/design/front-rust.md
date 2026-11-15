@@ -512,8 +512,10 @@ transmute: a `bool` that holds 100, a reference made of a number), a
 raw pointer cast to a reference (`p as &T`: a reference of any
 address), `&T as &mut T`, and `&mut s as &mut [u8]` of a `&mut str`
 (F0.1's distinct conversion: safe code would write bytes that are not
-UTF-8; `&str as &[u8]` stays, it only reads) are `error
-type.ref_cast`, rustc E0605/E0606. The fixes are a conversion of the
+UTF-8), and `&str as &[u8]` (0.30.1, the review: rustc's E0605; one
+language) are `error type.ref_cast`, rustc E0605/E0606; `&mut [u8] as
+&mut str` is `as str`'s error (bytes not checked as UTF-8) as `&[u8] as
+&str` is. The fixes are a conversion of the
 value, `&*p` in an unsafe block, `s.as_bytes()`. *Anchor:*
 `synth_cast`, `ref_cast_error` (RT-M2-4, RT-M2-5).
 
@@ -543,6 +545,18 @@ annotation, `let a: [i64; 2]`, or `i64::from(s)`. *Anchor:*
 `rust_f_f293_widen_i32_ok`. Rustc's own answer, an integer variable
 unified with the use before any default, is 0.31's (F18.6's variables
 would need integer kinds and a default at the function's end).
+(0.30.1, the review) A form the check does not know is taken as
+computed, and one it cannot tell written is not written: no yes from
+what it cannot read. A match's arm, a loop's `break` value, an
+Option's unwrap of a computed value, the field of a tuple or the
+element of an array made of one are computed; a closure's parameter
+without a type, a closure's capture and a closure's result are not
+written. Cost: 2 cases of tests/run and no example changed (a sweep of
+tests/run and the examples). Not covered yet: arithmetic inside a
+closure's body on its inferred parameter, `Some(a).map(|x| x + x)`,
+whose widening is made inside the closure (0.30.2). The error comes
+only while no other error is reported (a type an earlier error left
+unknown made the i32).
 
 ### F30 Places through raw pointers
 
@@ -912,6 +926,26 @@ build_opaque_instances`, `places/impl_regions.vl: check_impl_regions`.
 *Cases:* `rt_001_impl_method_lifetime`, `rt_001_impl_iter_item_lifetime`,
 `rt_002_generic_impl_signature`, `rust_f_f55_*`.
 
+**F5.5 (generic functions, 0.30.1, the review).** An impl's function of
+a generic trait function has as many type parameters of its own (else
+`error trait.impl_generics`, rustc E0049). Its opaque instance (D22.2)
+binds the trait's parameters to the same Ωs, so the signatures compare
+as a non-generic one's (E0053, and its lifetimes as above); then each
+bound of the impl's parameters must hold of an Ω of the trait's
+parameter, with the impl's bound to those Ωs: a trait bound by the
+trait's (a supertrait's implies), `'static` by the trait's (D4.5), an
+`Fn*` bound with the trait's lifetimes at each place (both elided, both
+'static, or the same name) (else `error trait.impl_generics`, E0276,
+E0308). A caller through the trait meets only the trait's bounds:
+0.30.0 accepted `fn f<T: 'static>` for the trait's `fn f<T>` and a
+generic caller passed a `&str` to a thread, `fn f<T: Copy>` copied a
+String, `F: FnMut(&'a str)` for `FnMut(&'static str)` stored a borrow
+as 'static. A default the impl copies is the trait's text, not
+compared. compiler/src's `IntVecItems::fold` took `&self` and
+`FnMut(&B, i64)` where Iterator's takes `self` and `FnMut(B, i64)`:
+now the trait's. *Cases:* `rust_f_impl_generics_err`,
+`rust_f_impl_generics_ok`.
+
 **F5.6 (std's sealed traits, 0.30.1).** A trait std marks
 `#[sealed_trait]` (accepted in std's text only) takes no impl outside
 std: `error trait.sealed` at the impl. std's code relies on what their
@@ -945,7 +979,11 @@ type `τᵢ`), inherent then in-scope trait methods; two trait methods at
 one step are `error method.ambiguous` (rustc E0034). A result that
 differs from rustc's silently is a bug: where the front cannot tell the
 step it keeps its order and the corpus names it. Consequences that are
-corpus cases (each checked with rustc): with `impl S { fn tag(&self) }`
+corpus cases (each checked with rustc): (0.30.1, the review) with impls
+of Tr for a primitive P and for `&P`, `x.m()` and `Tr::m(x)` on `x: &P`
+are P's `&self` method (receiver `&P` = `τ₀` by value), as for a
+struct; 0.30.0 took the `&P` impl's (`rust_f_f84_qualified_path`);
+with `impl S { fn tag(&self) }`
 and `impl Tag for &S { fn tag(&self) }`, `r.tag()` on `r: &S` is S's
 (receiver `&S` = `τ₀` by value) and `rr.tag()` on `rr: &&S` the impl's
 (receiver `&&S` = `τ₀` by value, S's only at `τ₁`); `s.c()` on `s: S`
@@ -1316,9 +1354,10 @@ disambiguates a primitive (`<i64>::MAX`, `<[T]>::len`).
 
 **F8.4 (`<τ as Tr>::name` in an expression).** With `τ` a name
 (`<i32 as FromStr>::from_str("-7")`, `<W as Make>::make()`), the path
-`τ::name` (F8.3). In 0.27.2.1 the trait is parsed and not kept, so two
-traits in scope that both declare `name` for `τ` are F9.3's ambiguity,
-where rustc takes `Tr`'s; a `τ` that is not a name (`<Vec<T> as
+`τ::name` (F8.3), with Tr kept (0.30.1, the review: 0.27.2.1 parsed it
+and dropped it, so `<S as B>::m(&s)` ran A's m, and S's inherent m over
+B's): with a receiver it is `Tr::name(x)` (F8.2), through Tr only;
+without one, τ's impl of Tr (`<S as B>::mk()`); a `τ` that is not a name (`<Vec<T> as
 Tr>::f`) is a parser error. *Anchor:* `front/parser/exprs.vl:
 parse_primary`. Case `rust_f_f8_qualified_call_ok`.
 
@@ -2325,6 +2364,7 @@ where a `try:` is named, a case in `tests/borrowck-try`'s shape under
 | `trait.unconstrained` | F14.1 | E0207 | none; names the parameter |
 | `trait.unmet` | F2.3, F10.2, F11.1, F13.2 (none applies), F16.2, F20.4, F22.1 | E0277 | the missing impl's header, or `use` of the trait when an impl exists in a module not in scope |
 | `trait.impl_lifetimes` | F5.5 (0.30.1) | E0308, E0195 | none: the trait's lifetimes, written in the impl's signature |
+| `trait.impl_generics` | F5.5 (0.30.1) | E0049, E0276, E0308 | none: the trait's type parameters and bounds, written in the impl |
 | `trait.sealed` | F5.6 (0.30.1) | E0658 (Pattern, Step), a sealed trait | none: one of std's impls |
 | `trait.cycle` | F2.1, F3.1 | E0391 | none |
 | `trait.missing_item` | F3.1 (a const without default omitted), an impl missing a method (today's message, now coded) | E0046 | inserts the item's signature with `todo()` |

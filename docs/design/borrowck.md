@@ -836,6 +836,28 @@ leaves to the template. A bound `P: 'a` of a named lifetime is not
 checked so yet (the Ω has no region to relate): a gap, rustc's E0309.
 *Cases:* `rt_008_static_bound_through_generic`,
 `rust_b_param_outlives_err`, `rust_b_param_outlives_ok`.
+(0.30.1, the review) The bound is required wherever it is declared: a
+trait method's own type parameter called through a bound (`x.f(t)`, its
+virtual function's copy of the declaration keeps the parameters'
+lifetime bounds), a `where Self: 'static` or `where I::Item: 'static`
+of the callee (kept on the predicate's subject, checked with the
+predicate), an `impl Tr + 'static` result (its hidden type). And an Ω
+has it as rustc reads it without writing it on the parameter: the
+implied bound of a parameter's `&'static T`, a lifetime `'a: 'static`
+with `T: 'a`, a bound's trait declared `trait St: 'static` (or a
+supertrait so), an associated type declared `type Out: 'static`, a
+`where` predicate on a projection; the opaque instance takes its
+template's `where` predicates as its Ωs' bounds (front/traits.vl:
+assume_where_preds) and is no longer unsure for having one (0.27.3's
+model dropped such an instance's errors: `where I::Item: Copy` turned
+the check off). A walk deeper than its limit is no yes: the limits of
+places/impl_regions.vl `walk`, regions.vl `slots_in`, `bind_walk`,
+`decl_pairs`, `copy_in`, `slot_variances_in`, `var_walk` and
+fn_values.vl `needs_static` are gone (each walks a finite type tree;
+25 nested `Option<&'a str>` were accepted where `&'static str` was
+declared). *Cases:* `rust_b_param_outlives_bound_err`,
+`rust_b_param_outlives_bound_ok`, `rust_b_deep_types_err`,
+`rust_b_deep_types_fn_err`, `rust_b_deep_types_ok`.
 
 **D4.6 (implied bounds, as rustc's well-formedness; 0.27.2.1).** D4.5's
 walk is completed by four readings, each rustc's (a type in a signature
@@ -1753,8 +1775,8 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.dropped_borrowed` | D2.5: `WD` vs a loan; D9.2 | E0597, E0713 | "declare `x` before `v`" when both are locals of one block (the reorder is mechanical: `fix` moves the `let`) |
 | `borrowck.return_local` | D6.2.2 | E0515 | none; the help suggests returning an owned value |
 | `borrowck.outlives` | D6.2.1; D19.10 case 1 | E0621, E0623, E0521 | "add `'a: 'b`", or "name the lifetime `'a` on `x`" when the blame path ends at two parameters of elided regions (E2 failed): `fix --suggested` writes `<'a>` on both |
-| `borrowck.param_outlives` | D4.5 (0.30.1) | E0310 | "add `T: 'static`" |
-| `borrowck.fn_value_static` | D4.7 (0.30.1) | E0308 | "call it by name, or take `&T`" |
+| `borrowck.param_outlives` | D4.5 (0.30.1) | E0310 | none mechanical; the help says to add `T: 'static` |
+| `borrowck.fn_value_static` | D4.7 (0.30.1) | E0308 | none mechanical; the help says to call it by name, or take `&T` |
 | `borrowck.elision` | E4 at the signature (ir271) | E0106 | writes `<'a>` and `&'a` on the only reference parameter when there is one |
 | `borrowck.unused_param` | D5.3 (ir271) | E0392 | adds a `PhantomData<&'a ()>` field |
 | `borrowck.use_moved` | M1, M5 | E0382 | `.clone()` when `Clone` (as `own.moved`'s) |
