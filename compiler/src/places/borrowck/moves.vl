@@ -36,6 +36,9 @@ const M_MOVED_HERE: i64 = 5;
 // (bck.reported's entry of a local with an E0381 reported: M_UNINIT_MARK,
 // the location, 0, the local)
 const M_UNINIT_MARK: i64 = -5;
+// (bck.reported's entry of a move out of a static reported: M_STATIC_MARK,
+// the node it is read at, 0, the static's local)
+const M_STATIC_MARK: i64 = -6;
 
 // RULE: D8.2
 pub fn check(bck: &mut Bck<Comp>, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
@@ -257,7 +260,7 @@ fn assigned_prefixes(s: i64, l: i64, p: i64, bck: &mut Bck<Comp>, pbody: &Body<C
         // (rustc's exception: a field of a union moved out is assigned
         // anew, the union with it, F19.7; never assigned, it is E0381)
         let reinit_union = k == PJ_UNION && q >= 0 && bit_get(1, q, pcx)
-            && reaching_move(l, q, s, bck, pbody, pcx) >= 0;
+            && move_precedes(l, q, s, bck, pbody, pcx);
         if q >= 0 && bit_get(1, q, pcx) && !reinit_union {
             cand_p = base;
             cand_q = q;
@@ -267,6 +270,47 @@ fn assigned_prefixes(s: i64, l: i64, p: i64, bck: &mut Bck<Comp>, pbody: &Body<C
     if cand_q >= 0 {
         report(M_ASSIGN_PART, s, l, cand_p, cand_q, bck, pbody, pcx);
     }
+}
+
+// RULE: M2 (0.30.1, rustc's union exception in check_parent_of_field)
+// Whether a move of union path q of local l (or of a path under it) is at
+// a location from which location s can be reached, `is_predecessor_of`:
+// an earlier statement of s's block, or a block s's block is reachable
+// from, a loop's back edge included (`u.a = ..` in each iteration after
+// the last one's move of u). Not the reaching move of an E0382, which
+// must not pass an assignment.
+fn move_precedes(l: i64, q: i64, s: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>,
+    pcx: &mut Ctx<Comp>) -> bool {
+    let bs = crate::places::borrowck::loc_block(s, pbody);
+    if bs < 0 {
+        return false;
+    }
+    for t in 0..pbody.stmts.len() as i64 {
+        let st = pbody.stmts[t as usize];
+        if crate::places::ir::is_terminator(st.kind) {
+            continue;
+        }
+        let mut moves = false;
+        for i in 0..st.nops {
+            if op_kind(st.ops, i, pbody) == OK_MOVE && op_a(st.ops, i, pbody) == l {
+                let m = path_of(l, op_b(st.ops, i, pbody), false, pbody, pcx);
+                if m >= 0 && path_under(m, q, pcx) {
+                    moves = true;
+                }
+            }
+        }
+        if !moves {
+            continue;
+        }
+        let bt = crate::places::borrowck::loc_block(t, pbody);
+        if bt < 0 || pbody.rpo_index[bt as usize] < 0 {
+            continue;
+        }
+        if bt == bs && t < s || reaches(bt, bs, bck, pbody) {
+            return true;
+        }
+    }
+    false
 }
 
 // Whether place (l, p)'s type has a Drop impl (elab.vl's whole_only).
@@ -1109,6 +1153,24 @@ fn report(what0: i64, s: i64, l: i64, p: i64, q: i64, bck: &mut Bck<Comp>, pbody
             return;
         }
     }
+    // (0.30.1: a move out of a static once per place it is read at: an
+    // or-pattern's alternatives bind out of one scrutinee, rustc's one
+    // E0507)
+    if what == M_MOVE_OUT && has_flag(l, LF_STATIC, pbody) {
+        let at = pbody.stmts[s as usize].node;
+        let mut j: i64 = 0;
+        while j < bck.reported.len() as i64 {
+            if bck.reported[j as usize] == M_STATIC_MARK && bck.reported[(j + 1) as usize] == at
+                && bck.reported[(j + 3) as usize] == l {
+                return;
+            }
+            j += 4;
+        }
+        bck.reported.push(M_STATIC_MARK);
+        bck.reported.push(at);
+        bck.reported.push(0);
+        bck.reported.push(l);
+    }
     // (section 14.3: a use after a move once per path, the first use)
     while i < bck.reported.len() as i64 {
         if bck.reported[i as usize] == q
@@ -1185,10 +1247,14 @@ fn report(what0: i64, s: i64, l: i64, p: i64, q: i64, bck: &mut Bck<Comp>, pbody
             let fnmut = pcx.types[local_ty(1, pbody) as usize].b == crate::front::types::REF_MUT;
             buf_str(m, if fnmut { c"', a captured variable in an `FnMut` closure" }
                 else { c"', a captured variable in an `Fn` closure" });
+        } else if has_flag(l, LF_STATIC, pbody) {
+            // (0.30.1: the static's place, `ST.0`, as rustc names it, not
+            // the text of the binder or the aggregate that moves it)
+            crate::places::borrowck::diag::buf_place(m, l, p, 0, pbody, pcx);
+            buf_str(m, c"', a static");
         } else {
             buf_moved_place(m, pbody.stmts[s as usize].node, l, p, pbody, pcx);
-            buf_str(m, if has_flag(l, LF_STATIC, pbody) { c"', a static" }
-                else if has_flag(l, LF_BORROWED, pbody) { c"', a borrowed copy" }
+            buf_str(m, if has_flag(l, LF_BORROWED, pbody) { c"', a borrowed copy" }
                 else { move_out_why(l, p, pbody, pcx) });
         }
         help = c"clone it, borrow it (`&`), or take it out (`mem::take`, `Option::take`, `swap_remove`)";
@@ -1205,6 +1271,12 @@ fn report(what0: i64, s: i64, l: i64, p: i64, q: i64, bck: &mut Bck<Comp>, pbody
         tr = binding_try(pbody.stmts[tried as usize].node, pcx);
     } else if what == M_MOVE_OUT && binding(pbody.stmts[s as usize].node, pcx) {
         tr = binding_try(pbody.stmts[s as usize].node, pcx);
+    } else if what == M_MOVE_OUT && has_flag(l, LF_STATIC, pbody) && static_bound(s, pbody, pcx) {
+        // (0.30.1: a `let` or a pattern binding out of a static: borrow the
+        // static where it is read, `match &SE`, `let t = &SN;`, rustc's
+        // "consider borrowing here"; every binder of the pattern, the
+        // alternatives of an or-pattern too, binds by reference then)
+        tr = crate::places::borrowck::diag::try_wrap(pbody.stmts[s as usize].node, c"&", c"", pcx);
     } else if what == M_USE_MOVED && tried >= 0 {
         // (0.28.0: a `&mut T` moved, a C variadic's argument, D3.6: a
         // reborrow, `&mut *r`; its `.clone()` would be T's)
@@ -1314,6 +1386,22 @@ fn binding_try(n: i64, pcx: &Ctx<Comp>) -> i64 {
         return -1;
     }
     crate::places::borrowck::diag::try_wrap(n, c"ref ", c"", pcx)
+}
+
+// (0.30.1) Whether statement s writes a user's binding (a `let`'s, a
+// pattern's) with the place it reads, as it is (not a part of an
+// aggregate, `W { d: SD }`): a move out of a static there is borrowed
+// where the static is read. A binding the front made has no text (`e;`'s
+// `{ let __own_tmp = e; }`: its pattern's span is empty), and no try: the
+// value is not bound by the user.
+fn static_bound(s: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> bool {
+    let st = pbody.stmts[s as usize];
+    if st.kind != SK_ASSIGN || st.c != crate::places::ir::RV_USE || st.a < 0 || st.b != 0
+        || st.node <= 0 || (pbody.locals[st.a as usize].flags & LF_USER) == 0 {
+        return false;
+    }
+    let pat = pbody.locals[st.a as usize].node;
+    pat > 0 && pcx.nodes[pat as usize].end > pcx.nodes[pat as usize].start
 }
 
 // The name of the captured variable place (l, p) moves out of in a closure

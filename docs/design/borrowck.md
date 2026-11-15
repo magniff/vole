@@ -1367,9 +1367,13 @@ its cut-offs.)
   the path alone (shallow, as D2.2 says). What a raw pointer reaches
   (a deferred closure body's env, D10.4; none from 0.27.2, D19.4) is not
   checked (R1); the pointer itself is (0.30.1: before, `let p: *const
-  i64; unsafe { *p }` read p unassigned). An `SK_MENTION` (0.30.1): an
-  expression statement's place, `x;` (`MENTION_READ`), is read as an
-  operand is (E0381, E0382; a static's value not Copy, E0507); a place
+  i64; unsafe { *p }` read p unassigned). An `SK_MENTION` (0.30.1): a
+  place an expression statement's value ends in, whatever way (`x;`, a
+  block's tail, `{ x };`, a branch's or an arm's, `if c { x } else { 0
+  };`, a `break`'s value; `MENTION_READ`, set while the builder lowers the
+  statement's value, `Ctx.discard_read`, and cleared by a `let` in it), is
+  read as an operand is (E0381, E0382; a static's value not Copy, E0507;
+  before, only the statement's own place, `x;`); a place
   only mentioned, `let _ = x;`, a match's scrutinee, a hidden borrow's,
   reads nothing but the base of an index in it (rustc's PlaceMention:
   `let _ = *p;` of a p never assigned passes, `let _ = a[i];` of an a
@@ -1392,8 +1396,13 @@ its cut-offs.)
   never assigned on some path (`let p: P; p.a = 1;`,
   `borrowck.assign_moved_part`, rustc E0381 "partially assigned
   binding"; through an index or a `*`, `borrowck.use_uninit`). A union's
-  field assigned after the union moved is not an error (rustc's
-  exception: it assigns the union anew). Then the assignment
+  field assigned where a move of the union precedes it is not an error
+  (rustc's exception: it assigns the union anew): rustc's
+  `is_predecessor_of`, an earlier statement of the block or a block the
+  assignment's is reachable from, a loop's back edge included
+  (`move_precedes`: `u.a = ..; let d = u.a;` in each iteration; before
+  0.30.1's last change it was the reaching move of E0382, which does not
+  pass the assignment, a false error there). Then the assignment
   initializes. `Q = (L, 0)`: no requirement (reinitialization), and it
   kills `L`'s loans through a deref (D2.3). One E0381 per local, its
   first (rustc's `uninitialized_error_reported`), naming the binding, not
@@ -1416,7 +1425,14 @@ its cut-offs.)
   `LF_FOR_SEQ`, set from the desugaring's `PAT_FOR_SEQ` mark (before: its
   name, `__for_seq`, read through `src` as a LOCALS index, which for a
   static is its symbol: out of bounds, or a static taken for it and moved
-  out of unchecked; and a program's own `let __for_seq` was exempt). MVS
+  out of unchecked; and a program's own `let __for_seq` was exempt). The
+  error names the static's place, as rustc's (`SD`, `ST.0`, `SW.d`,
+  `MD` of `m::MD`: not the binder's text, nor an aggregate's, `W { d: SD
+  }`), and a binder's is at the scrutinee (or the `let`'s initializer), once per scrutinee
+  (an or-pattern's alternatives too: rustc's one E0507 there); its try
+  borrows the static there, `match &SE`, rustc's "consider borrowing
+  here", which binds every binder by reference (before: two errors, each
+  trying `ref` in one alternative, a pattern vole refuses). MVS
   keeps `own.move_out` (`diff.vl`'s backstop) unchanged.
 - (M4) An `OK_MOVE` of a strict sub-place of a value whose type has
   `impl Drop` (whole-only): `borrowck.move_from_drop` (E0509).

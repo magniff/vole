@@ -90,12 +90,6 @@ const EN_DEAD: i64 = 2;
 // held to there (hidden_borrow)
 const EN_MENTION: i64 = 3;
 
-fn syms(pcx: &mut Ctx<Comp>) {
-    if pcx.sym_for_seq == 0 {
-        pcx.sym_for_seq = intern_c(c"__for_seq", pcx);
-    }
-}
-
 fn unsupported(n: i64, pcx: &mut Ctx<Comp>) {
     if !pcx.build_failed {
         pcx.build_failed = true;
@@ -1065,7 +1059,8 @@ fn expr_into(e: i64, dl: i64, dp: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Com
         // (a value discarded: a place is mentioned, a value made)
         if is_place_expr(e, pcx) {
             if place_of(e, pbody, pcx) {
-                emit(SK_MENTION, pcx.pl_l, pcx.pl_p, 0, 0, 0, 0, 0, e, pbody);
+                let read = if pcx.discard_read { crate::places::ir::MENTION_READ } else { 0 };
+                emit(SK_MENTION, pcx.pl_l, pcx.pl_p, read, 0, 0, 0, 0, e, pbody);
             }
             return;
         }
@@ -2556,7 +2551,9 @@ fn lower_match(n: i64, dl: i64, dp: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<C
         let guard = pcx.nodes[arm as usize].b;
         if guard != 0 && reachable(pbody) {
             phase_begin(-1, pcx);
+            pcx.bind_scrut = scrut;
             bind_pattern(pat, sl, sp, st, true, pbody, pcx);
+            pcx.bind_scrut = 0;
             let g = push_scope(SC_STMT, guard, false, pcx);
             if short_circuit(guard, pcx) {
                 // (0.28.0) a guard `a && b` branches on each operand
@@ -2588,7 +2585,9 @@ fn lower_match(n: i64, dl: i64, dp: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<C
                 emit(SK_MENTION, f, 0, 0, 0, 0, 0, 0, arm, pbody);
             }
             phase_begin(-1, pcx);
+            pcx.bind_scrut = scrut;
             bind_pattern(pat, sl, sp, st, false, pbody, pcx);
+            pcx.bind_scrut = 0;
             expr_into(pcx.nodes[arm as usize].c, dl, dp, pbody, pcx);
         }
         pop_scope_at(s, pbody, pcx);
@@ -2860,7 +2859,9 @@ fn lower_match_switch(n: i64, st: i64, sl: i64, sp: i64, dl: i64, dp: i64, h: i6
         }
         let s = push_scope(SC_ARM, arm, false, pcx);
         phase_begin(-1, pcx);
+        pcx.bind_scrut = pcx.nodes[n as usize].a;
         bind_pattern(pcx.nodes[arm as usize].a, sl, sp, st, false, pbody, pcx);
+        pcx.bind_scrut = 0;
         expr_into(pcx.nodes[arm as usize].c, dl, dp, pbody, pcx);
         pop_scope_at(s, pbody, pcx);
         if reachable(pbody) {
@@ -3160,7 +3161,11 @@ fn bind_one(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: &mut Body<Com
         let moving = !borrowed
             || pcx.rust_body && pcx.pat_deref == 0 && (proj_indirect(p, pbody) || exclusive);
         place_operand(l, p, ty, moving, pbody, pcx);
-        emit_use(ir, 0, pat, pbody, pcx);
+        // (0.30.1: a binding out of a static's place, made at the
+        // scrutinee: rustc's E0507 is there, once for all its binders)
+        let at = if pcx.bind_scrut > 0 && l >= 0 && has_flag(l, LF_STATIC, pbody) { pcx.bind_scrut }
+            else { pat };
+        emit_use(ir, 0, at, pbody, pcx);
     }
     if first && !has_flag(ir, LF_BORROWED, pbody) && needs_drop(pbody.locals[ir as usize].ty, pcx) {
         schedule_outer(pcx.bind_scope, EN_DROP, ir, pbody, pcx);
@@ -3194,7 +3199,9 @@ fn lower_let_pattern(pat: i64, init: i64, s: i64, pbody: &mut Body<Comp>, pcx: &
         enter_block(ok, pbody);
     }
     phase_begin(s, pcx);
+    pcx.bind_scrut = init;
     bind_pattern(pat, l, p, ty, false, pbody, pcx);
+    pcx.bind_scrut = 0;
     pcx.bind_scope = -1;
 }
 
@@ -3291,36 +3298,38 @@ fn desugared_block(b: i64, pcx: &Ctx<Comp>) -> bool {
 
 fn lower_stmt(st: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
     let k = pcx.nodes[st as usize].kind;
+    // RULE: M1 (0.30.1) a statement's value is evaluated and dropped: a
+    // place it ends in, by whatever way (`x;`, a block's or a branch's or
+    // an arm's tail), is read, as rustc's (E0381 of an x never assigned);
+    // a `let`'s pattern only mentions it (`let _ = x;`). Saved and put
+    // back, so a statement inside a block keeps its own.
+    let saved = pcx.discard_read;
+    pcx.discard_read = k != NodeKind::Let;
     if k == NodeKind::Let {
         lower_let(st, pbody, pcx);
+        pcx.discard_read = saved;
         return;
     }
     if k == NodeKind::ExprStmt {
         let e = pcx.nodes[st as usize].a;
         if e == 0 {
+            pcx.discard_read = saved;
             return;
         }
         let s = push_scope(SC_STMT, st, pcx.stmt_home, pcx);
         if pcx.nodes[e as usize].kind == NodeKind::Assign {
             lower_assign_at(e, pbody, pcx);
         } else {
-            let mark = pbody.stmts.len();
             expr_into(e, -1, 0, pbody, pcx);
-            // RULE: M1 (0.30.1) `x;` reads its place, as rustc's statement
-            // does (E0381 of an x never assigned); `let _ = x;` only
-            // mentions it: the mention expr_into made for e itself is marked
-            let last = pbody.stmts.len();
-            if last > mark && pbody.stmts[last - 1].kind == SK_MENTION
-                && pbody.stmts[last - 1].node == e {
-                pbody.stmts[last - 1].c = crate::places::ir::MENTION_READ;
-            }
         }
         pop_scope_at(s, pbody, pcx);
+        pcx.discard_read = saved;
         return;
     }
     let s = push_scope(SC_STMT, st, pcx.stmt_home, pcx);
     expr_into(st, -1, 0, pbody, pcx);
     pop_scope_at(s, pbody, pcx);
+    pcx.discard_read = saved;
 }
 
 // Schedules an entry at the end of scope s, below the scopes inside it.
@@ -3734,9 +3743,11 @@ fn writer_autoref(pat: i64, init: i64, pcx: &Ctx<Comp>) -> bool {
 // Builds function f's body (Fn node item) into the IR tables; false when
 // a construct is not handled (a fallback).
 pub fn build_body(f: i64, item: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) -> bool {
-    syms(pcx);
     pcx.build_failed = false;
     pcx.fail_node = 0;
+    // (a body whose build stopped part way leaves no statement's state)
+    pcx.discard_read = false;
+    pcx.bind_scrut = 0;
     pcx.build_gen += 1;
     pcx.cur_f = f;
     body_begin(f, item, pbody);
