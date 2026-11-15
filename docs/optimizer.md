@@ -232,8 +232,8 @@ through two slots that holds an integer and an f64: `x2 -> slot(x)`,
 `n2 -> slot(n)` with x2 in n's slot and n2 in x's. The cycle is broken
 by saving one slot's current value in the cycle register; that value is
 the one the moves reading the slot take, so the register's class and the
-save's type are theirs (`pm_reader_ty`), not those of the move writing
-the slot. 0.30.1's release branch took the writer's: an integer went
+save's type are theirs, not those of the move writing the slot. 0.30.1's
+release branch took the writer's: an integer went
 through d31 and was stored as `str x63`, which the assembler encoded as
 `str xzr`, a 0, and an f64 through x17 was stored as `str d-15`, encoded
 as `str s0`; x86-64 stored `movq %xmm15, m` as a 4-byte movd. The
@@ -248,6 +248,52 @@ others 0-31, `x31` is not a name) and an operand that is not a register
 where an instruction reads one; the x86-64 assembler refuses a register
 of the wrong class in an instruction that takes one class
 (`tests/arch/enc.sh`).
+
+**Slots as cells** (0.30.1, RT-CG-6). A spill slot is 8 bytes; a 16-
+or 32-byte vector takes 2 or 4 of them, aligned, and the slots beside
+it may hold other values at other times. A location is therefore a
+range of cells: a register is one, slot k with a value of size s is the
+cells k .. k + ceil(s / 8) - 1 (`loc_cells`), and two locations are the
+same place when their cells meet (`locs_overlap`). 0.30.0 compared slot
+numbers, so a move writing slot k+1 was not ordered after the move
+reading a vector from slot k: `ldr d30, [sp]; str d30, [sp, #24]; ldr
+q17, [sp, #16]` on AArch64 at -O1, `movups %xmm2, 144(%rsp)` then
+`movsd %xmm2, 152(%rsp)` on x86-64, and the vector read had half of an
+f64 in it. The order of an edge's moves is one function, `pm_plan`: it
+gives the steps (destination, source, type), the emitter emits them and
+the checker simulates them, cell by cell, so the two cannot disagree. A
+move is ready when no pending move reads a cell it writes; when none is,
+the moves form a cycle, and the source of one move on it is saved in
+the cycle register, by the type of the moves that read it (when two
+moves read one location as values of different types or sizes, that is
+an internal error, never code). When the cycle register holds a value
+already (a second cycle through a vector and a scalar), the save goes
+to 4 cells kept at the end of the spill area of a function with vectors.
+The checker requires that each move's destination hold its value after
+the steps, so a plan that overwrites a value before it is moved is an
+internal error under `--verify-regalloc` (tested by planting slot
+equality back: it reports `the moves' order overwrites a value before
+it is moved` on the reviews' programs). Random programs for these moves,
+with every class and width rotated through shared slots around a loop
+under pressure: `tests/fuzz/run.sh -M` (scalars and a struct) and `-M
+-V` (vectors), the gate's rows `fuzz-moves` and `fuzz-moves-vec`, and
+`tests/affected.map` runs both for a change under compiler/src/back.
+
+**The assemblers' registers** (0.30.1). On AArch64 register number 31
+is sp in some fields and xzr in others; the assembler keeps them apart:
+an operand where the field means xzr refuses `sp`, one where it means sp
+refuses `xzr`, and a memory base is x0-x30 or sp (`add x0, xzr, #1`,
+`orr sp, x0, x1`, `ldr x0, [xzr]` are errors, as in cc). `ldr`/`str`
+of `h` and `b` registers are encoded by their size, not as q. A symbol
+is never a register: an operand is a symbol where the instruction takes
+one (`b`, `bl`, `b.cond`, `adr`, `adrp`, `cbz`, `tbz` and a relocation),
+so a C function named `d5` or `w7` links. On x86-64 the table's
+instructions (`compiler/arch/insn_x86.def`) carry each operand's class
+(`r:` the classes in order, `x` vector, `g` general, `i` either), and
+the assembler refuses a register of the other class there, in an atomic
+(`xadd`, `cmpxchg`: a general register into memory) and in an indirect
+`call`/`jmp`. The moves `ma_move` and `mx_move` and the jump table's
+registers go through `m_check_reg` as the loads and stores do.
 
 | | AArch64 | x86-64 |
 |---|---|---|
