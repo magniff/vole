@@ -1,0 +1,781 @@
+// (0.30.1) An impl method's lifetimes against its trait's (front-rust.md
+// F5.5; rustc's compare_impl_method: E0308, "method not compatible with
+// trait", and E0195). The front (traits::check_impl_fn) compares the
+// types with their lifetimes erased and keeps, for each method that
+// agrees so, the trait's types as the impl has them (Ctx.impl_regions).
+// Here, once the variances are known (regions::variance_table), each
+// such method's signature is read with its lifetimes, the trait's
+// declaration with them in the impl's terms, and the impl's must be at
+// least as general: with the trait's lifetimes fixed (each one the
+// method could be called with) and the impl's own late-bound ones
+// chosen, every parameter the trait's declaration takes is one the
+// impl's takes (`sub(trait ≤ impl)`), and the impl's result is one the
+// trait's declares (`sub(impl ≤ trait)`), knowing only what the trait's
+// signature and the impl's header imply. A generic caller (and a
+// generic instance's borrow check, borrowck.md D4.4 (g)) reads a call
+// through the trait's signature; this is what makes that sound.
+
+use crate::base::sym_text;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{err_begin, err_end_soft, err_fmt, err_help};
+use crate::front::ast::{NODE_REF, NodeKind, child};
+use crate::front::parser::rust::{lifetimes_of, where_key};
+use crate::front::types::{REF_RAW, TyKind, fn_param, type_elem};
+use crate::places::front::{fn_node, fn_ret, fn_template};
+use crate::places::regions::{
+    B_ELIDED, B_NAMED, B_STATIC, V_CO, V_CONTRA, V_INV, adt_node, adt_targ, adt_targ_count,
+    assoc_named, decl_lifetimes, is_ref_kind, lifetime_binding, proj_shape, slot_count,
+    slot_variances,
+};
+
+// The regions of the comparison (two words: kind, x). Universals, which it
+// may not choose: 'static; a named lifetime of the impl (x its symbol); an
+// elided one of the impl's header (x: its slot of Self); the trait
+// method's own named lifetime (x its symbol); an elided input region of
+// the trait's declaration (x: its entry); an elided lifetime of the
+// impl's trait arguments (x: 4096 k + j); a lifetime parameter of the
+// trait the impl does not give (x its index); a slot neither walk names
+// (x: 4096 position + slot, the same on both sides). Variables, which it
+// chooses: the impl method's own named lifetime (x its symbol), an elided
+// input region of the impl method (x its entry).
+const R_STATIC: i64 = 0;
+const R_IMPL: i64 = 1;
+const R_IMPL_ELIDED: i64 = 2;
+const R_TRAIT_FN: i64 = 3;
+const R_TRAIT_IN: i64 = 4;
+const R_TRAIT_ARG: i64 = 5;
+const R_TRAIT_LT: i64 = 6;
+const R_FREE: i64 = 7;
+const R_VAR_NAMED: i64 = 8;
+const R_VAR_IN: i64 = 9;
+// (an elided output region, until E2/E3 name it)
+const R_OUT: i64 = 10;
+
+// Which text a walk reads: the trait's declaration, the impl method's
+// signature, or the impl's header, associated type or trait arguments
+// (the impl's names only).
+const SIDE_TRAIT: i64 = 0;
+const SIDE_IMPL: i64 = 1;
+const SIDE_HEAD: i64 = 2;
+const SIDE_ARG: i64 = 3;
+const SIDE_ASSOC: i64 = 4;
+
+// One comparison: the method f of impl i and its trait's declaration.
+struct Cmp<A: std::alloc::Allocator> {
+    i: i64,
+    decl: i64,
+    node: i64,
+    self_node: i64,
+    // (the slots of Self, read once from the header: five words each)
+    head: Vec<i64, A>,
+    // the regions (kind, x) and the constraints (a, b, where: a outlives
+    // b, where the parameter, -1 the result) and what is known (a, b: a
+    // outlives b)
+    regions: Vec<i64, A>,
+    edges: Vec<i64, A>,
+    known: Vec<i64, A>,
+    // (an elided trait-argument lifetime: its argument, and where its
+    // walk began, while one is read)
+    arg: i64,
+    arg_base: i64,
+    position: i64,
+}
+
+// RULE: F5.5 (0.30.1) Every impl method the front kept (Ctx.impl_regions)
+// compared with its trait's declaration, lifetimes included.
+pub fn check_impl_regions(pcx: &mut Ctx<Comp>) {
+    let n = pcx.impl_regions.len() as i64 / 5;
+    for r in 0..n {
+        let w = (5 * r) as usize;
+        let f = pcx.impl_regions[w];
+        let i = pcx.impl_regions[w + 1];
+        let decl = pcx.impl_regions[w + 2];
+        let at = pcx.impl_regions[w + 3];
+        let count = pcx.impl_regions[w + 4];
+        compare(f, i, decl, at, count, pcx);
+    }
+}
+
+fn region(c: &mut Cmp<Comp>, kind: i64, x: i64) -> i64 {
+    for r in 0..c.regions.len() as i64 / 2 {
+        if c.regions[(2 * r) as usize] == kind && c.regions[(2 * r + 1) as usize] == x {
+            return r;
+        }
+    }
+    c.regions.push(kind);
+    c.regions.push(x);
+    c.regions.len() as i64 / 2 - 1
+}
+
+fn is_var(c: &Cmp<Comp>, r: i64) -> bool {
+    let k = c.regions[(2 * r) as usize];
+    k == R_VAR_NAMED || k == R_VAR_IN
+}
+
+// Whether lifetimes holder h has the lifetime sym (its index, or -1).
+fn lt_index(h: i64, sym: i64, pcx: &Ctx<Comp>) -> i64 {
+    if h <= 0 || sym == 0 {
+        return -1;
+    }
+    for k in 0..pcx.nodes[h as usize].count {
+        if pcx.nodes[child(h, k, pcx) as usize].a == sym {
+            return k;
+        }
+    }
+    -1
+}
+
+fn is_name(n: i64, text: &[u8], pcx: &Ctx<Comp>) -> bool {
+    n > 0 && pcx.nodes[n as usize].kind == NodeKind::TyName && pcx.nodes[n as usize].list == 0
+        && pcx.nodes[n as usize].g == 0 && pcx.nodes[n as usize].count == 0
+        && sym_text(pcx.nodes[n as usize].a, pcx) == text
+}
+
+fn is_kind(n: i64, k: NodeKind, pcx: &Ctx<Comp>) -> bool {
+    n > 0 && pcx.nodes[n as usize].kind == k
+}
+
+// The index of the trait's type parameter node n names (-1).
+fn trait_param(n: i64, c: &Cmp<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    if !is_kind(n, NodeKind::TyName, pcx) || pcx.nodes[n as usize].list != 0
+        || pcx.nodes[n as usize].g != 0 || pcx.nodes[n as usize].count != 0 {
+        return -1;
+    }
+    let g = pcx.traits[pcx.traits_impls[c.i as usize].tr as usize].params;
+    if g <= 0 {
+        return -1;
+    }
+    for k in 0..pcx.nodes[g as usize].count {
+        if pcx.nodes[child(g, k, pcx) as usize].a == pcx.nodes[n as usize].a {
+            return k;
+        }
+    }
+    -1
+}
+
+// The region a lifetime written sym (0: none) names in text `side`, at
+// entry e of the walk; out: whether it is in an output position.
+fn lifetime(sym: i64, side: i64, e: i64, output: bool, c: &mut Cmp<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let b = lifetime_binding(sym, pcx);
+    if b == B_STATIC {
+        return region(c, R_STATIC, 0);
+    }
+    let impl_lts = lifetimes_of(-c.node, pcx);
+    if b == B_ELIDED {
+        if side == SIDE_HEAD {
+            return region(c, R_IMPL_ELIDED, e);
+        }
+        if side == SIDE_ARG {
+            return region(c, R_TRAIT_ARG, 4096 * c.arg + e - c.arg_base);
+        }
+        if side == SIDE_ASSOC {
+            return region(c, R_FREE, 4096 * c.position + e);
+        }
+        if output {
+            return region(c, R_OUT, 4096 * side + e);
+        }
+        return region(c, if side == SIDE_TRAIT { R_TRAIT_IN } else { R_VAR_IN },
+            4096 * c.position + e);
+    }
+    if side == SIDE_TRAIT {
+        if lt_index(lifetimes_of(c.decl, pcx), sym, pcx) >= 0 {
+            return region(c, R_TRAIT_FN, sym);
+        }
+        // (a lifetime parameter of the trait: the impl's argument for it)
+        let tr = pcx.traits_impls[c.i as usize].tr;
+        let q = lt_index(lifetimes_of(pcx.traits[tr as usize].node, pcx), sym, pcx);
+        if q >= 0 {
+            let tname = pcx.nodes[pcx.traits_impls[c.i as usize].node as usize].a;
+            let given = lifetimes_of(tname, pcx);
+            if given > 0 && q < pcx.nodes[given as usize].count {
+                let s = pcx.nodes[child(given, q, pcx) as usize].a;
+                let gb = lifetime_binding(s, pcx);
+                if gb == B_STATIC {
+                    return region(c, R_STATIC, 0);
+                }
+                if gb == B_NAMED && lt_index(impl_lts, s, pcx) >= 0 {
+                    return region(c, R_IMPL, s);
+                }
+            }
+            return region(c, R_TRAIT_LT, q);
+        }
+        return region(c, R_FREE, 4096 * c.position + e);
+    }
+    if side == SIDE_IMPL && lt_index(lifetimes_of(c.node, pcx), sym, pcx) >= 0 {
+        return region(c, R_VAR_NAMED, sym);
+    }
+    if lt_index(impl_lts, sym, pcx) >= 0 {
+        return region(c, R_IMPL, sym);
+    }
+    region(c, R_FREE, 4096 * c.position + e)
+}
+
+// Pushes entry (region, up, input) to out: three words.
+fn push(r: i64, up: i64, input: bool, out: &mut Vec<i64, Comp>) {
+    out.push(r);
+    out.push(up);
+    out.push(if input { 1 } else { 0 });
+}
+
+// RULE: D4.2 (the parallel walk, regions::bind_walk's, with the impl's
+// texts for `Self`, `Self::A` and the trait's parameters) The slots of
+// type t read with type node n of text `side`, pushed to out (three words
+// each: the region, the entry of the reference or view around it or -1,
+// whether it counts as an input region for E2).
+fn walk(n0: i64, t: i64, side: i64, up: i64, output: bool, out: &mut Vec<i64, Comp>, depth: i64,
+    c: &mut Cmp<Comp>, pcx: &Ctx<Comp>) {
+    if t <= 0 || depth > 24 {
+        return;
+    }
+    let mut n = n0;
+    // `Self`: the header's slots, the same at every occurrence
+    // (a trait argument left to its default `Self`, `impl PartialEq for
+    // W<'_>`, is the header's node itself: convert::default_trait_args)
+    if (is_name(n, b"Self", pcx) || n == c.self_node && n > 0) && side != SIDE_HEAD {
+        let at = out.len() as i64 / 3;
+        if c.head.len() as i64 != 3 * slot_count(t, pcx) {
+            for _ in 0..slot_count(t, pcx) {
+                let r = region(c, R_FREE, 4096 * c.position + out.len() as i64 / 3);
+                push(r, up, false, out);
+            }
+            return;
+        }
+        for e in 0..c.head.len() as i64 / 3 {
+            let u = c.head[(3 * e + 1) as usize];
+            let r = c.head[(3 * e) as usize];
+            // (an elided lifetime of the header is no input region, D4.6
+            // (b); a named one is, as the borrow checker reads the impl's)
+            let input = side == SIDE_IMPL && c.regions[(2 * r) as usize] != R_IMPL_ELIDED;
+            push(r, if u >= 0 { at + u } else { up }, input, out);
+        }
+        return;
+    }
+    // `Self::A`: the impl's own definition
+    if proj_shape(n, pcx) && sym_text(pcx.nodes[child(n, 0, pcx) as usize].a, pcx) == b"Self" {
+        let inode = pcx.traits_impls[c.i as usize].node;
+        let a = assoc_named(pcx.nodes[inode as usize].c, pcx.nodes[n as usize].a, pcx);
+        if a != 0 {
+            let at = out.len() as i64 / 3;
+            walk(pcx.nodes[a as usize].b, t, SIDE_ASSOC, up, output, out, depth + 1, c, pcx);
+            if side == SIDE_TRAIT {
+                // (the trait's reading: a projection of Self, no input)
+                for e in at..out.len() as i64 / 3 {
+                    out[(3 * e + 2) as usize] = 0;
+                }
+            }
+            return;
+        }
+    }
+    // a parameter of the trait: the impl's argument for it
+    if side == SIDE_TRAIT {
+        let k = trait_param(n, c, pcx);
+        if k >= 0 {
+            let tname = pcx.nodes[pcx.traits_impls[c.i as usize].node as usize].a;
+            let g = pcx.nodes[tname as usize].g;
+            let an: i64 = if g > 0 && k < pcx.nodes[g as usize].count { child(g, k, pcx) }
+                else { 0 };
+            let (saved, saved_base) = (c.arg, c.arg_base);
+            let at = out.len() as i64 / 3;
+            c.arg = k;
+            c.arg_base = at;
+            walk(an, t, SIDE_ARG, up, output, out, depth + 1, c, pcx);
+            c.arg = saved;
+            c.arg_base = saved_base;
+            for e in at..out.len() as i64 / 3 {
+                out[(3 * e + 2) as usize] = 0;
+            }
+            return;
+        }
+    }
+    let input = !output && side != SIDE_HEAD;
+    let k = pcx.types[t as usize].kind;
+    if k == TyKind::Ptr {
+        let ast: i64 = if is_kind(n, NodeKind::TyPtr, pcx) { pcx.nodes[n as usize].a } else { 0 };
+        if is_ref_kind(pcx.types[t as usize].b) {
+            let me = out.len() as i64 / 3;
+            let lt: i64 = if is_kind(n, NodeKind::TyPtr, pcx)
+                && (pcx.nodes[n as usize].p & NODE_REF) != 0 { pcx.nodes[n as usize].c } else { 0 };
+            let r = lifetime(lt, side, me, output, c, pcx);
+            push(r, up, input, out);
+            walk(ast, pcx.types[t as usize].a, side, me, output, out, depth + 1, c, pcx);
+        } else {
+            walk(ast, pcx.types[t as usize].a, side, up, output, out, depth + 1, c, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Slice && pcx.types[t as usize].b == REF_RAW {
+        let sn = if is_kind(n, NodeKind::TyPtr, pcx) { pcx.nodes[n as usize].a } else { n };
+        let ast: i64 = if is_kind(sn, NodeKind::TySlice, pcx) { pcx.nodes[sn as usize].a }
+            else { 0 };
+        walk(ast, pcx.types[t as usize].a, side, up, output, out, depth + 1, c, pcx);
+        return;
+    }
+    // (a view, `&'a [T]`, `&'a str`, `&'a Self` of an impl for one: the
+    // reference's lifetime is the view's, D4.6 (b))
+    let mut vlt: i64 = 0;
+    if is_kind(n, NodeKind::TyPtr, pcx) && (pcx.nodes[n as usize].p & NODE_REF) != 0
+        && (k == TyKind::Slice || k == TyKind::Distinct) {
+        let a = pcx.nodes[n as usize].a;
+        let kp: i64 = if side == SIDE_TRAIT { trait_param(a, c, pcx) } else { -1 };
+        if is_name(a, b"Self", pcx) && c.self_node > 0 {
+            vlt = pcx.nodes[n as usize].c;
+            n = c.self_node;
+        } else if kp >= 0 {
+            let tname = pcx.nodes[pcx.traits_impls[c.i as usize].node as usize].a;
+            let g = pcx.nodes[tname as usize].g;
+            vlt = pcx.nodes[n as usize].c;
+            n = if g > 0 && kp < pcx.nodes[g as usize].count { child(g, kp, pcx) } else { 0 };
+        } else if is_kind(a, NodeKind::TySlice, pcx)
+            || is_kind(a, NodeKind::TyName, pcx)
+            && sym_text(pcx.nodes[a as usize].a, pcx) == b"str" {
+            vlt = pcx.nodes[n as usize].c;
+            n = a;
+        }
+    }
+    if k == TyKind::Slice {
+        let me = out.len() as i64 / 3;
+        let slice = is_kind(n, NodeKind::TySlice, pcx);
+        let lt: i64 = if vlt != 0 { vlt } else if slice { pcx.nodes[n as usize].c } else { 0 };
+        let r = lifetime(lt, side, me, output, c, pcx);
+        push(r, up, input, out);
+        walk(if slice { pcx.nodes[n as usize].a } else { 0 }, pcx.types[t as usize].a, side, me,
+            output, out, depth + 1, c, pcx);
+        return;
+    }
+    if k == TyKind::Distinct {
+        let u = pcx.types[t as usize].a;
+        if u > 0 && pcx.types[u as usize].kind == TyKind::Slice
+            && pcx.types[u as usize].b != REF_RAW {
+            let me = out.len() as i64 / 3;
+            let named = is_kind(n, NodeKind::TyName, pcx)
+                && sym_text(pcx.nodes[n as usize].a, pcx) == b"str";
+            let lt: i64 = if vlt != 0 { vlt } else if named { pcx.nodes[n as usize].c } else { 0 };
+            let r = lifetime(lt, side, me, output, c, pcx);
+            push(r, up, input, out);
+            walk(0, pcx.types[u as usize].a, side, me, output, out, depth + 1, c, pcx);
+        } else {
+            walk(0, u, side, up, output, out, depth + 1, c, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Unsized {
+        let v = pcx.types[t as usize].a;
+        let s = if pcx.types[v as usize].kind == TyKind::Distinct { pcx.types[v as usize].a }
+            else { v };
+        let ast: i64 = if is_kind(n, NodeKind::TySlice, pcx) { pcx.nodes[n as usize].a } else { 0 };
+        walk(ast, pcx.types[s as usize].a, side, up, output, out, depth + 1, c, pcx);
+        return;
+    }
+    if k == TyKind::Array {
+        let ast: i64 = if is_kind(n, NodeKind::TyArray, pcx) { pcx.nodes[n as usize].a } else { 0 };
+        walk(ast, pcx.types[t as usize].a, side, up, output, out, depth + 1, c, pcx);
+        return;
+    }
+    if k == TyKind::Tuple {
+        let tuple = is_kind(n, NodeKind::TyTuple, pcx);
+        for e in 0..pcx.types[t as usize].count {
+            let ast: i64 = if tuple && e < pcx.nodes[n as usize].count { child(n, e, pcx) }
+                else { 0 };
+            walk(ast, type_elem(t, e, pcx), side, up, output, out, depth + 1, c, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].closure != 0 {
+        // (a closure's type: not written in a signature; its slots its own)
+        for _ in 0..slot_count(t, pcx) {
+            let r = region(c, R_FREE, 4096 * c.position + out.len() as i64 / 3);
+            push(r, up, false, out);
+        }
+        return;
+    }
+    if k == TyKind::Struct || k == TyKind::Enum {
+        let name = is_kind(n, NodeKind::TyName, pcx);
+        let lts: i64 = if name { lifetimes_of(n, pcx) } else { 0 };
+        for e in 0..decl_lifetimes(adt_node(t, pcx), pcx) {
+            let sym: i64 = if lts > 0 && e < pcx.nodes[lts as usize].count {
+                pcx.nodes[child(lts, e, pcx) as usize].a
+            } else { 0 };
+            let me = out.len() as i64 / 3;
+            let r = lifetime(sym, side, me, output, c, pcx);
+            push(r, up, input, out);
+        }
+        let args: i64 = if name { pcx.nodes[n as usize].g } else { 0 };
+        for e in 0..adt_targ_count(t, pcx) {
+            let ast: i64 = if args > 0 && e < pcx.nodes[args as usize].count { child(args, e, pcx) }
+                else { 0 };
+            walk(ast, adt_targ(t, e, pcx), side, up, output, out, depth + 1, c, pcx);
+        }
+    }
+}
+
+// The output regions E2/E3 leave elided in walk `w` (one side's result),
+// named by that side's inputs (params: the side's walks of its parameters
+// one after the other, starts: where each begins).
+fn elide(w: &mut Vec<i64, Comp>, params: &Vec<i64, Comp>, self_ref: i64, c: &mut Cmp<Comp>) {
+    let mut inputs: i64 = 0;
+    let mut only: i64 = -1;
+    for e in 0..params.len() as i64 / 3 {
+        if params[(3 * e + 2) as usize] != 0 {
+            if only < 0 {
+                only = params[(3 * e) as usize];
+            }
+            inputs += 1;
+        }
+    }
+    for e in 0..w.len() as i64 / 3 {
+        let r = w[(3 * e) as usize];
+        if c.regions[(2 * r) as usize] == R_OUT {
+            // RULE: D4.2 (E2, E3; E4 is borrowck.elision, reported at the
+            // function: here a region of its own)
+            w[(3 * e) as usize] = if inputs == 1 { only } else if self_ref >= 0 { self_ref }
+                else { region(c, R_FREE, (1 << 40) + e) };
+        }
+    }
+}
+
+// The constraints of one position: trait walk tw against impl walk iw with
+// variances vs; at: the parameter, or -1 the result.
+fn relate(tw: &Vec<i64, Comp>, iw: &Vec<i64, Comp>, vs: &Vec<i64, Comp>, at: i64,
+    c: &mut Cmp<Comp>) {
+    for e in 0..vs.len() as i64 {
+        let tr = tw[(3 * e) as usize];
+        let ir = iw[(3 * e) as usize];
+        let v = vs[e as usize];
+        // (a parameter: sub(trait ≤ impl); the result: sub(impl ≤ trait))
+        let (src, dst) = if at >= 0 { (tr, ir) } else { (ir, tr) };
+        if v == V_CO || v == V_INV {
+            c.edges.push(src);
+            c.edges.push(dst);
+            c.edges.push(at);
+        }
+        if v == V_CONTRA || v == V_INV {
+            c.edges.push(dst);
+            c.edges.push(src);
+            c.edges.push(at);
+        }
+    }
+    // RULE: D4.5 (the trait's signature's implied bounds: `&'a τ`, every
+    // region of τ outlives 'a; what is known in the impl's method, as
+    // rustc's implied bounds of the trait's signature)
+    for e in 0..tw.len() as i64 / 3 {
+        let u = tw[(3 * e + 1) as usize];
+        if u >= 0 {
+            c.known.push(tw[(3 * e) as usize]);
+            c.known.push(tw[(3 * u) as usize]);
+        }
+    }
+}
+
+// The declared `'a: 'b` of lifetimes holder h, read in text `side`:
+// known (the trait's, the impl's header's) or required (the impl
+// method's own: constraints).
+fn declared(h: i64, side: i64, required: bool, c: &mut Cmp<Comp>, pcx: &Ctx<Comp>) {
+    if h <= 0 {
+        return;
+    }
+    for k in 0..pcx.nodes[h as usize].count {
+        let ln = child(h, k, pcx);
+        let bounds = pcx.nodes[ln as usize].h;
+        if bounds <= 0 || lifetime_binding(pcx.nodes[ln as usize].a, pcx) != B_NAMED {
+            continue;
+        }
+        let a = lifetime(pcx.nodes[ln as usize].a, side, 0, false, c, pcx);
+        for j in 0..pcx.nodes[bounds as usize].count {
+            let bs = pcx.nodes[child(bounds, j, pcx) as usize].a;
+            if lifetime_binding(bs, pcx) == B_ELIDED {
+                continue;
+            }
+            let b = lifetime(bs, side, 0, false, c, pcx);
+            if required {
+                c.edges.push(a);
+                c.edges.push(b);
+                c.edges.push(-2);
+            } else {
+                c.known.push(a);
+                c.known.push(b);
+            }
+        }
+    }
+}
+
+// The comparison of impl method f (impl i) with the trait's declaration
+// decl, whose types as the impl has them are TLISTS[at ..= at + count].
+fn compare(f: i64, i: i64, decl: i64, at: i64, count: i64, pcx: &mut Ctx<Comp>) {
+    let tf = fn_template(f, pcx);
+    let node = fn_node(tf, pcx);
+    if !is_kind(node, NodeKind::Fn, pcx) || !is_kind(decl, NodeKind::Fn, pcx) {
+        return;
+    }
+    let mut c = Cmp {
+        i: i, decl: decl, node: node, self_node: pcx.nodes[node as usize].h,
+        head: Vec::new_in(Comp {}), regions: Vec::new_in(Comp {}), edges: Vec::new_in(Comp {}),
+        known: Vec::new_in(Comp {}), arg: 0, arg_base: 0, position: 0,
+    };
+    let _ = region(&mut c, R_STATIC, 0);
+    let st = pcx.fns[f as usize].self_ty;
+    if c.self_node > 0 && st > 0 {
+        let mut head = Vec::<i64, Comp>::new_in(Comp {});
+        c.position = -1;
+        walk(c.self_node, st, SIDE_HEAD, -1, false, &mut head, 0, &mut c, pcx);
+        c.head = head;
+        // (the header's implied bounds: what its type's well-formedness says)
+        for e in 0..c.head.len() as i64 / 3 {
+            let u = c.head[(3 * e + 1) as usize];
+            if u >= 0 {
+                let a = c.head[(3 * e) as usize];
+                let b = c.head[(3 * u) as usize];
+                c.known.push(a);
+                c.known.push(b);
+            }
+        }
+    }
+    // the parameters, then the result: each side's walk
+    let mut tparams = Vec::<i64, Comp>::new_in(Comp {});
+    let mut iparams = Vec::<i64, Comp>::new_in(Comp {});
+    let mut tstarts = Vec::<i64, Comp>::new_in(Comp {});
+    let mut istarts = Vec::<i64, Comp>::new_in(Comp {});
+    let mut tself: i64 = -1;
+    let mut iself: i64 = -1;
+    for p in 0..count {
+        c.position = p;
+        let tn = pcx.nodes[child(decl, p, pcx) as usize].b;
+        let inn: i64 = if p < pcx.nodes[node as usize].count {
+            pcx.nodes[child(node, p, pcx) as usize].b
+        } else { 0 };
+        let tt = pcx.tlists[(at + p) as usize];
+        let it = fn_param(f, p, pcx);
+        tstarts.push(tparams.len() as i64);
+        istarts.push(iparams.len() as i64);
+        let mut tw = Vec::<i64, Comp>::new_in(Comp {});
+        let mut iw = Vec::<i64, Comp>::new_in(Comp {});
+        walk(tn, tt, SIDE_TRAIT, -1, false, &mut tw, 0, &mut c, pcx);
+        walk(inn, it, SIDE_IMPL, -1, false, &mut iw, 0, &mut c, pcx);
+        if p == 0 && tw.len() > 0 && is_self_ref(decl, tt, pcx) {
+            tself = tw[0];
+        }
+        if p == 0 && iw.len() > 0 && is_self_ref(node, it, pcx) {
+            iself = iw[0];
+        }
+        if !shapes_agree(&tw, &iw, tt, pcx) {
+            shape_error(p, pcx, &c);
+            return;
+        }
+        for &x in tw.as_slice() {
+            tparams.push(x);
+        }
+        for &x in iw.as_slice() {
+            iparams.push(x);
+        }
+    }
+    c.position = count;
+    let tret = pcx.tlists[(at + count) as usize];
+    let iret = fn_ret(f, pcx);
+    let mut tw = Vec::<i64, Comp>::new_in(Comp {});
+    let mut iw = Vec::<i64, Comp>::new_in(Comp {});
+    walk(pcx.nodes[decl as usize].b, tret, SIDE_TRAIT, -1, true, &mut tw, 0, &mut c, pcx);
+    walk(pcx.nodes[node as usize].b, iret, SIDE_IMPL, -1, true, &mut iw, 0, &mut c, pcx);
+    if !shapes_agree(&tw, &iw, tret, pcx) {
+        shape_error(-1, pcx, &c);
+        return;
+    }
+    elide(&mut tw, &tparams, tself, &mut c);
+    elide(&mut iw, &iparams, iself, &mut c);
+    // the constraints: each parameter's, the result's
+    for p in 0..count {
+        let tt = pcx.tlists[(at + p) as usize];
+        let mut vs = Vec::<i64, Comp>::new_in(Comp {});
+        slot_variances(tt, V_CO, &mut vs, pcx);
+        let mut a = Vec::<i64, Comp>::new_in(Comp {});
+        let mut b = Vec::<i64, Comp>::new_in(Comp {});
+        let tend = if p + 1 < count { tstarts[(p + 1) as usize] } else { tparams.len() as i64 };
+        let iend = if p + 1 < count { istarts[(p + 1) as usize] } else { iparams.len() as i64 };
+        for x in tstarts[p as usize]..tend {
+            // (each word as the position's walk made it: its ups its own)
+            a.push(tparams[x as usize]);
+        }
+        for x in istarts[p as usize]..iend {
+            b.push(iparams[x as usize]);
+        }
+        relate(&a, &b, &vs, p, &mut c);
+    }
+    let mut vs = Vec::<i64, Comp>::new_in(Comp {});
+    slot_variances(tret, V_CO, &mut vs, pcx);
+    relate(&tw, &iw, &vs, -1, &mut c);
+    // what is declared: the trait's method's and the impl's `'a: 'b`
+    // known, the impl method's own required
+    declared(lifetimes_of(decl, pcx), SIDE_TRAIT, false, &mut c, pcx);
+    declared(lifetimes_of(where_key(decl), pcx), SIDE_TRAIT, false, &mut c, pcx);
+    declared(lifetimes_of(-node, pcx), SIDE_HEAD, false, &mut c, pcx);
+    declared(lifetimes_of(node, pcx), SIDE_IMPL, true, &mut c, pcx);
+    declared(lifetimes_of(where_key(node), pcx), SIDE_IMPL, true, &mut c, pcx);
+    solve(&c, pcx);
+}
+
+// Whether parameter 0 of function node n, of type t, is `&self` or `&mut
+// self` (E3's region: its reference's).
+fn is_self_ref(n: i64, t: i64, pcx: &Ctx<Comp>) -> bool {
+    if pcx.nodes[n as usize].count == 0 {
+        return false;
+    }
+    let pn = child(n, 0, pcx);
+    if !is_kind(pn, NodeKind::Param, pcx) || sym_text(pcx.nodes[pn as usize].a, pcx) != b"self" {
+        return false;
+    }
+    pcx.types[t as usize].kind == TyKind::Ptr && is_ref_kind(pcx.types[t as usize].b)
+        || pcx.types[t as usize].kind == TyKind::Slice && pcx.types[t as usize].b != REF_RAW
+}
+
+fn shapes_agree(tw: &Vec<i64, Comp>, iw: &Vec<i64, Comp>, t: i64, pcx: &Ctx<Comp>) -> bool {
+    let n = slot_count(t, pcx);
+    tw.len() as i64 == 3 * n && iw.len() as i64 == 3 * n
+}
+
+// RULE: F5.5 (a limit is an error: a slot the walk cannot pair is
+// reported, never taken as agreeing)
+fn shape_error(p: i64, pcx: &mut Ctx<Comp>, c: &Cmp<Comp>) {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"trait.impl_lifetimes";
+    err_begin(pcx.nodes[c.node as usize].start, pcx);
+    err_fmt(format_args("the lifetimes of '{}' cannot be compared with its trait's declaration: {} is read with another shape",
+        str::from_utf8(sym_text(pcx.nodes[c.node as usize].a, pcx)).unwrap(),
+        if p < 0 { "the result" } else { "a parameter" }), pcx);
+    err_help(c"write the parameter's type as the trait's declaration does (with `Self` and the trait's names)", pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved;
+}
+
+// Whether a outlives b by what is known (reflexive, 'static outlives
+// every region, transitive), over the universals.
+fn known_outlives(a: i64, b: i64, c: &Cmp<Comp>) -> bool {
+    if a == b || c.regions[(2 * a) as usize] == R_STATIC {
+        return true;
+    }
+    let n = c.regions.len() as i64 / 2;
+    let mut seen = Vec::<bool, Comp>::new_in(Comp {});
+    for _ in 0..n {
+        seen.push(false);
+    }
+    let mut stack = Vec::<i64, Comp>::new_in(Comp {});
+    stack.push(a);
+    seen[a as usize] = true;
+    while let Some(x) = stack.pop() {
+        if x == b {
+            return true;
+        }
+        for k in 0..c.known.len() as i64 / 2 {
+            if c.known[(2 * k) as usize] == x {
+                let y = c.known[(2 * k + 1) as usize];
+                // ('static known to outlive a region: every region then)
+                if c.regions[(2 * y) as usize] == R_STATIC {
+                    return true;
+                }
+                if !seen[y as usize] {
+                    seen[y as usize] = true;
+                    stack.push(y);
+                }
+            }
+        }
+    }
+    false
+}
+
+// RULE: F5.5 (the solve) The impl's variables take the least values the
+// constraints allow: a universal u that must outlive a variable must
+// outlive every universal the variable must (through any chain of
+// variables). Each universal u, each universal w reached from u through
+// variables only: u must outlive w by what is known, else the error.
+fn solve(c: &Cmp<Comp>, pcx: &mut Ctx<Comp>) {
+    let n = c.regions.len() as i64 / 2;
+    for u in 0..n {
+        if is_var(c, u) {
+            continue;
+        }
+        let mut seen = Vec::<bool, Comp>::new_in(Comp {});
+        for _ in 0..n {
+            seen.push(false);
+        }
+        let mut stack = Vec::<i64, Comp>::new_in(Comp {});
+        let mut whence = Vec::<i64, Comp>::new_in(Comp {});
+        stack.push(u);
+        whence.push(-3);
+        seen[u as usize] = true;
+        while let Some(x) = stack.pop() {
+            let wh = whence.pop().unwrap();
+            for k in 0..c.edges.len() as i64 / 3 {
+                if c.edges[(3 * k) as usize] != x {
+                    continue;
+                }
+                let y = c.edges[(3 * k + 1) as usize];
+                let at = if wh == -3 { c.edges[(3 * k + 2) as usize] } else { wh };
+                if is_var(c, y) {
+                    if !seen[y as usize] {
+                        seen[y as usize] = true;
+                        stack.push(y);
+                        whence.push(at);
+                    }
+                    continue;
+                }
+                if !known_outlives(u, y, c) {
+                    region_error(u, y, at, c, pcx);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// A region in a message: `'a`, `'static`, or what it is.
+fn region_text(r: i64, c: &Cmp<Comp>, pcx: &Ctx<Comp>) -> String<Comp> {
+    let k = c.regions[(2 * r) as usize];
+    let x = c.regions[(2 * r + 1) as usize];
+    let mut s = String::new_in(Comp {});
+    if k == R_STATIC {
+        s.push_str("'static");
+    } else if k == R_IMPL || k == R_TRAIT_FN || k == R_VAR_NAMED {
+        let text = sym_text(x, pcx);
+        if text.len() == 0 || text[0] != b'\'' {
+            s.push_str("'");
+        }
+        s.push_str(str::from_utf8(text).unwrap());
+        if k == R_TRAIT_FN {
+            s.push_str(" (the trait's)");
+        }
+    } else if k == R_IMPL_ELIDED {
+        s.push_str("the elided lifetime of the impl's type");
+    } else if k == R_TRAIT_IN {
+        s.push_str("an elided lifetime of the trait's parameter");
+    } else if k == R_TRAIT_ARG {
+        s.push_str("an elided lifetime of the impl's trait argument");
+    } else if k == R_TRAIT_LT {
+        s.push_str("a lifetime parameter of the trait");
+    } else {
+        s.push_str("a lifetime of the signature");
+    }
+    s
+}
+
+// RULE: F5.5 error trait.impl_lifetimes: the impl's signature is not as
+// general as the trait's (rustc E0308/E0195).
+fn region_error(u: i64, w: i64, at: i64, c: &Cmp<Comp>, pcx: &mut Ctx<Comp>) {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"trait.impl_lifetimes";
+    let tr = pcx.traits_impls[c.i as usize].tr;
+    let name = str::from_utf8(sym_text(pcx.nodes[c.node as usize].a, pcx)).unwrap();
+    let place = if at == -1 { String::from_in("its result", Comp {}) }
+        else if at == -2 { String::from_in("its own `'a: 'b` bound", Comp {}) }
+        else {
+            let pn = child(c.node, at, pcx);
+            let mut s = String::from_in("its parameter '", Comp {});
+            s.push_str(str::from_utf8(sym_text(pcx.nodes[pn as usize].a, pcx)).unwrap());
+            s.push_str("'");
+            s
+        };
+    err_begin(pcx.nodes[c.node as usize].start, pcx);
+    err_fmt(format_args("'{}' does not have the lifetimes trait '{}' declares: {} needs {} to outlive {}, which neither the trait's signature nor the impl says",
+        name, str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap(), place.as_str(),
+        region_text(u, c, pcx).as_str(), region_text(w, c, pcx).as_str()), pcx);
+    err_help(c"write the trait's lifetimes in the impl's signature: an impl may be more general than its trait, never less (rustc E0308/E0195)", pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved;
+}

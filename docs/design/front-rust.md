@@ -839,6 +839,60 @@ patterns `Self { .. }`, `Self(..)`, are those of `σ`. In a trait body
 synth_name` (today `Self` resolves only to a non-generic self type at
 some sites: M2's gap 12).
 
+**F5.5 (an impl's method against its trait's declaration, 0.30.1).**
+An impl method has the signature its trait declares, with `Self` the
+impl's type, the trait's parameters the impl's arguments and `Self::A`
+the impl's definitions: the same number of parameters (rustc E0050),
+each type and `self`'s form (`self`, `&self`, `&mut self`) and the
+result (E0053), compared with lifetimes erased by the front
+(`front/traits.vl: check_impl_fn`). A generic impl's methods are
+compared so in their opaque instance, each of the impl's parameters an
+Ω (D22.1): with the parameters as parameters (`build_opaque_instances`
+calls it; 0.30.0 compared only a non-generic impl's, so a generic
+impl's `fn nm(&self) -> i32` for the trait's `-> i64` was taken, and a
+generic caller widened it). Then the lifetimes (`places/impl_regions.vl`,
+once the variances are known, D5.3): the impl's signature must be at
+least as general as the trait's (rustc's compare_impl_method, E0308 and
+E0195). The trait's lifetimes are universals: its method's own (named
+or elided inputs), the impl's (its header's, named or elided, D4.6
+(b); its trait arguments'), and 'static; the impl method's own
+late-bound lifetimes (named, or elided inputs) are variables. Each
+parameter gives `sub(trait ≤ impl)` and the result `sub(impl ≤ trait)`,
+slot by slot with the slot's variance (D3.5, D5.4); an elided result
+region is E2's or E3's of each side (D4.2). What is known is 'static
+outliving all, the trait signature's implied bounds (D4.5: `&'a τ`),
+the impl header's, and the declared `'a: 'b` of the trait's method and
+of the impl; the impl method's own declared bounds are required. The
+variables take their least values; a universal that must outlive a
+variable must outlive every universal the variable must, through any
+chain of variables, by what is known: else `error trait.impl_lifetimes`
+at the method. A slot the two walks cannot pair is the same error
+(never taken as agreeing). Why it is needed: a generic caller, and a
+generic instance's borrow check (borrowck.md D4.4 (g)), read a call
+through the trait's signature; 0.30.0 accepted `fn mk(&self) -> &'a
+str` for the trait's `&'static str`, and `go<T: Mk>` handed out a
+borrow of a dropped String as `&'static str`. A default method the
+impl copies is the trait's own text, not compared. *Anchor:*
+`front/traits.vl: check_impl_fn`, `front/opaque.vl:
+build_opaque_instances`, `places/impl_regions.vl: check_impl_regions`.
+*Cases:* `rt_001_impl_method_lifetime`, `rt_001_impl_iter_item_lifetime`,
+`rt_002_generic_impl_signature`, `rust_f_f55_*`.
+
+**F5.6 (std's sealed traits, 0.30.1).** A trait std marks
+`#[sealed_trait]` (accepted in std's text only) takes no impl outside
+std: `error trait.sealed` at the impl. std's code relies on what their
+impls say: Pattern (str's methods slice a str at the bytes a match
+gives), Step (a Range of a Step ends: `front/check/iterate.vl:
+ends_by_itself`, and so the effects and -O2's willreturn), SliceIndex,
+and the atomics' AtomicValue, AtomicBitwise, AtomicInteger (an Atomic is
+one machine access of 1 to 8 bytes; their methods return a
+`std::sync::atomic::Sealed`, a public struct with no fields, which a
+program could make: 0.30.0 took an `impl AtomicValue` for a 24-byte
+struct, and its Atomic crashed). *Anchor:* `front/parser/rust.vl:
+take_sealed`, `front/traits.vl: check_sealed`. *Cases:*
+`rt_022_sealed_std_traits_impl`, `rust_f_f56_sealed_ok`,
+`rust_f_f56_sealed_atomic_err`.
+
 ### F6 `impl .. for &'a T`, and the probe order
 
 **F6.1 (reference self types).** `impl<'a, T: Tr> Tr for &'a T`,
@@ -2236,6 +2290,8 @@ where a `try:` is named, a case in `tests/borrowck-try`'s shape under
 | `trait.overlap` | F4.2 | E0119 | none; the message gives the witness types |
 | `trait.unconstrained` | F14.1 | E0207 | none; names the parameter |
 | `trait.unmet` | F2.3, F10.2, F11.1, F13.2 (none applies), F16.2, F20.4, F22.1 | E0277 | the missing impl's header, or `use` of the trait when an impl exists in a module not in scope |
+| `trait.impl_lifetimes` | F5.5 (0.30.1) | E0308, E0195 | none: the trait's lifetimes, written in the impl's signature |
+| `trait.sealed` | F5.6 (0.30.1) | E0658 (Pattern, Step), a sealed trait | none: one of std's impls |
 | `trait.cycle` | F2.1, F3.1 | E0391 | none |
 | `trait.missing_item` | F3.1 (a const without default omitted), an impl missing a method (today's message, now coded) | E0046 | inserts the item's signature with `todo()` |
 | `trait.extra_item` | F3.1, an impl item the trait lacks | E0407, E0438 | none |

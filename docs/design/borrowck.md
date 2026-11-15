@@ -818,6 +818,25 @@ bounds instantiated (`Scope<'scope, 'env: 'scope>` gives `'env ⊒
 'scope`) and its inferred requirements (D4.6), and recurses into `τ`. Values: `val('u) = Pts ∪ {end('v) |
 'u ⊒ 'v}`; in particular `val('static) = Pts ∪ Ends`.
 
+*(0.30.1) A type parameter's outlives bound at a call* (rustc E0310). A
+callee's (or a struct's) `P: 'static` is met by a concrete argument
+through its lifetimes (its slots, D3.6 at the call); by the caller's own
+type parameter `T` (an Ω in the opaque instance, D4.4 (d), which has no
+slots) only through `T`'s declared bounds, `T: 'static` in its list or a
+`where`; and by a type holding a `T` (a tuple, a closure capturing one,
+a struct's or enum's argument, a reference to one) only when each such
+`T` has it. Else `error borrowck.param_outlives`, at the call or the
+type, made by the front (`front/traits.vl: check_bounds,
+check_outlives`; an Ω copies its parameter's lifetime bounds,
+`front/opaque.vl: omega_of`). 0.30.0 checked neither: `fn start<T:
+FnOnce() -> usize + Send>(t: T) -> JoinHandle<..> { spawn_in(t, gpa) }`
+was accepted, and its concrete instance's check reads the closure's
+captured borrow as a substitution's region, whose violations D4.4 (g)
+leaves to the template. A bound `P: 'a` of a named lifetime is not
+checked so yet (the Ω has no region to relate): a gap, rustc's E0309.
+*Cases:* `rt_008_static_bound_through_generic`,
+`rust_b_param_outlives_err`, `rust_b_param_outlives_ok`.
+
 **D4.6 (implied bounds, as rustc's well-formedness; 0.27.2.1).** D4.5's
 walk is completed by four readings, each rustc's (a type in a signature
 or an impl header is assumed well-formed, so what its well-formedness
@@ -1710,6 +1729,7 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.dropped_borrowed` | D2.5: `WD` vs a loan; D9.2 | E0597, E0713 | "declare `x` before `v`" when both are locals of one block (the reorder is mechanical: `fix` moves the `let`) |
 | `borrowck.return_local` | D6.2.2 | E0515 | none; the help suggests returning an owned value |
 | `borrowck.outlives` | D6.2.1; D19.10 case 1 | E0621, E0623, E0521 | "add `'a: 'b`", or "name the lifetime `'a` on `x`" when the blame path ends at two parameters of elided regions (E2 failed): `fix --suggested` writes `<'a>` on both |
+| `borrowck.param_outlives` | D4.5 (0.30.1) | E0310 | "add `T: 'static`" |
 | `borrowck.elision` | E4 at the signature (ir271) | E0106 | writes `<'a>` and `&'a` on the only reference parameter when there is one |
 | `borrowck.unused_param` | D5.3 (ir271) | E0392 | adds a `PhantomData<&'a ()>` field |
 | `borrowck.use_moved` | M1, M5 | E0382 | `.clone()` when `Clone` (as `own.moved`'s) |

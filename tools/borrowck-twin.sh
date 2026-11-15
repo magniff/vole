@@ -95,6 +95,7 @@ map_code() {
         E0515) echo return_local ;;
         E0621|E0623|E0521|lifetime|captured) echo outlives ;;  # (0.27.2: E0521, D20.3; "captured variable cannot escape", D19.10)
         E0106) echo elision ;;
+        E0310) echo param_outlives ;;  # (0.30.1, D4.5: the front's check of a type parameter's 'static)
         E0392) echo unused_param ;;
         E0382) echo use_moved ;;
         E0381) echo assign_moved_part ;;
