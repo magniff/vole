@@ -85,6 +85,14 @@
 # voltty-fuzz (tests/voltty/run.sh -s 60: the terminal's core against
 # alacritty_terminal, 60 s of the differential fuzzer, 0.23; skipped
 # without cargo);
+# e18-loans (tests/e18_loans.sh, 0.30.1: E1.8's two lists, the walk's
+# borrow sites and the places IR's borrows, compared over every tests/run
+# program and example, after its self-test: the planted faults seen, each
+# changing a listing and a verdict; --quick too);
+# main-stack (tests/main_stack.sh, 0.30.1: the compiler's own 1 GiB
+# thread, and its refusals planted with a shim: said once, as a
+# diagnostic, and a -j 4 build on fewer threads; macOS, else a SKIP;
+# --quick too);
 # unsafe-audit (tests/unsafe_audit.sh, 0.25.3: the unsafe sites of
 # compiler/src and std without // UNSAFE: and // SAFETY:, `volec query
 # unsafe`; 0.29: none of them, and no unsafe block of compiler/src with
@@ -305,7 +313,7 @@ esac
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-seed fuzz-sem"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin stdtools std-check std-tests cachediff"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost e18-loans main-stack unsafe-audit borrowck-twin stdtools std-check std-tests cachediff"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
 # rebuild compilers rather than test one
 RELEASE_STEPS="chain-diverse chain-fresh"
@@ -322,7 +330,7 @@ OTHER_STEPS="valgrind $INSIDE_SMOKE_STEPS"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
     quick)
-        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost unsafe-audit borrowck-twin stdtools std-tests cachediff"
+        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost e18-loans main-stack unsafe-audit borrowck-twin stdtools std-tests cachediff"
         [ $LINUX -eq 1 ] && STEPS="$SMOKE_STEPS $STEPS" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
@@ -413,10 +421,10 @@ held_slots() { # <step>
     hs=0
     if [ $INSIDE -eq 0 ]; then
         case "$1" in
-            suite-*|stress-grow) hs=2 ;;
+            suite-*|stress-grow|e18-loans) hs=2 ;;
             cachediff|std-check) hs=4 ;;
             chain-diverse|chain-fresh) hs=$JOBS ;;
-            layout|debug|unsafe-audit|borrowck-twin|stdtools|voltty-fuzz|compile-cost) hs=1 ;;
+            layout|debug|unsafe-audit|borrowck-twin|stdtools|voltty-fuzz|compile-cost|main-stack) hs=1 ;;
         esac
     fi
     hs_max=$JOBS
@@ -933,6 +941,11 @@ run_step() {
         threads) sh "$ROOT/tests/threads_writes.sh" -c "$C" && sh "$ROOT/tests/threads.sh" -c "$C" ;;
         incremental) sh "$ROOT/tests/incremental.sh" -c "$C" ;;
         # (0.25.3) the unsafe sites without justification, against the baseline
+        # (0.30.1: the self-test, then the sweep with VOLE_CACHE=off, its
+        # own; two jobs, its slots)
+        e18-loans) sh "$ROOT/tests/e18_loans.sh" -c "$C" --self-test \
+            && sh "$ROOT/tests/e18_loans.sh" -c "$C" -j 2 ;;
+        main-stack) sh "$ROOT/tests/main_stack.sh" -c "$C" ;;
         unsafe-audit) sh "$ROOT/tests/unsafe_audit.sh" -c "$C" ;;
         # (0.30) std inside the tools, in a copy of compiler/std (also a
         # suite of tests/run.sh)
@@ -1525,8 +1538,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*|smoke-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff)
-            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff|e18-loans|main-stack)
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff|e18-loans|main-stack):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         # (no rows: it failed before the container's steps, e.g. docker)

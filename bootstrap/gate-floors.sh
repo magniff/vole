@@ -251,6 +251,18 @@ case "$STEP" in
     # (0.30.0: 469)
     borrowck-twin)
         judge "$(count 'borrowck-twin: ')" "$(hfloor 420)" "cases compared with rustc" ;;
+    # (0.30.1: 5581 programs swept, after a self-test that names 4
+    # verdicts; a SKIP of main-stack off macOS is its line's)
+    e18-loans)
+        [ "$(lines 'e18-loans: self-test ok: .* [0-9]+ verdicts changed by one')" -ge 1 ] \
+            || refuse "no self-test line in its log: the sweep ran without its faults shown caught"
+        judge "$(count 'borrow site, over ')" "$(hfloor 5000)" "programs swept" ;;
+    main-stack)
+        if grep -q '^main-stack: SKIP' "$LOG"; then
+            echo "floor $STEP: SKIP: $(grep '^main-stack: SKIP' "$LOG" | tail -1)"
+            exit 77
+        fi
+        judge "$(lines '^main-stack: ok: ')" 1 "checks" ;;
     # (0.30.0: 41)
     stdtools)
         judge "$(count 'stdtools: ')" "$(hfloor 38)" "cases" ;;
