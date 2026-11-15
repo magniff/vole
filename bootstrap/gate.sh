@@ -72,7 +72,9 @@
 # fuzz-div, fuzz-range, fuzz-arch (0.19: intrinsics), fuzz-guard (0.25:
 # guarded accesses, never run where the program does not), fuzz-moves
 # and fuzz-moves-vec (0.30.1: values of every class and width rotated
-# around loops, the edges' moves through shared spill slots), fuzz-seed
+# around loops, the edges' moves through shared spill slots, built with
+# --verify-regalloc; at least 20 programs in every mode, and again for
+# x86_64-macos under Rosetta: fuzz-moves-x86, fuzz-moves-vec-x86), fuzz-seed
 # (against the Rust seed), fuzz-sem (0.25: value semantics, drops and
 # leaks against tools/semfuzz/semfuzz.py's model; not in 0.28, back in
 # 0.29 with its programs in the one language); abi-plain,
@@ -304,8 +306,12 @@ case "$MODE" in
 esac
 [ -z "$FUZZ_N" ] || { FZ=$FUZZ_N; XFZ=$FUZZ_N; AFZ=$FUZZ_N; SFZ=$FUZZ_N; }
 [ -z "$ABI_N" ] || { AB=$ABI_N; XAB=$ABI_N; AAB=$ABI_N; }
+# (0.30.1) the moves rows: at least 20 programs, whatever the mode (RT-CG-6
+# planted back fails first at -M -V's seed 13); gate-floors.sh asks the same
+MFZ=$FZ
+[ "$MFZ" -ge 20 ] || MFZ=20
 
-FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-moves fuzz-moves-vec fuzz-seed fuzz-sem"
+FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-moves fuzz-moves-vec fuzz-moves-x86 fuzz-moves-vec-x86 fuzz-seed fuzz-sem"
 ABI_STEPS="abi-plain abi-import abi-header"
 HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin stdtools std-check std-tests cachediff"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
@@ -894,8 +900,19 @@ run_step() {
         fuzz-guard) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -G ;;
         # (0.30.1, RT-CG-5, RT-CG-6) the moves of loop edges through spill
         # slots shared by integers, floats, structs and vectors
-        fuzz-moves) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -M ;;
-        fuzz-moves-vec) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -M -V ;;
+        fuzz-moves) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$MFZ" -k "$k" -M ;;
+        fuzz-moves-vec) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$MFZ" -k "$k" -M -V ;;
+        # (0.30.1) the same for x86-64, where 0.30.0 failed more of them,
+        # run by Rosetta; a host without it is a SKIP the log names
+        fuzz-moves-x86|fuzz-moves-vec-x86)
+            if [ "$(uname -s)" != Darwin ] || ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+                echo "skip: no x86_64-macos here (Rosetta: softwareupdate --install-rosetta)"
+                return 0
+            fi
+            v=""
+            [ "$1" = fuzz-moves-vec-x86 ] && v=-V
+            # shellcheck disable=SC2086
+            sh "$ROOT/tests/fuzz/run.sh" -c "$C" -t x86_64-macos -n "$MFZ" -k "$k" -M $v ;;
         # (0.25) value semantics: seeded (the same programs every run of
         # a mode), failing ones shrunk and kept with their expected output;
         # 0.25.2: as many again with --assign-calls (owned

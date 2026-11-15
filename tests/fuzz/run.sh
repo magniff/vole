@@ -41,7 +41,8 @@
 #                 under register pressure, from genmoves.awk (0.30.1,
 #                 RT-CG-5, RT-CG-6: the moves of an edge through spill
 #                 slots shared by an integer, a float and a vector);
-#                 with -V, the 8-, 16- and 32-byte vectors among them
+#                 with -V, the 8-, 16- and 32-byte vectors among them;
+#                 each built with --verify-regalloc
 #   -j JOBS       programs tested at once (default: the number of CPUs,
 #                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
 
@@ -77,9 +78,11 @@ while [ $# -gt 0 ]; do
         -G) GUARDS=1; shift ;;
         -M) MOVES=1; shift ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
+VERIFY_RA=""
+[ "${MOVES:-0}" = 1 ] && VERIFY_RA=--verify-regalloc
 if [ -z "$TARGET" ]; then
     case "$(uname -s)-$(uname -m)" in
         Darwin-arm64) TARGET=aarch64-macos ;;
@@ -158,7 +161,11 @@ test_seed() {
             # (0.26.3, decision 6: the programs' arithmetic wraps, at
             # every level, with the overflow checks off; -O0 would check
             # it. tests/run's ovf_ cases test the checks.)
-            "$COMPILER" --target "$TARGET" "-$level" --overflow-checks=off --deny-warnings --verify-ir "$program" -o "$exe.o" >"$exe.log" 2>&1 \
+            # (0.30.1) -M: the allocation checked too, its moves simulated
+            # (--verify-regalloc), so a wrong order is an error even where
+            # the program's output does not show it
+            # shellcheck disable=SC2086
+            "$COMPILER" --target "$TARGET" "-$level" --overflow-checks=off --deny-warnings --verify-ir $VERIFY_RA "$program" -o "$exe.o" >"$exe.log" 2>&1 \
                 || { why="-$level failed to compile it: $(head -3 "$exe.log")"; break; }
             # shellcheck disable=SC2086
             cc_run $ARCH -o "$exe" "$exe.o" >>"$exe.log" 2>&1 || { why="-$level: cc failed"; break; }
