@@ -96,6 +96,13 @@ aarch64-macos|fmov d5, x63
 aarch64-macos|fadd v32.2d, v0.2d, v1.2d
 aarch64-macos|str d-15, [sp, #16]
 aarch64-macos|ldr x-1, [sp]
+aarch64-macos|str sp, [x0]
+aarch64-macos|add x0, xzr, #1
+aarch64-macos|adds sp, x0, #1
+aarch64-macos|orr sp, x0, x1
+aarch64-macos|ldr x0, [xzr]
+aarch64-macos|ldr x0, [w1]
+aarch64-macos|ldr v1, [sp]
 x86_64-macos|movsd 16(%rsp), %r10
 x86_64-macos|movss %eax, 16(%rsp)
 x86_64-macos|movapd %rax, %xmm1
@@ -108,6 +115,17 @@ x86_64-macos|leaq (%rax), %xmm0
 x86_64-macos|cvtsi2sdq %xmm2, %xmm1
 x86_64-macos|cvttsd2si %xmm1, %xmm2
 x86_64-macos|movq %xmm16, 16(%rsp)
+x86_64-macos|call *%xmm0
+x86_64-macos|jmp *%xmm1
+x86_64-macos|xaddq %xmm0, (%rax)
+x86_64-macos|cmpxchgl %eax, %ecx
+x86_64-macos|pmovmskb %rax, %eax
+x86_64-macos|pextrq $1, %rax, %rcx
+x86_64-macos|pinsrq $1, %xmm1, %xmm2
+x86_64-macos|popcntq %xmm1, %rax
+x86_64-macos|paddsb %rax, %xmm1
+x86_64-macos|vpmovmskb %xmm1, %xmm2
+x86_64-macos|andnq %xmm1, %rax, %rcx
 EOF
 echo "enc: $refused registers of the wrong class or number refused"
 # The moves of an xmm register to and from memory, as cc writes them.
@@ -126,6 +144,47 @@ if cc -target x86_64-apple-macos -c "$OUT/movq.s" -o "$OUT/movq.cc.o" 2>/dev/nul
         else
             echo "enc: movq and movd to and from memory: the same bytes as cc's"
         fi
+    fi
+fi
+# (0.30.1) AArch64's sp and xzr each where its field means it, and the
+# loads and stores of q, h and b registers (h and b were encoded as q),
+# as cc writes them.
+printf '.text\n.globl _f\n_f:\n    mov x0, xzr\n    add sp, sp, #16\n    sub sp, sp, #32\n    mov x29, sp\n    mov sp, x29\n    add x0, sp, x1\n    cmp sp, #0\n    str xzr, [sp]\n    subs x0, sp, #1\n    add x0, x1, xzr\n    ldr q1, [sp, #16]\n    str q1, [sp, #16]\n    ldr h1, [sp, #2]\n    str h1, [sp, #2]\n    ldr b1, [sp, #1]\n    str b1, [sp, #1]\n    ldr h2, [x0, x1, lsl #1]\n    ldr b2, [x0, x1]\n    ret\n' >"$OUT/a64regs.s"
+if cc -target arm64-apple-macos -c "$OUT/a64regs.s" -o "$OUT/a64regs.cc.o" 2>/dev/null; then
+    if ! "$COMPILER" assemble --target aarch64-macos "$OUT/a64regs.s" -o "$OUT/a64regs.o" >"$OUT/a64regs.log" 2>&1; then
+        echo "enc: FAIL a64regs: $(head -1 "$OUT/a64regs.log")"
+        status=1
+    else
+        objdump -d --no-leading-addr "$OUT/a64regs.o" | sed -n '/^ /p' >"$OUT/a64regs.ours"
+        objdump -d --no-leading-addr "$OUT/a64regs.cc.o" | sed -n '/^ /p' >"$OUT/a64regs.theirs"
+        if ! cmp -s "$OUT/a64regs.ours" "$OUT/a64regs.theirs"; then
+            echo "enc: FAIL a64regs: the encodings differ from cc's (< ours, > cc's):"
+            diff "$OUT/a64regs.ours" "$OUT/a64regs.theirs" | head -10
+            status=1
+        else
+            echo "enc: AArch64 sp, xzr, q, h and b: the same bytes as cc's"
+        fi
+    fi
+fi
+# (0.30.1) A symbol is never a register: where the instruction takes a
+# symbol (a branch's target, adrp's page, a relocation) `d5`, `w7`, `x3`,
+# `q1` and `sp` are labels, as C's names may be (0.30.0 refused them or
+# took them for registers). cc's assembler refuses these names, so the
+# check is the branches' targets and the relocations' symbols; ELF, where
+# a C name is not prefixed with `_`.
+printf '.text\n.globl f\nf:\n    bl d5\n    bl w7\n    b x3\n    cbz x0, q1\n    tbz x0, #3, sp\n    adrp x1, ext_d6\n    bl ext_d6\n    adrp x2, w8\n    add x2, x2, :lo12:w8\n    bl w8\n    ret\nd5:\n    ret\nw7:\n    ret\nx3:\n    ret\nq1:\n    ret\nsp:\n    ret\n' | sed 's/ext_d6/d6/g' >"$OUT/sym.s"
+if ! "$COMPILER" assemble --target aarch64-linux "$OUT/sym.s" -o "$OUT/sym.o" >"$OUT/sym.log" 2>&1; then
+    echo "enc: FAIL symbols named like registers: $(head -1 "$OUT/sym.log")"
+    status=1
+else
+    got=$({ objdump -d --no-leading-addr "$OUT/sym.o" | sed -n '/^ /p' | grep -oE '<(d5|w7|x3|q1|sp)>'
+        objdump -r "$OUT/sym.o" | grep -oE 'R_AARCH64_[A-Z0-9_]+[[:space:]]+(d6|w8)'; } | tr -s ' \t' ' ' | tr '\n' ',')
+    want='<d5>,<w7>,<x3>,<q1>,<sp>,R_AARCH64_ADR_PREL_PG_HI21 d6,R_AARCH64_CALL26 d6,R_AARCH64_ADR_PREL_PG_HI21 w8,R_AARCH64_ADD_ABS_LO12_NC w8,R_AARCH64_CALL26 w8,'
+    if [ "$got" != "$want" ]; then
+        echo "enc: FAIL symbols named like registers: $got, not $want"
+        status=1
+    else
+        echo "enc: AArch64 symbols named like registers: labels and relocations"
     fi
 fi
 [ $status = 0 ] && echo "enc: ok"

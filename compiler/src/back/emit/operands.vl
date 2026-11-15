@@ -191,7 +191,7 @@ pub fn pm_kind(cx: &mut FnCtx<Comp>, i: i64) -> i64 { (
 pub fn pm_src(cx: &mut FnCtx<Comp>, i: i64) -> i64 { (
     cx.pm[(i * PM_FIELDS + 2) as usize]) }
 
-fn pm_ty(cx: &mut FnCtx<Comp>, i: i64) -> i64 { (cx.pm[(i * PM_FIELDS + 3) as usize]) }
+pub fn pm_ty(cx: &mut FnCtx<Comp>, i: i64) -> i64 { (cx.pm[(i * PM_FIELDS + 3) as usize]) }
 
 fn pm_done(cx: &mut FnCtx<Comp>, i: i64) -> bool {
     (cx.pm[(i * PM_FIELDS + 4) as usize]) != 0
@@ -230,68 +230,79 @@ fn move_loc(cx: &mut FnCtx<Comp>, dst: i64, src: i64, ty: i64, pcx: &Ctx<Comp>) 
     }
 }
 
-// Whether location `loc` is the source of a pending location move other
-// than move `except`.
-fn pm_is_source(cx: &mut FnCtx<Comp>, loc: i64, except: i64) -> bool {
-    let n = cx.pm.len() as i64 / PM_FIELDS;
-    for j in 0..n {
-        if j != except && !pm_done(cx, j) && pm_kind(cx, j) == PM_LOC && pm_src(cx, j) == loc {
-            return true;
-        }
+// (0.30.1, RT-CG-6) A location as storage: a register is one cell; a
+// spill slot is 8 bytes, and a value wider than 8 bytes (a 128-bit vector,
+// x86-64's 256-bit one) stored at slot k takes the slots k to k + cells -
+// 1 (assign_spill_slots gives it that many, aligned). Moves, their order
+// and the allocation's check reason about these cells, never about the
+// slot number alone: a move writing slot k + 1 must wait for a 16-byte
+// read of slot k.
+pub fn loc_cells(loc: i64, ty: i64, pcx: &Ctx<Comp>) -> i64 {
+    if loc >= 0 {
+        return 1;
     }
-    false
+    let size = type_size(spill_type(ty, pcx), pcx);
+    if size > 8 { (size + 7) / 8 } else { 1 }
 }
 
-// (0.30.1) The type of the value location `d` holds for the pending
-// location moves that read it, of the first n moves. They read one value,
-// so they agree in its class and in the size its location is accessed
-// with; a disagreement, or no move reading it, is an internal error.
-fn pm_reader_ty(cx: &mut FnCtx<Comp>, d: i64, n: i64, pcx: &Ctx<Comp>) -> i64 {
-    let mut found = false;
-    let mut ty: i64 = 0;
-    for j in 0..n {
-        if pm_done(cx, j) || pm_kind(cx, j) != PM_LOC || pm_src(cx, j) != d {
-            continue;
-        }
-        let tj = pm_ty(cx, j);
-        if !found {
-            found = true;
-            ty = tj;
-        } else if in_fregs(tj, pcx) != in_fregs(ty, pcx)
-            || type_size(spill_type(tj, pcx), pcx) != type_size(spill_type(ty, pcx), pcx) {
-            die(c"internal error: a parallel move cycle reads one location as two kinds of value");
-        }
+// Whether location a (a value of type ta) and location b (of type tb)
+// share storage.
+pub fn locs_overlap(a: i64, ta: i64, b: i64, tb: i64, pcx: &Ctx<Comp>) -> bool {
+    if a >= 0 || b >= 0 {
+        return a == b;
     }
-    if !found {
-        die(c"internal error: a parallel move cycle with no move reading its location");
-    }
-    ty
+    let sa = 0 - a - 1;
+    let sb = 0 - b - 1;
+    sa < sb + loc_cells(b, tb, pcx) && sb < sa + loc_cells(a, ta, pcx)
 }
 
-// Emits every pending move, then clears them.
-pub fn pm_resolve(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
+// The pending location move other than `except` (of the first n) whose
+// source shares storage with location loc of type ty, or -1.
+fn plan_reader(cx: &mut FnCtx<Comp>, src: &[i64], done: &[bool], loc: i64, ty: i64, except: i64,
+    n: i64, pcx: &Ctx<Comp>) -> i64 {
+    for j in 0..n {
+        if j != except && !done[j as usize]
+            && locs_overlap(src[j as usize], pm_ty(cx, j), loc, ty, pcx) {
+            return j;
+        }
+    }
+    -1
+}
+
+// (0.30.1, RT-CG-5, RT-CG-6) The order of the pending location moves,
+// as steps of three (destination, source, type), each made by move_loc:
+// what pm_resolve emits and what the allocation's check simulates. A move
+// is made once no other pending move reads any cell of its destination.
+// When only cycles are left, one move on a cycle has its source saved in
+// the cycle register (of the class of its own type: the value's) and the
+// moves reading that source read the register instead; that frees the
+// move before it on the cycle. A source that other pending moves read
+// only in part, or as another kind of value, is an internal error (two
+// values never share a cell while both are live).
+pub fn pm_plan(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) -> Vec<i64, Comp> {
     let n = cx.pm.len() as i64 / PM_FIELDS;
+    let mut src: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut done: Vec<bool, Comp> = Vec::new_in(Comp {});
     for i in 0..n {
-        if pm_kind(cx, i) == PM_LOC && pm_dst(cx, i) == pm_src(cx, i) {
-            (cx.pm[(i * PM_FIELDS + 4) as usize]) = 1;
-        }
+        src.push(pm_src(cx, i));
+        done.push(pm_kind(cx, i) != PM_LOC || pm_dst(cx, i) == pm_src(cx, i));
     }
+    let mut steps: Vec<i64, Comp> = Vec::new_in(Comp {});
     loop {
         let mut pending = false;
         let mut progress = false;
         for i in 0..n {
-            if pm_done(cx, i) || pm_kind(cx, i) != PM_LOC {
+            if done[i as usize] {
                 continue;
             }
             pending = true;
-            let pm_dst_v1 = pm_dst(cx, i);
-            let pm_is_source_v = pm_is_source(cx, pm_dst_v1, i);
-            if !pm_is_source_v {
-                let pm_dst_v = pm_dst(cx, i);
-                let pm_src_v = pm_src(cx, i);
-                let pm_ty_v = pm_ty(cx, i);
-                move_loc(cx, pm_dst_v, pm_src_v, pm_ty_v, pcx);
-                (cx.pm[(i * PM_FIELDS + 4) as usize]) = 1;
+            let d = pm_dst(cx, i);
+            let ty = pm_ty(cx, i);
+            if plan_reader(cx, src.as_slice(), done.as_slice(), d, ty, i, n, pcx) < 0 {
+                steps.push(d);
+                steps.push(src[i as usize]);
+                steps.push(ty);
+                done[i as usize] = true;
                 progress = true;
             }
         }
@@ -301,30 +312,64 @@ pub fn pm_resolve(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
         if progress {
             continue;
         }
-        // Only cycles are left: save one destination's current value in
-        // the cycle register, and read it from there instead.
-        let mut i: i64 = 0;
-        while pm_done(cx, i) || pm_kind(cx, i) != PM_LOC {
-            i += 1;
+        // Every pending move waits for another: after n steps along the
+        // waits, c is on a cycle.
+        let mut c: i64 = 0;
+        while done[c as usize] {
+            c += 1;
         }
-        let d = pm_dst(cx, i);
-        // (0.30.1) The value saved is the one d holds now, which the
-        // moves reading d take: it has their type, not move i's. A spill
-        // slot is shared by values of either class, so a cycle through
-        // slots can write a float where an integer was read: saved by
-        // move i's type, the integer went through d31 and was stored from
-        // `x63`, which is xzr (RT-CG-5).
-        let saved_ty = pm_reader_ty(cx, d, n, pcx);
-        let temp = reg_cycle(in_fregs(saved_ty, pcx));
-        if pm_is_source(cx, temp, -1) {
-            die(c"internal error: parallel move cycle register in use");
-        }
-        move_loc(cx, temp, d, saved_ty, pcx);
-        for j in 0..n {
-            if !pm_done(cx, j) && pm_kind(cx, j) == PM_LOC && pm_src(cx, j) == d {
-                (cx.pm[(j * PM_FIELDS + 2) as usize]) = temp;
+        for _ in 0..n {
+            let d = pm_dst(cx, c);
+            let ty = pm_ty(cx, c);
+            c = plan_reader(cx, src.as_slice(), done.as_slice(), d, ty, c, n, pcx);
+            if c < 0 {
+                die(c"internal error: a parallel move waits for no move");
             }
         }
+        let s = src[c as usize];
+        let ty = pm_ty(cx, c);
+        for j in 0..n {
+            if done[j as usize]
+                || !locs_overlap(src[j as usize], pm_ty(cx, j), s, ty, pcx) {
+                continue;
+            }
+            let tj = pm_ty(cx, j);
+            if src[j as usize] != s || in_fregs(tj, pcx) != in_fregs(ty, pcx)
+                || loc_cells(s, tj, pcx) != loc_cells(s, ty, pcx)
+                || type_size(spill_type(tj, pcx), pcx) != type_size(spill_type(ty, pcx), pcx) {
+                die(c"internal error: a parallel move cycle reads one location as two values");
+            }
+        }
+        let mut temp = reg_cycle(in_fregs(ty, pcx));
+        if plan_reader(cx, src.as_slice(), done.as_slice(), temp, ty, -1, n, pcx) >= 0 {
+            // The cycle register holds an earlier break's value: the
+            // cells assign_spill_slots keeps for a second one.
+            temp = 0 - (1 + (cx.spill_count - 4));
+            if !cx.spill_vectors
+                || plan_reader(cx, src.as_slice(), done.as_slice(), temp, ty, -1, n, pcx) >= 0 {
+                die(c"internal error: parallel move cycle register in use");
+            }
+        }
+        steps.push(temp);
+        steps.push(s);
+        steps.push(ty);
+        for j in 0..n {
+            if !done[j as usize] && src[j as usize] == s {
+                src[j as usize] = temp;
+            }
+        }
+    }
+    steps
+}
+
+// Emits every pending move, then clears them.
+pub fn pm_resolve(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
+    let n = cx.pm.len() as i64 / PM_FIELDS;
+    let steps = pm_plan(cx, pcx);
+    let mut k: usize = 0;
+    while k < steps.len() {
+        move_loc(cx, steps[k], steps[k + 1], steps[k + 2], pcx);
+        k += 3;
     }
     for i in 0..n {
         if pm_done(cx, i) || pm_kind(cx, i) == PM_LOC {
