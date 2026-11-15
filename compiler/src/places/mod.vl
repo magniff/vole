@@ -176,7 +176,13 @@ pub fn run_places(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
     crate::places::impl_regions::check_impl_regions(pcx);
     // (0.27.2: every closure's kind and env type, before the bodies:
     // D19.2-D19.4, front/closures/kinds.vl)
-    crate::front::closures::kinds::infer_kinds(pbody, pcx);
+    let failed = crate::front::closures::kinds::infer_kinds(pbody, pcx);
+    // RULE: D19.6 (0.30.1) a closure that does not meet its bound
+    // (closure.kind, rustc E0525) is the error: the bodies that would be
+    // borrow-checked with a kind it does not have are not
+    // (kind_failed_bodies); the others are
+    let skip = kind_failed_bodies(&failed, pcx);
+    let skipped = |g: i64| g >= 0 && g < skip.len() as i64 && skip[g as usize];
     // (FN_COUNT grows: a `Drop::drop` instance a drop needs is made here,
     // shim.vl: drop_fn, and built in turn; 0.26.2: a std `drop` that
     // nothing called, checked only now, is built before the functions
@@ -188,7 +194,8 @@ pub fn run_places(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
     let mut id = pcx.closures.len() as i64 - 1;
     while id >= 0 {
         let g = pcx.closures[id as usize].f;
-        if pcx.closures[id as usize].xc_at > 0 || pcx.closures[id as usize].kind != 0 {
+        if (pcx.closures[id as usize].xc_at > 0 || pcx.closures[id as usize].kind != 0)
+            && !skipped(g) {
             pcx.next_fn = g + 1;
             place_body(g, out, &mut bck, pbody, pcx);
             first.push(g);
@@ -203,7 +210,7 @@ pub fn run_places(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
             late += 1;
         } else {
             pcx.next_fn = f + 1;
-            if !first.contains(&f) {
+            if !first.contains(&f) && !skipped(f) {
                 place_body(f, out, &mut bck, pbody, pcx);
             }
             f += 1;
@@ -256,6 +263,62 @@ pub fn run_places(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
         buf_write_fd(msg, STDERR);
         die(c"places.verify failed");
     }
+}
+
+// RULE: D19.6 (0.30.1) The bodies a closure that does not meet its bound
+// (closure.kind, kinds.vl infer_kinds) leaves unchecked: its own, the
+// function that holds it, every instance whose type argument is it or a
+// reference to it (`race::<C>`, whose `f()` of a `&F` would ask an FnMut
+// for what only an Fn gives), and the closures inside those. They would
+// be borrow-checked with a kind the closure does not have; every other
+// body is checked as always, its errors reported.
+fn kind_failed_bodies(failed: &Vec<i64, Comp>, pcx: &Ctx<Comp>) -> Vec<bool, Comp> {
+    let n = pcx.fns.len() as i64;
+    let mut skip = Vec::<bool, Comp>::new_in(Comp {});
+    for _ in 0..n {
+        skip.push(false);
+    }
+    if failed.len() == 0 {
+        return skip;
+    }
+    let mut types = Vec::<i64, Comp>::new_in(Comp {});
+    for &id in failed.as_slice() {
+        let c = pcx.closures[id as usize];
+        skip[c.f as usize] = true;
+        if c.encl_fn >= 0 && c.encl_fn < n {
+            skip[c.encl_fn as usize] = true;
+        }
+        types.push(c.ty);
+    }
+    for g in 0..n {
+        let mut i: i64 = 0;
+        while crate::places::front::fn_targ(g, i, pcx) > 0 {
+            let mut t = crate::places::front::fn_targ(g, i, pcx);
+            while t > 0 && pcx.types[t as usize].kind == crate::front::types::TyKind::Ptr
+                && pcx.types[t as usize].b != 0 {
+                t = pcx.types[t as usize].a;
+            }
+            if types.contains(&t) {
+                skip[g as usize] = true;
+            }
+            i += 1;
+        }
+    }
+    // (the closures in a body left out, nested ones in turn)
+    for _ in 0..pcx.closures.len() + 1 {
+        let mut grew = false;
+        for c in pcx.closures.as_slice() {
+            if c.encl_fn >= 0 && c.encl_fn < n && skip[c.encl_fn as usize] && c.f >= 0 && c.f < n
+                && !skip[c.f as usize] {
+                skip[c.f as usize] = true;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    skip
 }
 
 // RULE: Z7.2 (0.27.4) Whether f's body, std's and not an instance, is
@@ -316,6 +379,20 @@ fn place_body(f: i64, out: i64, bck: &mut crate::places::borrowck::Bck<Comp>,
         pcx.fallbacks += 1;
         if pcx.verify_places {
             report_fallback(f, pcx);
+        }
+        // RULE: D2.7 (0.30.1) a rust body the builder could not make is never
+        // borrow-checked: an error, at check and at a build, never a body
+        // passed unchecked (a limit is an error, never a yes). Before, check
+        // said ok and a build stopped in the code generators (`&mut *v` of a
+        // captured view). Not after an error of the body: the builder stops
+        // at what the front refused.
+        if rust && error_count(pcx) == errors {
+            let at = if pcx.fail_node > 0 { pcx.nodes[pcx.fail_node as usize].start }
+                else { pcx.nodes[fn_node(f, pcx) as usize].start };
+            crate::base::diag::report_error_tries(at, 0, c"places.not_built",
+                c"the compiler cannot build this function's places IR, so it cannot borrow-check it: a compiler bug",
+                c"report it, with this function; rewriting the construct named here avoids it", b"",
+                false, pcx);
         }
         return;
     }
