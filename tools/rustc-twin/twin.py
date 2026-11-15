@@ -216,7 +216,8 @@ def inverse_in(s, gpas):
 
 
 def macros(s):
-    """println( -> println!(, a first argument that is no literal printed."""
+    """println( -> println!(, a first argument that is no literal printed,
+    in the arguments too."""
     # (std's free `std::fmt::write(w, x)`, which the translator writes
     # qualified (a program's own `write` shadows the prelude's): Rust's is
     # the macro, as for the bare `write(`)
@@ -230,7 +231,9 @@ def macros(s):
         args, end = scan_args(s, m.end() - 1)
         if args is None:
             continue
-        parts = [s[a:b].strip() for a, b in args]
+        # (0.30.1) a call of one inside the arguments too (`println("{}",
+        # { if c { panic("x") } 1 })`)
+        parts = [macros(s[a:b].strip()) for a, b in args]
         k = FMT_ARG.get(name, 0)
         if len(parts) > k and not parts[k].startswith('"'):
             parts.insert(k, '"{}"')

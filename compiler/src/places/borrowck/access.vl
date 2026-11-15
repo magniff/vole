@@ -19,11 +19,11 @@ use crate::places::borrowck::diag::report;
 use crate::places::cfg::{pred, pred_count};
 use crate::places::ir::{
     BK_FAKE, BK_MUT, BK_MUT2, BK_RAW, BK_RAW_MUT, BK_SHARED, Body, DS_REMOVED, LF_PARAM, LF_STATIC,
-    OK_COPY, OK_MOVE, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, RV_CAST,
-    RV_DISCR, RV_LEN, RV_REF, RV_SLICE, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP,
-    SK_INTRINSIC, SK_LIVE, SK_MENTION, TK_RETURN, TK_SWITCH, block_count, block_start, block_term,
-    has_flag, local_ty, op_a, op_b, op_kind, proj_kind, proj_parent, proj_val, step_type,
-    undistinct,
+    OK_COPY, OK_MOVE, OK_PLACE, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT,
+    RV_CAST, RV_DISCR, RV_LEN, RV_REF, RV_SLICE, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD,
+    SK_DROP, SK_INTRINSIC, SK_LIVE, SK_MENTION, TK_RETURN, TK_SWITCH, block_count, block_start,
+    block_term, has_flag, local_ty, op_a, op_b, op_kind, proj_kind, proj_parent, proj_val,
+    step_type, undistinct,
 };
 
 // Access kinds (D2.2).
@@ -253,9 +253,19 @@ fn val_has(r: i64, p: i64, bck: &Bck<Comp>) -> bool {
 }
 
 // RULE: D7.1 (the activation location of each two-phase loan: the first
-// location after it in its block whose operands mention its temporary)
+// location after it whose operands mention its temporary. 0.30.1: any
+// mention, a copy or a move of it or of a place through it, `&mut2 (*t)`,
+// the reborrow a writer's `__r` is passed on as, in any block after it
+// (the builder makes the blocks of an argument's `&&` or `if` between the
+// reservation and the call, in order: the call's statements come after
+// theirs); with none, its own location, an ordinary `&mut` from there.
+// Before, only a whole copy or move in the loan's own block counted, and
+// a loan with none stayed shared to its end: a writer's reservation was
+// never activated, and a shared borrow of the writer live across the
+// write was accepted)
 fn activations(bck: &mut Bck<Comp>, pbody: &Body<Comp>) {
     bck.act.clear();
+    let ns = pbody.stmts.len() as i64;
     for j in 0..loan_count(bck) {
         bck.act.push(-1);
         if loan_kind(j, bck) != BK_MUT2 {
@@ -267,22 +277,19 @@ fn activations(bck: &mut Bck<Comp>, pbody: &Body<Comp>) {
             continue;
         }
         let t = st.a;
-        let b = crate::places::borrowck::loc_block(s, pbody);
-        if b < 0 {
-            continue;
-        }
-        for loc in s + 1..block_term(b, pbody) + 1 {
+        let mut loc = s + 1;
+        while loc < ns && bck.act[j as usize] < 0 {
             let u = pbody.stmts[loc as usize];
             for i in 0..u.nops {
                 let k = op_kind(u.ops, i, pbody);
-                if (k == OK_COPY || k == OK_MOVE) && op_a(u.ops, i, pbody) == t
-                    && op_b(u.ops, i, pbody) == 0 {
+                if (k == OK_COPY || k == OK_MOVE || k == OK_PLACE) && op_a(u.ops, i, pbody) == t {
                     bck.act[j as usize] = loc;
                 }
             }
-            if bck.act[j as usize] >= 0 {
-                break;
-            }
+            loc += 1;
+        }
+        if bck.act[j as usize] < 0 {
+            bck.act[j as usize] = s;
         }
     }
 }
@@ -598,6 +605,12 @@ fn access(deep: bool, kind: i64, target: i64, l: i64, p: i64, deref: i64, loc: i
             let conflict = if kind == A_RC || kind == A_RB || kind == A_RESERVE { mutable }
                 else { true };
             if !conflict {
+                continue;
+            }
+            // (0.30.1: two two-phase loans activated by one call, `f(s, s)`
+            // of a view's implicit reborrows: one error, the later's against
+            // the earlier, as rustc's E0499)
+            if kind == A_ACTIVATE && lk == BK_MUT2 && bck.act[j as usize] == loc && j > target {
                 continue;
             }
             // The code (step 6), by the loan's kind.
