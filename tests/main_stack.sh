@@ -8,7 +8,13 @@
 # elsewhere): the check must still pass, with the warning once; without
 # the shim there is no warning, and an 8000-term chain checks
 # (rt_028_long_operator_chain.vl, which the first thread's 8 MB does not
-# take).
+# take). (0.30.1, the review's) The warning is a diagnostic,
+# thread.main-stack: once in a build that fails too (a lazy std's build
+# with errors is made again, and the first run's is not printed), JSON
+# under --json, and not said by --version or explain, which compile
+# nothing; with every stack size refused (nosize: the workers' 64 MB
+# too), a -j 4 build at -O2 builds, on fewer threads, and its program
+# runs.
 #
 # usage: tests/main_stack.sh [-c COMPILER]
 set -u
@@ -44,17 +50,44 @@ s=$?
 if [ $s -ne 0 ]; then
     echo "main-stack: FAIL: an 8000-term chain: exit $s"; bad=1
 fi
-for mode in nosize nobig; do
-    SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" check "$T/ok.vl" \
+cat > "$T/bad.vl" <<'VL'
+fn main() {
+    let x: u64 = "s";
+}
+VL
+# (each: the shim's mode, the exit status wanted, the command line)
+while read -r mode want args; do
+    # shellcheck disable=SC2086
+    SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" $args \
         > "$T/o" 2> "$T/e"
     s=$?
-    n=$(grep -c "$W" "$T/e")
-    if [ $s -ne 0 ] || [ "$n" -ne 1 ]; then
-        echo "main-stack: FAIL: SHIM_MODE=$mode: exit $s, the warning $n times (1 wanted):"
-        cat "$T/e"; bad=1
+    n=$(cat "$T/o" "$T/e" | grep -c "$W")
+    if [ $s -ne "$want" ] || [ "$n" -ne 1 ]; then
+        echo "main-stack: FAIL: SHIM_MODE=$mode volec $args: exit $s ($want wanted), the warning $n times (1 wanted):"
+        cat "$T/o" "$T/e"; bad=1
+    fi
+done <<LINES
+nosize 0 check $T/ok.vl
+nobig 0 check $T/ok.vl
+nobig 1 $T/bad.vl -o $T/bad
+nosize 0 -O2 -j 4 $T/ok.vl -o $T/ok4
+LINES
+if [ ! -x "$T/ok4" ] || [ "$("$T/ok4")" != 3 ]; then
+    echo "main-stack: FAIL: the -j 4 build on no worker's stack did not run"; bad=1
+fi
+SHIM_MODE=nobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" --json check "$T/ok.vl" \
+    > "$T/o" 2> "$T/e"
+if ! cat "$T/o" "$T/e" | grep -q '^{"kind":"diagnostic","severity":"warning","code":"thread.main-stack"'; then
+    echo "main-stack: FAIL: --json: the warning is not a JSON diagnostic:"; cat "$T/o" "$T/e"; bad=1
+fi
+for args in "--version" "explain lex.utf8"; do
+    # shellcheck disable=SC2086
+    SHIM_MODE=nobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" $args > "$T/o" 2> "$T/e"
+    if cat "$T/o" "$T/e" | grep -q "$W"; then
+        echo "main-stack: FAIL: volec $args, which compiles nothing, said the warning"; bad=1
     fi
 done
 if [ $bad -ne 0 ]; then
     exit 1
 fi
-echo "main-stack: ok: the compiler's own thread, and its planted refusals said once"
+echo "main-stack: ok: the compiler's own thread, and its planted refusals said once, as a diagnostic, by a compilation only; no worker's stack, a -j 4 build still builds"
