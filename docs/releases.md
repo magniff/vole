@@ -116,13 +116,21 @@ the bytes of a cold one when a function's number of calls changes.
   program that ran clean under `--check-unsafe` may now stop with
   `unsafe access after free` or `unsafe access out of bounds`, naming
   the line. Blocks aligned above 16 (`posix_memalign`) are recorded too.
-  Memory the check did not see allocated is never reported as freed: a
+  Memory the check did not see allocated is not reported as freed: a
   block the program frees is held back from C's allocator while the
-  check counts it freed (the last 4096 blocks, at most 64 MB), and every
-  block has 16 bytes after its end that no one is given. So C's own
-  mallocs (strdup's, opendir's) neither reuse a freed block nor start
-  where a block ends, and a program under the check uses that much more
-  memory. A `realloc` of a block moves it.
+  check counts it freed (the last 4096 blocks, at most 64 MB: a block
+  that alone is more is given back at once, and a use of it after the
+  free is then not seen), and every block has 16 bytes after its end
+  that no one is given. So C's own mallocs (strdup's, opendir's) neither
+  reuse a freed block nor start where a block ends, and a program under
+  the check uses that much more memory. A `realloc` of a block moves it.
+  A block C reallocates or frees inside the C library (getline's buffer,
+  `reallocf`) is not seen; before any report the check asks C's
+  allocator for the block's size (`malloc_size`, glibc's
+  `malloc_usable_size`) and reads its 16 bytes after the end, a tag it
+  wrote there: a size that changed or a tag written over means C gave
+  the memory out again, and the block is forgotten, not reported. What
+  this leaves is in "Known issues".
 - **An address is not an access** under `--check-unsafe`, as in Rust:
   `&p[i]`, `p.add(i)` and `p.sub(i)` of a pointer into a live block must
   stay in that block or one past its end (`unsafe address out of
@@ -136,7 +144,9 @@ the bytes of a cold one when a function's number of calls changes.
   size overflows panics (`attempt to multiply with overflow`), as in
   0.30.0. Under `--check-unsafe`, at every level, an offset that does
   not fit an isize is refused (`an offset of N elements of 8 bytes
-  overflows`).
+  overflows`), add's and sub's apart at every element size, a byte's
+  too: `p.add(usize::MAX)` is refused, though the address it wraps to
+  is `p.sub(1)`'s.
 - **`#[link_name]` names the C function** for every check and
   optimization, both ways. `#[link_name = "my_alloc"] fn malloc` is not
   C's malloc: -O2 kept its calls (0.30.0 removed them as a heap
@@ -150,8 +160,10 @@ the bytes of a cold one when a function's number of calls changes.
   calls (RT-6).
 - **`--trace` reports a stack overflow** (RT-14): its SIGSEGV and
   SIGBUS handler runs on a stack of its own (`sigaltstack`), one for
-  each thread, and prints `stopped by signal 11` (10, SIGBUS, for a
-  spawned thread on macOS) and the frames where it printed nothing.
+  each thread std::thread spawns (64 KB, freed when the thread ends),
+  and prints `stopped by signal 11` (10, SIGBUS, for a spawned thread on
+  macOS) and the frames where it printed nothing. A thread made by C's
+  `pthread_create` has no such stack: its overflow prints nothing.
 
 #### Bugs fixed
 
@@ -192,10 +204,23 @@ the bytes of a cold one when a function's number of calls changes.
 
 - **Gate floors** ("The gate"): `bootstrap/gate-floors.sh` reads the
   log of every row that passed. A row whose count is missing, or is
-  below its floor (0.30.0's counts less a margin), fails. The SKIPs a
-  release accepts are listed there with what each leaves unverified.
+  below its floor, fails. The rows that also run in the Linux
+  containers are judged by what they report against the tree: the suite
+  rows plan every case the tree lists and fail none (tests/run.sh prints
+  a `cases:` line, the cases apart from the suites' checks); objcheck
+  compiles two of each program and all are the same. The other floors
+  are 0.30.0's counts less a margin, on macOS only. The SKIPs a release
+  accepts are listed there with what each leaves unverified.
   `tests/gate_floors.sh` checks every floor against a zero count, a
   quarter of the count, and a missing line.
+- tests/incremental.sh reads its builds' exit status always: a compiler
+  that writes its object and then crashes (storing to the cache, say)
+  fails the row, as does a program that does not build unedited (a
+  skip in 0.30.0). tests/runner/run.sh plants the faults: a stand-in
+  compiler that crashes before its object, after it, and after it on a
+  warm build only, each failing the series and the pairs.
+- voltty-fuzz is a SKIP only without cargo: an oracle that does not
+  build fails the row.
 - **Canaries**: a case for every net that must catch it.
   - Bounds of a slice, a Vec, a String and an array:
     `canary_bounds_*`, at every level.
@@ -213,8 +238,14 @@ the bytes of a cold one when a function's number of calls changes.
   (docs/xfail.md). RT-6, RT-14, RT-CG-3 and RT-TL-2 are fixed here.
 - `--check-unsafe`'s own: C's strdup after a freed Box or Vec, its copy
   read and freed (`check_unsafe_c_reuse_*`), ten thousand blocks and
-  96 MB through the quarantine (`check_unsafe_quarantine`), an offset
-  that overflows (`check_unsafe_add_overflow`, `ovf_o0_ptr_add_count`).
+  96 MB through the quarantine (`check_unsafe_quarantine`), four Vecs of
+  96 MB one at a time (`check_unsafe_quarantine_cap`: the peak is one),
+  getline's and reallocf's blocks, valid programs that run clean
+  (`check_unsafe_c_getline`, `check_unsafe_c_reallocf`), offsets that
+  overflow (`check_unsafe_add_overflow`, `check_unsafe_add_max`,
+  `check_unsafe_add_isize`, `ovf_o0_ptr_add_count`).
+- `--trace`'s stacks for its handler, freed with their threads:
+  `trace_thread_altstack_freed`.
 
 #### Known issues
 
@@ -228,6 +259,15 @@ the bytes of a cold one when a function's number of calls changes.
   the program's call: vole has no caller location for std's functions
   (Rust's `#[track_caller]`). The message's numbers are the block's and
   the offset's; the line is the one in std.
+- `--check-unsafe` can still report a block C freed inside the C library
+  and gave to one of its own allocations of the same size by C's
+  allocator, when the program reads bytes past the old block's end that
+  C did not write (the tag is still there). On glibc a block C freed may
+  keep its size there, and `malloc_usable_size` of a large block C has
+  unmapped may crash the program. Only macOS ran.
+- `--check-unsafe` refuses `p.offset(isize::MIN / size)`, whose offset
+  in bytes is exactly isize::MIN, which Rust allows: std's offset of a
+  negative count is a sub of its magnitude, which does not fit.
 
 ### What's new in 0.30.0
 
@@ -7908,12 +7948,21 @@ than 20 s on a loaded machine (the examples-checkalloc step: 2 minutes).
 (0.30.1) **Floors.** A step that passes has also counted what it exists to
 count: `bootstrap/gate-floors.sh` reads the log of every step that passed,
 and one whose count line is missing, or whose count is below its floor,
-fails (`floor STEP: ...`, the last line of its log). The floors are 0.30.0's
-release gate's counts less a margin for cases that come and go (the suite
-rows 6000 cases passed, objcheck 12000 compilations, threads 14000,
+fails (`floor STEP: ...`, the last line of its log). The rows the Linux
+containers also run are judged by what they report against the tree, the
+same on every host: a suite row's plan (`plan: N cases`) is every case
+`tests/run.sh -l` lists, its `cases:` line (the cases alone; the table's
+total adds the suites' checks) counts them all, none failed, and no more
+skipped than the tree has cases with a `// REQUIRES:` line; objcheck's N
+of M are all the same, M at least two (-O0, -O2) of each program of
+tests/run the suite compiles; incremental's series are its plan, the
+same on every host, at least 150, each rebuilt the same or skipped with
+its reason (at most 4). The other floors are 0.30.0's
+release gate's counts less a margin for cases that come and go (threads 14000,
 incremental 150 edit series, cachediff 150 transcripts, compiler-memcheck
 700, std-check 3500 bodies, std-tests 1400, borrowck-twin 420,
-examples-checkalloc 175, stdtools 38, layout 100 records, chain-fresh 52
+examples-checkalloc 175, stdtools 38, layout 100 records (30 in a
+container), chain-fresh 52
 releases, chain-diverse 50000 compilations of the corpus), or what the
 step was asked for (each fuzz row's and ABI row's programs, all of them:
 `-n`; fuzz-sem's five runs; voltty-fuzz's 200 scripts, which the row asks
@@ -7922,23 +7971,24 @@ for on top of its minute, so that no load lowers the count; incremental's
 caught, `debug` both levels, `compile-cost` its four programs, `chain`
 the fixpoint. A row whose input changed under it once passed on 4
 records of 111 (layout, 0.28.0, which then got its own floor): this is
-such a floor for every row. A row that skips what it counts and says so
-(voltty-fuzz's `skip oracle` without cargo) is a SKIP (the floor exits
-77), not a pass and not a failure. A gate of the self-test or of stubs is
-not judged.
+such a floor for every row. A row that skips what it counts for a reason
+the release accepts (voltty-fuzz's `skip oracle (no cargo)`) is a SKIP
+(the floor exits 77), not a pass and not a failure; an oracle that does
+not build fails. A gate of the self-test or of stubs is not judged.
 
-The counts are aarch64-macos's, the only host 0.30.0's gate ran on. In
-the Linux containers (`gate.sh --inside`: the suite rows, fuzz, ABI,
-layout, objcheck, debug, valgrind and the smoke rows) each floor that is
-one of those counts is a quarter of it, and layout's is its row's own 30.
-The containers run the same corpora less what is the platform's own (the
-8 cases of `// REQUIRES: metal` or `clang`, the examples of std::gpu and
-std::window, x86-64's own intrinsics' programs, glibc's headers), which
-no count of macOS's gives exactly, and a quarter still fails a row that
-ran next to nothing. The floors that are what a row was asked for, or a
-line it prints, hold on every host. `tests/gate_floors.sh` shows each
-floor failing a zero count, a quarter of it and a log without its line,
-a Linux row passing at a quarter, and the skipped oracle a SKIP.
+No floor is a fraction of another host's count. 0.30.0's counts are
+aarch64-macos's, the only host its gate ran on: a row with such a floor
+runs on the macOS host only, and on any other it fails (`no floor for
+HOST`) until a gate there gives it one. What cannot be checked without a
+Linux machine: that the containers' logs print the lines the floors read
+(the same scripts print them there), and how many programs objcheck
+compiles there (its floor is the tree's, which holds anywhere the suite
+runs whole). `tests/gate_floors.sh` shows each floor failing a zero
+count, a quarter of it and a log without its line, a suite row failing
+a plan short of the tree (a container's 1501 cases), too many skips or a
+missing `cases:` line, a macOS-only row failing on Linux, incremental
+failing 134 skipped series and passing 4 named ones, and the skipped
+oracle a SKIP while an oracle that does not build fails.
 
 (0.30.1) **The SKIPs a release accepts**, and what each leaves unverified:
 
