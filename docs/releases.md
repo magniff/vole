@@ -480,13 +480,17 @@ that keeps few values live is unlikely to make such moves.
   line under `--json`), the moment a command starts to read a program
   (a build, check, query, fmt, fix, test, try, the LSP; not
   `--version`, `explain` or `guide`), so that it is there before a deep
-  expression overflows that stack. When only a volec a command starts
-  falls back (try's, test's, probe's checks and builds), the command
-  takes the child's line out of what it reads and says it itself: once,
-  and never inside try's answer. A program volec runs (`run`, `test`,
-  `probe`, `try`) no longer gets the variables volec sets for itself
-  (`VOLEC_NESTED`, `VOLEC_EDIT_TAG`, `VOLEC_MAIN_STACK_SAID`; `volec
-  guide tools`). A worker or the assembler's thread that
+  expression overflows that stack. A volec a command starts (try's,
+  test's, probe's checks and builds, a lazy std's build made again)
+  writes its warning into the first volec's file
+  (`VOLEC_MAIN_STACK_FILE`), not on the output the command reads, and
+  the first volec says it once after the child ends: never inside try's
+  answer, and no output is filtered. A program volec runs (`run`,
+  `test`, `test --input`, `probe`, `try`, `reduce --until`'s command)
+  no longer gets the variables volec sets for itself (`VOLEC_NESTED`,
+  `VOLEC_EDIT_TAG`, `VOLEC_MAIN_STACK_FILE`; `volec guide tools`): it
+  is exec'd with volec's environment less those, by execve of its
+  path. A worker or the assembler's thread that
   cannot be made leaves the build on fewer threads (the main thread's
   at the least), where 0.30.0 stopped it (`try -j1`)
   (tests/main_stack.sh plants each). A stack

@@ -21,6 +21,7 @@ use crate::tools::ctx::Tcx;
 extern "C" {
     fn fork() -> i32;
     fn execvp(file: *const u8, argv: *const *const u8) -> i32;
+    fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
     fn pipe(fds: *mut i32) -> i32;
     fn dup2(from: i32, to: i32) -> i32;
@@ -67,16 +68,30 @@ fn exit_code(status: i32) -> i64 {
 // stdout and stderr into buffer `out`; returns its exit status (127 when
 // it could not be run).
 pub fn run_capture(argv: &[*const u8], out: i64) -> i64 {
-    // (0.30.1: a volec's warning on its stack taken out, child_output)
-    let from = buf_len(out);
+    capture(argv, out, false)
+}
+
+// (0.30.1) run_capture of a user's program (try's): argv[0] its path, run
+// with this process's environment less volec's own variables
+// (exec_program).
+pub fn run_capture_program(argv: &[*const u8], out: i64) -> i64 {
+    capture(argv, out, true)
+}
+
+// run_capture and run_capture_program: a user's program (`program`) exec'd
+// by exec_program, else argv[0] as a shell finds it with this process's
+// environment. A volec it started that fell back is said after it ends
+// (say_children_main_stack).
+fn capture(argv: &[*const u8], out: i64, program: bool) -> i64 {
     // UNSAFE: pipe, fork, dup2, close, execvp, read and waitpid are C's: a
     // child with its output on a pipe; the bytes are read into the buffer's
     // own block (BUFS, base's raw table).
     // SAFETY: fds is a local of two i32s that pipe fills; argv is a list of C
     // strings ending with a null (exec_words, argv_of, cptrs), borrowed for
-    // the call; the child calls only dup2, close, execvp and _exit;
-    // buf_reserve made room for 65536 bytes past the buffer's len before each
-    // read, and len grows by what read returned; status is a local.
+    // the call; the child calls only dup2, close, execvp (or exec_program,
+    // which calls only execve) and _exit; buf_reserve made room for 65536
+    // bytes past the buffer's len before each read, and len grows by what
+    // read returned; status is a local.
     let code = unsafe {
         let mut fds = [0 as i32, 0 as i32];
         if pipe(&mut fds[0]) != 0 {
@@ -91,6 +106,9 @@ pub fn run_capture(argv: &[*const u8], out: i64) -> i64 {
             dup2((fds[1]), 2);
             close((fds[0]));
             close((fds[1]));
+            if program {
+                exec_program(argv);
+            }
             execvp(argv[0], argv.as_ptr() as *const *const u8);
             _exit(127);
         }
@@ -109,77 +127,85 @@ pub fn run_capture(argv: &[*const u8], out: i64) -> i64 {
         waitpid(pid, &mut status, 0);
         exit_code(status)
     };
-    child_output(out, from);
+    say_children_main_stack();
     code
 }
 
-// (0.30.1) What a child wrote, captured by this volec from `from` on in
-// buffer out (run_capture; same-output's compilers' files, sameout and
-// samebuild): the line in which a volec says it compiles on the first
-// thread's stack (base::diag::say_main_stack_now, on its stderr, which a
-// capture merges with its stdout) is taken out, and this volec says it
-// instead, once for all. So the warning reaches the user once, whichever
-// process fell back, and never inside output a parent reads: try's type
-// and value, a test's build log, a probe's errors. (Other output that is
-// that line, byte for byte, goes the same way.)
-pub fn child_output(out: i64, from: i64) {
-    let all = buf_copy(out);
-    let len = all.len() as i64;
-    let mut found = false;
-    let kept = buf_new();
-    buf_bytes(kept, &all[0..from as usize]);
-    let mut i = from;
-    while i < len {
-        let mut j = i;
-        while j < len && all[j as usize] != b'\n' {
-            j += 1;
+// (0.30.1) The variables volec sets for itself and the volecs it starts
+// (VOLEC_NESTED, VOLEC_EDIT_TAG: base::diag::ok_line_setup;
+// VOLEC_MAIN_STACK_FILE: main.vl compile), which a user's program does
+// not get.
+const VOLEC_OWN: [&[u8]; 3] = [b"VOLEC_NESTED=", b"VOLEC_EDIT_TAG=", b"VOLEC_MAIN_STACK_FILE="];
+
+// (0.30.1) Execs a user's program, in the child fork made: argv[0] its
+// path, as given (no PATH lookup; every caller's is a path volec made or
+// was given), argv a null-ended list of C strings, and the environment
+// this process's less volec's own variables (VOLEC_OWN): environ's array,
+// the child's own copy, compacted in place, then execve. It allocates
+// nothing and calls only execve and _exit (async-signal-safe): the
+// callers' alarm and process group stay. 127 when the exec fails. The one
+// way volec starts a user's program: run (run_foreground), try
+// (run_capture_program), test, fuzz and reduce's runs
+// (testrun::program::start_job), test --input (testrun::run_case),
+// reduce --until's `/bin/sh -c CMD` (reduce::run_limited) and probe
+// (probe::run::run_program).
+pub fn exec_program(argv: &[*const u8]) -> ! {
+    let env = std::__sys::environ() as *mut *const u8;
+    // UNSAFE: environ's array and its strings read and the array written
+    // through raw pointers, and execve and _exit, are C's.
+    // SAFETY: environ is a null-ended array of NUL-ended strings, this
+    // child's own copy after fork (no other thread exists in it and nothing
+    // else reads it before the exec); an entry is read only up to the first
+    // byte that differs from a name or its NUL, and the array is written only
+    // at indices below the one read (kept <= i), then its null; argv is the
+    // caller's null-ended list of C strings, alive until the exec.
+    unsafe {
+        let mut i: usize = 0;
+        let mut kept: usize = 0;
+        loop {
+            let p = *env.add(i);
+            if p.is_null() {
+                break;
+            }
+            let mut own = false;
+            for name in VOLEC_OWN {
+                let mut k: usize = 0;
+                while k < name.len() && *p.add(k) == name[k] {
+                    k += 1;
+                }
+                own = own || k == name.len();
+            }
+            if !own {
+                *env.add(kept) = p;
+                kept += 1;
+            }
+            i += 1;
         }
-        if crate::base::diag::is_main_stack_line(&all[i as usize..j as usize]) {
-            found = true;
-        } else {
-            buf_bytes(kept, &all[i as usize..(if j < len { j + 1 } else { j }) as usize]);
-        }
-        i = j + 1;
-    }
-    if found {
-        buf_truncate(out, 0);
-        buf_bytes(out, &buf_copy(kept));
-        crate::base::diag::say_main_stack_now();
+        *env.add(kept) = 0 as *const u8;
+        execve(argv[0], argv.as_ptr(), env as *const *const u8);
+        _exit(127)
     }
 }
 
-// (0.30.1) A child_output of the file a child wrote (spawn_to_file's),
-// rewritten without the line; nothing when it cannot be read.
-pub fn child_output_file(path: *const u8) {
-    let b = buf_new();
-    if !read_file_if(path, b) {
+// (0.30.1) A volec this one started that fell back to the first thread's
+// stack wrote its warning into VOLEC_MAIN_STACK_FILE, this volec's (main.vl
+// compile), not onto its output: after a child ends, this volec says it,
+// once, and takes the file away. Out of band, so that nothing is read out
+// of any output (a program's lines are never touched). A volec that
+// inherited the file is not its owner and leaves it to the one that is.
+pub fn say_children_main_stack() {
+    if !crate::base::diag::get_main_stack_owner() {
         return;
     }
-    let before = buf_len(b);
-    child_output(b, 0);
-    if buf_len(b) != before {
-        write_file_if(path, &buf_copy(b));
+    let path = crate::base::env_var(c"VOLEC_MAIN_STACK_FILE");
+    if path.len() == 0 {
+        return;
     }
-}
-
-// (0.30.1) The words that run a user's program: argv (ending with a 0)
-// under `env -u` of every variable volec sets for itself and the volecs
-// it starts (VOLEC_NESTED, VOLEC_EDIT_TAG: base::diag::ok_line_setup;
-// VOLEC_MAIN_STACK_SAID: main.vl compile), so that the program gets
-// volec's environment as it was given, less those. The one place volec
-// starts a user's program goes through it: run (cli::run), test, fuzz
-// and reduce (testrun::program::start_job), probe (probe::run::
-// run_program), try (snippet::check_and_run).
-pub fn program_argv(argv: &[*const u8]) -> Vec<*const u8, Comp> {
-    let mut w: Vec<*const u8, Comp> = Vec::new_in(Comp {});
-    for p in [c"env", c"-u", c"VOLEC_NESTED", c"-u", c"VOLEC_EDIT_TAG", c"-u",
-        c"VOLEC_MAIN_STACK_SAID"] {
-        w.push(p);
+    let b = buf_new();
+    buf_bytes(b, &path);
+    if remove_file(buf_cstr(b)) {
+        crate::base::diag::say_main_stack_now();
     }
-    for &a in argv {
-        w.push(a);
-    }
-    w
 }
 
 // Starts argv with its stdout and stderr into file `path` (made anew);
@@ -217,7 +243,7 @@ pub fn run_inherit(argv: &[*const u8]) -> i64 {
     // SAFETY: argv is a list of C strings ending with a null, borrowed for the
     // call; the child calls only execvp and _exit; status is a local that
     // waitpid writes.
-    unsafe {
+    let code = unsafe {
         let pid = fork();
         if pid < 0 {
             return 127;
@@ -229,19 +255,24 @@ pub fn run_inherit(argv: &[*const u8]) -> i64 {
         let mut status = 0 as i32;
         waitpid(pid, &mut status, 0);
         exit_code(status)
-    }
+    };
+    // (0.30.1: a volec child on the first thread's stack, said once)
+    say_children_main_stack();
+    code
 }
 
 // (0.25.4) Runs argv (argv[0] a path; argv ends with 0) as a shell runs a
 // command in the foreground (`volec run`): with this process's stdin,
-// stdout and stderr, volec ignoring ^C and ^\ (SIGINT, SIGQUIT) meanwhile,
+// stdout and stderr, (0.30.1) its environment less volec's own
+// variables (exec_program), volec ignoring ^C and ^\ (SIGINT, SIGQUIT) meanwhile,
 // which the program gets from the terminal as before. Its exit status, 128
 // + N when signal N ended it, 127 when it could not be run.
 pub fn run_foreground(argv: &[*const u8]) -> i64 {
-    // UNSAFE: fork, execvp, waitpid and signal are C's (POSIX): std::process
+    // UNSAFE: fork, waitpid and signal are C's (POSIX): std::process
     // takes at most 32 arguments and cannot leave a signal to the child.
     // SAFETY: argv is exec_words' null-ended array of NUL-terminated
-    // strings; the child calls only execvp and _exit before it is replaced;
+    // strings; the child calls only exec_program (execve, _exit) before it is
+    // replaced;
     // status is a local that waitpid writes; SIG_IGN (1) is a valid
     // disposition, and the ones before are restored after the wait.
     unsafe {
@@ -250,8 +281,7 @@ pub fn run_foreground(argv: &[*const u8]) -> i64 {
             return 127;
         }
         if pid == 0 {
-            execvp(argv[0], argv.as_ptr() as *const *const u8);
-            _exit(127);
+            exec_program(argv);
         }
         let int_was = signal(2, 1 as *mut u8);
         let quit_was = signal(3, 1 as *mut u8);
@@ -271,7 +301,7 @@ pub fn run_with_stdin(argv: &[*const u8], b: i64) -> i64 {
     // strings ending with a null, borrowed for the call; the child calls only
     // close, dup2, execvp and _exit; each end of the pipe is closed once;
     // status is a local.
-    unsafe {
+    let code = unsafe {
         if b < 0 {
             return run_inherit(argv);
         }
@@ -296,7 +326,10 @@ pub fn run_with_stdin(argv: &[*const u8], b: i64) -> i64 {
         let mut status = 0 as i32;
         waitpid(pid, &mut status, 0);
         exit_code(status)
-    }
+    };
+    // (0.30.1: a volec child on the first thread's stack, said once)
+    say_children_main_stack();
+    code
 }
 
 // Starts a copy of this process (fork): 0 in the copy, its process id in
@@ -321,12 +354,15 @@ pub fn worker_exit(code: i64) -> ! {
 pub fn wait_any(status: &mut i64) -> i64 {
     // UNSAFE: waitpid is C's.
     // SAFETY: st is a local i32 that waitpid writes.
-    unsafe {
+    let pid = unsafe {
         let mut st = 0 as i32;
         let pid = waitpid(-1, &mut st, 0);
         *status = exit_code(st);
         pid as i64
-    }
+    };
+    // (0.30.1: a volec child on the first thread's stack, said once)
+    say_children_main_stack();
+    pid
 }
 
 // Reads file `path` into buffer `out`; false when it cannot be read.

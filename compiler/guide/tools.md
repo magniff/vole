@@ -276,11 +276,11 @@ a program volec runs (`run`, `test`, `probe`, `try`) gets none of them:
 |---|---|
 | `VOLEC_NESTED=1` | started by another volec: no `ok:` line, no colour |
 | `VOLEC_EDIT_TAG=PID` | the first volec's pid: the copies its edits check |
-| `VOLEC_MAIN_STACK_SAID=1` | (0.30.1) a volec on the first thread's stack started this one and said `warning thread.main-stack` for both |
+| `VOLEC_MAIN_STACK_FILE=PATH` | (0.30.1) the first volec's: a started volec on the first thread's stack writes `warning thread.main-stack` there, and the first one says it |
 
 Set by hand they act the same: `VOLEC_NESTED=1` drops the `ok:` line;
 two shells with one `VOLEC_EDIT_TAG` share edit copies (a bad idea);
-`VOLEC_MAIN_STACK_SAID=1` hides that warning.
+a `VOLEC_MAIN_STACK_FILE` of your own gets that warning instead of stderr.
 
 ## Seeing what the optimizer did
 

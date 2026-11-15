@@ -20,7 +20,7 @@
 # a build and `--json check` with the warning already on stderr (the
 # compiler before said nothing, exit 139). Every command that reads a
 # program says it, once, on stderr (query, fmt, fix, test, try: the
-# volecs a command starts do not, VOLEC_MAIN_STACK_SAID, so try's answer
+# volecs a command starts write theirs to VOLEC_MAIN_STACK_FILE, so try's answer
 # is still its type and value), and guide, --version and explain do not.
 #
 # usage: tests/main_stack.sh [-c COMPILER]
@@ -126,8 +126,9 @@ VL
 # (0.30.1, the fourth review's) and when only a volec another starts
 # falls back (childnobig: try's, test's and probe's checks and builds),
 # or only a lazy std's build made again (eagernobig), the warning is
-# still said once on stderr, by the volec that captured the child's
-# output (tools::proc::child_output), and never inside that output:
+# still said once on stderr, by the first volec, after the child ends
+# (the child writes it to VOLEC_MAIN_STACK_FILE, out of band:
+# tools::proc::say_children_main_stack), and never inside its output:
 # try's answer stays its type and value. A check or a build starts no
 # volec, and there none falls back: no warning.
 while read -r mode want args; do
@@ -174,13 +175,13 @@ eagernobig 0 check t.vl
 LINES
 # (0.30.1, the fourth review's) a user's program gets none of the
 # variables volec sets for itself (VOLEC_NESTED, VOLEC_EDIT_TAG,
-# VOLEC_MAIN_STACK_SAID, tools::proc::program_argv), under run, test,
-# probe and try alike, with the fallback (which sets the last) and without
+# VOLEC_MAIN_STACK_FILE, tools::proc::exec_program), under run, test,
+# probe and try alike, with the fallback and without
 mkdir -p "$T/leak"
 cat > "$T/leak/main.vl" <<'VL'
 fn leaks(gpa: Gpa) -> i64 {
     let mut n: i64 = 0;
-    for name in ["VOLEC_NESTED", "VOLEC_EDIT_TAG", "VOLEC_MAIN_STACK_SAID"] {
+    for name in ["VOLEC_NESTED", "VOLEC_EDIT_TAG", "VOLEC_MAIN_STACK_FILE"] {
         if std::env::var_in(name, gpa).is_ok() {
             n += 1;
         }
@@ -198,7 +199,7 @@ fn main(gpa: Gpa) {
     println("leaks {}", n);
 }
 VL
-L='let mut n = 0; for v in ["VOLEC_NESTED", "VOLEC_EDIT_TAG", "VOLEC_MAIN_STACK_SAID"] { if std::env::var_in(v, gpa).is_ok() { n += 1; } } n'
+L='let mut n = 0; for v in ["VOLEC_NESTED", "VOLEC_EDIT_TAG", "VOLEC_MAIN_STACK_FILE"] { if std::env::var_in(v, gpa).is_ok() { n += 1; } } n'
 for mode in nobig none; do
     (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" run leak > "$T/o" 2> "$T/e")
     grep -qx "leaks 0" "$T/o" || { echo "main-stack: FAIL: SHIM_MODE=$mode volec run: the program sees volec's variables: $(cat "$T/o")"; bad=1; }
@@ -208,6 +209,97 @@ for mode in nobig none; do
     grep -q "#1  n = 0" "$T/o" || { echo "main-stack: FAIL: SHIM_MODE=$mode volec probe: the program sees volec's variables:"; cat "$T/o"; bad=1; }
     (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" try "$L" > "$T/o" 2> "$T/e")
     [ "$(cat "$T/o")" = "i32 = 0" ] || { echo "main-stack: FAIL: SHIM_MODE=$mode volec try: the snippet sees volec's variables: $(cat "$T/o")"; bad=1; }
+done
+# (0.30.1, the fifth review's) the same for test --input and reduce
+# --until (testrun::run_case, reduce::run_limited), and the program is
+# run as it is named, its environment the parent's but for those
+# variables (no env(1) between: proc::exec_program): a path with `=`, a
+# TMPDIR with `=`, DYLD_* passed on, PATH empty or with an `env` of
+# its own first
+echo x > "$T/in.txt"
+for mode in nobig none; do
+    (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" test leak/main.vl --input in.txt > "$T/o" 2> "$T/e")
+    grep -qx "leaks 0" "$T/o" || { echo "main-stack: FAIL: SHIM_MODE=$mode volec test --input: the program sees volec's variables:"; cat "$T/o"; bad=1; }
+    printf 'a\nb\n' > "$T/r.txt"; rm -f "$T/seen"
+    (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" reduce r.txt --until 'n=0; for v in VOLEC_NESTED VOLEC_EDIT_TAG VOLEC_MAIN_STACK_FILE; do eval "x=\${$v+set}"; [ -n "$x" ] && n=$((n+1)); done; echo $n >> seen' > "$T/o" 2> "$T/e")
+    if [ ! -s "$T/seen" ] || grep -qvx 0 "$T/seen"; then
+        echo "main-stack: FAIL: SHIM_MODE=$mode volec reduce --until: the command sees volec's variables: $(cat "$T/seen" "$T/o" "$T/e")"; bad=1
+    fi
+done
+mkdir -p "$T/a=b" "$T/tmp=x" "$T/fakebin"
+printf '#!/bin/sh\necho FAKE-ENV "$@"\n' > "$T/fakebin/env"; chmod +x "$T/fakebin/env"
+cat > "$T/a=b/main.vl" <<'VL'
+fn main(gpa: Gpa) -> i32 {
+    let mut n: i64 = 0;
+    for name in ["VOLEC_NESTED", "VOLEC_EDIT_TAG", "VOLEC_MAIN_STACK_FILE"] {
+        if std::env::var_in(name, gpa).is_ok() {
+            n += 1;
+        }
+    }
+    println("leaks {}", n);
+    let mut code = 0;
+    let mut i: i64 = 0;
+    for a in std::env::args() {
+        if i > 0 {
+            println("arg {}", a);
+            if a == "exit3" {
+                code = 3;
+            }
+        }
+        i += 1;
+    }
+    match std::env::var_in("DYLD_LIBRARY_PATH", gpa) {
+        Ok(x) => println("dyld {}", x),
+        Err(_) => println("dyld unset"),
+    }
+    code
+}
+
+#[test]
+fn t() {
+    assert_eq(1 + 2, 3);
+}
+VL
+envrun() { # NAME VALUE ARGS...: volec ARGS in a=b, NAME=VALUE
+    n=$1; v=$2; shift 2
+    (cd "$T/a=b" && env "$n=$v" VOLE_CACHE=off "$C" "$@" > "$T/o" 2> "$T/e"); echo $? > "$T/rc"
+}
+for nv in "FOO=bar" "TMPDIR=$T/tmp=x" "DYLD_LIBRARY_PATH=/opt/x" "PATH=" "PATH=$T/fakebin:$PATH"; do
+    n=${nv%%=*}; v=${nv#*=}
+    envrun "$n" "$v" run . -- one exit3
+    want="leaks 0
+arg one
+arg exit3
+dyld $([ "$n" = DYLD_LIBRARY_PATH ] && echo /opt/x || echo unset)"
+    if [ "$(cat "$T/o")" != "$want" ] || [ "$(cat "$T/rc")" != 3 ]; then
+        echo "main-stack: FAIL: $n=$v volec run in a=b: not the program's argv, environment or exit (rc $(cat "$T/rc")):"; cat "$T/o" "$T/e"; bad=1
+    fi
+    if [ "$nv" != "PATH=" ]; then # (test and probe link with cc, found on PATH)
+        envrun "$n" "$v" test main.vl
+        grep -q "1 passed" "$T/o" || { echo "main-stack: FAIL: $n=$v volec test in a=b:"; cat "$T/o" "$T/e"; bad=1; }
+        envrun "$n" "$v" probe main.vl:8 n
+        grep -q "#1  n = 0" "$T/o" || { echo "main-stack: FAIL: $n=$v volec probe in a=b:"; cat "$T/o" "$T/e"; bad=1; }
+    fi
+    envrun "$n" "$v" try '1 + 2'
+    [ "$(cat "$T/o")" = "i32 = 3" ] || { echo "main-stack: FAIL: $n=$v volec try: $(cat "$T/o" "$T/e")"; bad=1; }
+done
+# (0.30.1, the fifth review's) nothing is read out of any output: a
+# snippet that prints the warning's own line, and a JSON object of its
+# keys, prints them as they are, and no warning is said that did not
+# happen (none; childnobig: the one that did)
+cat > "$T/warnlines.sh" <<'SH'
+printf '%s\n' 'println("warning thread.main-stack: no thread with a 1 GiB stack could be made: compiling on the main thread'"'"'s stack, which a deeply nested expression may overflow"); println("{{\"kind\":\"diagnostic\",\"severity\":\"warning\",\"code\":\"thread.main-stack\",\"mine\":1}}"); println("after"); 1 + 2'
+SH
+S=$(sh "$T/warnlines.sh")
+for mode in none childnobig; do
+    (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" try "$S" > "$T/o" 2> "$T/e")
+    want=0; [ $mode = childnobig ] && want=1
+    if [ "$(sed -n 1p "$T/o")" != "warning thread.main-stack: $W: compiling on the main thread's stack, which a deeply nested expression may overflow" ] \
+        || ! sed -n 2p "$T/o" | grep -q '"mine":1' || [ "$(sed -n 3,4p "$T/o")" != "after
+i32 = 3" ] || [ "$(grep -c "$W" "$T/e")" -ne $want ]; then
+        echo "main-stack: FAIL: SHIM_MODE=$mode volec try: a snippet's own lines changed, or a warning said $(grep -c "$W" "$T/e") times ($want wanted):"
+        cat "$T/o" "$T/e"; bad=1
+    fi
 done
 for args in "--version" "explain lex.utf8" "explain thread.main-stack" "guide --list"; do
     # shellcheck disable=SC2086
