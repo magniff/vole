@@ -990,6 +990,7 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
                     let before = pcx.fx_borrow_sites.len();
                     walk_scrutinee(e, binds_ref_mut(pcx.nodes[s as usize].a, pcx), pcx);
                     note_let_alias(pcx.nodes[s as usize].a, e, before, pcx);
+                    note_ref_bindings(pcx.nodes[s as usize].a, e, pcx);
                 } else {
                     walk(e, pcx);
                 }
@@ -1009,6 +1010,7 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
             walk_scrutinee(pcx.nodes[n as usize].c, binds_ref_mut(pcx.nodes[n as usize].a, pcx),
                 pcx);
             note_let_alias(pcx.nodes[n as usize].a, pcx.nodes[n as usize].c, before, pcx);
+            note_ref_bindings(pcx.nodes[n as usize].a, pcx.nodes[n as usize].c, pcx);
         }
         NodeKind::If => walk_if(n, pcx),
         NodeKind::Loop => {
@@ -1027,6 +1029,7 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
             walk_scrutinee(pcx.nodes[n as usize].a, lends, pcx);
             for i in 0..pcx.nodes[n as usize].count {
                 let arm = child(n, i, pcx);
+                note_ref_bindings(pcx.nodes[arm as usize].a, pcx.nodes[n as usize].a, pcx);
                 walk(pcx.nodes[arm as usize].b, pcx);
                 walk(pcx.nodes[arm as usize].c, pcx);
             }
@@ -1271,6 +1274,82 @@ fn note_let_alias(p: i64, e: i64, before: usize, pcx: &mut Ctx<Comp>) {
     }
 }
 
+// RULE: E1.8 (0.30.1) Pattern p matched against scrutinee e (a `let`'s,
+// a let-else's, a `match` arm's, an `if let`'s, a `while let`'s): a
+// binding by reference in it, at any depth (`ref q`, `ref mut q`, one
+// under a reference pattern; `Some(ref q)`, `(ref a, _)`, a field's), of
+// a place rooted at local x (x, a field or an element of it, `*r` of an
+// alias r of x) is a borrow of x: the bound local is an alias of x, its
+// uses x's borrows (settle_addresses). Before, `match d { ref q => zap(q)
+// }` was no borrow, and `x / d` after it kept its proof. A value (a
+// call's result, a tuple) is a temporary: a binding by reference of it
+// borrows no local. A `for`'s pattern and a parameter's bind the
+// iterator's items and the arguments, no place of the function's.
+fn note_ref_bindings(p: i64, e: i64, pcx: &mut Ctx<Comp>) {
+    if p <= 0 || e <= 0 {
+        return;
+    }
+    let root = place_root(e, pcx);
+    if root >= 0 {
+        ref_binds(p, root, pcx);
+    }
+}
+
+// The local place e is rooted at (a field's, an element's, `*r` of an
+// alias r: r), or -1: no local's place.
+fn place_root(e: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut n = e;
+    let mut depth = 0;
+    while n > 0 && depth < 32 {
+        let k = pcx.nodes[n as usize].kind;
+        if k == NodeKind::Ident {
+            return if pcx.nodes[n as usize].res == Res::Local { pcx.nodes[n as usize].y }
+                else { -1 };
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
+            n = pcx.nodes[n as usize].a;
+        } else if k == NodeKind::Unary && pcx.nodes[n as usize].op == Tok::Star {
+            let r = pcx.nodes[n as usize].b;
+            if r > 0 && pcx.nodes[r as usize].kind == NodeKind::Ident
+                && pcx.nodes[r as usize].res == Res::Local
+                && is_alias(pcx.nodes[r as usize].y, pcx) {
+                return pcx.nodes[r as usize].y;
+            }
+            // (through another reference: its borrow is a site of its own)
+            return -1;
+        } else {
+            return -1;
+        }
+        depth += 1;
+    }
+    -1
+}
+
+// Each binding by reference in pattern p: an alias of local root.
+fn ref_binds(p: i64, root: i64, pcx: &mut Ctx<Comp>) {
+    if p <= 0 {
+        return;
+    }
+    let k = pcx.nodes[p as usize].kind;
+    if k == NodeKind::PatBind {
+        if (pcx.nodes[p as usize].c != 0 || (pcx.nodes[p as usize].p & PAT_REF) != 0)
+            && pcx.nodes[p as usize].x >= 0 {
+            pcx.fx_alias.push(pcx.nodes[p as usize].x);
+            pcx.fx_alias.push(root);
+        }
+        return;
+    }
+    if k == NodeKind::FieldInit {
+        ref_binds(pcx.nodes[p as usize].b, root, pcx);
+        return;
+    }
+    if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
+        for i in 0..pcx.nodes[p as usize].count {
+            ref_binds(child(p, i, pcx), root, pcx);
+        }
+    }
+}
+
 // (E1.8) The locals a borrow of local `root` may be reached through, in
 // set: root, each r bound to a borrow of one of them (fx_alias), so on.
 fn alias_set(root: i64, set: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
@@ -1330,10 +1409,24 @@ pub fn holds_ref(t: i64, raw: bool, depth: i64, pcx: &Ctx<Comp>) -> bool {
                 return true;
             }
         }
+        // (its type arguments too: a buffer kept as erased bytes, `*mut
+        // u8`, or a PhantomData holds what they say)
+        for i in 0..pcx.structs[st as usize].targ_count {
+            if holds_ref((pcx.tlists[(pcx.structs[st as usize].targs + i) as usize]), raw,
+                depth + 1, pcx) {
+                return true;
+            }
+        }
         return false;
     }
     if k == TyKind::Enum {
         let en = pcx.types[u as usize].a;
+        for i in 0..(pcx.enums[en as usize]).targ_count {
+            if holds_ref((pcx.tlists[((pcx.enums[en as usize]).targs + i) as usize]), raw,
+                depth + 1, pcx) {
+                return true;
+            }
+        }
         for v in 0..(pcx.enums[en as usize]).variant_count {
             let vi = pcx.variants[enum_variant(en, v, pcx) as usize];
             for j in 0..vi.field_count {
