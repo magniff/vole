@@ -1379,9 +1379,16 @@ its cut-offs.)
   `let _ = *p;` of a p never assigned passes, `let _ = a[i];` of an a
   never assigned is E0381). Open: front/drops.vl makes `let _ = x;` of an
   owned place `let _ = &x;`, a borrow, refused after x moved where rustc
-  accepts (`rust_b_ok_mention_after_move`, XFAIL); and `s;` of a value
-  not Copy reads s in place where rustc moves it into a temporary
-  dropped at the statement's end (`rust_b_err_stmt_moves`, XFAIL).
+  accepts (`rust_b_ok_mention_after_move`, XFAIL); `s;` of a value not
+  Copy, wherever it comes from (a block's tail, a branch's, a break's),
+  reads s in place where rustc moves it into a temporary dropped at the
+  statement's end (RT-31c: `rust_b_err_stmt_moves`,
+  `rust_b_err_discard_moves`, `rust_b_ok_discard_drops`, XFAIL; the rule
+  needs moves out of `*raw` and `*&` refused, E0507, Box moves and Rust
+  2021's disjoint closure captures with it: lowered alone, `unsafe { *p;
+  }` dropped the value twice); and `let _ = { x };` mentions the tail
+  where rustc reads it (RT-31d: `rust_b_err_init_let_wild_value`,
+  XFAIL).
 - (M2) `SK_ASSIGN`/`SK_CALL`/`SK_INTRINSIC` with destination `Q =
   L.π`, `π ≠ ∅` (0.30.1: rustc's check_if_assigned_path_is_moved, from
   the last projection in): a field's (a variant's, a union's) base
@@ -1403,7 +1410,16 @@ its cut-offs.)
   (`move_precedes`: `u.a = ..; let d = u.a;` in each iteration; before
   0.30.1's last change it was the reaching move of E0382, which does not
   pass the assignment, a false error there). Then the assignment
-  initializes. `Q = (L, 0)`: no requirement (reinitialization), and it
+  initializes what rustc's `gather_init` does (elab.vl `init_path`, the
+  one rule for the check's sets, drop elaboration's and its flags'):
+  its place's path, but a field of a union initializes the union, its
+  immediate base, and only when that base has a path of its own;
+  nothing under a union's field has one (a move out of it moves the
+  outermost union), so `o.i.a = 7`, i a union field of a union o,
+  initializes nothing (0.30.1: before, o, and `let w = o;` in a loop
+  read o's other field's uninitialized bytes; straight on or after a
+  branch's move it hid E0382; `rust_b_err_union_nested`,
+  `rust_b_ok_union_nested`). `Q = (L, 0)`: no requirement (reinitialization), and it
   kills `L`'s loans through a deref (D2.3). One E0381 per local, its
   first (rustc's `uninitialized_error_reported`), naming the binding, not
   the place read through it. The walk back for the reaching move follows
