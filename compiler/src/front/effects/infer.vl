@@ -43,8 +43,8 @@ use crate::base::ctx::Ctx;
 use crate::base::timer::{T_CHECK, T_EFFECTS, timer_now, timer_sub};
 use crate::front::ast::{
     ARM_SYNTHETIC, FN_BODY_FAILED, FN_SIG_FAILED, FN_TERMINATES, FN_UNSAFE, NODE_CAPTURE,
-    NODE_IN_BOUNDS, NODE_RAW, NODE_RAW_BORROW, NODE_REF_MUT, NodeKind, PAT_REF, REPR_UNION, VK_LANE,
-    VK_LOAD, VK_STORE, VK_WITH, child,
+    NODE_IN_BOUNDS, NODE_RAW, NODE_RAW_BORROW, NODE_REF_MUT, NodeKind, PAT_AMP, PAT_REF, REPR_UNION,
+    VK_LANE, VK_LOAD, VK_STORE, VK_WITH, child,
 };
 use crate::front::check::Res;
 use crate::front::check::iterate::ends_by_itself;
@@ -839,9 +839,13 @@ fn walk(n: i64, pcx: &mut Ctx<Comp>) {
         if pcx.fx_alias.len() > 0 && is_alias(pcx.nodes[n as usize].y, pcx) {
             pcx.fx_borrow_sites.push(pcx.nodes[n as usize].y);
             pcx.fx_borrow_sites.push(n);
-            // (-n: a use of an alias's value seen at n, which an IR borrow
-            // only read through at n is, LOAN_READ: ir_unseen)
-            pcx.fx_seen.push(-n);
+            // (-n: a use of an alias's value followed at n, which a read
+            // through an IR borrow at n is, a hole's `copy (*_k)` of an
+            // alias: BK_READ_THROUGH, ir_unseen; VOLE_E18_PLANT=use leaves
+            // it out, a planted fault: tests/e18_loans.sh --self-test)
+            if crate::base::env_var(c"VOLE_E18_PLANT").as_slice() != b"use" {
+                pcx.fx_seen.push(-n);
+            }
         }
         // (E1.8: a closure's capture of a local is a borrow kept beyond
         // the expression, settle_addresses)
@@ -916,14 +920,26 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
             if lends {
                 pcx.static_write -= 1;
             }
-            // (E1.8: `*r` reads through r; `&*r` is a borrow of its own,
-            // and `&r`, note_address: r's use inside it is no other)
+            // (E1.8: `*r` reads through r: a value that holds no address
+            // is no use of r, one that may (`*rr` of `rr = &r`, an alias's
+            // alias) is r's value, so the use of rr goes on as `*rr`'s,
+            // its site moved to n (read_gives_address, the rule the
+            // places IR's read-through borrows are settled by); `&*r` is a
+            // borrow of its own, and `&r`, note_address: r's use inside
+            // it is no other. VOLE_E18_PLANT=walk drops the rule, a planted
+            // fault: tests/e18_loans.sh --self-test)
             let o = pcx.nodes[n as usize].b;
             let at = pcx.fx_borrow_sites.len();
-            if (pcx.nodes[n as usize].op == Tok::Star || pcx.nodes[n as usize].op == Tok::Amp)
-                && at >= 2
+            let star = pcx.nodes[n as usize].op == Tok::Star;
+            if (star || pcx.nodes[n as usize].op == Tok::Amp) && at >= 2
                 && (pcx.fx_borrow_sites[at - 1]) == o {
-                pcx.fx_borrow_sites.truncate(at - 2);
+                if star && read_gives_address(t, pcx)
+                    && crate::base::env_var(c"VOLE_E18_PLANT").as_slice() != b"walk" {
+                    pcx.fx_borrow_sites[at - 1] = n;
+                    pcx.fx_seen.push(-n);
+                } else {
+                    pcx.fx_borrow_sites.truncate(at - 2);
+                }
             }
             // (E1.7: `-x` checks overflow as the operators do, but of a
             // literal: places/build.vl lower_unary)
@@ -1117,14 +1133,16 @@ fn note_address(n: i64, pcx: &mut Ctx<Comp>) {
         local(n, EFF_ADDR, 0, pcx);
     }
     let mut o = pcx.nodes[n as usize].b;
-    // (`&*r`, r bound to a local's borrow: a borrow of what r is)
-    if o > 0 && pcx.nodes[o as usize].kind == NodeKind::Unary
-        && pcx.nodes[o as usize].op == Tok::Star {
-        let r = pcx.nodes[o as usize].b;
-        if r > 0 && pcx.nodes[r as usize].kind == NodeKind::Ident
-            && pcx.nodes[r as usize].res == Res::Local && is_alias(pcx.nodes[r as usize].y, pcx) {
-            o = r;
-        }
+    // (`&*r`, r bound to a local's borrow: a borrow of what r is; `&**rr`,
+    // rr bound to a borrow of such an r, of what rr reaches, at any depth)
+    let mut q = o;
+    while q > 0 && pcx.nodes[q as usize].kind == NodeKind::Unary
+        && pcx.nodes[q as usize].op == Tok::Star {
+        q = pcx.nodes[q as usize].b;
+    }
+    if q != o && q > 0 && pcx.nodes[q as usize].kind == NodeKind::Ident
+        && pcx.nodes[q as usize].res == Res::Local && is_alias(pcx.nodes[q as usize].y, pcx) {
+        o = q;
     }
     if o <= 0 || pcx.nodes[o as usize].kind != NodeKind::Ident
         || pcx.nodes[o as usize].res != Res::Local {
@@ -1240,8 +1258,10 @@ fn is_alias(r: i64, pcx: &Ctx<Comp>) -> bool {
 // sites from `before`: a borrow of local x (`&x`, not raw), a reference
 // already bound so, or a closure (its captures) makes r an alias of x:
 // the borrow is then where r goes, each use of r a borrow site of its own
-// (walk), a read through it (`*r`) none. Any other binding leaves the
-// borrow a site that goes anywhere.
+// (walk), a read through it (`*r`) none, but one that may read an address
+// (`*rr`, rr an alias of an alias: read_gives_address) is a use of what
+// it reaches, and `let r2 = *rr;` binds r2 so too. Any other binding
+// leaves the borrow a site that goes anywhere.
 fn note_let_alias(p: i64, e: i64, before: usize, pcx: &mut Ctx<Comp>) {
     if p <= 0 || e <= 0 || pcx.nodes[p as usize].kind != NodeKind::PatBind
         || pcx.nodes[p as usize].c != 0 || (pcx.nodes[p as usize].p & PAT_REF) != 0
@@ -1256,7 +1276,10 @@ fn note_let_alias(p: i64, e: i64, before: usize, pcx: &mut Ctx<Comp>) {
     let borrow = k == NodeKind::Unary && pcx.nodes[e as usize].op == Tok::Amp
         && (pcx.nodes[e as usize].p & NODE_RAW_BORROW) == 0
         && !is_raw_pointer(pcx.nodes[e as usize].ty, pcx);
-    let rebind = k == NodeKind::Ident && pcx.nodes[e as usize].res == Res::Local;
+    // (`let r2 = r;`, and `let r2 = *rr;` of an alias's alias: what rr
+    // reaches, read_gives_address, its site moved to e)
+    let rebind = k == NodeKind::Ident && pcx.nodes[e as usize].res == Res::Local
+        || k == NodeKind::Unary && pcx.nodes[e as usize].op == Tok::Star;
     if borrow || rebind {
         // (the one site e made, the borrow itself)
         let at = pcx.fx_borrow_sites.len();
@@ -1340,6 +1363,16 @@ fn ref_binds(p: i64, root: i64, pcx: &mut Ctx<Comp>) {
         return;
     }
     let k = pcx.nodes[p as usize].kind;
+    // (RT-32: `&q` binds by value what the reference points to, `let &q =
+    // rr;` as `let q = *rr;`: when that may be an address, q is an alias
+    // too, and the read at the pattern is a use the walk followed)
+    if k == NodeKind::PatBind && (pcx.nodes[p as usize].p & PAT_AMP) != 0
+        && pcx.nodes[p as usize].x >= 0 && amp_gives_address(p, pcx) {
+        pcx.fx_alias.push(pcx.nodes[p as usize].x);
+        pcx.fx_alias.push(root);
+        pcx.fx_seen.push(-p);
+        return;
+    }
     if k == NodeKind::PatBind {
         if (pcx.nodes[p as usize].c != 0 || (pcx.nodes[p as usize].p & PAT_REF) != 0)
             && pcx.nodes[p as usize].x >= 0 {
@@ -1358,6 +1391,14 @@ fn ref_binds(p: i64, root: i64, pcx: &mut Ctx<Comp>) {
             ref_binds(child(p, i, pcx), root, pcx);
         }
     }
+}
+
+// (RT-32) Whether pattern p, written `&q`, binds a value that may be an
+// address (read_gives_address of what the reference it matches points
+// to, the pattern's type once checked; a type not known: yes).
+fn amp_gives_address(p: i64, pcx: &Ctx<Comp>) -> bool {
+    let t = pcx.nodes[p as usize].ty;
+    t <= 0 || read_gives_address(t, pcx)
 }
 
 // (E1.8) FX_IR_LOANS by function: fx_ir_index holds each function's
@@ -1400,9 +1441,15 @@ fn index_ir_loans(pcx: &mut Ctx<Comp>) {
 // (places::build::emit_ref): a form the walk does not know still makes
 // one, and goes anywhere (settle_addresses: the function's own set
 // decides), unless the built body only reads through its reference
-// (LOAN_READ, places::build::settle_loans: it gives no one an address). A closure's environment given to its call is the walk's
-// (closure_env_arg). With VOLE_E18_CHECK set, each is an error: the walk
-// is to be as complete as the IR's borrows (tests/e18_loans.sh).
+// (LOAN_READ, LOAN_READ_PLAIN: places::build::settle_loans). (RT-32) Each
+// read through a noted borrow's reference that may give an address
+// (BK_READ_THROUGH: `*rr` of `rr = &r`, a hole's `copy (*_k)` of an
+// alias), the borrow seen or not, must be a use the walk followed there
+// (-node in FX_SEEN: an alias's use, walk; a `*` whose value may be an
+// address, walk_node), else it goes anywhere too. A closure's environment
+// given to its call is the walk's (closure_env_arg). With VOLE_E18_CHECK
+// set, each is an error: the walk is to be as complete as the IR's
+// borrows (tests/e18_loans.sh).
 fn ir_unseen(m: i64, set: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     if m < 0 || (m + 1) as usize >= pcx.fx_ir_start.len() {
         return 0;
@@ -1415,27 +1462,29 @@ fn ir_unseen(m: i64, set: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> i64 {
         if !set.contains(&(pcx.fx_ir_loans[k + 1])) {
             continue;
         }
-        let seen = check != 3 && pcx.fx_seen.contains(&node);
-        // (a borrow whose reference only the body reads through,
-        // places::build::settle_loans, gives the place's value at the node:
-        // none of an address when the value holds none; else it is the use
-        // of the local's value there, seen when the walk saw one, an
-        // alias's use, walk: -node)
+        let kind = pcx.fx_ir_loans[k + 3];
+        let through = kind == crate::places::ir::BK_READ_THROUGH;
+        let seen = check != 3
+            && (if through { node > 0 && pcx.fx_seen.contains(&(-node)) }
+                else { pcx.fx_seen.contains(&node) });
         let form = pcx.fx_ir_loans[k + 5];
-        let read = check != 3
-            && (form == crate::places::ir::LOAN_READ_PLAIN
-                || form == crate::places::ir::LOAN_READ && node > 0
-                && pcx.nodes[node as usize].kind == NodeKind::Ident
-                && pcx.nodes[node as usize].res == Res::Local
-                && pcx.nodes[node as usize].y == pcx.fx_ir_loans[k + 1]
-                && pcx.fx_seen.contains(&(-node)));
+        let read = check != 3 && !through
+            && (form == crate::places::ir::LOAN_READ_PLAIN || form == crate::places::ir::LOAN_READ);
         if check == 2 && !pcx.search && !pcx.eval && node > 0 {
-            // (VOLE_E18_CHECK=all: every borrow of the proof's locals)
-            let alias = form == crate::places::ir::LOAN_READ;
-            let msg = if seen && read { c"E1.8: a borrow the walk saw, only read through" }
+            // (VOLE_E18_CHECK=all: every borrow of the proof's locals, and
+            // every read through one that may give an address)
+            let plain = form == crate::places::ir::LOAN_READ_PLAIN;
+            let msg = if through
+                && seen { c"E1.8: a read of an address through a borrow, followed" }
+                else if through {
+                    c"internal: E1.8: a read of an address the effect walk did not see"
+                }
+                else if seen && read { c"E1.8: a borrow the walk saw, only read through" }
                 else if seen { c"E1.8: a borrow the walk saw" }
-                else if read && alias { c"E1.8: an alias's use the walk saw, only read through" }
-                else if read { c"E1.8: a borrow only read through" }
+                else if read && plain { c"E1.8: a borrow only read through" }
+                else if read {
+                    c"E1.8: a borrow only read through, its reads of an address followed"
+                }
                 else { c"internal: E1.8: a borrow of a local the effect walk did not see" };
             crate::base::diag::err_begin(pcx.nodes[node as usize].start, pcx);
             crate::base::diag::err_str(msg, pcx);
@@ -1444,13 +1493,13 @@ fn ir_unseen(m: i64, set: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> i64 {
         if seen || read {
             continue;
         }
-        let kind = pcx.fx_ir_loans[k + 3];
         let raw = kind == crate::places::ir::BK_RAW || kind == crate::places::ir::BK_RAW_MUT;
         out = if raw { 2 } else if out == 0 { 1 } else { out };
         if (check == 1 || check == 3) && !pcx.search && !pcx.eval && node > 0 {
             crate::base::diag::err_begin(pcx.nodes[node as usize].start, pcx);
-            crate::base::diag::err_str(
-                c"internal: E1.8: a borrow of a local the effect walk did not see", pcx);
+            crate::base::diag::err_str(if through {
+                c"internal: E1.8: a read of an address the effect walk did not see"
+            } else { c"internal: E1.8: a borrow of a local the effect walk did not see" }, pcx);
             crate::base::diag::err_end_soft(pcx);
         }
     }
@@ -1558,6 +1607,19 @@ pub fn holds_ref(t: i64, raw: bool, depth: i64, pcx: &Ctx<Comp>) -> bool {
         return false;
     }
     true
+}
+
+// RULE: E1.8 (0.30.1, RT-32) Whether a value of type t, read through a
+// reference (`*r`), may be an address: a reference or a raw pointer at
+// any depth of it (holds_ref). Such a read through an alias of a local is
+// a use of what the alias reaches, not a read of a value: `*rr` of `rr =
+// &r`, `r = &d`, is d's address. The one rule both sides read: the walk
+// (walk_node's `*`: its site goes on) and the places IR's read-through
+// borrows (places::build::settle_loans: LOAN_READ_PLAIN only when no read
+// gives one; each read that may is noted, and must be a use the walk
+// followed, ir_unseen).
+pub fn read_gives_address(t: i64, pcx: &Ctx<Comp>) -> bool {
+    holds_ref(t, true, 0, pcx)
 }
 
 // (E1.8) Whether a parameter of type t can keep nothing it is given: by
