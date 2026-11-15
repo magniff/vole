@@ -505,6 +505,18 @@ type.cast`, rustc E0641 "cannot cast to a pointer of an unknown kind".)
 
 **F29.2 (fat pointers).** Z9.3.
 
+**F29.4 (no reference of another type, 0.30.1).** `as` makes a
+reference only of a reference to the same pointee: `&mut T as &T`, `&T
+as &T`. `&x as &U` and `&mut x as &mut U` with `U` not `T` (a
+transmute: a `bool` that holds 100, a reference made of a number), a
+raw pointer cast to a reference (`p as &T`: a reference of any
+address), `&T as &mut T`, and `&mut s as &mut [u8]` of a `&mut str`
+(F0.1's distinct conversion: safe code would write bytes that are not
+UTF-8; `&str as &[u8]` stays, it only reads) are `error
+type.ref_cast`, rustc E0605/E0606. The fixes are a conversion of the
+value, `&*p` in an unsafe block, `s.as_bytes()`. *Anchor:*
+`synth_cast`, `ref_cast_error` (RT-M2-4, RT-M2-5).
+
 **F29.3 (no implicit numeric conversion).** As today: no `as` is
 inserted; an integer literal takes its type from its context (F18.3).
 There is no `u128`/`i128` in 0.27.2: the names are `syntax.later:
@@ -2302,6 +2314,7 @@ where a `try:` is named, a case in `tests/borrowck-try`'s shape under
 | `type.infer` | F18.1, F18.2, F7.3, F8.2, F18.5 (an integer's own method on a literal or an open local, 0.27.7) | E0282, E0689 | `g::<τ>(..)`, `let x: τ` |
 | `type.unsized` | F21.1, F21.2, F20.1 | E0277 | `&` the type, `?Sized` on the parameter, `Box<_>` |
 | `type.cast` | F1.3, F29.1, Z9.3, D22.3 | E0604, E0605, E0606 | `char::from_u32(x)` for `u32 as char`; none else |
+| `type.ref_cast` | F29.4 | E0605, E0606 | none (the help names `&*p`, `as_bytes`, a conversion) |
 | `type.transmute` | F19.5 | E0512 | none; names both sizes |
 | `generic.unbounded_use` | D22.3, F26.2 | E0599, E0369, E0609 | adds `T: Tr` when unique |
 | `generic.count` | F19.1 | E0107 | removes or completes the turbofish |
