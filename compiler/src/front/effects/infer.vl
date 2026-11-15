@@ -275,6 +275,8 @@ pub fn infer_effects(pcx: &mut Ctx<Comp>) {
     }
     sized_table(&mut pcx.local_fx, n + 1, Effects { bits: 0, allocs: 0 });
     pcx.fx_pending.clear();
+    // (E1.8: the IR's borrows, by function)
+    index_ir_loans(pcx);
     // (E1.8: the references the checker made raw pointers, a table)
     pcx.fx_coerced.clear();
     pcx.fx_coerced.resize(pcx.nodes.len(), 0);
@@ -1126,6 +1128,7 @@ fn note_address(n: i64, pcx: &mut Ctx<Comp>) {
         return;
     }
     let y = pcx.nodes[o as usize].y;
+    pcx.fx_seen.push(n);
     if !env && ((pcx.nodes[n as usize].p & NODE_RAW_BORROW) != 0
         || is_raw_pointer(pcx.nodes[n as usize].ty, pcx)) {
         pcx.fx_addressed.push(y);
@@ -1291,6 +1294,9 @@ fn note_ref_bindings(p: i64, e: i64, pcx: &mut Ctx<Comp>) {
     }
     let root = place_root(e, pcx);
     if root >= 0 {
+        // (the IR's borrow of a `let`'s place is at its value, a pattern's
+        // at the binding: both seen, ir_unseen)
+        pcx.fx_seen.push(e);
         ref_binds(p, root, pcx);
     }
 }
@@ -1336,6 +1342,7 @@ fn ref_binds(p: i64, root: i64, pcx: &mut Ctx<Comp>) {
             && pcx.nodes[p as usize].x >= 0 {
             pcx.fx_alias.push(pcx.nodes[p as usize].x);
             pcx.fx_alias.push(root);
+            pcx.fx_seen.push(p);
         }
         return;
     }
@@ -1347,6 +1354,98 @@ fn ref_binds(p: i64, root: i64, pcx: &mut Ctx<Comp>) {
         for i in 0..pcx.nodes[p as usize].count {
             ref_binds(child(p, i, pcx), root, pcx);
         }
+    }
+}
+
+// (E1.8) FX_IR_LOANS by function: fx_ir_index holds each function's
+// entries' indices, from fx_ir_start[f] to fx_ir_start[f + 1].
+fn index_ir_loans(pcx: &mut Ctx<Comp>) {
+    let n = pcx.fns.len();
+    pcx.fx_ir_start.clear();
+    pcx.fx_ir_start.resize(n + 1, 0);
+    pcx.fx_ir_index.clear();
+    let mut k: usize = 0;
+    while k + 3 < pcx.fx_ir_loans.len() {
+        let f = pcx.fx_ir_loans[k];
+        if f >= 0 && (f as usize) < n {
+            (pcx.fx_ir_start[(f + 1) as usize]) += 1;
+        }
+        k += 4;
+    }
+    for i in 0..n {
+        (pcx.fx_ir_start[i + 1]) += pcx.fx_ir_start[i];
+    }
+    pcx.fx_ir_index.resize(pcx.fx_ir_start[n] as usize, 0);
+    let mut fill: Vec<i64, Comp> = Vec::new_in(Comp {});
+    fill.resize(n, 0);
+    k = 0;
+    while k + 3 < pcx.fx_ir_loans.len() {
+        let f = pcx.fx_ir_loans[k];
+        if f >= 0 && (f as usize) < n {
+            let at = pcx.fx_ir_start[f as usize] + fill[f as usize];
+            (pcx.fx_ir_index[at as usize]) = k as i64;
+            (fill[f as usize]) += 1;
+        }
+        k += 4;
+    }
+}
+
+// RULE: E1.8 (0.30.1) Whether the places IR has a borrow of one of the
+// locals in set, in function m, that the walk did not see (FX_SEEN): 2
+// when one is raw (the address taken), 1 when one is not, 0 none. The
+// IR's borrows are every borrow made, whatever the syntax
+// (places::build::emit_ref): a form the walk does not know still makes
+// one, and goes anywhere (settle_addresses: the function's own set
+// decides). A closure's environment given to its call is the walk's
+// (closure_env_arg). With VOLE_E18_CHECK set, each is an error: the walk
+// is to be as complete as the IR's borrows (tests/e18_loans.sh).
+fn ir_unseen(m: i64, set: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    if m < 0 || (m + 1) as usize >= pcx.fx_ir_start.len() {
+        return 0;
+    }
+    let mut out: i64 = 0;
+    let check = e18_check();
+    for j in (pcx.fx_ir_start[m as usize])..(pcx.fx_ir_start[(m + 1) as usize]) {
+        let k = pcx.fx_ir_index[j as usize] as usize;
+        let node = pcx.fx_ir_loans[k + 2];
+        if !set.contains(&(pcx.fx_ir_loans[k + 1])) {
+            continue;
+        }
+        let seen = pcx.fx_seen.contains(&node);
+        if check == 2 && !pcx.search && !pcx.eval && node > 0 {
+            // (VOLE_E18_CHECK=all: every borrow of the proof's locals)
+            crate::base::diag::err_begin(pcx.nodes[node as usize].start, pcx);
+            crate::base::diag::err_str(if seen { c"E1.8: a borrow the walk saw" }
+                else { c"internal: E1.8: a borrow of a local the effect walk did not see" }, pcx);
+            crate::base::diag::err_end_soft(pcx);
+        }
+        if seen {
+            continue;
+        }
+        let kind = pcx.fx_ir_loans[k + 3];
+        let raw = kind == crate::places::ir::BK_RAW || kind == crate::places::ir::BK_RAW_MUT;
+        out = if raw { 2 } else if out == 0 { 1 } else { out };
+        if check == 1 && !pcx.search && !pcx.eval && node > 0 {
+            crate::base::diag::err_begin(pcx.nodes[node as usize].start, pcx);
+            crate::base::diag::err_str(
+                c"internal: E1.8: a borrow of a local the effect walk did not see", pcx);
+            crate::base::diag::err_end_soft(pcx);
+        }
+    }
+    out
+}
+
+// (E1.8) VOLE_E18_CHECK: 1 when set, ir_unseen's borrows are errors; 2
+// when `all`, every IR borrow of a proof's locals is reported, seen or
+// not (the list itself checked); 0 unset.
+fn e18_check() -> i64 {
+    // UNSAFE: C's getenv, and the bytes of its string.
+    // SAFETY: the name is a NUL-terminated literal; getenv gives null or a
+    // NUL-terminated string, read only when not null and up to its NUL.
+    unsafe {
+        let p = crate::base::getenv(c"VOLE_E18_CHECK");
+        if p == 0 as *mut u8 || *p == 0 { 0 }
+        else if *p == b'a' && *p.add(1) == b'l' && *p.add(2) == b'l' { 2 } else { 1 }
     }
 }
 
@@ -1545,7 +1644,10 @@ fn settle_addresses(pcx: &mut Ctx<Comp>) {
         for j in 0..set.len() {
             taken = taken || address_taken(set[j], pcx);
         }
-        if taken {
+        // (the IR's borrows of these locals that the walk did not see:
+        // a raw one takes the address, another goes anywhere)
+        let unseen = ir_unseen(pcx.walk_node, &set, pcx);
+        if taken || unseen == 2 {
             local(n, bit, 0, pcx);
             continue;
         }
@@ -1563,6 +1665,10 @@ fn settle_addresses(pcx: &mut Ctx<Comp>) {
                 pcx.fx_pending[at + 3] += 1;
             }
             s += 2;
+        }
+        if unseen == 1 {
+            pcx.fx_pending.push(-1);
+            pcx.fx_pending[at + 3] += 1;
         }
         if pcx.fx_pending[at + 3] == 0 {
             pcx.fx_pending.truncate(at);
@@ -1656,6 +1762,7 @@ fn walk_body(f: i64, pcx: &mut Ctx<Comp>) {
     pcx.fx_arg_callee.clear();
     pcx.fx_borrow_sites.clear();
     pcx.fx_alias.clear();
+    pcx.fx_seen.clear();
     pcx.fx_ref_cast = false;
     walk(pcx.nodes[pcx.fns[f as usize].node as usize].c, pcx);
     settle_addresses(pcx);
