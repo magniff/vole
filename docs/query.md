@@ -1100,7 +1100,11 @@ drops0261/main.vl:22 in pick
 ```
 
 The innermost function holds the line (a closure inside its parent;
-the first instance of a generic one). A line in no function with a body
+the first instance of a generic one). (0.30.1) The functions the
+compiler made from it with its text come after it, each with its own
+drops: an `ensures`'s `f$body`, which holds the body (f is then the
+wrapper that calls it and checks), a `requires`'s `f$pre`, a
+`#[multiversion]` copy (tests/query/drops0301.q). A line in no function with a body
 (a generic one never instantiated, C's, one with errors): `error
 query.no-match`, `try:` the item at that line. `check --emit-places`
 prints the whole IR; `--emit-shims` the drop shims a `[kept]` drop
