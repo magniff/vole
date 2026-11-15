@@ -1606,7 +1606,16 @@ closure the region is instantiated fresh (D3.6, D4.3), as it should be.
   ir271 M2: the builder emits) the reborrow `&'new mut (*Q)`, a loan
   subject to I3′; so no two `&mut` values to one place exist without one
   being a reborrow of the other, and the reborrow's region is bounded
-  by the outer reference's (`'q : 'new`).
+  by the outer reference's (`'q : 'new`). (0.30.1) Nor a whole mutable
+  view, with no exception: given to a call, into a shared view or
+  `&T` (shared_coercion, the hidden binding of a format hole, a typed
+  `let`), it is reborrowed; only a copy into a raw pointer (R1, a cast
+  or a coercion, an access of the reference's kind) and a `requires`
+  companion's read (C3.2) are no reborrow. verify_mut_copies asserts
+  it of every body the runner builds (`--verify-places`); the
+  exemptions it had for views (a call's argument, an intrinsic's, a
+  shared destination) hid `f(s, s)`, `let b: &[T] = s;` with a write
+  under b, and a write under a format hole's view.
 
 - (I8, closure bodies; 0.27.2) §19's soundness paragraph: with the
   env a reference or a value (D19.4) and the requirements (D19.10),
