@@ -1212,52 +1212,77 @@ fn emit_ref(dl: i64, dp: i64, l: i64, p: i64, kind: i64, node: i64, pbody: &mut 
 }
 
 // RULE: E1.8 (0.30.1) Where the references of the built body's borrows
-// go, the entries of FX_IR_LOANS from `from` on (emit_ref). Two rules
-// decide whether the reference d a borrow is written to (a whole local)
-// goes anywhere:
-//   - d as a statement's place: only as a borrow's destination (`d =
-//     &P`), or whole in a drop, a mention, a storage marker; a write
-//     through it, or into a part of it, a call's or an intrinsic's result
-//     put in it, a drop of a place under it, go on (the place rule);
-//   - d as an operand: only a place under its `*`, read (copied, moved)
-//     or, as a place, its length or discriminant taken; d used whole (a
-//     call's argument, an aggregate's part, a cast), a place of it not
-//     under its `*`, a borrow or a slicing of a place under it, go on (the
-//     operand rule).
-// A borrow whose d meets both, is no raw borrow and d a reference (one
-// predicate, reference_loan: a raw borrow's d is a raw pointer), gives
-// only the borrowed place's value, read at each read: LOAN_READ_PLAIN
-// when no read may give an address (front::effects::infer::
-// read_gives_address, the rule the walk's `*` reads by), else LOAN_READ.
-// Every read through d that may give an address is noted as an entry of
-// its own (BK_READ_THROUGH, at the read's node), for every noted borrow
-// of d whatever its settling: the walk must have followed a use there
-// (ir_unseen), so a read the walk drops is reported (RT-32: `zap(*rr)` of
-// `rr = &r`, `r = &d`). Any other borrow is LOAN_ANY, and the walk must
-// have seen it. Decided from the built body, not from the syntax that
-// made the borrow. (An index's local, PJ_INDEX, is an integer, never a
-// reference: not looked at.) VOLE_E18_PLANT names one rule to leave out,
-// a planted fault tests/e18_loans.sh --self-test must see: place,
-// operand, reference, reads.
+// go, the entries of FX_IR_LOANS from `from` on (emit_ref). A borrow's
+// reference is written to a whole local d; it is followed into every
+// local it is copied or moved into whole (`x = h`, a temporary's too: the
+// holders, d's copies, whose value is the reference). A holder that is
+// also given a value from a local that is no holder goes on, as the place
+// rule's other writes. A reference to a holder (`rr = &r`) is a borrow of
+// its own, with its own holders, whose reads give the reference (below).
+// Two rules decide whether the reference goes anywhere else, for each
+// holder:
+//   - a holder as a statement's place: only as a borrow's destination
+//     (`d = &P`), a copy into it, or whole in a drop, a mention, a
+//     storage marker; a write through it, or into a part of it, a call's
+//     or an intrinsic's result put in it, a drop of a place under it, go
+//     on (the place rule);
+//   - a holder as an operand: only a place under its `*`, read (copied,
+//     moved) or, as a place, its length or discriminant taken, or copied
+//     whole into a local; a holder used whole otherwise (a call's argument,
+//     an aggregate's part, a cast), a place of it not under its `*`, a
+//     borrow or a slicing of a place under it, go on (the operand rule).
+// A borrow whose holders meet both, is no raw borrow and d a reference
+// (one predicate, reference_loan: a raw borrow's d is a raw pointer),
+// gives only the borrowed place's value, read at each read:
+// LOAN_READ_PLAIN when no read through a holder may give an address
+// (front::effects::infer::read_gives_address, the rule the walk's `*`
+// reads by), else LOAN_READ. Every read through a holder that may give
+// an address is noted as an entry of its own (BK_READ_THROUGH, at the
+// read's node), for every noted borrow whatever its settling: the walk
+// must have followed a use there (ir_unseen), so a read the walk drops
+// is reported (RT-32: `zap(*rr)` of `rr = &r`, `r = &d`; and through a
+// copy, `rr2 = rr; zap(*rr2)`, the review's). Any other borrow is
+// LOAN_ANY, and the walk must have seen it. Decided from the built body,
+// not from the syntax that made the borrow, so no spelling of a copy or a
+// borrow of the reference escapes it. (An index's local, PJ_INDEX, is an
+// integer, never a reference: not looked at.) VOLE_E18_PLANT names one
+// rule to leave out, a planted fault tests/e18_loans.sh --self-test must
+// see: place, operand, reference, reads, follow (no copy followed: a copy
+// is an escape, as before 0.30.1's review).
 fn settle_loans(from: usize, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     if from >= pcx.fx_ir_loans.len() {
         return;
     }
-    let plant = crate::base::env_var(c"VOLE_E18_PLANT");
-    let no_place = plant.as_slice() == b"place";
-    let no_operand = plant.as_slice() == b"operand";
-    let no_reference = plant.as_slice() == b"reference";
-    let no_reads = plant.as_slice() == b"reads";
+    let no_place = crate::front::effects::infer::e18_plant(b"place");
+    let no_operand = crate::front::effects::infer::e18_plant(b"operand");
+    let no_reference = crate::front::effects::infer::e18_plant(b"reference");
+    let no_reads = crate::front::effects::infer::e18_plant(b"reads");
+    let no_follow = crate::front::effects::infer::e18_plant(b"follow");
     let n = local_count(pbody) as usize;
     let mut escapes: Vec<bool, Comp> = Vec::new_in(Comp {});
     escapes.resize(n, false);
     // (the reads that may give an address: local, node)
     let mut reads: Vec<i64, Comp> = Vec::new_in(Comp {});
+    // (the flows of a holder's value into a whole local: from, to)
+    let mut flows: Vec<i64, Comp> = Vec::new_in(Comp {});
     for s in 0..pbody.stmts.len() {
         let st = pbody.stmts[s];
+        // (a flow: `x = h`, a local copied or moved whole into another)
+        let mut flow = false;
+        if st.kind == SK_ASSIGN && st.b == 0 && st.a >= 0 && (st.a as usize) < n
+            && st.nops == 1 && st.c == RV_USE && !no_follow {
+            let k = op_kind(st.ops, 0, pbody);
+            let a = op_a(st.ops, 0, pbody);
+            if (k == OK_COPY || k == OK_MOVE) && op_b(st.ops, 0, pbody) == 0 && a >= 0
+                && (a as usize) < n {
+                flow = true;
+                flows.push(a);
+                flows.push(st.a);
+            }
+        }
         let placed = st.kind == SK_ASSIGN || st.kind == SK_CALL || st.kind == SK_INTRINSIC
             || st.kind == SK_DROP;
-        if placed && st.a >= 0 && (st.a as usize) < n && !no_place
+        if placed && st.a >= 0 && (st.a as usize) < n && !no_place && !flow
             && (st.b != 0 || st.kind == SK_CALL || st.kind == SK_INTRINSIC
                 || st.kind == SK_ASSIGN && st.c != RV_REF) {
             escapes[st.a as usize] = true;
@@ -1270,7 +1295,7 @@ fn settle_loans(from: usize, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
             }
             let p = op_b(st.ops, i, pbody);
             let under = p != 0 && root_proj_kind(p, pbody) == PJ_DEREF;
-            let read = under
+            let read = flow || under
                 && (k != OK_PLACE || st.kind == SK_ASSIGN && (st.c == RV_DISCR || st.c == RV_LEN));
             if !read && !no_operand {
                 escapes[a as usize] = true;
@@ -1284,15 +1309,36 @@ fn settle_loans(from: usize, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
         }
     }
     let end = pcx.fx_ir_loans.len();
+    // (a loan's holders: marked in `holders`, listed in `members`, unmarked
+    // after the loan: no pass over every local per loan)
+    let mut holders: Vec<bool, Comp> = Vec::new_in(Comp {});
+    holders.resize(n, false);
+    let mut members: Vec<i64, Comp> = Vec::new_in(Comp {});
     let mut k = from;
     while k + IR_LOAN_WORDS <= end {
         let d = pcx.fx_ir_loans[k + 4];
         let kind = pcx.fx_ir_loans[k + 3];
         if d >= 0 && (d as usize) < n {
+            // (the holders: d, and what its value flows into, to a fixpoint)
+            holders[d as usize] = true;
+            members.push(d);
+            let mut grew = flows.len() > 0;
+            while grew {
+                grew = false;
+                let mut f: usize = 0;
+                while f + 1 < flows.len() {
+                    if holders[flows[f] as usize] && !holders[flows[f + 1] as usize] {
+                        holders[flows[f + 1] as usize] = true;
+                        members.push(flows[f + 1]);
+                        grew = true;
+                    }
+                    f += 2;
+                }
+            }
             let mut gives = false;
             let mut j: usize = 0;
             while j + 1 < reads.len() {
-                if reads[j] == d {
+                if holders[reads[j] as usize] {
                     gives = true;
                     if !no_reads {
                         pcx.fx_ir_loans.push(pcx.fx_ir_loans[k]);
@@ -1305,8 +1351,21 @@ fn settle_loans(from: usize, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
                 }
                 j += 2;
             }
-            if !escapes[d as usize]
-                && (no_reference || reference_loan(kind, local_ty(d, pbody), pcx)) {
+            // (a holder given a value from elsewhere too, a flow from a
+            // local that is no holder: as the place rule's other writes)
+            let mut escaped = false;
+            let mut f: usize = 0;
+            while f + 1 < flows.len() {
+                escaped = escaped
+                    || !no_place && holders[flows[f + 1] as usize] && !holders[flows[f] as usize];
+                f += 2;
+            }
+            for m in 0..members.len() {
+                escaped = escaped || escapes[members[m] as usize];
+                holders[members[m] as usize] = false;
+            }
+            members.clear();
+            if !escaped && (no_reference || reference_loan(kind, local_ty(d, pbody), pcx)) {
                 pcx.fx_ir_loans[k + 5] = if gives { LOAN_READ } else { LOAN_READ_PLAIN };
             }
         }

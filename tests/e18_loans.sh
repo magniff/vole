@@ -23,8 +23,14 @@
 # says, line for line; and each planted fault (VOLE_E18_PLANT: a rule of
 # places::build::settle_loans, the place, operand or reference rule, the
 # reads through a borrow left unnoted, the walk's `*` rule, an alias's
-# use left unmarked) must change that list. With a PATTERN, the run over
-# it follows.
+# use left unmarked, a copy of a reference not followed) must change that
+# list. (0.30.1, the second review's) And each fault must change a
+# verdict where the other side does not mask it: each tests/e18/verdict
+# program says, on its first line (`// VERDICT: MODE BASE PLANT`), the
+# side that decides alone (VOLE_E18_CHECK=ir, walk, or both), the faults
+# already planted (BASE, `-` for none) and the one added: its #[no_panic]
+# claim must be refused without PLANT and accepted with it (k then
+# panics: the claim is wrong). With a PATTERN, the run over it follows.
 #
 # usage: tests/e18_loans.sh [-c COMPILER] [-j N] [--self-test] [PATTERN]
 set -u
@@ -76,18 +82,37 @@ if [ "$SELF" -eq 1 ]; then
         echo "e18-loans: self-test FAIL: $f is not settled as tests/e18/forms.expect says:"
         diff tests/e18/forms.expect "$T/o4"; bad=1
     fi
-    for plant in place operand reference reads walk use; do
+    for plant in place operand reference reads walk use follow; do
         VOLE_E18_PLANT=$plant VOLE_CACHE=off VOLE_E18_CHECK=all "$C" check --each --max-errors=0 $f 2>&1 \
             | grep "E1.8" > "$T/o5"
         if cmp -s "$T/o5" tests/e18/forms.expect; then
             echo "e18-loans: self-test FAIL: the planted fault VOLE_E18_PLANT=$plant was not seen"; bad=1
         fi
     done
+    # (5) each fault changes a verdict where the other side does not mask it
+    nv=0
+    for v in tests/e18/verdict/*.vl; do
+        set -- $(head -1 "$v")
+        mode=$3; base=$4; plant=$5
+        [ "$mode" = both ] && mode=
+        [ "$base" = - ] && base=
+        with=${base:+$base,}$plant
+        VOLE_E18_CHECK=$mode VOLE_E18_PLANT=$base VOLE_CACHE=off "$C" check "$v" > "$T/v0" 2>&1
+        s0=$?
+        VOLE_E18_CHECK=$mode VOLE_E18_PLANT=$with VOLE_CACHE=off "$C" check "$v" > "$T/v1" 2>&1
+        s1=$?
+        if [ $s0 -eq 0 ] || ! grep -q "error\[effect\]" "$T/v0"; then
+            echo "e18-loans: self-test FAIL: $v: not refused without the fault ($plant)"; cat "$T/v0"; bad=1
+        elif [ $s1 -ne 0 ]; then
+            echo "e18-loans: self-test FAIL: $v: the planted fault $plant did not change the verdict"; bad=1
+        fi
+        nv=$((nv + 1))
+    done
     rm -rf "$T"
     if [ "$bad" -ne 0 ]; then
         exit 1
     fi
-    echo "e18-loans: self-test ok: a blind walk's borrows, a crash and a panic are reported, the forms settled, 6 planted faults seen"
+    echo "e18-loans: self-test ok: a blind walk's borrows, a crash and a panic are reported, the forms settled, 7 planted faults seen, $nv verdicts changed by one"
     if [ -z "$PAT" ]; then
         exit 0
     fi
