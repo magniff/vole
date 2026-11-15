@@ -277,8 +277,16 @@ the moves form a cycle, and the source of one move on it is saved in
 the cycle register, by the type of the moves that read it (when two
 moves read one location as values of different types or sizes, that is
 an internal error, never code). When the cycle register holds a value
-already (a second cycle through a vector and a scalar), the save goes
-to 4 cells kept at the end of the spill area of a function with vectors.
+already, the save goes to cells after the spill slots. With values of
+several widths any number of saves may be pending at once, so the cells
+are counted before the frame is laid out: `reserve_save_cells` plans
+every edge and gap of a function with a vector on the stack (saves in
+cells without an end) and keeps as many as they used, and the emitter's
+plans are the same plans. Without a vector on the stack every location
+is one unit, the stalled moves are simple cycles, and the cycle register
+is enough. A move edge never fails a compile; `plan_break`'s choice of
+what to save only keeps the saves few (`tests/fuzz/pm_model.py` models
+it all, line for line, over random edges).
 The checker requires that each move's destination hold its value after
 the steps, so a plan that overwrites a value before it is moved is an
 internal error under `--verify-regalloc` (tested by planting slot

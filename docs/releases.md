@@ -182,19 +182,31 @@ that keeps few values live is unlikely to make such moves.
   each, the quick gate's too), run by tests/affected.sh for a change to
   the back end with `tests/fuzz/pm_model.py`, a model of the moves'
   plan run over random edges.
-- How the plan breaks a cycle (`plan_break`): when every pending move
-  waits, a value is saved whose readers can then all be made before the
-  next stall, if there is one; two saves may have to be pending at
-  once (an edge with two cycles joined through a wide move needs them
-  whatever is chosen), the cycle register's and 4 cells kept at the end
-  of a vector function's spill area. Measured on the model, 2,000,000
-  edges for each target: never a third. The plan of this branch's
-  second review walked to a cycle and saved what it found there, and
-  died for want of a third save on 133 of 200,000 x86-64 edges (an
-  internal error, never code).
+- **No move edge can fail a compile.** When every pending move waits,
+  one value is saved and its readers read the save; with values of
+  several widths several saves may be pending at once (the reviews found
+  edges needing two and three, whatever is chosen), so no fixed storage
+  is enough. Before the frame is laid out, `reserve_save_cells` plans
+  every edge and gap of a function with a vector on the stack, saves
+  taking cells after the spill slots without an end, and the frame gets
+  as many cells as they used; the emitter's plans are the same plans, so
+  a save always has storage. Without a vector on the stack every
+  location is one unit, the stalled moves are simple cycles and the
+  cycle register is enough. `plan_break`'s choice of the value to save
+  only keeps the saves few. Round 2 of this work had 4 fixed cells and a
+  walk that died on 133 of 200,000 of the second review's x86-64 edges;
+  round 3 a better choice that the third review still saw die (an
+  internal error, never code). The model, `tests/fuzz/pm_model.py`,
+  plans each edge as the compiler does, the dry run and then the
+  emitter's plan with that many cells: 1,000,000 edges for each target,
+  half of them dense float and vector edges and full tilings of the
+  cells, none dies, none is wrong.
 - The cost, in instructions: the compiler's -O2 self-build +0.5% (its
   phase of register allocation and emission +4.4%, the registers' and
   cells' checks), -O0 0.0%; examples/nes +0.17% at -O0, +0.37% at -O2.
+  The cells for saves cost nothing measurable: the self-build's
+  instructions the same as with round 3's fixed cells, its text 8 bytes
+  smaller on aarch64 and 320 on x86-64, nes's the same and 128 smaller.
 
 #### What changes for a program
 
