@@ -290,7 +290,7 @@ fn main(gpa: Gpa) {
 error[borrowck.use_moved]: 'a' is used here after it moved (moved at main.vl: line 4, column 17)
  --> main.vl: line 6, column 22
   = help: use it before the move, pass a clone where it moves, or take it by reference
-  = try: volec edit patch main.vl:4 --old 'let mut b = a;' --new 'let mut b = a.clone();'
+  = try: volec edit patch --at main.vl:4 --old 'let mut b = a;' --new 'let mut b = a.clone();'
 ```
 
 Following the `try:` line, `let mut b = a.clone();` makes `b` a copy, and
