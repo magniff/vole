@@ -29,8 +29,9 @@
 # program says, on its first line (`// VERDICT: MODE BASE PLANT`), the
 # side that decides alone (VOLE_E18_CHECK=ir, walk, or both), the faults
 # already planted (BASE, `-` for none) and the one added: its #[no_panic]
-# claim must be refused without PLANT and accepted with it (k then
-# panics: the claim is wrong). With a PATTERN, the run over it follows.
+# claim must be refused without PLANT and accepted with it, and the
+# program, built with PLANT, must panic in k (exit 101: the claim is
+# wrong, the third review's). With a PATTERN, the run over it follows.
 #
 # usage: tests/e18_loans.sh [-c COMPILER] [-j N] [--self-test] [PATTERN]
 set -u
@@ -90,10 +91,12 @@ if [ "$SELF" -eq 1 ]; then
         fi
     done
     # (5) each fault changes a verdict where the other side does not mask it
-    nv=0
-    for v in tests/e18/verdict/*.vl; do
-        set -- $(head -1 "$v")
-        mode=$3; base=$4; plant=$5
+    # (verdict FILE: 0 when FILE's claim is refused without the fault and
+    # accepted with it, and its build with the fault panics in k; else 1,
+    # with what failed in $T/why)
+    verdict() {
+        set -- "$1" $(head -1 "$1")
+        v=$1; mode=$4; base=$5; plant=$6
         [ "$mode" = both ] && mode=
         [ "$base" = - ] && base=
         with=${base:+$base,}$plant
@@ -102,17 +105,46 @@ if [ "$SELF" -eq 1 ]; then
         VOLE_E18_CHECK=$mode VOLE_E18_PLANT=$with VOLE_CACHE=off "$C" check "$v" > "$T/v1" 2>&1
         s1=$?
         if [ $s0 -eq 0 ] || ! grep -q "error\[effect\]" "$T/v0"; then
-            echo "e18-loans: self-test FAIL: $v: not refused without the fault ($plant)"; cat "$T/v0"; bad=1
-        elif [ $s1 -ne 0 ]; then
-            echo "e18-loans: self-test FAIL: $v: the planted fault $plant did not change the verdict"; bad=1
+            { echo "$v: not refused without the fault ($plant)"; cat "$T/v0"; } > "$T/why"; return 1
+        fi
+        if [ $s1 -ne 0 ]; then
+            echo "$v: the planted fault $plant did not change the verdict" > "$T/why"; return 1
+        fi
+        # (0.30.1, the third review's) the accepted claim is wrong: built
+        # with the fault, k must panic (exit 101), as the comment says
+        rm -f "$T/k"
+        VOLE_E18_CHECK=$mode VOLE_E18_PLANT=$with VOLE_CACHE=off "$C" "$v" -o "$T/k" > "$T/v2" 2>&1
+        if [ $? -ne 0 ] || [ ! -x "$T/k" ]; then
+            { echo "$v: with the fault $plant, its claim accepted by check, it does not build:"; cat "$T/v2"; } > "$T/why"
+            return 1
+        fi
+        "$T/k" > "$T/v3" 2>&1
+        s3=$?
+        if [ $s3 -ne 101 ] || ! grep -q "attempt to divide by zero" "$T/v3"; then
+            { echo "$v: with the fault $plant, k does not panic dividing by zero (exit $s3, 101 wanted): the program does not show the claim wrong:"
+              cat "$T/v3"; } > "$T/why"
+            return 1
+        fi
+        return 0
+    }
+    nv=0
+    for f in tests/e18/verdict/*.vl; do
+        if ! verdict "$f"; then
+            echo "e18-loans: self-test FAIL: $(cat "$T/why")"; bad=1
         fi
         nv=$((nv + 1))
     done
+    # (the run of k shown to catch: a verdict program whose zap writes 1,
+    # so that k never divides by zero, must be reported)
+    sed 's/= 0;$/= 1;/' tests/e18/verdict/walk.vl > "$T/nopanic.vl"
+    if verdict "$T/nopanic.vl" || ! grep -q "k does not panic" "$T/why"; then
+        echo "e18-loans: self-test FAIL: a verdict program whose k does not panic was not reported"; bad=1
+    fi
     rm -rf "$T"
     if [ "$bad" -ne 0 ]; then
         exit 1
     fi
-    echo "e18-loans: self-test ok: a blind walk's borrows, a crash and a panic are reported, the forms settled, 7 planted faults seen, $nv verdicts changed by one"
+    echo "e18-loans: self-test ok: a blind walk's borrows, a crash and a panic are reported, the forms settled, 7 planted faults seen, $nv verdicts changed by one, each fault's build panicking in k (and one that does not, reported)"
     if [ -z "$PAT" ]; then
         exit 0
     fi
