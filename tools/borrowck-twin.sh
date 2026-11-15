@@ -110,6 +110,7 @@ map_code() {
         E0596) echo borrow_immutable ;;
         E0510) echo guard_write ;;
         E0796|static_mut) echo static_mut_ref ;;
+        E0793) echo packed_ref ;;  # (0.30.1, D2.10)
         *) echo "?$1" ;;
     esac
 }

@@ -482,6 +482,22 @@ E0506); no memory is at stake. *Anchor:* `places/build.vl:
 hidden_borrow`, `front/check/interp.vl: hole_by_ref`. *Cases:*
 `rt_025_*`, `rust_b_hidden_*`.
 
+**D2.10 (a reference to a packed struct's field; 0.30.1, RT-M2-12).** A
+reference made by the builder (`RV_REF` of `BK_SHARED`, `BK_MUT`,
+`BK_MUT2`: `&p.x`, `&mut p.x`, an autoref'd `&self` or `&mut self`
+receiver, a hidden binding's borrow, D2.9) to a place that may be
+unaligned is `borrowck.packed_ref` (rustc E0793), as rustc's
+`is_disaligned`: on the place's way to its local, before any deref, a
+field of a `#[repr(C, packed(N))]` struct or union with N below the
+alignment of the place's type. A raw borrow (`&raw const p.x`), a copy
+(`let x = p.x;`), a field whose type the packing aligns (`u8`, `[u8;
+N]`, any type with `packed(N)` and alignment at most N) and a place behind a
+deref (`&(*p.r).y`) are not. The fake loans of a match guard (D2.6) are
+not references. Before, every such reference was accepted, and an
+atomic through one stopped the program with SIGBUS. *Anchor:*
+`places/build.vl: disaligned`. *Cases:* `rt_m2_012_*`,
+`rust_b_packed_ref_ok`, `rust_b_err_packed_ref_hole`.
+
 ## 3. Regions (S3)
 
 **D3.1 (denotation).** A region variable `'r` denotes a set `val('r) ⊆
@@ -1783,6 +1799,7 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.move_from_drop` | M4 | E0509 | none; the help names `mem::take`/`Option::take` |
 | `borrowck.guard_write` | D2.5 vs a `fake` loan; L6 | E0510, E0594 | none; the help says to write after the match |
 | `borrowck.static_mut_ref` | D6.2.5 (ir271) | the `static_mut_refs` lint (no E-code in 1.98) | `&raw mut S` |
+| `borrowck.packed_ref` (0.30.1) | D2.10 | E0793 | none; the help says to copy the field out or take `&raw const` |
 | `borrowck.unchecked` (warning) | D10.4 only | — | kept from 0.27.0; the message names the closure. Retired in 0.27.2 (D19.4): fires on no body |
 | `closure.kind` (0.27.2, the front) | D19.6; D19.3(c) | E0525; E0594, E0596 | none; the help names the bound to relax, or `.clone()` before the closure |
 | `closure.sig` (0.27.2, the front) | D20.3, D20.5 | E0631 | none |
