@@ -18,7 +18,7 @@
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{
-    NODE_REF, NODE_REF_MUT, NodeKind, list_begin, list_end, list_push, new_node,
+    NODE_REF, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::lexer::Tok;
 use crate::front::parser::{advance, at, cur_start, eat, prev_end, tok_kind};
@@ -100,6 +100,49 @@ pub fn bind_lifetimes(n: i64, pcx: &mut Ctx<Comp>) {
     pcx.lt_last = 0;
 }
 
+// (0.30.1, review 4) An impl's `where 'a: 'b + 'static` (wh, parse_where's
+// lt_where holder) joined to its header's lifetime parameters (header,
+// the holder bound to the impl and its functions): the bounds of each
+// predicate added to those of the parameter it names, so that the header's
+// bounds and the where clause are one list of predicates, read alike by
+// every reader of a parameter's h (the impl's methods assume them,
+// traits::check_impl_statics trusts them, regions::impl_bound_ties
+// requires them where the impl is chosen). A predicate on a lifetime the
+// header lacks is not joined: `'static: 'a` says nothing, an undeclared
+// lifetime is front's error.
+pub fn join_where_lifetimes(header: i64, wh: i64, pcx: &mut Ctx<Comp>) {
+    if header == 0 || wh == 0 {
+        return;
+    }
+    for wi in 0..pcx.nodes[wh as usize].count {
+        let w = child(wh, wi, pcx);
+        let wb = pcx.nodes[w as usize].h;
+        if wb <= 0 || pcx.nodes[wb as usize].count == 0 {
+            continue;
+        }
+        for pi in 0..pcx.nodes[header as usize].count {
+            let p = child(header, pi, pcx);
+            if pcx.nodes[p as usize].a != pcx.nodes[w as usize].a {
+                continue;
+            }
+            let pb = pcx.nodes[p as usize].h;
+            let joined = new_node(NodeKind::Generics, pcx.nodes[w as usize].start,
+                pcx.nodes[wb as usize].end, pcx);
+            let mark = list_begin(pcx);
+            if pb > 0 {
+                for i in 0..pcx.nodes[pb as usize].count {
+                    list_push(child(pb, i, pcx), pcx);
+                }
+            }
+            for i in 0..pcx.nodes[wb as usize].count {
+                list_push(child(wb, i, pcx), pcx);
+            }
+            list_end(joined, mark, pcx);
+            pcx.nodes[p as usize].h = joined;
+        }
+    }
+}
+
 // (0.27.2.1) Pair (key, value) onto pcx.lt_items, its key's first indexed
 // (lifetimes_of); (0.28.0) each pair chained to the next of its key
 // (outlives_of: lt_next, lt_key_last).
@@ -172,6 +215,12 @@ pub fn outlives_key(p: i64) -> i64 {
     p + (2 << 40)
 }
 
+// (0.30.1) The key of path node n's trait in pcx.lt_items, `<S as Tr>::f`:
+// the trait's type node (lifetimes_of(qpath_key(n))), 0 when it has none.
+pub fn qpath_key(n: i64) -> i64 {
+    n + (3 << 40)
+}
+
 // At a lifetime bound in type parameter `param`'s list of bounds (`T: 'a +
 // Clone`): kept for the region checker (borrowck.md D4.5, D20.6), the
 // token taken, true; else skip_lifetime_bound's (`?Sized`; false).
@@ -205,6 +254,29 @@ pub fn outlives_of(p: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
         j = pcx.lt_next[(j / 2) as usize] - 1;
     }
     0
+}
+
+// (0.30.1) Type parameter node p's lifetime bounds (`T: 'a`), copied to
+// node q, an Ω's copy of p (front::opaque::omega_of): outlives_of(q, i)
+// reads them as outlives_of(p, i) does.
+pub fn copy_outlives(p: i64, q: i64, pcx: &mut Ctx<Comp>) {
+    let mut values = Vec::<i64, Comp>::new_in(Comp {});
+    let mut j = pcx.lt_first.get(outlives_key(p)) - 1;
+    while j >= 0 {
+        values.push(pcx.lt_items[(j + 1) as usize]);
+        j = pcx.lt_next[(j / 2) as usize] - 1;
+    }
+    for &v in values.as_slice() {
+        lt_push(outlives_key(q), v, pcx);
+    }
+}
+
+// (0.30.1) Node q (an Ω's, front::opaque) has the lifetime bound
+// `'static`, at pos: one its parameter has without writing it.
+pub fn add_static_outlives(q: i64, pos: i64, pcx: &mut Ctx<Comp>) {
+    let n = new_node(NodeKind::TyName, pos, pos, pcx);
+    pcx.nodes[n as usize].a = crate::base::intern(b"'static", pcx);
+    lt_push(outlives_key(q), n, pcx);
 }
 
 // At a `where` predicate on a lifetime, `'a: 'b + 'c`: taken, true.
@@ -295,6 +367,22 @@ pub fn take_builtin_impls(pcx: &mut Ctx<Comp>) -> bool {
     pcx.builtin_traits.push(start);
     pcx.builtin_traits.push(prev_end(pcx));
     pcx.builtin_traits.push(0);
+    true
+}
+
+// (0.30.1) At `#[sealed_trait]` in std's text (not 0.16's obsolete `#[sealed]` of a struct): the trait parsed next takes no
+// impl outside std (front::traits::check_sealed, trait.sealed: std's code
+// trusts what its impls say); true, and the caller parses the trait and
+// records it. Anywhere else the attribute is not taken.
+pub fn take_sealed(pcx: &mut Ctx<Comp>) -> bool {
+    if !at(Tok::Hash, pcx) || tok_kind(1, pcx) != Tok::LBracket || !word_at(2, "sealed_trait", pcx)
+        || tok_kind(3, pcx) != Tok::RBracket
+        || !crate::front::parser::items::attrs::in_std_source(cur_start(pcx), pcx) {
+        return false;
+    }
+    for _ in 0..4 {
+        advance(pcx);
+    }
     true
 }
 
@@ -457,11 +545,14 @@ pub fn parse_item_bounds(pcx: &mut Ctx<Comp>) -> i64 {
     }
     let start = cur_start(pcx);
     advance(pcx);
+    // (0.30.1: its lifetime bounds kept on the holder, outlives_of(h):
+    // `trait St: 'static`, `type Out: 'static`; E0310)
+    let h = new_node(NodeKind::Generics, start, 0, pcx);
     let mark = list_begin(pcx);
     loop {
         if eat(Tok::Question, pcx) {
             crate::front::parser::types::parse_bound(pcx);
-        } else if !skip_lifetime_bound(pcx) {
+        } else if !take_outlives_bound(h, pcx) {
             list_push(crate::front::parser::types::parse_bound(pcx), pcx);
         }
         if !eat(Tok::Plus, pcx) {
@@ -469,7 +560,6 @@ pub fn parse_item_bounds(pcx: &mut Ctx<Comp>) -> i64 {
         }
     }
     drop_sized(mark, start, pcx);
-    let h = new_node(NodeKind::Generics, start, 0, pcx);
     list_end(h, mark, pcx);
     pcx.nodes[h as usize].end = prev_end(pcx);
     h

@@ -95,6 +95,7 @@ map_code() {
         E0515) echo return_local ;;
         E0621|E0623|E0521|lifetime|captured) echo outlives ;;  # (0.27.2: E0521, D20.3; "captured variable cannot escape", D19.10)
         E0106) echo elision ;;
+        E0310) echo param_outlives ;;  # (0.30.1, D4.5: the front's check of a type parameter's 'static)
         E0392) echo unused_param ;;
         E0382) echo use_moved ;;
         E0381) echo assign_moved_part ;;
@@ -189,6 +190,11 @@ for case_ in "$@"; do
         # (E0308 where an `impl Trait` result's values differ, D21.2)
         if [ "$want" = opaque.mismatch ] && [ "$first" = E0308 ]; then
             gotcode=opaque.mismatch
+        fi
+        # (0.30.1, D4.7: E0308, "one type is more general than the
+        # other", where a function needing a 'static parameter is a value)
+        if [ "$want" = fn_value_static ] && [ "$first" = E0308 ]; then
+            gotcode=fn_value_static
         fi
     fi
     msg=$(awk '/^error/ && !/^error: aborting/ { print; exit }' "$WORK/out" | cut -c1-120)

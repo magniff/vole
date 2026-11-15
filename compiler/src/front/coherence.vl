@@ -744,36 +744,47 @@ pub fn check_generic_obligations(i: i64, pcx: &mut Ctx<Comp>) {
 }
 
 // RULE: F14.1 (an impl's type parameter is constrained: it occurs in the
-// self type or the trait's arguments, or in a bound of a parameter that
-// is; else error trait.unconstrained, rustc E0207)
+// self type or the trait's arguments, or in an associated-type constraint
+// of a bound of a parameter that is; else error trait.unconstrained,
+// rustc E0207) (0.30.1, review 4: an occurrence in a projection, `W<<T as
+// B>::X>`, `W<T::X>`, constrains nothing: many T give one X; nor does a
+// bound's trait argument, `U: Tr<T>`: U may implement Tr<i32> and
+// Tr<i64>; and a lifetime of the impl its associated types use is
+// constrained so too, `impl<'a> B for H { type X = &'a str; }` is
+// refused, else `H::X` would be `&'a str` for any 'a, 'static too)
 pub fn check_constrained(i: i64, pcx: &mut Ctx<Comp>) {
     let node = pcx.traits_impls[i as usize].node;
     let params = pcx.nodes[node as usize].g;
-    if params == 0 || pcx.nodes[params as usize].count == 0 {
+    let count: i64 = if params == 0 { 0 } else { pcx.nodes[params as usize].count };
+    let lts = crate::front::parser::rust::lifetimes_of(node, pcx);
+    let lcount: i64 = if lts > 0 { pcx.nodes[lts as usize].count } else { 0 };
+    if count == 0 && lcount == 0 {
         return;
     }
-    let count = pcx.nodes[params as usize].count;
     let mark = pcx.tscratch.len() as i64;
-    let targs = pcx.nodes[pcx.nodes[node as usize].a as usize].g;
-    for k in 0..count {
-        let sym = pcx.nodes[child(params, k, pcx) as usize].a;
-        let mut fixed = names_sym(pcx.nodes[node as usize].b, sym, pcx)
-            || sym_text(sym, pcx).len() > 0
-            && sym_text(sym, pcx)[0] == b'\'';
-        for j in 0..(if targs == 0 { 0 } else { pcx.nodes[targs as usize].count }) {
-            fixed = fixed || names_sym(child(targs, j, pcx), sym, pcx);
-        }
+    let tnode = pcx.nodes[node as usize].a;
+    // (the type parameters, then the lifetimes: count + lcount flags)
+    for k in 0..count + lcount {
+        let (sym, lifetime) = if k < count { (pcx.nodes[child(params, k, pcx) as usize].a, false) }
+            else { (pcx.nodes[child(lts, k - count, pcx) as usize].a, true) };
+        let quoted = sym_text(sym, pcx).len() > 0 && sym_text(sym, pcx)[0] == b'\'';
+        let fixed = !lifetime && quoted
+            || constrains(pcx.nodes[node as usize].b, sym, lifetime, params, pcx)
+            || constrains(tnode, sym, lifetime, params, pcx);
         pcx.tscratch.push(fixed as i64);
     }
-    // (through the bounds of the parameters fixed so far, to a fixpoint)
+    // (through the associated-type constraints of the bounds of the
+    // parameters fixed so far, to a fixpoint)
     let mut changed = true;
     while changed {
         changed = false;
-        for k in 0..count {
+        for k in 0..count + lcount {
             if pcx.tscratch[(mark + k) as usize] != 0 {
                 continue;
             }
-            let sym = pcx.nodes[child(params, k, pcx) as usize].a;
+            let (sym, lifetime) = if k
+                < count { (pcx.nodes[child(params, k, pcx) as usize].a, false) }
+                else { (pcx.nodes[child(lts, k - count, pcx) as usize].a, true) };
             for j in 0..count {
                 let bounds = pcx.nodes[child(params, j, pcx) as usize].h;
                 if pcx.tscratch[(mark + j) as usize] == 0 || bounds == 0 {
@@ -781,7 +792,7 @@ pub fn check_constrained(i: i64, pcx: &mut Ctx<Comp>) {
                 }
                 for m in 0..pcx.nodes[bounds as usize].count {
                     if pcx.tscratch[(mark + k) as usize] == 0
-                        && names_sym(child(bounds, m, pcx), sym, pcx) {
+                        && binding_constrains(child(bounds, m, pcx), sym, lifetime, params, pcx) {
                         pcx.tscratch[(mark + k) as usize] = 1;
                         changed = true;
                     }
@@ -789,18 +800,32 @@ pub fn check_constrained(i: i64, pcx: &mut Ctx<Comp>) {
             }
         }
     }
-    for k in 0..count {
-        if pcx.tscratch[(mark + k) as usize] == 0 {
-            let p = child(params, k, pcx);
-            let saved_kind = pcx.err_kind;
-            pcx.err_kind = c"trait.unconstrained";
-            err_begin(pcx.nodes[p as usize].start, pcx);
+    for k in 0..count + lcount {
+        if pcx.tscratch[(mark + k) as usize] != 0 {
+            continue;
+        }
+        if k >= count {
+            // (a lifetime no associated type uses is free, as rustc's)
+            let sym = pcx.nodes[child(lts, k - count, pcx) as usize].a;
+            if !assoc_uses_lifetime(node, sym, pcx) {
+                continue;
+            }
+        }
+        let p = if k < count { child(params, k, pcx) } else { child(lts, k - count, pcx) };
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"trait.unconstrained";
+        err_begin(pcx.nodes[p as usize].start, pcx);
+        if k < count {
             err_fmt(format_args("the type parameter '{}' is not constrained by the impl's trait, \
                 self type or bounds", str::from_utf8(sym_text(pcx.nodes[p as usize].a, pcx)).unwrap()), pcx);
-            err_help(c"use it in the self type or the trait's arguments, or drop it", pcx);
-            err_end_soft(pcx);
-            pcx.err_kind = saved_kind;
+            err_help(c"use it in the self type or the trait's arguments (not only in a projection, `<T as Tr>::X`), or drop it", pcx);
+        } else {
+            err_fmt(format_args("the lifetime parameter `'{}` is used by an associated type but not constrained by the impl's trait or self type",
+                str::from_utf8(sym_text(pcx.nodes[p as usize].a, pcx)).unwrap()), pcx);
+            err_help(c"use the lifetime in the self type (`impl<'a> Tr for H<'a>`) or the trait's arguments, or write the associated type without it", pcx);
         }
+        err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
     }
     pcx.tscratch.truncate(mark as usize);
 }
@@ -854,6 +879,151 @@ fn names_sym(n: i64, sym: i64, pcx: &Ctx<Comp>) -> bool {
             }
         }
         return kind == TyFn && names_sym(pcx.nodes[n as usize].a, sym, pcx);
+    }
+    false
+}
+
+// (0.30.1, review 4) Whether type node n constrains the impl's parameter
+// sym (a lifetime when `lifetime`; params the impl's type parameters):
+// names_sym's occurrences, but none inside a projection (`<T as B>::X`,
+// `T::X`: an impl parameter's first segment), and a lifetime by a
+// reference's, a `str`'s or a type argument's.
+fn constrains(n: i64, sym: i64, lifetime: bool, params: i64, pcx: &Ctx<Comp>) -> bool {
+    if n <= 0 {
+        return false;
+    }
+    let kind = pcx.nodes[n as usize].kind;
+    if kind == TyName {
+        if (pcx.nodes[n as usize].p & crate::front::ast::NODE_QPATH) != 0 {
+            return false;
+        }
+        if pcx.nodes[n as usize].count > 0 {
+            let first = pcx.nodes[child(n, 0, pcx) as usize].a;
+            if params > 0 && tparam_index(params, first, pcx).is_some() {
+                return false;
+            }
+        } else if !lifetime && pcx.nodes[n as usize].a == sym {
+            return true;
+        }
+        if lifetime {
+            if sym_text(pcx.nodes[n as usize].a, pcx) == b"str" && pcx.nodes[n as usize].c == sym {
+                return true;
+            }
+            let h = crate::front::parser::rust::lifetimes_of(n, pcx);
+            for i in 0..(if h > 0 { pcx.nodes[h as usize].count } else { 0 }) {
+                if pcx.nodes[child(h, i, pcx) as usize].a == sym {
+                    return true;
+                }
+            }
+        }
+        let g = pcx.nodes[n as usize].g;
+        for i in 0..(if g == 0 { 0 } else { pcx.nodes[g as usize].count }) {
+            if constrains(child(g, i, pcx), sym, lifetime, params, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if !lifetime && kind == TyArray
+        && crate::front::generics::instantiate::array_len_name(n, pcx) == sym {
+        return true;
+    }
+    if (kind == TyPtr || kind == TySlice) && lifetime && pcx.nodes[n as usize].c == sym {
+        return true;
+    }
+    if kind == TyPtr || kind == TySlice || kind == TyArray {
+        return constrains(pcx.nodes[n as usize].a, sym, lifetime, params, pcx);
+    }
+    if kind == TyTuple || kind == TyFn {
+        for i in 0..pcx.nodes[n as usize].count {
+            if constrains(child(n, i, pcx), sym, lifetime, params, pcx) {
+                return true;
+            }
+        }
+        return kind == TyFn && constrains(pcx.nodes[n as usize].a, sym, lifetime, params, pcx);
+    }
+    false
+}
+
+// Whether bound b's associated-type constraints (`Iterator<Item = T>`, an
+// `Fn*` bound's result) constrain sym, as constrains reads them.
+fn binding_constrains(b: i64, sym: i64, lifetime: bool, params: i64, pcx: &Ctx<Comp>) -> bool {
+    if b <= 0 {
+        return false;
+    }
+    // (an `Fn*` bound's result is its Output's constraint, `F: FnMut(I::Item)
+    // -> B` fixes B; its parameters are trait arguments, which do not)
+    if pcx.nodes[b as usize].kind == TyFn {
+        return constrains(pcx.nodes[b as usize].a, sym, lifetime, params, pcx);
+    }
+    if pcx.nodes[b as usize].kind != TyName {
+        return false;
+    }
+    let h = pcx.nodes[b as usize].h;
+    for i in 0..(if h == 0 { 0 } else { pcx.nodes[h as usize].count }) {
+        let c = child(h, i, pcx);
+        if pcx.nodes[c as usize].kind == NodeKind::AssocType
+            && constrains(pcx.nodes[c as usize].b, sym, lifetime, params, pcx) {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether an associated type of impl node writes lifetime sym.
+fn assoc_uses_lifetime(node: i64, sym: i64, pcx: &Ctx<Comp>) -> bool {
+    let assoc = pcx.nodes[node as usize].c;
+    for i in 0..(if assoc > 0 { pcx.nodes[assoc as usize].count } else { 0 }) {
+        let c = child(assoc, i, pcx);
+        if pcx.nodes[c as usize].kind == NodeKind::AssocType
+            && mentions_lifetime(pcx.nodes[c as usize].b, sym, 0, pcx) {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether type node n writes lifetime sym anywhere.
+fn mentions_lifetime(n: i64, sym: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if n <= 0 || depth > 64 {
+        return false;
+    }
+    let kind = pcx.nodes[n as usize].kind;
+    if (kind == TyPtr || kind == TySlice
+        || kind == TyName && sym_text(pcx.nodes[n as usize].a, pcx) == b"str")
+        && pcx.nodes[n as usize].c == sym {
+        return true;
+    }
+    if kind == TyName {
+        let h = crate::front::parser::rust::lifetimes_of(n, pcx);
+        for i in 0..(if h > 0 { pcx.nodes[h as usize].count } else { 0 }) {
+            if pcx.nodes[child(h, i, pcx) as usize].a == sym {
+                return true;
+            }
+        }
+        for i in 0..pcx.nodes[n as usize].count {
+            if mentions_lifetime(child(n, i, pcx), sym, depth + 1, pcx) {
+                return true;
+            }
+        }
+        let g = pcx.nodes[n as usize].g;
+        for i in 0..(if g == 0 { 0 } else { pcx.nodes[g as usize].count }) {
+            if mentions_lifetime(child(g, i, pcx), sym, depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if kind == TyPtr || kind == TySlice || kind == TyArray {
+        return mentions_lifetime(pcx.nodes[n as usize].a, sym, depth + 1, pcx);
+    }
+    if kind == TyTuple || kind == TyFn {
+        for i in 0..pcx.nodes[n as usize].count {
+            if mentions_lifetime(child(n, i, pcx), sym, depth + 1, pcx) {
+                return true;
+            }
+        }
+        return kind == TyFn && mentions_lifetime(pcx.nodes[n as usize].a, sym, depth + 1, pcx);
     }
     false
 }

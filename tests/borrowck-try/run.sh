@@ -13,6 +13,8 @@
 #                    (an agent's pattern that must not be rejected)
 #   // TRY: text     one of the first diagnostic's try: lines contains text
 #                    (§2.9's exact commands), one directive per line
+#   // TRY-NOT: text (0.30.1) none of the first diagnostic's try: lines
+#                    contains text (a try that cannot work is not given)
 #   // ENV: K=V      (0.27.2) the compiler runs with K=V in its
 #                    environment, one per line
 #   // XFAIL: why    the checker task that reports CODE has not landed:
@@ -115,6 +117,12 @@ for dir in "$HERE"/*/; do
                 break
             fi
         done <"$WORK/wanted"
+        directive TRY-NOT "$main" >"$WORK/unwanted"
+        while [ -z "$why" ] && IFS= read -r unwant; do
+            if grep -qF -- "$unwant" "$WORK/tries"; then
+                why="a try: line has: $unwant"
+            fi
+        done <"$WORK/unwanted"
         k=0
         while [ -z "$why" ] && IFS= read -r cmd; do
             k=$((k + 1))

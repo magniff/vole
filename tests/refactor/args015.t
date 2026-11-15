@@ -109,7 +109,7 @@ $ refactor inline twice --dry-run
 -
 @@ -28 +24 @@
 -    let e = twice(3, 2) + twice(4, k: 5);
-+    let e = 3 * 2 + 4 * 5;
++    let e = 3i64 * 2i64 + 4i64 * 5i64;
 ## Written: the program still runs.
 $ refactor signature area --reorder w,depth,h
 reordered the parameters of crate::area, 4 calls	main.vl	+4 -4 lines

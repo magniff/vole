@@ -57,7 +57,7 @@ $ refactor inline shift --dry-run
 -
 @@ -23 +19 @@
 -    let q = shift(p, 3);
-+    let q = P { x: 3, y: p.y };
++    let q = P { x: 3i64, y: p.y };
 $ refactor signature make --add 'z: i64 = 5' --fill-calls --dry-run
 --- a/main.vl
 +++ b/main.vl
