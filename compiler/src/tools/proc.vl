@@ -45,6 +45,14 @@ extern "C" {
     fn symlink(target: *mut u8, path: *mut u8) -> i32;
     // (0.25.4: volec run leaves ^C to the program it runs)
     fn signal(sig: i32, handler: *mut u8) -> *mut u8;
+    // (0.30.1: VOLEC_MAIN_STACK_FILE, made unpredictable and exclusive,
+    // appended to without following a link, taken away at exit)
+    fn mkstemp(template: *mut u8) -> i32;
+    #[link_name = "open"]
+    fn proc_open(path: *const u8, flags: i32, ...) -> i32;
+    fn write(fd: i32, buf: *const u8, n: u64) -> i64;
+    fn getenv(name: *const u8) -> *const u8;
+    fn atexit(f: extern "C" fn()) -> i32;
 }
 
 // words (C strings) as the list exec takes: their pointers, then a null.
@@ -142,7 +150,8 @@ const VOLEC_OWN: [&[u8]; 3] = [b"VOLEC_NESTED=", b"VOLEC_EDIT_TAG=", b"VOLEC_MAI
 // was given), argv a null-ended list of C strings, and the environment
 // this process's less volec's own variables (VOLEC_OWN): environ's array,
 // the child's own copy, compacted in place, then execve. It allocates
-// nothing and calls only execve and _exit (async-signal-safe): the
+// nothing and calls only std::__sys::environ (_NSGetEnviron on macOS, which
+// returns the variable's address), execve and _exit (async-signal-safe): the
 // callers' alarm and process group stay. 127 when the exec fails. The one
 // way volec starts a user's program: run (run_foreground), try
 // (run_capture_program), test, fuzz and reduce's runs
@@ -157,7 +166,8 @@ pub fn exec_program(argv: &[*const u8]) -> ! {
     // child's own copy after fork (no other thread exists in it and nothing
     // else reads it before the exec); an entry is read only up to the first
     // byte that differs from a name or its NUL, and the array is written only
-    // at indices below the one read (kept <= i), then its null; argv is the
+    // at an index <= the one just read (kept <= i), then its null at kept <=
+    // the null's own index; argv is the
     // caller's null-ended list of C strings, alive until the exec.
     unsafe {
         let mut i: usize = 0;
@@ -188,23 +198,137 @@ pub fn exec_program(argv: &[*const u8]) -> ! {
 }
 
 // (0.30.1) A volec this one started that fell back to the first thread's
-// stack wrote its warning into VOLEC_MAIN_STACK_FILE, this volec's (main.vl
-// compile), not onto its output: after a child ends, this volec says it,
-// once, and takes the file away. Out of band, so that nothing is read out
-// of any output (a program's lines are never touched). A volec that
-// inherited the file is not its owner and leaves it to the one that is.
+// stack wrote its warning into VOLEC_MAIN_STACK_FILE, this volec's
+// (make_main_stack_file), not onto its output: after a child ends, this
+// volec says it, once, when the file is not empty. Out of band, so that
+// nothing is read out of any output (a program's lines are never
+// touched). A volec that inherited the file, or a copy fork made of this
+// one (fork_worker), is not its owner and leaves it to the one that is.
 pub fn say_children_main_stack() {
-    if !crate::base::diag::get_main_stack_owner() {
+    if !crate::base::diag::get_main_stack_owner() || crate::base::diag::get_main_stack_said() {
         return;
     }
     let path = crate::base::env_var(c"VOLEC_MAIN_STACK_FILE");
     if path.len() == 0 {
         return;
     }
-    let b = buf_new();
-    buf_bytes(b, &path);
-    if remove_file(buf_cstr(b)) {
+    let written = match str::from_utf8(&path) {
+        Ok(p) => match std::fs::symlink_metadata(p) {
+            Ok(m) => m.len() > 0,
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    if written {
         crate::base::diag::say_main_stack_now();
+    }
+}
+
+// (0.30.1) VOLEC_MAIN_STACK_FILE, made by the first volec at its start
+// (main.vl compile): $TMPDIR/volec-main-stack.XXXXXX (/tmp's when TMPDIR
+// is unset or empty, or the file cannot be made there), by
+// mkstemp (a name no one can guess, made with O_CREAT|O_EXCL, so neither
+// a file nor a link already there is opened, and mode 0600; mkstemp tries
+// another name while one exists), its absolute path in the variable for
+// the volecs this one starts, and taken away at exit
+// (main_stack_file_gone). When it cannot be made, the variable is not set
+// and a volec started that falls back says the warning on its own stderr.
+pub fn make_main_stack_file() {
+    crate::base::diag::set_main_stack_owner(true);
+    let tmp = crate::base::env_var(c"TMPDIR");
+    let mut p = 0 as *mut u8;
+    let mut fd: i32 = -1;
+    let mut i = if tmp.len() > 0 { 0 } else { 1 };
+    while fd < 0 && i < 2 {
+        let t = buf_new();
+        if i == 0 {
+            buf_bytes(t, &tmp);
+        } else {
+            buf_str(t, c"/tmp");
+        }
+        buf_str(t, c"/volec-main-stack.XXXXXX");
+        p = buf_cstr(t);
+        // UNSAFE: mkstemp is C's, given a template it rewrites in place.
+        // SAFETY: p is t's block, ended with a 0 by buf_cstr, the six bytes
+        // before it "XXXXXX", which mkstemp replaces with as many; it keeps
+        // nothing of p.
+        fd = unsafe { mkstemp(p) };
+        i += 1;
+    }
+    if fd < 0 {
+        return;
+    }
+    // UNSAFE: close is C's.
+    // SAFETY: fd is the descriptor mkstemp opened, checked, closed once.
+    unsafe {
+        close(fd);
+    }
+    crate::base::env_set(c"VOLEC_MAIN_STACK_FILE", absolute_path(p));
+    // UNSAFE: atexit is C's, a C call taking a function pointer.
+    // SAFETY: main_stack_file_gone is an `extern "C" fn()` that lives as
+    // long as the program; it is registered once, here, which runs once a
+    // process (compile, when VOLEC_MAIN_STACK_FILE was not set: it is
+    // now).
+    unsafe {
+        atexit(main_stack_file_gone);
+    }
+}
+
+// (0.30.1) At exit (main's return, or std::process::exit after an error,
+// on whichever thread calls it), the owner's VOLEC_MAIN_STACK_FILE taken
+// away; a copy fork made of the owner (fork_worker) is not it
+// (get_main_stack_owner compares the pid) and leaves the file. It
+// allocates nothing.
+extern "C" fn main_stack_file_gone() {
+    if !crate::base::diag::get_main_stack_owner() {
+        return;
+    }
+    // UNSAFE: getenv and unlink are C's.
+    // SAFETY: the name is a literal; getenv's result is null (checked) or
+    // a NUL-terminated string of the environment, which this process sets
+    // only at its start (base::env_set), before exit can run; unlink reads
+    // it during the call and keeps nothing.
+    unsafe {
+        let p = getenv(c"VOLEC_MAIN_STACK_FILE");
+        if p != 0 as *const u8 {
+            unlink(p);
+        }
+    }
+}
+
+// (0.30.1) A line appended to VOLEC_MAIN_STACK_FILE by a volec that
+// inherited it (base::diag::say_main_stack_now): opened O_WRONLY|O_APPEND
+// with O_NOFOLLOW and without O_CREAT, so that a link put in its place is
+// not followed and nothing is made; false when it cannot be opened or the
+// line is not written whole (the warning is then said on stderr).
+pub fn append_main_stack_file(path: *const u8, line: &[u8]) -> bool {
+    let host = crate::host_target();
+    let nofollow = if host == crate::base::target::T_AARCH64_MACOS
+        || host == crate::base::target::T_X86_64_MACOS {
+        0x100
+    } else if host == crate::base::target::T_AARCH64_LINUX {
+        0x8000
+    } else if host == crate::base::target::T_X86_64_LINUX {
+        0x20000
+    } else {
+        return false;
+    };
+    let append = if nofollow == 0x100 { 0x8 } else { 0x400 };
+    // UNSAFE: open, write and close are C's.
+    // SAFETY: path is a C string of the caller's; open is called without
+    // O_CREAT, so it reads no mode (none is passed); O_WRONLY is 1, and
+    // O_APPEND and O_NOFOLLOW are the host's (<fcntl.h>: 0x8 and 0x100 on
+    // macOS; 0x400, and 0x8000 on aarch64 or 0x20000 on x86-64 Linux); fd
+    // is checked and closed once; write reads line.len() bytes from the
+    // slice's pointer.
+    unsafe {
+        let fd = proc_open(path, 1 | append | nofollow);
+        if fd < 0 {
+            return false;
+        }
+        let n = write(fd, line.as_ptr(), line.len() as u64);
+        close(fd);
+        n == line.len() as i64
     }
 }
 

@@ -301,6 +301,50 @@ i32 = 3" ] || [ "$(grep -c "$W" "$T/e")" -ne $want ]; then
         cat "$T/o" "$T/e"; bad=1
     fi
 done
+# (0.30.1, the sixth review's) VOLEC_MAIN_STACK_FILE is made by mkstemp
+# and removed at exit, and a child appends to it without following a
+# link or making it (tools::proc::make_main_stack_file,
+# append_main_stack_file): a link planted at the old, predictable name
+# in a TMPDIR volec cannot write is not written through, and the
+# warning, made in /tmp then, is said once; a file the variable names
+# that is a link is not written through either (the warning goes to
+# stderr); an unwritable or missing TMPDIR loses no warning; and the
+# file is gone after the command.
+mkdir -p "$T/sy/tmpd" "$T/sy/tmpw" "$T/sy/ro"
+printf 'fn f() -> i64 { 1 }\n#[test]\nfn t() { assert_eq(f(), 1); }\nfn main() {\n    println("{}", f());\n}\n' > "$T/sy/t.vl"
+echo "precious data" > "$T/sy/victim.txt"
+(cd "$T/sy" && sh -c 'ln -s "$1/victim.txt" "$1/tmpd/volec-main-stack.$$"; chmod 555 "$1/tmpd"; exec env TMPDIR="$1/tmpd" SHIM_MODE=childnobig DYLD_INSERT_LIBRARIES="$2" VOLE_CACHE=off "$3" test t.vl' sh "$T/sy" "$T/shim.dylib" "$C" > "$T/o" 2> "$T/e")
+chmod 755 "$T/sy/tmpd"
+if [ "$(cat "$T/sy/victim.txt")" != "precious data" ] || [ "$(grep -c "$W" "$T/e")" -ne 1 ] || grep -q "$W" "$T/o"; then
+    echo "main-stack: FAIL: a link planted at volec-main-stack.PID: victim '$(cat "$T/sy/victim.txt")', the warning $(grep -c "$W" "$T/e") times on stderr (1 wanted)"; cat "$T/o" "$T/e"; bad=1
+fi
+echo "precious data" > "$T/sy/victim.txt"; ln -s "$T/sy/victim.txt" "$T/sy/link"
+(cd "$T/sy" && VOLEC_MAIN_STACK_FILE="$T/sy/link" SHIM_MODE=nobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" check t.vl > "$T/o" 2> "$T/e")
+if [ "$(cat "$T/sy/victim.txt")" != "precious data" ] || [ "$(grep -c "$W" "$T/e")" -ne 1 ]; then
+    echo "main-stack: FAIL: VOLEC_MAIN_STACK_FILE a link: victim '$(cat "$T/sy/victim.txt")', the warning $(grep -c "$W" "$T/e") times on stderr (1 wanted)"; bad=1
+fi
+chmod 555 "$T/sy/ro"
+for td in "$T/sy/ro" "$T/sy/none" "$T/sy/tmpw"; do
+    rm -rf "$T/sy/.volec"
+    (cd "$T/sy" && TMPDIR="$td" SHIM_MODE=childnobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" test t.vl > "$T/o" 2> "$T/e")
+    if [ "$(grep -c "$W" "$T/e")" -ne 1 ] || grep -q "$W" "$T/o" || ! grep -q "1 passed" "$T/o"; then
+        echo "main-stack: FAIL: TMPDIR=$td volec test: the warning $(grep -c "$W" "$T/e") times on stderr (1 wanted):"; cat "$T/o" "$T/e"; bad=1
+    fi
+done
+chmod 755 "$T/sy/ro"
+if ls "$T/sy/tmpw" | grep -q volec-main-stack; then
+    echo "main-stack: FAIL: VOLEC_MAIN_STACK_FILE left after the command: $(ls "$T/sy/tmpw")"; bad=1
+fi
+# (0.30.1, the sixth review's) a copy fork made of the first volec (a
+# batch's steps, same-output's and samebuild's workers: fork_worker) is
+# not the file's owner (MAIN_STACK_OWNER is a pid): a step's nested
+# volec that falls back is said once, on stderr, not once a step inside
+# the batch's answer
+printf 'try 1+2\ntry 2+3\ncheck t.vl\n' > "$T/sy/cmds"
+(cd "$T/sy" && SHIM_MODE=childnobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" batch < cmds > "$T/o" 2> "$T/e")
+if [ "$(grep -c "$W" "$T/e")" -ne 1 ] || grep -q "$W" "$T/o"; then
+    echo "main-stack: FAIL: SHIM_MODE=childnobig volec batch: the warning $(grep -c "$W" "$T/e") times on stderr (1 wanted), $(grep -c "$W" "$T/o") in its answer (0 wanted)"; bad=1
+fi
 for args in "--version" "explain lex.utf8" "explain thread.main-stack" "guide --list"; do
     # shellcheck disable=SC2086
     SHIM_MODE=nobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" $args > "$T/o" 2> "$T/e"

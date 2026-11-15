@@ -485,7 +485,10 @@ that keeps few values live is unlikely to make such moves.
   writes its warning into the first volec's file
   (`VOLEC_MAIN_STACK_FILE`), not on the output the command reads, and
   the first volec says it once after the child ends: never inside try's
-  answer, and no output is filtered. A program volec runs (`run`,
+  answer, and no output is filtered. The file is made by mkstemp (a name
+  no one can guess, made exclusively, mode 0600) and removed at exit; a
+  child appends to it without following a link and without making it,
+  and says the warning on its stderr when it cannot. A program volec runs (`run`,
   `test`, `test --input`, `probe`, `try`, `reduce --until`'s command)
   no longer gets the variables volec sets for itself (`VOLEC_NESTED`,
   `VOLEC_EDIT_TAG`, `VOLEC_MAIN_STACK_FILE`; `volec guide tools`): it

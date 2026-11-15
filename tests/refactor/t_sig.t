@@ -6,6 +6,10 @@
 ## C's exit(3) and the test build exits 101 (std::test's harness), not 3
 ## (rustc's harness exits 3). Both must fail, with the signal and the
 ## code the process ended with.
+## Recorded with it (the sixth review's, not fixed in 0.30.1): a
+## program that exits 127 cannot be told apart from one whose exec
+## failed (tools::proc::exec_program's _exit(127), the shell's
+## convention), under run, test and try alike.
 $ test
 test main.vl: 1 passed, 2 failed (3 #[test]; -O0 and -O2 agree)
 FAIL t_segv: stopped by signal 11 (SIGSEGV: an invalid memory access)
