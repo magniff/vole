@@ -65,5 +65,68 @@ for t in x86_64-macos x86_64-linux; do
     fi
     echo "enc: $t: $n instructions, the same bytes as cc's"
 done
+
+# (0.30.1, RT-CG-5) A register of the wrong class or of a number its
+# class has not is refused, never encoded as another register: arm64's
+# `str x63` was `str xzr` (a field masked to 5 bits), `str d-15` was
+# `str s0`; x86-64's `movsd m, %r10` was xmm10, `movq %xmm15, m` a 4-byte
+# movd. Each line alone in a function must fail with "cannot assemble";
+# needs no cc.
+refused=0
+while IFS='|' read -r t line; do
+    [ -z "$t" ] && continue
+    printf '.text\n.globl _f\n_f:\n    %s\n    ret\n' "$line" >"$OUT/refuse.s"
+    if "$COMPILER" assemble --target "$t" "$OUT/refuse.s" -o "$OUT/refuse.o" >"$OUT/refuse.log" 2>&1; then
+        echo "enc: FAIL $t: encoded, not refused: $line"
+        status=1
+    elif ! grep -q 'cannot assemble' "$OUT/refuse.log"; then
+        echo "enc: FAIL $t: not refused by the assembler: $line ($(head -1 "$OUT/refuse.log"))"
+        status=1
+    else
+        refused=$((refused + 1))
+    fi
+done <<'EOF'
+aarch64-macos|str x63, [sp, #16]
+aarch64-macos|ldr x32, [sp]
+aarch64-macos|ldr d32, [sp]
+aarch64-macos|str q40, [sp]
+aarch64-macos|mov x31, x0
+aarch64-macos|mov w31, w0
+aarch64-macos|fmov d5, x63
+aarch64-macos|fadd v32.2d, v0.2d, v1.2d
+aarch64-macos|str d-15, [sp, #16]
+aarch64-macos|ldr x-1, [sp]
+x86_64-macos|movsd 16(%rsp), %r10
+x86_64-macos|movss %eax, 16(%rsp)
+x86_64-macos|movapd %rax, %xmm1
+x86_64-macos|addsd %rax, %xmm0
+x86_64-macos|movl %xmm15, 16(%rsp)
+x86_64-macos|movw %xmm1, (%rax)
+x86_64-macos|movd %xmm1, %xmm0
+x86_64-macos|addq %xmm1, %rax
+x86_64-macos|leaq (%rax), %xmm0
+x86_64-macos|cvtsi2sdq %xmm2, %xmm1
+x86_64-macos|cvttsd2si %xmm1, %xmm2
+x86_64-macos|movq %xmm16, 16(%rsp)
+EOF
+echo "enc: $refused registers of the wrong class or number refused"
+# The moves of an xmm register to and from memory, as cc writes them.
+printf '.text\n.globl _f\n_f:\n    movq %%xmm15, 16(%%rsp)\n    movq 16(%%rsp), %%xmm15\n    movq %%xmm0, (%%rax)\n    movq (%%r12,%%rax,8), %%xmm9\n    movq %%xmm3, %%rax\n    movq %%rbx, %%xmm2\n    movd %%xmm3, 8(%%rsp)\n    movd 8(%%rsp), %%xmm3\n    ret\n' >"$OUT/movq.s"
+if cc -target x86_64-apple-macos -c "$OUT/movq.s" -o "$OUT/movq.cc.o" 2>/dev/null; then
+    if ! "$COMPILER" assemble --target x86_64-macos "$OUT/movq.s" -o "$OUT/movq.o" >"$OUT/movq.log" 2>&1; then
+        echo "enc: FAIL movq: $(head -1 "$OUT/movq.log")"
+        status=1
+    else
+        objdump -d --no-leading-addr "$OUT/movq.o" | sed -n '/^ /p' >"$OUT/movq.ours"
+        objdump -d --no-leading-addr "$OUT/movq.cc.o" | sed -n '/^ /p' >"$OUT/movq.theirs"
+        if ! cmp -s "$OUT/movq.ours" "$OUT/movq.theirs"; then
+            echo "enc: FAIL movq: the encodings differ from cc's (< ours, > cc's):"
+            diff "$OUT/movq.ours" "$OUT/movq.theirs" | head -10
+            status=1
+        else
+            echo "enc: movq and movd to and from memory: the same bytes as cc's"
+        fi
+    fi
+fi
 [ $status = 0 ] && echo "enc: ok"
 exit $status

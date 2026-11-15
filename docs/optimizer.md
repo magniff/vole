@@ -226,6 +226,29 @@ predecessors disagree holds nothing), until nothing changes; every use
 must find its value where the allocation says it is. `--print-regalloc`
 shows the blocks' positions and every value's intervals and locations.
 
+**Registers and their classes** (0.30.1, RT-CG-5). A spill slot is
+shared by values of either class, so an edge's moves can form a cycle
+through two slots that holds an integer and an f64: `x2 -> slot(x)`,
+`n2 -> slot(n)` with x2 in n's slot and n2 in x's. The cycle is broken
+by saving one slot's current value in the cycle register; that value is
+the one the moves reading the slot take, so the register's class and the
+save's type are theirs (`pm_reader_ty`), not those of the move writing
+the slot. 0.30.1's release branch took the writer's: an integer went
+through d31 and was stored as `str x63`, which the assembler encoded as
+`str xzr`, a 0, and an f64 through x17 was stored as `str d-15`, encoded
+as `str s0`; x86-64 stored `movq %xmm15, m` as a 4-byte movd. The
+checker above did not see it: it follows locations, and the moves were
+right as locations. Three nets now make such a mistake an internal error
+instead of code: every load, store and move of a register goes through
+`m_load`, `m_store` and `m_mov`, which require the register's number to
+be of the class of the type it is spelled by (`m_check_reg`: 0-31
+general, 32-63 float and vector; x86-64 0-15 and 32-47); the AArch64
+assembler refuses a register number its class has not (x/w 0-30, the
+others 0-31, `x31` is not a name) and an operand that is not a register
+where an instruction reads one; the x86-64 assembler refuses a register
+of the wrong class in an instruction that takes one class
+(`tests/arch/enc.sh`).
+
 | | AArch64 | x86-64 |
 |---|---|---|
 | allocated, caller-saved | x0-x15, d0-d7, d16-d29 | rax, rcx, rdx, rsi, rdi, r8, r9, xmm0-xmm13 |
