@@ -128,11 +128,16 @@ the bytes of a cold one when a function's number of calls changes.
   of a block moves it.
 - **C's own frees and copies.** On macOS the check sees every free and
   realloc C makes, the C library's own included (`malloc_logger`,
-  libmalloc's hook): a block of the program's that getline grows or
-  `reallocf` frees is forgotten then, and C freeing a block the program
-  freed is reported (`a freed block freed again, by C`). Under the
-  check, C's `memcpy`, `memmove` and `memset` check their bytes first,
-  both ends: the program's calls and std's (`ptr::copy`,
+  libmalloc's hook, the program's own logger still called first): a
+  block of the program's that getline grows or `reallocf` frees is
+  forgotten then, and C's free of a block the program freed is reported
+  (`a freed block freed again, by C`; a realloc's log, which comes after
+  C freed the old memory, only forgets). A program that replaces
+  `malloc_logger` after the check set it takes that sight away, and a
+  report then says so. Under the check, C's `memcpy`, `memmove` and
+  `memset` check their bytes first, both ends: by link symbol, called
+  or through a function pointer (as `malloc` and `free` are), the
+  program's calls and std's (`ptr::copy`,
   `copy_nonoverlapping` and `fill_copies` of 4 elements or more), which
   0.30.0 did not check (`unsafe access out of bounds: 17 bytes at offset
   0 of a block of 16 bytes`, `--> memcpy, its destination`). Other C
@@ -142,7 +147,9 @@ the bytes of a cold one when a function's number of calls changes.
   On glibc, which has no such hook, a block whose size by C's allocator
   changed (`malloc_usable_size`: getline's in place) is forgotten at a
   report; one C freed and gave out again at its size is reported, the
-  note saying that it may not be the program's ("Known issues").
+  note saying that it may not be the program's ("Known issues"). The
+  check's allocator costs more than 0.30.0's: about +10% on strdup and
+  free, +21% on Box churn, +25% on Vec clones, +90% on `push_str`.
 - **An address is not an access** under `--check-unsafe`, as in Rust:
   `&p[i]`, `p.add(i)` and `p.sub(i)` of a pointer into a live block must
   stay in that block or one past its end (`unsafe address out of
@@ -284,13 +291,18 @@ the bytes of a cold one when a function's number of calls changes.
   an allocation of its own of the same size is still the program's to
   the check, and a read of the new owner past the old end is reported,
   with a note that the block's red zone was written over or C gave the
-  memory out again (`check_unsafe_c_reallocf` runs on macOS only). A
+  memory out again (`check_unsafe_c_reallocf`, XFAIL on Linux). A
   block C freed may keep its size there, and `malloc_usable_size` of a
   large block C has unmapped may crash the program. Only macOS ran.
+- A program that sets `malloc_logger` after its first malloc replaces the
+  check's: C's own frees are not seen from then on, and a block C freed
+  and gave out again may be reported, the report saying the program
+  replaced the logger (`check_unsafe_c_logger_replaced`). Set before the
+  first malloc, the program's logger is kept and called.
 - On macOS a block that C reallocates in another thread at the moment
   another thread allocates the old memory may lose that new block's
   record (the hook reports a realloc after it): the block is then
-  unchecked, never reported wrongly.
+  unchecked, never reported wrongly (`check_unsafe_c_realloc_race`).
 - `--check-unsafe` refuses `p.offset(isize::MIN / size)`, whose offset
   in bytes is exactly isize::MIN, which Rust allows: std's offset of a
   negative count is a sub of its magnitude, which does not fit.
@@ -7978,13 +7990,18 @@ fails (`floor STEP: ...`, the last line of its log). The rows the Linux
 containers also run are judged by what they report against the tree, the
 same on every host: a suite row's one plan (`plan: N cases`) is every
 case `tests/run.sh -l` lists, its one `cases:` line (the cases alone;
-the table's total adds the suites' checks) counts them all, none
-failed, and the skipped ones, each named (`skip case NAME: REQUIRES
-...`), are exactly the cases the tree's REQUIRES lines skip on the host
-(`metal` off aarch64-macos, the examples' 25 included, and `macos` off
-macOS; `clang` either way, as the host's cc is clang or not); objcheck's
-N of M are all the same, M at least four (-O0 and -O2, with -g and
-without) of each program of tests/run the suite compiles; incremental's series are its plan, the
+the table's total, at least as much, adds the suites' checks) counts
+them all and names them (`names CRC-LENGTH`, the digest of the sorted
+names run, which must be `-l`'s: each case once), none failed, and the
+skipped ones, each named (`skip case NAME: REQUIRES ...`), are exactly
+the cases the tree's REQUIRES lines skip on the host (`metal` off
+aarch64-macos, the examples' 25 included, `macos` off macOS, and
+`clang` when the log's `cc:` line says the host's cc is not clang);
+objcheck's N of M are all the same, its tests/run programs by name the
+tree's (tests/objcheck.sh prints their digest, each compiled at four
+settings; the floor finds the tree's by one grep per directive, the same
+set as `tests/objcheck.sh --list`), M at least four (-O0 and -O2, with
+-g and without) of each; incremental's series are its plan, the
 same on every host, at least 150, each rebuilt the same or skipped with
 its reason (at most 4). The other floors are 0.30.0's
 release gate's counts less a margin for cases that come and go (threads 14000,
@@ -8015,9 +8032,11 @@ compiles there (its floor is the tree's, which holds anywhere the suite
 runs whole). `tests/gate_floors.sh` shows each floor failing a zero
 count, a quarter of it and a log without its line, a suite row failing
 a plan short of the tree (a container's 1501 cases), a skip the tree
-does not make or one it makes missing, two plans or two `cases:` lines,
-a missing `cases:` line, a Linux row passing with its 37 skips named,
-objcheck failing 7000 of 7000, a macOS-only row failing on Linux, incremental
+does not make or one it makes missing (a clang case skipped where cc is
+clang), a case run twice and another left out, a table total below the
+cases', two plans or two `cases:` lines, a missing `cases:` line, a Linux
+row passing with its 37 skips named, objcheck failing 7000 of 7000 and a
+right count of programs not the tree's, a macOS-only row failing on Linux, incremental
 failing 134 skipped series and passing 4 named ones, and the skipped
 oracle a SKIP while an oracle that does not build fails.
 
