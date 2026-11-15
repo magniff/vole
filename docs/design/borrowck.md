@@ -418,8 +418,21 @@ kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
   so a `&mut` behind a captured `&` is not mutable there either
   (`|| { *r.p = 9; }` with `r: &P`, `|| clobber(r.s, gpa)`: E0594,
   E0596; moves.vl env_inner). Before, every place under the env counted
-  as mutable: a write under a live `&i64` and a use after free. *Cases:*
-  `rust_b_err_closure_through_shared`, `rust_b_closure_capture_write_ok`;
+  as mutable: a write under a live `&i64` and a use after free. (RT-36)
+  The kind decides the closure's part: an `Fn` closure's env is behind
+  its `&`, so every mutable use of a place reached through a capture, by
+  any mode (a write, a `&mut`, a two-phase autoref, a `&raw mut`, a
+  mutable slicing, a reborrow lent on), is refused, rustc's "captured
+  variable in a `Fn` closure" (E0594, E0596; moves.vl immutable_why,
+  its 3). Each of those is what the mutability check asks of a place,
+  and front/closures/kinds.vl scan_body counts the same uses as writes of
+  the capture, so a closure whose kind is inferred is FnMut whenever its
+  body would be refused as `Fn`; only a bound (`F: Fn()`) fixes a kind
+  the body does not have, and then its body is refused. Before, the
+  closure's part always counted as mutable, and two threads given `&F`
+  with `F: Fn() + Sync` raced on `*r += 1`. *Cases:*
+  `rust_b_err_closure_through_shared`, `rust_b_closure_capture_write_ok`,
+  `rust_b_err_fn_closure_*`, `rust_b_closure_through_mut_kinds_ok`;
 - (0.30.1, RT-33) a `&mut` of a view's *referent*, what a slicing
   borrows: `&mut s[..]`, `&mut s[a..b]`, `&mut *s` (the front makes it
   the slicing `&mut s[..]`), a `&mut self` method of `[T]` or `str`
@@ -434,10 +447,20 @@ kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
   place, and so is asked: (1) the front makes a slicing used as `&mut`
   (`&mut e[..]`, the receiver of a `&mut self` method of `[T]` or `str`,
   a `requires` binding of it) a mutable slicing at one choke point,
-  `front/check/rust.vl: mut_slicing`, down its chain of slicings to the
-  base place (`v[..2][..1].swap(0, 1)`: both slicings, the base `*v`
-  asked); (2) an explicit shared `&` of a slicing, `(&v[..]).reverse()`,
-  an `if`'s or a call's shared view, is never retyped: it stays shared,
+  `front/check/rust.vl: mut_slicing`, down every projection of the place
+  as rustc's place has them, a slicing, an element, a field, to the base
+  place or a deref (`v[..2][..1].swap(0, 1)`: both slicings, the base
+  `*v` asked; `a[1..][0][..1].reverse()`, `a[1..][0][0] = 9`: the
+  slicing under the element). It is called for every mutable use of a
+  place: an assignment's target, a `&mut e`'s e, and place_to_mut's
+  (a `&mut self` receiver, a `ref mut` binding's scrutinee, a reborrow);
+  (2) an explicit shared `&` of a slicing, `(&v[..]).reverse()`, an
+  `if`'s or a call's shared view, is never retyped: it stays shared (a
+  `&mut` of a call's view, `&mut w[0..3]` of a W with Index only, is the
+  slicing of that view, refused at the borrow with rustc's "data in an
+  index of `W`", "data in dereference of `D`"; one with IndexMut or
+  DerefMut is that call, place_to_mut, also where a view's deref was
+  read as the view, Z4.1: `w[0..3].reverse()`, `d[..2].reverse()`),
   and (3) the call check refuses any operand of a shared view type, a
   temporary's or a binding's, given to a `&mut` parameter (E0596,
   "cannot borrow data in a `&` reference as mutable", moves.vl, the
@@ -1351,7 +1374,10 @@ the shared view, and the call is E0596). A message names a binding
 is cut at a character with `..`: diag.vl buf_src_place). The binding
 is known by a flag, not its name: requires_call marks its pattern
 (`PAT_CONTRACT_ARG`), the builder its local (`LF_CONTRACT_ARG`), and
-the messages and the writer's autoref test the flag. Seen, not fixed: a mutable view given
+the messages and the writer's autoref test the flag; so is std's write!
+receiver `__r` (`PAT_WRITER_RECV`, front/check/interp.vl direct_call):
+a program's own `let __r = r;` moves r (E0382, case
+`rust_b_err_user_binding_named_r`). Seen, not fixed: a mutable view given
 to an ordinary call is copied into it, read as its reborrow from the
 call on (I7), so a later argument that writes through it is accepted
 (rustc E0506; case `rust_b_err_view_arg_written`, XFAIL).
@@ -2690,7 +2716,13 @@ In 0.27.2.1 the type check reported only D22.3's error. From 0.27.3
 (front-rust.md FL11) it reports an opaque instance's type errors as
 rustc does, unless the instance meets a gap of the model, which makes it
 *unsure*: its errors, and those of the instances its check makes, are
-forgotten (`opaque_unsure`, front/opaque.vl build_opaque_instances). The
+forgotten (`opaque_unsure`, front/opaque.vl build_opaque_instances), and
+(0.30.1) such an instance with an error forgotten is not borrow-checked:
+its body was not checked whole (a call it could not resolve is left
+without its callee, `p(x.measure())` under `where T::Output: Display`),
+as one whose check stopped is not; its concrete instances are (case
+`rust_b_assoc_output_generic_call_ok`; before, its body was built, and
+the builder's fallback refused the program). The
 model covers operators on an Ω through its bound (`a + b` with `T:
 Add<Output = T>`, `==`, `<`, `-a`, `!a`, `a << b`, `+=`: has_impl, an Ω
 having its bounds' traits), a bound's type arguments and a trait

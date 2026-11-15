@@ -240,7 +240,7 @@ fn mutability(bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
             let k = st.kind;
             if (k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC) && st.a >= 0 && st.b != 0 {
                 let why = immutable_why(st.a, st.b, pbody, pcx);
-                if why == 1 {
+                if why == 1 || why == 3 {
                     report_immutable(loc, st.a, st.b, 0, why, false, bck, pbody, pcx);
                 }
             }
@@ -359,8 +359,9 @@ fn mutability(bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
                     else { TyKind::Ptr };
                 let unique = (ck == TyKind::Ptr || ck == TyKind::Slice)
                     && capture_loan(loc, st.a, block_term(b, pbody), pbody);
-                if why == 1 || why == 2 && (st.d == crate::places::ir::BK_MUT || call_env
-                    || st.d == crate::places::ir::BK_RAW_MUT)
+                if why == 1 || why == 3
+                    || why == 2 && (st.d == crate::places::ir::BK_MUT || call_env
+                        || st.d == crate::places::ir::BK_RAW_MUT)
                     && !unique {
                     report_immutable(loc, l, p, 0, why, true, bck, pbody, pcx);
                 }
@@ -440,8 +441,20 @@ fn immutable_why(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64
     let closure_env = env && et > 0 && pcx.types[et as usize].kind == TyKind::Struct
         && pcx.structs[pcx.types[et as usize].a as usize].closure != 0;
     let inner = if closure_env { env_inner(p, et, pbody, pcx) } else { 0 };
+    // RULE: D19.2 (0.30.1, RT-36) the closure's own part of the path is
+    // mutable as its kind makes it: an `Fn` closure's env is behind its
+    // `&`, so a write or a `&mut` reached through a capture, by any mode,
+    // `*r += 1`, `v[0] = 5`, `v.reverse()`, `v[..2].reverse()` of a
+    // captured `&mut`, is not mutable (3, rustc's "captured variable in a
+    // `Fn` closure", E0594/E0596). Before, it always was: an `Fn` closure
+    // given to two threads wrote one place from both. kinds.vl makes a
+    // closure that does it FnMut where its kind is inferred; a bound
+    // `F: Fn()` fixes it, and its body is refused here.
+    let fn_env = closure_env
+        && pcx.closures[(pcx.structs[pcx.types[et as usize].a as usize].closure - 1) as usize].kind
+        == crate::front::closures::kinds::KIND_FN;
     if closure_env && inner < 0 {
-        return 0;
+        return if fn_env && p != 0 { 3 } else { 0 };
     }
     let mut q = p;
     let mut via_mut = false;
@@ -484,6 +497,11 @@ fn immutable_why(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64
         }
         q = parent;
     }
+    // (the program's part mutable, or through a `&mut`: the closure's
+    // part decides)
+    if fn_env {
+        return 3;
+    }
     if via_mut {
         return 0;
     }
@@ -518,7 +536,9 @@ fn referent_why(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64 
         return immutable_why(l, p, pbody, pcx);
     }
     if pcx.types[t as usize].b == crate::front::types::REF_MUT {
-        return if immutable_why(l, p, pbody, pcx) == 1 { 1 } else { 0 };
+        // (a `&mut` behind a `&`, 1, or in an `Fn` closure's env, 3)
+        let why = immutable_why(l, p, pbody, pcx);
+        return if why == 1 || why == 3 { why } else { 0 };
     }
     if shared_ty(t, pcx) { 1 } else { 0 }
 }
@@ -587,7 +607,23 @@ fn report_immutable(loc: i64, l: i64, p: i64, deref: i64, why: i64, borrow: bool
     // program's, `(&v[..]).reverse()`, `s.as_bytes().swap(1, 2)`, is
     // rustc's "data in a `&` reference"
     let (nl, np, nd) = crate::places::borrowck::diag::named_source(l, p, deref, pbody, pcx);
-    if nl < 0 && why == 1 {
+    // (rustc's "data in an index of `W`", "data in dereference of `D`":
+    // a view an Index or Deref call gave, which has no IndexMut, DerefMut)
+    let over = if nl < 0 && np >= 0 { crate::places::borrowck::diag::overloaded_call(np, pcx) }
+        else { 0 };
+    if over != 0 && why == 1 {
+        buf_str(m, if borrow { c"cannot borrow data in " } else { c"cannot assign to data in " });
+        buf_str(m, if over == 1 { c"an index of `" } else { c"dereference of `" });
+        crate::front::types::buf_type(m, crate::places::borrowck::diag::overloaded_self(np, pcx),
+            pcx);
+        buf_str(m, if borrow { c"` as mutable" } else { c"`" });
+    } else if why == 3 {
+        // RULE: D19.2 (0.30.1, RT-36: rustc's words)
+        buf_str(m, if borrow { c"cannot borrow '" } else { c"cannot assign to '" });
+        crate::places::borrowck::diag::buf_place(m, l, p, deref, pbody, pcx);
+        buf_str(m, if borrow { c"' as mutable, as it is a captured variable in a `Fn` closure" }
+            else { c"', as it is a captured variable in a `Fn` closure" });
+    } else if nl < 0 && why == 1 {
         buf_str(m, if borrow { c"cannot borrow data in a `&` reference as mutable" }
             else { c"cannot assign to data in a `&` reference" });
     } else {
@@ -598,7 +634,8 @@ fn report_immutable(loc: i64, l: i64, p: i64, deref: i64, why: i64, borrow: bool
         buf_str(m, if why == 1 { c", which is behind a `&` reference" }
             else { c", as it is not declared as mutable" });
     }
-    let help = if why == 1 { c"take it by `&mut` where it is lent, or change it through a `Cell`" }
+    let help = if why == 3 { c"the closure writes what it captures: take it as `F: FnMut`" }
+        else if why == 1 { c"take it by `&mut` where it is lent, or change it through a `Cell`" }
         else { c"declare it `let mut`" };
     report_error_tries(pcx.nodes[node as usize].start, 5000 + loc,
         if borrow { c"borrowck.borrow_immutable" } else { c"borrowck.assign_immutable" },
