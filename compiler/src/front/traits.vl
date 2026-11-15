@@ -2560,7 +2560,11 @@ pub fn check_copy_drop(pcx: &mut Ctx<Comp>) {
 // declaration's parameter at its place lacks. Else error trait.drop_impl.
 // Its body assumes them; nothing would require them where the value is
 // dropped (review 5's f31, f06: a dropped String's str pushed into a
-// Vec<&'static str> by `drop`).
+// Vec<&'static str> by `drop`). (0.30.1, review 6: read from resolved
+// types and predicates, drop_impl_wrong: a type argument not a parameter
+// holds no lifetime once resolved, bounds compared as resolved traits,
+// the declaration's `where` and implied outlives counted, the type a
+// struct, enum or union of the program, rustc E0120.)
 pub fn check_drop_impls(pcx: &mut Ctx<Comp>) {
     let drop_tr = std_trait(c"Drop", pcx);
     if drop_tr < 0 {
@@ -2571,7 +2575,9 @@ pub fn check_drop_impls(pcx: &mut Ctx<Comp>) {
         let at = i;
         i = impls_after(i, pcx);
         let node = pcx.traits_impls[at as usize].node;
-        if pcx.traits_impls[at as usize].tr != drop_tr || node <= 0 || std_trusted(at, pcx) {
+        // (std's are checked by `check --std`, where they are not trusted)
+        if pcx.traits_impls[at as usize].tr != drop_tr || node <= 0
+            || std_trusted(at, pcx) && !pcx.check_std {
             continue;
         }
         let why = drop_impl_wrong(at, pcx);
@@ -2582,7 +2588,8 @@ pub fn check_drop_impls(pcx: &mut Ctx<Comp>) {
         pcx.err_kind = c"trait.drop_impl";
         err_begin(pcx.nodes[node as usize].start, pcx);
         err_fmt(
-            format_args("this `Drop` impl is not as general as its type: {} (rustc E0366/E0367)",
+            format_args(
+                "this `Drop` impl is not as general as its type: {} (rustc E0366, E0367, E0120)",
                 why.as_str()), pcx);
         err_help(c"write the impl for every value of the type, `impl<'a, T: B> Drop for W<'a, T>` with the declaration's bounds only; a `drop` that needs more cannot be written for the type", pcx);
         err_end_soft(pcx);
@@ -2591,27 +2598,55 @@ pub fn check_drop_impls(pcx: &mut Ctx<Comp>) {
 }
 
 // Why Drop impl i is not as general as its type's declaration (empty:
-// it is).
+// it is). (0.30.1, review 6) Read from resolved types and resolved
+// predicates, never from the text: the header must name a struct, enum
+// or union by its name (not an alias, a tuple, a reference, an array, a
+// primitive: rustc E0120); a type argument that is not a parameter of the
+// impl must carry no lifetime once resolved (aliases and projections
+// expanded: `App<Gpa>` is a drop of those values only, `V<&'c str>`,
+// `V<Sr>` with `type Sr = &'static str`, `V<<i64 as Tr>::A>` would run on
+// every lifetime, which selection erases: E0366); and every predicate of
+// the impl must follow from the declaration's (its bounds, its `where`,
+// the outlives its fields imply), compared as resolved traits and types.
 fn drop_impl_wrong(i: i64, pcx: &mut Ctx<Comp>) -> String<Comp> {
     let node = pcx.traits_impls[i as usize].node;
     let head = pcx.nodes[node as usize].b;
+    let module = pcx.traits_impls[i as usize].module;
     let mut out = String::new_in(Comp {});
-    if head <= 0 || pcx.nodes[head as usize].kind != NodeKind::TyName {
-        return out;
+    let mut decl: i64 = 0;
+    if head > 0 && pcx.nodes[head as usize].kind == NodeKind::TyName
+        && (pcx.nodes[head as usize].p & crate::front::ast::NODE_QPATH) == 0 {
+        let saved_mod = pcx.cur_mod;
+        pcx.cur_mod = module;
+        let key = crate::front::check::resolve::type_name_key(head, pcx);
+        pcx.cur_mod = saved_mod;
+        if key >= 0 {
+            decl = if pcx.sym_struct[key as usize] != 0 {
+                pcx.structs[(pcx.sym_struct[key as usize] - 1) as usize].node
+            } else if pcx.sym_enum[key as usize] != 0 {
+                (pcx.enums[(pcx.sym_enum[key as usize] - 1) as usize]).node
+            } else { 0 };
+        }
     }
-    let saved_mod = pcx.cur_mod;
-    pcx.cur_mod = pcx.traits_impls[i as usize].module;
-    let key = crate::front::check::resolve::type_name_key(head, pcx);
-    pcx.cur_mod = saved_mod;
-    if key < 0 {
-        return out;
+    if decl <= 0 && head > 0 && pcx.nodes[head as usize].kind == NodeKind::TyName {
+        // (an alias, resolved: a struct or enum with no lifetime in it, for
+        // an impl with no parameters, is a drop of those values only, as
+        // `P<i64>` written out; anything else is refused, never read as
+        // fine)
+        let t = crate::front::check::alloc_rules::resolve_scoped_quietly(head, module, pcx);
+        let itps0 = pcx.nodes[node as usize].g;
+        let ilts0 = crate::front::parser::rust::lifetimes_of(node, pcx);
+        if t > 0 && (pcx.types[t as usize].kind == TyKind::Struct
+            && pcx.structs[pcx.types[t as usize].a as usize].closure == 0
+            || pcx.types[t as usize].kind == TyKind::Enum)
+            && crate::places::regions::slot_count(t, pcx) == 0
+            && (itps0 <= 0 || pcx.nodes[itps0 as usize].count == 0)
+            && (ilts0 <= 0 || pcx.nodes[ilts0 as usize].count == 0) {
+            return out;
+        }
     }
-    let decl = if pcx.sym_struct[key as usize] != 0 {
-        pcx.structs[(pcx.sym_struct[key as usize] - 1) as usize].node
-    } else if pcx.sym_enum[key as usize] != 0 {
-        (pcx.enums[(pcx.sym_enum[key as usize] - 1) as usize]).node
-    } else { 0 };
     if decl <= 0 {
+        out.push_str("its type is not a struct, enum or union of the program (a tuple, a reference, an array or a primitive has no Drop of its own; an alias is read as what it names, and for an impl with parameters, or of a type with a lifetime, is refused: write the type)");
         return out;
     }
     let itps = pcx.nodes[node as usize].g;
@@ -2642,25 +2677,53 @@ fn drop_impl_wrong(i: i64, pcx: &mut Ctx<Comp>) -> String<Comp> {
             }
         }
     }
+    // (the impl's type parameters stand for the declaration's at their
+    // places: the Ω of each, so that both sides' predicates resolve to the
+    // same types)
+    // (one Ω per declaration parameter, the same type on both sides: each
+    // omega_of is a new type)
+    let dmark = pcx.tscratch.len() as i64;
+    for k in 0..count(dtps, pcx) {
+        let o = crate::front::opaque::omega_of(child(dtps, k, pcx), pcx);
+        pcx.tscratch.push(o);
+    }
+    let dtargs = crate::front::generics::take_targs(dmark, pcx);
+    let mut iomega = Vec::<i64, Comp>::new_in(Comp {});
+    for q in 0..count(itps, pcx) {
+        let mut at: i64 = -1;
+        for k in 0..count(hargs, pcx) {
+            if at < 0 && drop_param_index(itps, child(hargs, k, pcx), pcx) == q {
+                at = k;
+            }
+        }
+        let o = if at >= 0 && at < count(dtps, pcx) { pcx.tlists[(dtargs + at) as usize] }
+            else { crate::front::opaque::omega_of(child(itps, q, pcx), pcx) };
+        iomega.push(o);
+    }
+    let mark = pcx.tscratch.len() as i64;
+    for &o in iomega.as_slice() {
+        pcx.tscratch.push(o);
+    }
+    let itargs = crate::front::generics::take_targs(mark, pcx);
     // (the header's type arguments: a type parameter of the impl's at one
-    // place only; another type with no 'static in it (`App<Gpa>`, std's
-    // `IntoIter<T, [T; N]>`: a drop for those values only, which assumes
-    // nothing of a lifetime); and each type parameter of the impl's is
-    // one of the arguments, so its bounds are read against the
-    // declaration's at that place)
+    // place only, or a type with no lifetime once resolved)
     for k in 0..count(hargs, pcx) {
         let a = child(hargs, k, pcx);
         let q = drop_param_index(itps, a, pcx);
         if q < 0 {
-            let mut lts = Vec::<i64, Comp>::new_in(Comp {});
-            let mut ret = Vec::<i64, Comp>::new_in(Comp {});
-            bound_lifetimes(a, 0, &mut lts, &mut ret, pcx);
-            for &l in lts.as_slice() {
-                if crate::places::regions::lifetime_binding(l, pcx)
-                    == crate::places::regions::B_STATIC {
-                    out.push_str("its type is written with a type argument that holds `'static`");
-                    return out;
-                }
+            let env = crate::front::generics::env_enter(itps, itargs, count(itps, pcx), pcx);
+            // (an array's slots are its element's, whatever its length: `[T;
+            // N]` of std's `#[array_builtin(N)]` impls, whose N no scope
+            // names, is read as its element)
+            let mut an = a;
+            while pcx.nodes[an as usize].kind == NodeKind::TyArray && pcx.nodes[an as usize].a > 0 {
+                an = pcx.nodes[an as usize].a;
+            }
+            let t = crate::front::check::alloc_rules::resolve_scoped_quietly(an, module, pcx);
+            crate::front::generics::env_leave(env, pcx);
+            if t <= 0 || crate::places::regions::slot_count(t, pcx) > 0 {
+                out.push_str("its type is written with a type argument that is not a parameter of the impl and holds a lifetime (the drop would run for every lifetime of it)");
+                return out;
             }
             continue;
         }
@@ -2686,31 +2749,33 @@ fn drop_impl_wrong(i: i64, pcx: &mut Ctx<Comp>) -> String<Comp> {
             return out;
         }
     }
-    // (no lifetime bound the declaration lacks)
+    // (what the declaration says of its lifetimes and its parameters'
+    // outlives, with what its fields imply: pairs (from, to), positions
+    // of its lifetimes, -1 'static; a type parameter k as -(2 + k))
+    let mut facts = Vec::<i64, Comp>::new_in(Comp {});
+    decl_outlives(decl, dlts, dtps, &mut facts, pcx);
+    // (no lifetime bound the declaration does not imply)
     for li in 0..count(ilts, pcx) {
         let p = child(ilts, li, pcx);
         let pb = pcx.nodes[p as usize].h;
         for bi in 0..count(pb, pcx) {
             let to = pcx.nodes[child(pb, bi, pcx) as usize].a;
             let from_at = header_lifetime_at(hlts, pcx.nodes[p as usize].a, pcx);
-            let to_static = crate::places::regions::lifetime_binding(to, pcx)
-                == crate::places::regions::B_STATIC;
-            let to_at = header_lifetime_at(hlts, to, pcx);
-            let declared = from_at >= 0 && from_at < count(dlts, pcx)
-                && (to_static || to_at >= 0 && to_at < count(dlts, pcx))
-                && decl_lifetime_bound(dlts, from_at, to_static, to_at, pcx);
-            if !declared {
+            let to_at = if crate::places::regions::lifetime_binding(to, pcx)
+                == crate::places::regions::B_STATIC { -1 }
+                else { header_lifetime_at(hlts, to, pcx) };
+            if from_at < 0 || to_at < -1 || !outlives_implied(&facts, from_at, to_at) {
                 out.push_str("it bounds the lifetime '");
                 out.push_str(str::from_utf8(sym_text(pcx.nodes[p as usize].a, pcx)).unwrap()
                     .trim_start_matches("'"));
                 out.push_str("' by '");
                 out.push_str(str::from_utf8(sym_text(to, pcx)).unwrap().trim_start_matches("'"));
-                out.push_str("', which the type's declaration does not");
+                out.push_str("', which the type's declaration does not imply");
                 return out;
             }
         }
     }
-    // (no bound of a type parameter the declaration's lacks)
+    // (no bound of a type parameter the declaration's does not imply)
     for k in 0..count(hargs, pcx) {
         let q = drop_param_index(itps, child(hargs, k, pcx), pcx);
         if q < 0 || k >= count(dtps, pcx) {
@@ -2721,14 +2786,20 @@ fn drop_impl_wrong(i: i64, pcx: &mut Ctx<Comp>) -> String<Comp> {
         let ib = pcx.nodes[ip as usize].h;
         for bi in 0..count(ib, pcx) {
             let b = child(ib, bi, pcx);
-            if !decl_has_bound(pcx.nodes[dp as usize].h, b, pcx) {
+            let mut mine = Vec::<i64, Comp>::new_in(Comp {});
+            bound_key(b, itps, itargs, &mut mine, pcx);
+            let db = pcx.nodes[dp as usize].h;
+            let mut found = false;
+            for di in 0..count(db, pcx) {
+                let mut theirs = Vec::<i64, Comp>::new_in(Comp {});
+                bound_key(child(db, di, pcx), dtps, dtargs, &mut theirs, pcx);
+                found = found || bound_implies(&theirs, &mine);
+            }
+            if !found {
                 out.push_str("it bounds its type parameter '");
                 out.push_str(str::from_utf8(sym_text(pcx.nodes[ip as usize].a, pcx)).unwrap());
-                out.push_str("' by `");
                 out.push_str(
-                    str::from_utf8(&crate::base::get_src()[pcx.nodes[b as usize].start as usize
-                        ..pcx.nodes[b as usize].end as usize]).unwrap());
-                out.push_str("`, which the type's declaration does not");
+                    "' by a trait bound the type's declaration does not have at its place");
                 return out;
             }
         }
@@ -2738,27 +2809,13 @@ fn drop_impl_wrong(i: i64, pcx: &mut Ctx<Comp>) -> String<Comp> {
             if to == 0 {
                 break;
             }
-            let to_static = crate::places::regions::lifetime_binding(to, pcx)
-                == crate::places::regions::B_STATIC;
-            let to_at = header_lifetime_at(hlts, to, pcx);
-            let mut has = false;
-            let mut di: i64 = 0;
-            loop {
-                let d = crate::front::parser::rust::outlives_of(dp, di, pcx);
-                if d == 0 {
-                    break;
-                }
-                let d_static = crate::places::regions::lifetime_binding(d, pcx)
-                    == crate::places::regions::B_STATIC;
-                has = has || to_static && d_static
-                    || !to_static && !d_static && to_at >= 0 && to_at < count(dlts, pcx)
-                    && pcx.nodes[child(dlts, to_at, pcx) as usize].a == d;
-                di += 1;
-            }
-            if !has {
+            let to_at = if crate::places::regions::lifetime_binding(to, pcx)
+                == crate::places::regions::B_STATIC { -1 }
+                else { header_lifetime_at(hlts, to, pcx) };
+            if to_at < -1 || !outlives_implied(&facts, -(2 + k), to_at) {
                 out.push_str("it bounds its type parameter '");
                 out.push_str(str::from_utf8(sym_text(pcx.nodes[ip as usize].a, pcx)).unwrap());
-                out.push_str("' by a lifetime, which the type's declaration does not");
+                out.push_str("' by a lifetime the type's declaration does not imply");
                 return out;
             }
             oi += 1;
@@ -2791,42 +2848,292 @@ fn header_lifetime_at(hlts: i64, sym: i64, pcx: &Ctx<Comp>) -> i64 {
     -1
 }
 
-// Whether the declaration's lifetime at position from is bounded by
-// 'static (to_static) or by its lifetime at position to.
-fn decl_lifetime_bound(dlts: i64, from: i64, to_static: bool, to: i64, pcx: &Ctx<Comp>) -> bool {
-    let p = child(dlts, from, pcx);
-    let pb = pcx.nodes[p as usize].h;
-    for bi in 0..(if pb > 0 { pcx.nodes[pb as usize].count } else { 0 }) {
-        let d = pcx.nodes[child(pb, bi, pcx) as usize].a;
-        if to_static && crate::places::regions::lifetime_binding(d, pcx)
-            == crate::places::regions::B_STATIC
-            || !to_static && pcx.nodes[child(dlts, to, pcx) as usize].a == d {
+// (0.30.1, review 6) The outlives facts of declaration decl (lifetimes
+// dlts, type parameters dtps) into facts, pairs (from, to): its
+// lifetimes' bounds (`'b: 'a`, its `where` joined to them), its type
+// parameters' (`T: 'a`, from -(2 + k)), and what its fields imply (a
+// reference or view `&'l P`: each lifetime and type parameter in P
+// outlives 'l). -1 is 'static.
+fn decl_outlives(decl: i64, dlts: i64, dtps: i64, facts: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    for k in 0..(if dlts > 0 { pcx.nodes[dlts as usize].count } else { 0 }) {
+        let pb = pcx.nodes[child(dlts, k, pcx) as usize].h;
+        for bi in 0..(if pb > 0 { pcx.nodes[pb as usize].count } else { 0 }) {
+            let to = pcx.nodes[child(pb, bi, pcx) as usize].a;
+            let at = lifetime_pos(dlts, to, pcx);
+            if at >= -1 {
+                facts.push(k);
+                facts.push(at);
+            }
+        }
+    }
+    for k in 0..(if dtps > 0 { pcx.nodes[dtps as usize].count } else { 0 }) {
+        let p = child(dtps, k, pcx);
+        let mut oi: i64 = 0;
+        loop {
+            let to = crate::front::parser::rust::outlives_of(p, oi, pcx);
+            if to == 0 {
+                break;
+            }
+            let at = lifetime_pos(dlts, to, pcx);
+            if at >= -1 {
+                facts.push(-(2 + k));
+                facts.push(at);
+            }
+            oi += 1;
+        }
+    }
+    for f in 0..pcx.nodes[decl as usize].count {
+        let c = child(decl, f, pcx);
+        if pcx.nodes[c as usize].kind == NodeKind::Variant {
+            for v in 0..pcx.nodes[c as usize].count {
+                let vc = child(c, v, pcx);
+                let t = if pcx.nodes[vc as usize].kind
+                    == NodeKind::Field { pcx.nodes[vc as usize].b } else { vc };
+                field_outlives(t, dlts, dtps, facts, 0, pcx);
+            }
+        } else if pcx.nodes[c as usize].kind == NodeKind::Field {
+            field_outlives(pcx.nodes[c as usize].b, dlts, dtps, facts, 0, pcx);
+        }
+    }
+}
+
+// The position of lifetime sym among dlts (-1 'static, -2 none).
+fn lifetime_pos(dlts: i64, sym: i64, pcx: &Ctx<Comp>) -> i64 {
+    if crate::places::regions::lifetime_binding(sym, pcx) == crate::places::regions::B_STATIC {
+        return -1;
+    }
+    for k in 0..(if dlts > 0 { pcx.nodes[dlts as usize].count } else { 0 }) {
+        if pcx.nodes[child(dlts, k, pcx) as usize].a == sym {
+            return k;
+        }
+    }
+    -2
+}
+
+// A field type n's implied outlives: under each reference or view with a
+// declared lifetime, what its pointee names outlives it.
+fn field_outlives(n: i64, dlts: i64, dtps: i64, facts: &mut Vec<i64, Comp>, depth: i64,
+    pcx: &Ctx<Comp>) {
+    if n <= 0 || depth > 64 {
+        return;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    if k == NodeKind::TyPtr && (pcx.nodes[n as usize].p & crate::front::ast::NODE_REF) != 0
+        || k == NodeKind::TySlice {
+        let l = lifetime_pos(dlts, pcx.nodes[n as usize].c, pcx);
+        if l >= 0 {
+            let mut names = Vec::<i64, Comp>::new_in(Comp {});
+            names_in(pcx.nodes[n as usize].a, dlts, dtps, &mut names, 0, pcx);
+            for &x in names.as_slice() {
+                facts.push(x);
+                facts.push(l);
+            }
+        }
+    }
+    if k == NodeKind::TyPtr || k == NodeKind::TySlice || k == NodeKind::TyArray {
+        field_outlives(pcx.nodes[n as usize].a, dlts, dtps, facts, depth + 1, pcx);
+        return;
+    }
+    let g = if k == NodeKind::TyName { pcx.nodes[n as usize].g } else { n };
+    if k == NodeKind::TyName || k == NodeKind::TyTuple {
+        for i in 0..(if g > 0 { pcx.nodes[g as usize].count } else { 0 }) {
+            field_outlives(child(g, i, pcx), dlts, dtps, facts, depth + 1, pcx);
+        }
+    }
+}
+
+// The declaration's lifetimes (positions) and type parameters (-(2 + k))
+// type node n names, into out.
+fn names_in(n: i64, dlts: i64, dtps: i64, out: &mut Vec<i64, Comp>, depth: i64, pcx: &Ctx<Comp>) {
+    if n <= 0 || depth > 64 {
+        return;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    let mut lts = Vec::<i64, Comp>::new_in(Comp {});
+    let mut ret = Vec::<i64, Comp>::new_in(Comp {});
+    bound_lifetimes(n, 0, &mut lts, &mut ret, pcx);
+    for &l in lts.as_slice() {
+        let at = lifetime_pos(dlts, l, pcx);
+        if at >= 0 {
+            out.push(at);
+        }
+    }
+    names_params(n, dtps, out, depth, pcx);
+    let _ = k;
+}
+
+fn names_params(n: i64, dtps: i64, out: &mut Vec<i64, Comp>, depth: i64, pcx: &Ctx<Comp>) {
+    if n <= 0 || depth > 64 {
+        return;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    if k == NodeKind::TyName {
+        if pcx.nodes[n as usize].count == 0 && pcx.nodes[n as usize].g == 0 {
+            for q in 0..(if dtps > 0 { pcx.nodes[dtps as usize].count } else { 0 }) {
+                if pcx.nodes[child(dtps, q, pcx) as usize].a == pcx.nodes[n as usize].a {
+                    out.push(-(2 + q));
+                }
+            }
+        }
+        let g = pcx.nodes[n as usize].g;
+        for i in 0..(if g > 0 { pcx.nodes[g as usize].count } else { 0 }) {
+            names_params(child(g, i, pcx), dtps, out, depth + 1, pcx);
+        }
+        return;
+    }
+    if k == NodeKind::TyPtr || k == NodeKind::TySlice || k == NodeKind::TyArray {
+        names_params(pcx.nodes[n as usize].a, dtps, out, depth + 1, pcx);
+        return;
+    }
+    if k == NodeKind::TyTuple || k == NodeKind::TyFn {
+        for i in 0..pcx.nodes[n as usize].count {
+            names_params(child(n, i, pcx), dtps, out, depth + 1, pcx);
+        }
+        if k == NodeKind::TyFn {
+            names_params(pcx.nodes[n as usize].a, dtps, out, depth + 1, pcx);
+        }
+    }
+}
+
+// Whether facts imply from outlives to (-1 'static): the same, or a chain
+// of facts, or from outliving 'static.
+fn outlives_implied(facts: &Vec<i64, Comp>, from: i64, to: i64) -> bool {
+    if from == to {
+        return true;
+    }
+    let mut seen = Vec::<i64, Comp>::new_in(Comp {});
+    let mut todo = Vec::<i64, Comp>::new_in(Comp {});
+    todo.push(from);
+    while todo.len() > 0 {
+        let x = todo[todo.len() - 1];
+        todo.truncate(todo.len() - 1);
+        if x == to || x == -1 {
             return true;
+        }
+        let mut was = false;
+        for &s in seen.as_slice() {
+            was = was || s == x;
+        }
+        if was {
+            continue;
+        }
+        seen.push(x);
+        let mut w: usize = 0;
+        while w + 1 < facts.len() {
+            if facts[w] == x {
+                todo.push(facts[w + 1]);
+            }
+            w += 2;
         }
     }
     false
 }
 
-// Whether the declaration's bounds db hold bound b: the same trait with
-// the same text of arguments, or the same text (an `Fn*` bound).
-fn decl_has_bound(db: i64, b: i64, pcx: &mut Ctx<Comp>) -> bool {
-    let text = |n: i64, pcx: &Ctx<Comp>| -> &'static [u8] {
-        &crate::base::get_src()[
-            pcx.nodes[n as usize].start as usize..pcx.nodes[n as usize].end as usize]
-    };
-    let bt = if pcx.nodes[b as usize].kind == NodeKind::TyName { bound_trait(b, pcx) } else { -1 };
-    for k in 0..(if db > 0 { pcx.nodes[db as usize].count } else { 0 }) {
-        let d = child(db, k, pcx);
-        if text(d, pcx) == text(b, pcx) {
-            return true;
+// Bound b resolved with params bound to targs, into key: an `Fn*` bound
+// [-2, its kind, its parameters' types.., -3, its result's type]; a
+// trait's [-1, the trait, its arguments' types.., then (name, type) per
+// associated-type constraint]; 0 for a part that does not resolve.
+fn bound_key(b: i64, params: i64, targs: i64, key: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+    let count = if params > 0 { pcx.nodes[params as usize].count } else { 0 };
+    let module = crate::front::modules::module_of(b, pcx);
+    let env = crate::front::generics::env_enter(params, targs, count, pcx);
+    if pcx.nodes[b as usize].kind == NodeKind::TyFn {
+        key.push(-2);
+        key.push(pcx.nodes[b as usize].d);
+        for i in 0..pcx.nodes[b as usize].count {
+            let t = crate::front::check::alloc_rules::resolve_scoped_quietly(child(b, i, pcx),
+                module, pcx);
+            key.push(t);
         }
-        if bt >= 0 && pcx.nodes[d as usize].kind == NodeKind::TyName && bound_trait(d, pcx) == bt
-            && pcx.nodes[d as usize].g == 0 && pcx.nodes[b as usize].g == 0
-            && pcx.nodes[d as usize].h == 0 && pcx.nodes[b as usize].h == 0 {
-            return true;
+        key.push(-3);
+        let r = pcx.nodes[b as usize].a;
+        let t = if r
+            > 0 { crate::front::check::alloc_rules::resolve_scoped_quietly(r, module, pcx) }
+            else { -4 };
+        key.push(t);
+    } else if pcx.nodes[b as usize].kind == NodeKind::TyName {
+        key.push(-1);
+        key.push(bound_trait(b, pcx));
+        let g = pcx.nodes[b as usize].g;
+        if g > 0 {
+            let args = bound_args(b, pcx);
+            for a in 0..pcx.nodes[g as usize].count {
+                key.push(if args >= 0 { pcx.tlists[(args + a) as usize] } else { 0 });
+            }
+        }
+        key.push(-3);
+        let h = pcx.nodes[b as usize].h;
+        for c in 0..(if h > 0 { pcx.nodes[h as usize].count } else { 0 }) {
+            let cn = child(h, c, pcx);
+            if pcx.nodes[cn as usize].kind == NodeKind::AssocType {
+                key.push(pcx.nodes[cn as usize].a);
+                let t = crate::front::check::alloc_rules::resolve_scoped_quietly(
+                    pcx.nodes[cn as usize].b, module, pcx);
+                key.push(t);
+            }
+        }
+    } else {
+        key.push(0);
+    }
+    crate::front::generics::env_leave(env, pcx);
+}
+
+// Whether the declaration's bound (key theirs) implies the impl's (mine):
+// the same trait with the same resolved arguments and each of mine's
+// associated-type constraints among theirs; an `Fn*` bound of a kind at
+// least as strong with the same types. A part that did not resolve
+// implies nothing.
+fn bound_implies(theirs: &Vec<i64, Comp>, mine: &Vec<i64, Comp>) -> bool {
+    if theirs.len() < 2 || mine.len() < 2 || theirs[0] != mine[0] {
+        return false;
+    }
+    // (from 2: a type 0 did not resolve; at 1 the trait, -1 when none,
+    // or the `Fn*` kind, either may be 0)
+    for e in 2..mine.len() {
+        if mine[e] == 0 {
+            return false;
         }
     }
-    false
+    if mine[0] == -2 {
+        if theirs.len() != mine.len() || theirs[1] > mine[1] {
+            return false;
+        }
+        for e in 2..mine.len() {
+            if theirs[e] != mine[e] {
+                return false;
+            }
+        }
+        return true;
+    }
+    if mine[0] != -1 || theirs[1] < 0 || theirs[1] != mine[1] {
+        return false;
+    }
+    // (the trait's arguments, up to -3)
+    let mut e: usize = 2;
+    while e < mine.len() && mine[e] != -3 {
+        if e >= theirs.len() || theirs[e] != mine[e] {
+            return false;
+        }
+        e += 1;
+    }
+    if e >= theirs.len() || theirs[e] != -3 {
+        return false;
+    }
+    let tstart = e + 1;
+    let mut m = e + 1;
+    while m + 1 < mine.len() {
+        let mut has = false;
+        let mut t = tstart;
+        while t + 1 < theirs.len() {
+            has = has || theirs[t] == mine[m] && theirs[t + 1] == mine[m + 1];
+            t += 2;
+        }
+        if !has {
+            return false;
+        }
+        m += 2;
+    }
+    true
 }
 
 // RULE: F2.6 (0.29, the rust edition) A struct or an enum is Copy only
