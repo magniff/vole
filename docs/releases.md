@@ -116,6 +116,13 @@ the bytes of a cold one when a function's number of calls changes.
   program that ran clean under `--check-unsafe` may now stop with
   `unsafe access after free` or `unsafe access out of bounds`, naming
   the line. Blocks aligned above 16 (`posix_memalign`) are recorded too.
+  Memory the check did not see allocated is never reported as freed: a
+  block the program frees is held back from C's allocator while the
+  check counts it freed (the last 4096 blocks, at most 64 MB), and every
+  block has 16 bytes after its end that no one is given. So C's own
+  mallocs (strdup's, opendir's) neither reuse a freed block nor start
+  where a block ends, and a program under the check uses that much more
+  memory. A `realloc` of a block moves it.
 - **An address is not an access** under `--check-unsafe`, as in Rust:
   `&p[i]`, `p.add(i)` and `p.sub(i)` of a pointer into a live block must
   stay in that block or one past its end (`unsafe address out of
@@ -123,20 +130,28 @@ the bytes of a cold one when a function's number of calls changes.
   0)`), and only a read or a write through the pointer is checked as an
   access. 0.30.0 checked `NonNull::add`'s one-past-the-end address as a
   read of the element there. std's `*const T::add` and `sub` are now
-  that address (`&p[count]`) and not integer arithmetic.
+  that address (`&p[count]`) and not integer arithmetic. Their offset
+  in bytes is computed first with the program's overflow checks, as
+  Rust's debug `add` asserts: at -O0 a count whose product with the
+  size overflows panics (`attempt to multiply with overflow`), as in
+  0.30.0. Under `--check-unsafe`, at every level, an offset that does
+  not fit an isize is refused (`an offset of N elements of 8 bytes
+  overflows`).
 - **`#[link_name]` names the C function** for every check and
   optimization, both ways. `#[link_name = "my_alloc"] fn malloc` is not
   C's malloc: -O2 kept its calls (0.30.0 removed them as a heap
   allocation it could put on the stack). `#[link_name = "exit"] fn
   leave` is C's exit: `#[no_io]` refuses it. The same holds for libm's
-  functions (sin, sqrt: their calls kept or made libcalls by the
-  symbol), `setjmp` (returns twice by its symbol) and a C static's
-  symbol. An extern named like a C function the compiler itself calls
+  functions (`#[link_name = "sqrt"] fn root` is an fsqrt at -O2),
+  `setjmp` (returns twice by its symbol), a function pointer to an
+  extern (0.30.0's -O2 took the calls through one for C's malloc and
+  free by the vole names) and a C static's symbol. An extern named like a C function the compiler itself calls
   (`memcpy`, `fmod`) with a `#[link_name]` no longer takes over those
   calls (RT-6).
-- **`--trace` reports a stack overflow** (RT-14): its SIGSEGV handler
-  runs on a stack of its own (`sigaltstack`), and prints `stopped by
-  signal 11` and the frames where it printed nothing.
+- **`--trace` reports a stack overflow** (RT-14): its SIGSEGV and
+  SIGBUS handler runs on a stack of its own (`sigaltstack`), one for
+  each thread, and prints `stopped by signal 11` (10, SIGBUS, for a
+  spawned thread on macOS) and the frames where it printed nothing.
 
 #### Bugs fixed
 
@@ -150,13 +165,22 @@ the bytes of a cold one when a function's number of calls changes.
   `if false { }`). Before its series it builds pairs of programs warm
   after each other and compares them with cold builds:
   tests/incremental/*.vl.txt, both orders, -O1 and -O2, -S and -c.
-  0.30.0 fails 8 of the 24.
+  0.30.0 fails 8 of RT-CG-3's 24. An edit the compiler refuses with a
+  diagnostic is taken back and another made; a crash of the compiler on
+  one fails the row.
+- The code cache (RT-TL-2): a changed `#[link_name]` of an extern
+  function or static was hashed only as being there, so a warm -O1 or
+  -O2 build reused code calling, or reading, the old symbol. The name in
+  the hash is now the link name (a C function is named by its symbol).
+  Its pairs in tests/incremental fail all 16 of their builds on 0.30.0;
+  no other fact of a declaration that changes code is hashed only as
+  being there (`#[target_feature]`'s string is read by the front end's
+  checks alone, `#[multiversion]` makes functions whose IR is hashed).
 - `--check-unsafe`'s tables were sorted arrays, unlocked, moved by
   `memmove` on every block: quadratic in the number of live blocks, and
   raced by a program's threads. They are treaps behind a lock, with the
-  last hit kept. A block that C freed unseen (`realloc`, a library's
-  own free) is forgotten when a new block overlaps it, and is not
-  reported.
+  last hit kept. A block passed to C that C freed is forgotten when a
+  new block overlaps it, and is not reported.
 - Two more places in the compiler computed addresses with a checked
   `+`, like `middle::lsr`'s fixed at 0.30.0's tag: `middle::fold`'s
   address offsets and `back::isel`'s pairing of loads and stores. They
@@ -186,7 +210,11 @@ the bytes of a cold one when a function's number of calls changes.
     each at its line, before it reads the compiler's count.
 - `chain-diverse` prints its same-output count, which its floor reads.
 - The red team's cases are tracked apart from the XFAIL census
-  (docs/xfail.md). RT-6, RT-14 and RT-CG-3 are fixed here.
+  (docs/xfail.md). RT-6, RT-14, RT-CG-3 and RT-TL-2 are fixed here.
+- `--check-unsafe`'s own: C's strdup after a freed Box or Vec, its copy
+  read and freed (`check_unsafe_c_reuse_*`), ten thousand blocks and
+  96 MB through the quarantine (`check_unsafe_quarantine`), an offset
+  that overflows (`check_unsafe_add_overflow`, `ovf_o0_ptr_add_count`).
 
 #### Known issues
 
@@ -195,6 +223,11 @@ the bytes of a cold one when a function's number of calls changes.
   XFAIL, `rust_b_err_mv_assign_part_uninit`.
 - `volec FILE --deny=unsafe` (a build) ignores `--deny=unsafe`: only
   `volec check` honours it.
+- `--check-unsafe` reports an address out of bounds made by std's
+  `add`, `sub` or `NonNull::add` at std's line (`<std>: line N`), not at
+  the program's call: vole has no caller location for std's functions
+  (Rust's `#[track_caller]`). The message's numbers are the block's and
+  the offset's; the line is the one in std.
 
 ### What's new in 0.30.0
 
