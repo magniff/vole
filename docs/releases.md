@@ -236,6 +236,25 @@ the bytes of a cold one when a function's number of calls changes.
   clause and the function dropped. It is now `contract.move`, and a move
   out of a binding that borrows one is `borrowck.move_out`.
   `query drops` shows the companions' drops too (tests/run/rt_034_*).
+- A clause that writes what the caller owns (RT-38, unsound, in 0.30.0):
+  a `requires` with a `mut` parameter or a `mut` binding could assign
+  it, `take()` it, `mem::replace` or `swap` it, or call a `mut self`
+  method on it, and `old(e)` ran on the parameters themselves (`old(
+  o.take().is_some())`, `old({ v[0] = 9; 1 })` through a `&mut`): the
+  caller's Vec was freed under the body, a Drop value dropped twice, and
+  `--debug-contracts` changed the output. A clause now reads the
+  parameters and `result` as through `&T` (a borrowed copy is never
+  written, lent `&mut` or moved out of, through a `&mut` it holds too),
+  `old(e)` and the checks through views of them, and a by-value binding
+  of a part that is not Copy is a move, in a `requires` as in an
+  `ensures` (one rule, Rust's on `*r`). A move out of an element or a
+  referent by a pattern is one error, not two (its binding owns what it
+  took). The ensures wrapper views only the parameters its clauses
+  read, so an `ensures *result >= 0` on a `&mut` that `result` borrows
+  from is no longer `borrowck.conflict` at 1:1. `--verify-places`
+  reports a borrowed copy copied whole into an owned local. `query
+  drops` keeps a generic function's instances one and names a closure's
+  `#[multiversion]` copy by its version (tests/run/rt_038_*).
 
 #### The safety nets
 
