@@ -19,9 +19,10 @@
 # to overflow the first thread's stack (30000 terms) must crash `check`,
 # a build and `--json check` with the warning already on stderr (the
 # compiler before said nothing, exit 139). Every command that reads a
-# program says it, once, on stderr (query, fmt, fix, test, try: the
-# volecs a command starts write theirs to VOLEC_MAIN_STACK_FILE, so try's answer
-# is still its type and value), and guide, --version and explain do not.
+# program says it, once, on stderr (query, fmt, fix, test, try), and
+# guide, --version and explain do not. (0.30.1) A volec another starts
+# (VOLEC_NESTED) never says it, so try's answer is still its type and
+# value: a child that alone falls back is not reported.
 #
 # usage: tests/main_stack.sh [-c COMPILER]
 set -u
@@ -123,14 +124,12 @@ fn main() {
     println("{}", f());
 }
 VL
-# (0.30.1, the fourth review's) and when only a volec another starts
-# falls back (childnobig: try's, test's and probe's checks and builds),
-# or only a lazy std's build made again (eagernobig), the warning is
-# still said once on stderr, by the first volec, after the child ends
-# (the child writes it to VOLEC_MAIN_STACK_FILE, out of band:
-# tools::proc::say_children_main_stack), and never inside its output:
-# try's answer stays its type and value. A check or a build starts no
-# volec, and there none falls back: no warning.
+# (0.30.1) When only a volec another starts falls back (childnobig:
+# try's, test's and probe's checks and builds), nothing is said: a nested
+# volec (VOLEC_NESTED) never says it, so it cannot reach output a parent
+# reads, and try's answer stays its type and value. A lazy std's build
+# made again (eagernobig) is not nested (stdlazy::rerun_eager) and says
+# it once. A check or a build starts no volec: no warning.
 while read -r mode want args; do
     # (test's own builds kept, .volec: none made, no volec started)
     rm -rf "$T/.volec"
@@ -163,10 +162,10 @@ nosize 1 test t.vl
 nosize 1 try 1+2
 nosize 1 probe t.vl:5 f()
 nosize 1 bad.vl -o bad
-childnobig 1 try 1+2
-childnobig 1 --json try 1+2
-childnobig 1 test t.vl
-childnobig 1 probe t.vl:5 f()
+childnobig 0 try 1+2
+childnobig 0 --json try 1+2
+childnobig 0 test t.vl
+childnobig 0 probe t.vl:5 f()
 childnobig 0 check t.vl
 childnobig 0 t.vl -o t
 childnobig 0 bad.vl -o bad
@@ -174,14 +173,14 @@ eagernobig 1 bad.vl -o bad
 eagernobig 0 check t.vl
 LINES
 # (0.30.1, the fourth review's) a user's program gets none of the
-# variables volec sets for itself (VOLEC_NESTED, VOLEC_EDIT_TAG,
-# VOLEC_MAIN_STACK_FILE, tools::proc::exec_program), under run, test,
+# variables volec sets for itself (VOLEC_NESTED, VOLEC_EDIT_TAG:
+# tools::proc::exec_program), under run, test,
 # probe and try alike, with the fallback and without
 mkdir -p "$T/leak"
 cat > "$T/leak/main.vl" <<'VL'
 fn leaks(gpa: Gpa) -> i64 {
     let mut n: i64 = 0;
-    for name in ["VOLEC_NESTED", "VOLEC_EDIT_TAG", "VOLEC_MAIN_STACK_FILE"] {
+    for name in ["VOLEC_NESTED", "VOLEC_EDIT_TAG"] {
         if std::env::var_in(name, gpa).is_ok() {
             n += 1;
         }
@@ -199,7 +198,7 @@ fn main(gpa: Gpa) {
     println("leaks {}", n);
 }
 VL
-L='let mut n = 0; for v in ["VOLEC_NESTED", "VOLEC_EDIT_TAG", "VOLEC_MAIN_STACK_FILE"] { if std::env::var_in(v, gpa).is_ok() { n += 1; } } n'
+L='let mut n = 0; for v in ["VOLEC_NESTED", "VOLEC_EDIT_TAG"] { if std::env::var_in(v, gpa).is_ok() { n += 1; } } n'
 for mode in nobig none; do
     (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" run leak > "$T/o" 2> "$T/e")
     grep -qx "leaks 0" "$T/o" || { echo "main-stack: FAIL: SHIM_MODE=$mode volec run: the program sees volec's variables: $(cat "$T/o")"; bad=1; }
@@ -221,7 +220,7 @@ for mode in nobig none; do
     (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" test leak/main.vl --input in.txt > "$T/o" 2> "$T/e")
     grep -qx "leaks 0" "$T/o" || { echo "main-stack: FAIL: SHIM_MODE=$mode volec test --input: the program sees volec's variables:"; cat "$T/o"; bad=1; }
     printf 'a\nb\n' > "$T/r.txt"; rm -f "$T/seen"
-    (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" reduce r.txt --until 'n=0; for v in VOLEC_NESTED VOLEC_EDIT_TAG VOLEC_MAIN_STACK_FILE; do eval "x=\${$v+set}"; [ -n "$x" ] && n=$((n+1)); done; echo $n >> seen' > "$T/o" 2> "$T/e")
+    (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" reduce r.txt --until 'n=0; for v in VOLEC_NESTED VOLEC_EDIT_TAG; do eval "x=\${$v+set}"; [ -n "$x" ] && n=$((n+1)); done; echo $n >> seen' > "$T/o" 2> "$T/e")
     if [ ! -s "$T/seen" ] || grep -qvx 0 "$T/seen"; then
         echo "main-stack: FAIL: SHIM_MODE=$mode volec reduce --until: the command sees volec's variables: $(cat "$T/seen" "$T/o" "$T/e")"; bad=1
     fi
@@ -231,7 +230,7 @@ printf '#!/bin/sh\necho FAKE-ENV "$@"\n' > "$T/fakebin/env"; chmod +x "$T/fakebi
 cat > "$T/a=b/main.vl" <<'VL'
 fn main(gpa: Gpa) -> i32 {
     let mut n: i64 = 0;
-    for name in ["VOLEC_NESTED", "VOLEC_EDIT_TAG", "VOLEC_MAIN_STACK_FILE"] {
+    for name in ["VOLEC_NESTED", "VOLEC_EDIT_TAG"] {
         if std::env::var_in(name, gpa).is_ok() {
             n += 1;
         }
@@ -286,14 +285,14 @@ done
 # (0.30.1, the fifth review's) nothing is read out of any output: a
 # snippet that prints the warning's own line, and a JSON object of its
 # keys, prints them as they are, and no warning is said that did not
-# happen (none; childnobig: the one that did)
+# happen (none, and childnobig: a nested volec says nothing)
 cat > "$T/warnlines.sh" <<'SH'
 printf '%s\n' 'println("warning thread.main-stack: no thread with a 1 GiB stack could be made: compiling on the main thread'"'"'s stack, which a deeply nested expression may overflow"); println("{{\"kind\":\"diagnostic\",\"severity\":\"warning\",\"code\":\"thread.main-stack\",\"mine\":1}}"); println("after"); 1 + 2'
 SH
 S=$(sh "$T/warnlines.sh")
 for mode in none childnobig; do
     (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" try "$S" > "$T/o" 2> "$T/e")
-    want=0; [ $mode = childnobig ] && want=1
+    want=0
     if [ "$(sed -n 1p "$T/o")" != "warning thread.main-stack: $W: compiling on the main thread's stack, which a deeply nested expression may overflow" ] \
         || ! sed -n 2p "$T/o" | grep -q '"mine":1' || [ "$(sed -n 3,4p "$T/o")" != "after
 i32 = 3" ] || [ "$(grep -c "$W" "$T/e")" -ne $want ]; then
@@ -301,63 +300,30 @@ i32 = 3" ] || [ "$(grep -c "$W" "$T/e")" -ne $want ]; then
         cat "$T/o" "$T/e"; bad=1
     fi
 done
-# (0.30.1, the sixth review's) VOLEC_MAIN_STACK_FILE is made by mkstemp
-# and removed at exit, and a child appends to it without following a
-# link or making it (tools::proc::make_main_stack_file,
-# append_main_stack_file): a link planted at the old, predictable name
-# in a TMPDIR volec cannot write is not written through, and the
-# warning, made in /tmp then, is said once; a file the variable names
-# that is a link is not written through either (the warning goes to
-# stderr); an unwritable or missing TMPDIR loses no warning; and the
-# file is gone after the command.
-mkdir -p "$T/sy/tmpd" "$T/sy/tmpw" "$T/sy/ro"
-printf 'fn f() -> i64 { 1 }\n#[test]\nfn t() { assert_eq(f(), 1); }\nfn main() {\n    println("{}", f());\n}\n' > "$T/sy/t.vl"
-echo "precious data" > "$T/sy/victim.txt"
-(cd "$T/sy" && sh -c 'ln -s "$1/victim.txt" "$1/tmpd/volec-main-stack.$$"; chmod 555 "$1/tmpd"; exec env TMPDIR="$1/tmpd" SHIM_MODE=childnobig DYLD_INSERT_LIBRARIES="$2" VOLE_CACHE=off "$3" test t.vl' sh "$T/sy" "$T/shim.dylib" "$C" > "$T/o" 2> "$T/e")
-chmod 755 "$T/sy/tmpd"
-if [ "$(cat "$T/sy/victim.txt")" != "precious data" ] || [ "$(grep -c "$W" "$T/e")" -ne 1 ] || grep -q "$W" "$T/o"; then
-    echo "main-stack: FAIL: a link planted at volec-main-stack.PID: victim '$(cat "$T/sy/victim.txt")', the warning $(grep -c "$W" "$T/e") times on stderr (1 wanted)"; cat "$T/o" "$T/e"; bad=1
-fi
-echo "precious data" > "$T/sy/victim.txt"; ln -s "$T/sy/victim.txt" "$T/sy/link"
-(cd "$T/sy" && VOLEC_MAIN_STACK_FILE="$T/sy/link" SHIM_MODE=nobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" check t.vl > "$T/o" 2> "$T/e")
-if [ "$(cat "$T/sy/victim.txt")" != "precious data" ] || [ "$(grep -c "$W" "$T/e")" -ne 1 ]; then
-    echo "main-stack: FAIL: VOLEC_MAIN_STACK_FILE a link: victim '$(cat "$T/sy/victim.txt")', the warning $(grep -c "$W" "$T/e") times on stderr (1 wanted)"; bad=1
-fi
-chmod 555 "$T/sy/ro"
-for td in "$T/sy/ro" "$T/sy/none" "$T/sy/tmpw"; do
-    rm -rf "$T/sy/.volec"
-    (cd "$T/sy" && TMPDIR="$td" SHIM_MODE=childnobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" test t.vl > "$T/o" 2> "$T/e")
-    if [ "$(grep -c "$W" "$T/e")" -ne 1 ] || grep -q "$W" "$T/o" || ! grep -q "1 passed" "$T/o"; then
-        echo "main-stack: FAIL: TMPDIR=$td volec test: the warning $(grep -c "$W" "$T/e") times on stderr (1 wanted):"; cat "$T/o" "$T/e"; bad=1
+# (0.30.1) a batch's steps (copies fork made, fork_worker): a step's
+# nested volec that falls back says nothing, on stderr or in the batch's
+# answer; when the batch itself falls back, it says it once
+mkdir -p "$T/sy"
+printf 'fn f() -> i64 { 1 }\n' > "$T/sy/t.vl"
+printf 'try 1+2\ntry 2+3\ncheck t.vl\n' > "$T/sy/cmds"
+for mode in childnobig nobig; do
+    (cd "$T/sy" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" batch < cmds > "$T/o" 2> "$T/e")
+    want=0; [ $mode = nobig ] && want=1
+    if [ "$(grep -c "$W" "$T/e")" -ne $want ] || grep -q "$W" "$T/o"; then
+        echo "main-stack: FAIL: SHIM_MODE=$mode volec batch: the warning $(grep -c "$W" "$T/e") times on stderr ($want wanted), $(grep -c "$W" "$T/o") in its answer (0 wanted)"; bad=1
     fi
 done
-chmod 755 "$T/sy/ro"
-if ls "$T/sy/tmpw" | grep -q volec-main-stack; then
-    echo "main-stack: FAIL: VOLEC_MAIN_STACK_FILE left after the command: $(ls "$T/sy/tmpw")"; bad=1
-fi
-# (0.30.1, the sixth review's) a copy fork made of the first volec (a
-# batch's steps, same-output's and samebuild's workers: fork_worker) is
-# not the file's owner (MAIN_STACK_OWNER is a pid): a step's nested
-# volec that falls back is said once, on stderr, not once a step inside
-# the batch's answer
-printf 'try 1+2\ntry 2+3\ncheck t.vl\n' > "$T/sy/cmds"
-(cd "$T/sy" && SHIM_MODE=childnobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" batch < cmds > "$T/o" 2> "$T/e")
-if [ "$(grep -c "$W" "$T/e")" -ne 1 ] || grep -q "$W" "$T/o"; then
-    echo "main-stack: FAIL: SHIM_MODE=childnobig volec batch: the warning $(grep -c "$W" "$T/e") times on stderr (1 wanted), $(grep -c "$W" "$T/o") in its answer (0 wanted)"; bad=1
-fi
 # (0.30.1) a volec that execs itself (a query answered by another
-# program, tools::query::roots::other_root: the same pid) stays the file's
-# owner (its pid in the name, tools::proc::keep_main_stack_file): the
-# file is gone after it, and the warning, which both images fall back
-# for, is said once
-mkdir -p "$T/oth/ex/demo" "$T/oth/td"
+# program, tools::query::roots::other_root): both images fall back, the
+# second is nested (VOLEC_NESTED, set by the first): said once
+mkdir -p "$T/oth/ex/demo"
 printf 'mod sim;\nfn main() {\n    println("{}", sim::snap_shot());\n}\n' > "$T/oth/ex/demo/main.vl"
 printf 'pub fn snap_shot() -> i64 {\n    1\n}\n' > "$T/oth/ex/demo/sim.vl"
 for mode in none nobig; do
-    (cd "$T/oth" && TMPDIR="$T/oth/td" SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" query show sim.vl::snap_shot > "$T/o" 2> "$T/e")
+    (cd "$T/oth" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" query show sim.vl::snap_shot > "$T/o" 2> "$T/e")
     want=0; [ $mode = nobig ] && want=1
-    if ! grep -q "crate::sim::snap_shot" "$T/o" || [ "$(grep -c "$W" "$T/e")" -ne $want ] || ls "$T/oth/td" | grep -q volec-main-stack; then
-        echo "main-stack: FAIL: SHIM_MODE=$mode a query asked again of another program: the warning $(grep -c "$W" "$T/e") times ($want wanted), left: $(ls "$T/oth/td")"; cat "$T/o" "$T/e"; bad=1
+    if ! grep -q "crate::sim::snap_shot" "$T/o" || [ "$(grep -c "$W" "$T/e")" -ne $want ]; then
+        echo "main-stack: FAIL: SHIM_MODE=$mode a query asked again of another program: the warning $(grep -c "$W" "$T/e") times ($want wanted)"; cat "$T/o" "$T/e"; bad=1
     fi
 done
 for args in "--version" "explain lex.utf8" "explain thread.main-stack" "guide --list"; do
@@ -370,4 +336,4 @@ done
 if [ $bad -ne 0 ]; then
     exit 1
 fi
-echo "main-stack: ok: the compiler's own thread, and its planted refusals said once on stderr, before an overflow, by every command that reads a program and by no other, whichever volec fell back; no worker's stack, a -j 4 build still builds; a user's program gets none of volec's own variables"
+echo "main-stack: ok: the compiler's own thread, and its planted refusals said once on stderr, before an overflow, by every command that reads a program and by no other, never by a nested volec; no worker's stack, a -j 4 build still builds; a user's program gets none of volec's own variables"

@@ -508,17 +508,14 @@ that keeps few values live is unlikely to make such moves.
   (a build, check, query, fmt, fix, test, try, the LSP; not
   `--version`, `explain` or `guide`), so that it is there before a deep
   expression overflows that stack. A volec a command starts (try's,
-  test's, probe's checks and builds, a lazy std's build made again)
-  writes its warning into the first volec's file
-  (`VOLEC_MAIN_STACK_FILE`), not on the output the command reads, and
-  the first volec says it once after the child ends: never inside try's
-  answer, and no output is filtered. The file is made by mkstemp (a name
-  no one can guess, made exclusively, mode 0600) and removed at exit; a
-  child appends to it without following a link and without making it,
-  and says the warning on its stderr when it cannot. A program volec runs (`run`,
+  test's, probe's checks and builds: `VOLEC_NESTED`) never says it, so
+  the warning cannot reach output a parent reads (try's answer); when
+  only such a child falls back it is not reported, and a child that
+  then overflows still fails visibly, as a crashed child (a lazy std's
+  build made again says it only when the first run did not). A program volec runs (`run`,
   `test`, `test --input`, `probe`, `try`, `reduce --until`'s command)
   no longer gets the variables volec sets for itself (`VOLEC_NESTED`,
-  `VOLEC_EDIT_TAG`, `VOLEC_MAIN_STACK_FILE`; `volec guide tools`): it
+  `VOLEC_EDIT_TAG`; `volec guide tools`): it
   is exec'd with volec's environment less those, by execve of its
   path. A worker or the assembler's thread that
   cannot be made leaves the build on fewer threads (the main thread's

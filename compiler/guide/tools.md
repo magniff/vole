@@ -276,12 +276,13 @@ a program volec runs (`run`, `test`, `probe`, `try`) gets none of them:
 |---|---|
 | `VOLEC_NESTED=1` | started by another volec: no `ok:` line, no colour |
 | `VOLEC_EDIT_TAG=PID` | the first volec's pid: the copies its edits check |
-| `VOLEC_MAIN_STACK_FILE=PATH` | (0.30.1) the first volec's (mkstemp's, removed at exit): a started volec on the first thread's stack appends `warning thread.main-stack` there (stderr when it cannot), and the first one says it |
 
 Set by hand they act the same: `VOLEC_NESTED=1` drops the `ok:` line;
-two shells with one `VOLEC_EDIT_TAG` share edit copies (a bad idea);
-a `VOLEC_MAIN_STACK_FILE` of your own, a file that exists, gets that warning
-instead of stderr.
+two shells with one `VOLEC_EDIT_TAG` share edit copies (a bad idea).
+(0.30.1) A nested volec never says `warning thread.main-stack`, so it
+cannot reach output its parent reads: when only a child falls back to
+the first thread's stack it is not reported, and a child that then
+overflows fails visibly, as a crashed child.
 
 ## Seeing what the optimizer did
 
