@@ -144,6 +144,7 @@ borrowck.move_from_drop
 borrowck.guard_write
 borrowck.assign_immutable
 borrowck.borrow_immutable
+borrowck.packed_ref
 ```
 
 and the `sync` family:
