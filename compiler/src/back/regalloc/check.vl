@@ -2,7 +2,9 @@
 // simulated over the control flow graph.
 
 use crate::back::emit::machine::call_returns_through_pointer;
-use crate::back::emit::operands::{PM_FIELDS, PM_LOC, pm_dst, pm_kind, pm_result, pm_src, pm_value};
+use crate::back::emit::operands::{
+    PM_FIELDS, PM_LOC, loc_cells, pm_dst, pm_kind, pm_plan, pm_result, pm_src, pm_ty, pm_value,
+};
 use crate::back::mc_x86_64::ops::ovf_uses_rdx;
 use crate::back::regalloc::{LOC_NONE, LOC_REMAT, USE_REG};
 use crate::back::regalloc::intervals::is_returns_twice_call;
@@ -52,15 +54,33 @@ fn check_index(loc: i64) -> i64 {
     -1
 }
 
-fn check_get(state: &[i64], loc: i64) -> i64 {
+// (0.30.1, RT-CG-6) What location loc holds as a value of type ty: the
+// value in each of its cells (loc_cells: a wide value in a spill slot
+// takes two or four), or -1 when they differ.
+fn check_get(state: &[i64], loc: i64, ty: i64, pcx: &Ctx<Comp>) -> i64 {
     let k = check_index(loc);
-    if k < 0 { -1 } else { state[k as usize] }
+    if k < 0 {
+        return -1;
+    }
+    let v = state[k as usize];
+    for i in 1..loc_cells(loc, ty, pcx) {
+        if k + i >= state.len() as i64 || state[(k + i) as usize] != v {
+            return -1;
+        }
+    }
+    v
 }
 
-fn check_set(state: &mut [i64], loc: i64, v: i64) {
+// Location loc gets value v of type ty, in every cell it takes.
+fn check_set(state: &mut [i64], loc: i64, ty: i64, v: i64, pcx: &Ctx<Comp>) {
     let k = check_index(loc);
-    if k >= 0 {
-        state[k as usize] = v;
+    if k < 0 {
+        return;
+    }
+    for i in 0..loc_cells(loc, ty, pcx) {
+        if k + i < state.len() as i64 {
+            state[(k + i) as usize] = v;
+        }
     }
 }
 
@@ -79,23 +99,49 @@ fn check_use(cx: &mut FnCtx<Comp>, state: &mut [i64], v: i64, pos: i64, kind: i6
     if loc == LOC_REMAT {
         return;
     }
-    if check_get(state, loc) != v {
+    if check_get(state, loc, (cx.insts[v as usize]).ty, pcx) != v {
         check_fail(cx, v, c"an operand not where it should be", pcx);
     }
 }
 
-// Applies the moves in PM (all sources read first), then clears them.
+// Applies the moves in PM, then clears them. (0.30.1, RT-CG-6) The
+// location moves are made in pm_plan's order, the steps pm_resolve emits,
+// cell by cell: each move's destination must then hold the value its
+// source held before any of them, so an order that overwrites a source
+// (or part of a wide one) before it is read is an error here, and not
+// only a plan whose sources are wrong.
 fn check_moves(cx: &mut FnCtx<Comp>, state: &mut [i64], pcx: &Ctx<Comp>) {
     let n = cx.pm.len() as i64 / PM_FIELDS;
     for i in 0..n {
         let value = pm_value(cx, i);
         if pm_kind(cx, i) == PM_LOC && value != 0
-            && check_get(state, pm_src(cx, i)) != value {
+            && check_get(state, pm_src(cx, i), pm_ty(cx, i), pcx) != value {
             check_fail(cx, value, c"a move of the wrong value", pcx);
         }
     }
+    let steps = pm_plan(cx, pcx);
+    let mut k: usize = 0;
+    while k < steps.len() {
+        // (0.30.1, RT-CG-5) a register a step moves through is of its
+        // type's class, as m_check_reg requires of the code
+        for r in [steps[k], steps[k + 1]] {
+            if r >= 0 && (r >= 32) != in_fregs(steps[k + 2], pcx) {
+                check_fail(cx, 0, c"a move through a register of the other class", pcx);
+            }
+        }
+        let v = check_get(state, steps[k + 1], steps[k + 2], pcx);
+        check_set(state, steps[k], steps[k + 2], v, pcx);
+        k += 3;
+    }
     for i in 0..n {
-        check_set(state, pm_dst(cx, i), pm_result(cx, i));
+        let value = pm_value(cx, i);
+        if pm_kind(cx, i) == PM_LOC && value != 0
+            && check_get(state, pm_dst(cx, i), pm_ty(cx, i), pcx) != value {
+            check_fail(cx, value, c"the moves' order overwrites a value before it is moved", pcx);
+        }
+    }
+    for i in 0..n {
+        check_set(state, pm_dst(cx, i), pm_ty(cx, i), pm_result(cx, i), pcx);
     }
     cx.pm.clear();
 }
@@ -126,7 +172,7 @@ fn check_clobber(cx: &mut FnCtx<Comp>, state: &mut [i64], v: i64, pcx: &Ctx<Comp
 
 // Value v defined at pos: in its location, and in its slot when it is
 // stored there.
-fn check_def(cx: &mut FnCtx<Comp>, state: &mut [i64], v: i64, pos: i64) {
+fn check_def(cx: &mut FnCtx<Comp>, state: &mut [i64], v: i64, pos: i64, pcx: &Ctx<Comp>) {
     let t = tracked(cx, v);
     if t < 0 {
         return;
@@ -136,7 +182,7 @@ fn check_def(cx: &mut FnCtx<Comp>, state: &mut [i64], v: i64, pos: i64) {
         state[loc as usize] = v;
     }
     if stored_at_def(cx, t) {
-        check_set(state, 0 - (1 + cx.rv_slot[t as usize]), v);
+        check_set(state, 0 - (1 + cx.rv_slot[t as usize]), (cx.insts[v as usize]).ty, v, pcx);
     }
 }
 
@@ -152,13 +198,14 @@ fn ra_check_block(cx: &mut FnCtx<Comp>, state: &mut [i64], b: i64, pcx: &Ctx<Com
         let op = (cx.insts[v as usize]).op;
         if t >= 0 && (op == Phi || op == Param) {
             let loc = tloc(cx, t, start);
+            let ty = (cx.insts[v as usize]).ty;
             if op == Param {
-                check_set(state, loc, v);
-            } else if check_get(state, loc) != v {
+                check_set(state, loc, ty, v, pcx);
+            } else if check_get(state, loc, ty, pcx) != v {
                 check_fail(cx, v, c"a phi not where it should be", pcx);
             }
             if stored_at_def(cx, t) {
-                check_set(state, 0 - (1 + cx.rv_slot[t as usize]), v);
+                check_set(state, 0 - (1 + cx.rv_slot[t as usize]), ty, v, pcx);
             }
         }
         v = (cx.insts[v as usize]).next;
@@ -194,14 +241,14 @@ fn ra_check_block(cx: &mut FnCtx<Comp>, state: &mut [i64], b: i64, pcx: &Ctx<Com
             check_use(cx, state, arg_v, p + 2, use_kind_v1, pcx);
         }
         if is_emitted(cx, v) {
-            check_def(cx, state, v, p + 2);
+            check_def(cx, state, v, p + 2, pcx);
         }
         if op.is_call() {
             let mut w = (cx.insts[v as usize]).next;
             while w != 0 {
                 if (cx.insts[w as usize]).op == Piece && (cx.insts[w as usize]).a == v
                     && tracked(cx, w) >= 0 {
-                    check_def(cx, state, w, p + 2);
+                    check_def(cx, state, w, p + 2, pcx);
                 }
                 w = (cx.insts[w as usize]).next;
             }

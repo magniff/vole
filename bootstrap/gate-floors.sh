@@ -166,6 +166,16 @@ case "$STEP" in
     # (each program asked for is counted: -n FZ)
     fuzz-plain|fuzz-loops|fuzz-generics|fuzz-pressure|fuzz-calls|fuzz-lang06|fuzz-vector|fuzz-div|fuzz-range|fuzz-arch|fuzz-guard|fuzz-seed)
         judge "$(count 'fuzz: ')" "$FZ" "programs" ;;
+    # (0.30.1) the moves rows ask at least 20 programs (gate.sh's MFZ); the
+    # x86-64 ones are a SKIP on a host without Rosetta, which the log says
+    fuzz-moves|fuzz-moves-vec|fuzz-moves-x86|fuzz-moves-vec-x86)
+        if grep -q '^skip: no x86_64-macos here' "$LOG"; then
+            echo "floor $STEP: SKIP: $(grep '^skip: no x86_64-macos here' "$LOG" | tail -1)"
+            exit 77
+        fi
+        mfz=$FZ
+        [ "$mfz" -ge 20 ] || mfz=20
+        judge "$(count 'fuzz: ')" "$mfz" "programs" ;;
     # (five runs of SFZ programs each)
     fuzz-sem)
         n=$(lines "^fuzz: $SFZ value-semantics programs, 0 failing \\($SFZ ok\\)")

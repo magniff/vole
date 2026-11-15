@@ -105,6 +105,108 @@ function is known by the symbol it links to and never by its vole name:
 -O2 removed the calls of a program's own allocator declared as
 `malloc`. `--trace` reports a stack overflow, and a warm -O2 build has
 the bytes of a cold one when a function's number of calls changes.
+Two silent miscompiles of 0.30.0's register allocator at -O1 and -O2
+are fixed, with the assemblers' holes that let them through.
+
+#### Miscompiles fixed
+
+0.30.0 compiles some programs at -O1 and -O2 to code that prints wrong
+values, without an error: values live around a loop whose edges move
+them between spill slots that values of another class or width shared.
+-O0 allocates no registers and was right. Measured with the
+generators of their review (random programs whose values of every class
+are rotated around a loop under register pressure), the scalar programs
+against rustc's output, the vector ones against -O0's:
+
+| | programs | 0.30.0 wrong, aarch64 | 0.30.0 wrong, x86-64 | 0.30.1 wrong |
+|---|---|---|---|---|
+| scalars, -O2 (RT-CG-5) | 400 | 99 | 189 | 0 |
+| vectors, -O1 (RT-CG-6) | 300 | 8 | 12 | 0 |
+| vectors, -O2 (RT-CG-6) | 300 | 38 | 113 | 0 |
+
+These rates are of programs made to hit the moves; the compiler's own
+build, the examples and the suite were right on 0.30.0, and a loop
+that keeps few values live is unlikely to make such moves.
+
+- **RT-CG-5: a cycle saved by the wrong class.** When an edge's moves
+  form a cycle through two slots, one holding an integer and one an
+  f64, one value is saved in the cycle register first. 0.30.0 chose
+  the register and the save's width by the move writing the slot, not
+  by the value in it. The forms seen, on 0.30.0 or on 0.30.1's branch
+  before the fix (the same code; which programs make the cycle differs
+  with the allocation): an integer went through d31 and was stored as
+  `str x63`, which the assembler encoded as `str xzr` (a 0), an f64
+  through x17 as `str d-15` (encoded `str s0`), and on x86-64 an f64
+  saved by an f32's `movss` lost its upper half, `movq %xmm15, m` was
+  a 4-byte `movd`. The save now has the type of the moves that read
+  it.
+- **RT-CG-6: a vector's slots overwritten.** A 16- or 32-byte vector
+  takes 2 or 4 of the 8-byte slots, and its neighbours may hold other
+  values at other times. 0.30.0 ordered an edge's moves by slot
+  number, so a move writing slot k+1 could run before the move reading
+  a vector from slot k, which then read half of another value (two of
+  the cases, `rt_cg_006_wide_slot_v4f32_beside_f64_swap_o1` and
+  `rt_cg_006_vector_cycle_through_q31_o1`, fail on 0.30.1's branch
+  before the fix and pass on 0.30.0, whose allocation makes no such
+  edge there; the review's vector programs fail on both). A
+  location is now a range of cells everywhere the moves are ordered
+  and checked.
+- One function orders an edge's moves, and `--verify-regalloc` checks
+  the steps it gives, cell by cell, with each value's width: a plan
+  that overwrites a value before it is moved, or reads one location as
+  two values, is an internal error. 0.30.0's checker followed slot
+  numbers and saw neither bug. Every load, store and move of a
+  register checks that its number is of its type's class.
+- **The assemblers refuse what they used to encode as something else**
+  (`tests/arch/enc.sh`, 40 forms, each refused with `cannot
+  assemble`): AArch64 register numbers out of their class's range
+  (`x31`, `x63`, `d32`, `d-15`), sp where the field means xzr and xzr
+  where it means sp (`add x0, xzr, #1`, `ldr x0, [xzr]`); x86-64 a
+  register of the other class in any instruction that takes one class
+  (the table's 368 instructions, `xadd`/`cmpxchg`, `call *%xmm0`,
+  `movsd m, %r10`). AArch64 `ldr`/`str` of `h` and `b` registers were
+  encoded as `q`, and are now encoded by their size. A C function
+  named like a register (`d5`, `w7`) is a symbol in `bl`, `adrp` and
+  the other instructions that take one; 0.30.0 took it for a register
+  on aarch64-linux, where C's names have no `_`, and failed to
+  assemble the call.
+- The cases: `rt_cg_005_*` and `rt_cg_006_*` in tests/run, 21 of them,
+  most at -O0, -O1 and -O2 (the levels where the program makes no
+  cycle are output guards) with rustc's output as their EXPECT; one at
+  -O1 whose assembly must save a vector cycle through q31, and one whose
+  two cycles need the cycle register at once (these two expect -O0's
+  output). Random programs of the same kind, built with
+  `--verify-regalloc`: `tests/fuzz/run.sh -M` and `-M -V`, the gate's
+  rows `fuzz-moves` and `fuzz-moves-vec` and, under Rosetta,
+  `fuzz-moves-x86` and `fuzz-moves-vec-x86` (at least 20 programs
+  each, the quick gate's too), run by tests/affected.sh for a change to
+  the back end with `tests/fuzz/pm_model.py`, a model of the moves'
+  plan run over random edges.
+- **No move edge can fail a compile.** When every pending move waits,
+  one value is saved and its readers read the save; with values of
+  several widths several saves may be pending at once (the reviews found
+  edges needing two and three, whatever is chosen), so no fixed storage
+  is enough. Before the frame is laid out, `reserve_save_cells` plans
+  every edge and gap of a function with a vector on the stack, saves
+  taking cells after the spill slots without an end, and the frame gets
+  as many cells as they used; the emitter's plans are the same plans, so
+  a save always has storage. Without a vector on the stack every
+  location is one unit, the stalled moves are simple cycles and the
+  cycle register is enough. `plan_break`'s choice of the value to save
+  only keeps the saves few. Round 2 of this work had 4 fixed cells and a
+  walk that died on 133 of 200,000 of the second review's x86-64 edges;
+  round 3 a better choice that the third review still saw die (an
+  internal error, never code). The model, `tests/fuzz/pm_model.py`,
+  plans each edge as the compiler does, the dry run and then the
+  emitter's plan with that many cells: 1,000,000 edges for each target,
+  half of them dense float and vector edges and full tilings of the
+  cells, none dies, none is wrong.
+- The cost, in instructions: the compiler's -O2 self-build +0.5% (its
+  phase of register allocation and emission +4.4%, the registers' and
+  cells' checks), -O0 0.0%; examples/nes +0.17% at -O0, +0.37% at -O2.
+  The cells for saves cost nothing measurable: the self-build's
+  instructions the same as with round 3's fixed cells, its text 8 bytes
+  smaller on aarch64 and 320 on x86-64, nes's the same and 128 smaller.
 
 #### What changes for a program
 

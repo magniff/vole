@@ -143,7 +143,11 @@ opcode map (`0f`, `0f38`, `0f3a`), `opcode` the byte, in hexadecimal;
 shift's immediate form (opcode XX with the digit), `c` commutative and
 `cmp` commutative for the symmetric predicates (the sources are swapped,
 as LLVM's assembler does, when only the second is r8-r15: the two-byte
-VEX prefix then holds). The classes (operands in AT&T order):
+VEX prefix then holds), `r:CLASSES` (0.30.1) the class of each
+operand in AT&T order when one is a general register: `g` general,
+`x` vector, `i` an immediate (the assembler refuses a register of the
+other class, and a general register past the word's end; an instruction
+without the word takes vector registers only). The classes (operands in AT&T order):
 
 | class | operands | ModRM reg, r/m, VEX.vvvv |
 |---|---|---|

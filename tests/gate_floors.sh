@@ -50,6 +50,8 @@ check() { # <step> <count> <line>...
 }
 check fuzz-loops 60 "fuzz: @N@ programs for aarch64-macos, 0 failing"
 check fuzz-seed 60 "fuzz: @N@ programs for aarch64-macos, 0 failing"
+check fuzz-moves-vec 60 "fuzz: @N@ programs for aarch64-macos, 0 failing"
+check fuzz-moves-vec-x86 60 "fuzz: @N@ programs for x86_64-macos, 0 failing"
 check abi-plain 100 "abi: @N@ programs (992 signatures) for aarch64-macos, 0 failing"
 # (objcheck's programs by name, from tests/objcheck.sh --list itself: the
 # floor's own greps must give the same set)
@@ -76,6 +78,22 @@ printf 'pass build\npass seeds\nskip oracle (no cargo)\nvoltty: all passed\n' >"
 out=$(sh "$F" voltty-fuzz "$W/voltty.skip.log" 60 100 300 2>&1)
 rc=$?
 [ $rc -eq 77 ] || { echo "FAIL voltty-fuzz: a skipped oracle exits $rc, not 77: $out"; failed=1; }
+# (0.30.1) the x86-64 moves rows on a host without Rosetta: a SKIP; the
+# quick gate's 10 programs are below the moves rows' 20: a FAIL
+rows=$((rows + 1))
+printf 'skip: no x86_64-macos here (Rosetta: softwareupdate --install-rosetta)\n' >"$W/moves.skip.log"
+out=$(sh "$F" fuzz-moves-x86 "$W/moves.skip.log" 60 100 300 2>&1)
+rc=$?
+[ $rc -eq 77 ] || { echo "FAIL fuzz-moves-x86: no Rosetta exits $rc, not 77: $out"; failed=1; }
+rows=$((rows + 1))
+printf 'fuzz: 10 programs for aarch64-macos, 0 failing\n' >"$W/moves.quick.log"
+out=$(sh "$F" fuzz-moves-vec "$W/moves.quick.log" 10 20 20 2>&1)
+rc=$?
+[ $rc -eq 1 ] || { echo "FAIL fuzz-moves-vec: 10 programs at FZ=10 exits $rc, not 1: $out"; failed=1; }
+printf 'fuzz: 20 programs for aarch64-macos, 0 failing\n' >"$W/moves.quick20.log"
+out=$(sh "$F" fuzz-moves-vec "$W/moves.quick20.log" 10 20 20 2>&1)
+rc=$?
+[ $rc -eq 0 ] || { echo "FAIL fuzz-moves-vec: 20 programs at FZ=10 exits $rc, not 0: $out"; failed=1; }
 # (0.30.0's line, an oracle that did not build, is no skip: a FAIL)
 rows=$((rows + 1))
 printf 'pass build\npass seeds\nskip oracle (no cargo, or the oracle does not build offline)\nvoltty: all passed\n' >"$W/voltty.nobuild.log"
