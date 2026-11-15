@@ -51,7 +51,7 @@ use crate::front::check::iterate::ends_by_itself;
 use crate::front::check::unsafety::{NODE_NO_READ, is_borrow, is_borrow_param};
 use crate::front::consteval::wrap_int;
 use crate::front::effects::{
-    ALLOC_ANY, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_INTERIOR, EFF_IO, EFF_PANIC,
+    ALLOC_ANY, EFF_ADDR, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_INTERIOR, EFF_IO, EFF_PANIC,
     EFF_RAW_DIVERGE, EFF_RAW_GLOBAL, EFF_RAW_PANIC, EFF_SYNC, EFF_THREAD, EFF_TLS, EFF_UNKNOWN,
     EFF_UNSAFE, Effects, allocator_bit, effects_none, effects_top, effects_union,
 };
@@ -274,6 +274,7 @@ pub fn infer_effects(pcx: &mut Ctx<Comp>) {
         }
     }
     sized_table(&mut pcx.local_fx, n + 1, Effects { bits: 0, allocs: 0 });
+    pcx.fx_pending.clear();
     sized_table(&mut pcx.callee_info, n + 1, 0);
     pcx.static_uses.clear();
     pcx.static_use_start.clear();
@@ -311,6 +312,11 @@ pub fn infer_effects(pcx: &mut Ctx<Comp>) {
     pcx.edge_start.push(pcx.edges.len() as i64);
     crate::front::effects::check::note_declarations(n, pcx);
     components(pcx);
+    // (E1.8: the proofs that waited for the sets: when one is lost, its
+    // function's set grows, and so may its callers')
+    if settle_pending(pcx) {
+        components(pcx);
+    }
     pcx.fn_effects_count = n;
     timer_sub(T_CHECK, T_EFFECTS, t, pcx);
 }
@@ -813,6 +819,12 @@ fn walk(n: i64, pcx: &mut Ctx<Comp>) {
         if pcx.loops.len() as i64 > 0 {
             local_used(n, pcx);
         }
+        // (E1.8: a closure's capture of a local is a borrow kept beyond
+        // the expression, settle_addresses)
+        if (pcx.nodes[n as usize].p & NODE_CAPTURE) != 0 {
+            pcx.fx_borrow_sites.push(pcx.nodes[n as usize].y);
+            pcx.fx_borrow_sites.push(0);
+        }
         return;
     }
     if kind == NodeKind::Int
@@ -917,6 +929,10 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
         NodeKind::FieldAccess => {
             if (pcx.nodes[n as usize].p & NODE_RAW) != 0 || reads_union(n, pcx) {
                 local(n, EFF_UNSAFE, 0, pcx);
+            }
+            // (E1.8: a union's read may make a pointer of a reference)
+            if reads_union(n, pcx) {
+                local(n, EFF_ADDR, 0, pcx);
             }
             walk(pcx.nodes[n as usize].a, pcx);
         }
@@ -1039,6 +1055,12 @@ fn is_place(e: i64, pcx: &Ctx<Comp>) -> bool {
 // any other borrow of x is noted, for a reference made a raw pointer
 // later (fx_ref_cast).
 fn note_address(n: i64, pcx: &mut Ctx<Comp>) {
+    // (E1.8: a raw borrow of any place, or a borrow typed as a raw
+    // pointer, makes a raw pointer of a reference)
+    if (pcx.nodes[n as usize].p & NODE_RAW_BORROW) != 0
+        || is_raw_pointer(pcx.nodes[n as usize].ty, pcx) {
+        local(n, EFF_ADDR, 0, pcx);
+    }
     let o = pcx.nodes[n as usize].b;
     if o <= 0 || pcx.nodes[o as usize].kind != NodeKind::Ident
         || pcx.nodes[o as usize].res != Res::Local {
@@ -1050,6 +1072,8 @@ fn note_address(n: i64, pcx: &mut Ctx<Comp>) {
         pcx.fx_addressed.push(y);
     } else {
         pcx.fx_borrowed.push(y);
+        pcx.fx_borrow_sites.push(y);
+        pcx.fx_borrow_sites.push(n);
     }
 }
 
@@ -1064,6 +1088,12 @@ fn note_cast_address(n: i64, pcx: &mut Ctx<Comp>) {
     let o = pcx.nodes[n as usize].a;
     if o <= 0 {
         return;
+    }
+    // (E1.8: a cast to a raw pointer of anything but an integer: of a
+    // reference, or of a pointer that may have been one)
+    let from = undistinct(pcx.nodes[o as usize].ty, pcx);
+    if !is_integer(from) {
+        local(n, EFF_ADDR, 0, pcx);
     }
     if pcx.nodes[o as usize].kind == NodeKind::Unary && pcx.nodes[o as usize].op == Tok::Amp {
         let x = pcx.nodes[o as usize].b;
@@ -1098,22 +1128,119 @@ fn rely_on(y: i64, n: i64, bit: i64, pcx: &mut Ctx<Comp>) {
 
 // RULE: E1.8 (0.30.1) A proof that reads a local holds only while nothing
 // unseen writes the local: after a function's walk, each proof (rely_on)
-// whose local's address a raw pointer may hold (note_address,
-// note_cast_address; a call that returns a raw pointer makes every
-// borrowed local so) gets its effect back. `let p = &raw mut i; while i
-// < n { *p = 0; i += 1 }` is `diverge`; `if d != 0 { (&raw const d as
-// *mut u64).write(0); x / d }` is `panic`.
+// gets its effect back when a raw pointer may hold its local's address:
+//   - the address is taken raw, or a borrow of it is cast to a raw
+//     pointer (note_address, note_cast_address; a cast of a reference
+//     not of a named local, or a raw pointer a call returns, counts for
+//     every local borrowed);
+//   - a borrow of it (`&x`, `&mut x`, a method's receiver, a closure's
+//     capture) goes where it may become one: to a callee whose set has
+//     the hidden `addr` (EFF_ADDR: it, or what it calls, makes a raw
+//     pointer of a reference), or anywhere else (a value, a binding, a
+//     capture) in a function whose set has it. Whether a set has `addr`
+//     is known once the sets are solved: such a proof waits in
+//     FX_PENDING (settle_pending, then the sets are solved again).
+// A shared borrow counts as an exclusive one: `r as *const T as *mut T`
+// and a write through it is not trusted to be undefined (safety over
+// speed). `let p = &raw mut i; while i < n { *p = 0; i += 1 }` and `let k
+// = keep(&mut i); while i < n { k.zero(); i += 1 }` are `diverge`; `if d
+// != 0 { zap(&d); x / d }` is `panic`.
 fn settle_addresses(pcx: &mut Ctx<Comp>) {
     let mut k: usize = 0;
     while k + 2 < pcx.fx_relied.len() {
         let y = pcx.fx_relied[k];
-        if address_taken(y, pcx) {
-            let n = pcx.fx_relied[k + 1];
-            let bit = pcx.fx_relied[k + 2];
-            local(n, bit, 0, pcx);
-        }
+        let n = pcx.fx_relied[k + 1];
+        let bit = pcx.fx_relied[k + 2];
         k += 3;
+        if address_taken(y, pcx) {
+            local(n, bit, 0, pcx);
+            continue;
+        }
+        // (the callees y's borrows go to, -1: anywhere)
+        let at = pcx.fx_pending.len();
+        pcx.fx_pending.push(pcx.walk_node);
+        pcx.fx_pending.push(n);
+        pcx.fx_pending.push(bit);
+        pcx.fx_pending.push(0);
+        let mut s: usize = 0;
+        while s + 1 < pcx.fx_borrow_sites.len() {
+            if pcx.fx_borrow_sites[s] == y {
+                let c = arg_callee(pcx.fx_borrow_sites[s + 1], pcx);
+                pcx.fx_pending.push(c);
+                pcx.fx_pending[at + 3] += 1;
+            }
+            s += 2;
+        }
+        if pcx.fx_pending[at + 3] == 0 {
+            pcx.fx_pending.truncate(at);
+        } else if pcx.search || pcx.eval {
+            // (the sets are solved, or are not to be: decided here)
+            let lost = pcx.eval || borrow_lost(at, pcx);
+            pcx.fx_pending.truncate(at);
+            if lost {
+                local(n, bit, 0, pcx);
+            }
+        }
     }
+}
+
+// The callee that borrow node a is passed to, straight (walk_call); -1:
+// none, or a capture (a = 0).
+fn arg_callee(a: i64, pcx: &Ctx<Comp>) -> i64 {
+    if a <= 0 {
+        return -1;
+    }
+    let mut i: usize = 0;
+    while i + 1 < pcx.fx_arg_callee.len() {
+        if pcx.fx_arg_callee[i] == a {
+            return pcx.fx_arg_callee[i + 1];
+        }
+        i += 2;
+    }
+    -1
+}
+
+// Whether the proof of FX_PENDING's entry at `at` is lost: a callee its
+// local's borrows go to, or (-1) its function, has `addr` (E1.8).
+fn borrow_lost(at: usize, pcx: &Ctx<Comp>) -> bool {
+    let m = pcx.fx_pending[at];
+    let count = pcx.fx_pending[at + 3] as usize;
+    for j in 0..count {
+        let c = pcx.fx_pending[at + 4 + j];
+        let w = if c < 0 { m } else { c };
+        if w < 0 || w as usize >= pcx.node_fx.len()
+            || ((pcx.node_fx[w as usize]).bits & EFF_ADDR) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+// (E1.8) Once the sets are solved: each waiting proof whose local may be
+// written through a pointer gives its function the effect back; true when
+// one did (the sets are solved again, infer_effects).
+fn settle_pending(pcx: &mut Ctx<Comp>) -> bool {
+    let mut changed = false;
+    let mut k: usize = 0;
+    while k + 3 < pcx.fx_pending.len() {
+        let count = pcx.fx_pending[k + 3] as usize;
+        if borrow_lost(k, pcx) {
+            let m = pcx.fx_pending[k] as usize;
+            let mut bit = pcx.fx_pending[k + 2];
+            if (bit & EFF_PANIC) != 0 {
+                bit |= EFF_RAW_PANIC;
+            }
+            if (bit & EFF_DIVERGE) != 0 {
+                bit |= EFF_RAW_DIVERGE;
+            }
+            if ((pcx.local_fx[m]).bits & bit) != bit {
+                (pcx.local_fx[m]).bits |= bit;
+                changed = true;
+            }
+        }
+        k += 4 + count;
+    }
+    changed
 }
 
 fn address_taken(y: i64, pcx: &Ctx<Comp>) -> bool {
@@ -1129,6 +1256,8 @@ fn walk_body(f: i64, pcx: &mut Ctx<Comp>) {
     pcx.fx_addressed.clear();
     pcx.fx_borrowed.clear();
     pcx.fx_relied.clear();
+    pcx.fx_arg_callee.clear();
+    pcx.fx_borrow_sites.clear();
     pcx.fx_ref_cast = false;
     walk(pcx.nodes[pcx.fns[f as usize].node as usize].c, pcx);
     settle_addresses(pcx);
@@ -1597,6 +1726,16 @@ fn reads_union(n: i64, pcx: &Ctx<Comp>) -> bool {
 fn walk_call(n: i64, pcx: &mut Ctx<Comp>) {
     let f = pcx.nodes[n as usize].x - 1;
     if f >= 0 {
+        // (E1.8: a borrow of a local passed straight to f: settled by f's
+        // set, settle_addresses)
+        for i in 0..pcx.nodes[n as usize].count {
+            let a = child(n, i, pcx);
+            if a > 0 && pcx.nodes[a as usize].kind == NodeKind::Unary
+                && pcx.nodes[a as usize].op == Tok::Amp {
+                pcx.fx_arg_callee.push(a);
+                pcx.fx_arg_callee.push(f);
+            }
+        }
         walk_list(n, pcx);
         if f == pcx.check_fn {
             // (an assertion or a clause, lowered in place as a branch
@@ -2640,7 +2779,8 @@ fn signature_of(m: i64, pcx: &mut Ctx<Comp>) {
         d.bits &= i.bits;
         d.allocs = if d.allocs < 0 { i.allocs } else { d.allocs & i.allocs };
     }
-    let hidden = EFF_RAW_PANIC | EFF_RAW_DIVERGE | EFF_RAW_GLOBAL | EFF_INTERIOR | EFF_UNSAFE;
+    let hidden = EFF_RAW_PANIC | EFF_RAW_DIVERGE | EFF_RAW_GLOBAL | EFF_INTERIOR | EFF_UNSAFE
+        | EFF_ADDR;
     let debt = if std { i.bits & (EFF_TLS | EFF_THREAD | EFF_SYNC) } else { 0 };
     if track {
         // (a list allows a cell's write, set_bound: that is no write of
