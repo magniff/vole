@@ -123,29 +123,92 @@ fn main() {
     println("{}", f());
 }
 VL
-while read -r args; do
+# (0.30.1, the fourth review's) and when only a volec another starts
+# falls back (childnobig: try's, test's and probe's checks and builds),
+# or only a lazy std's build made again (eagernobig), the warning is
+# still said once on stderr, by the volec that captured the child's
+# output (tools::proc::child_output), and never inside that output:
+# try's answer stays its type and value. A check or a build starts no
+# volec, and there none falls back: no warning.
+while read -r mode want args; do
+    # (test's own builds kept, .volec: none made, no volec started)
+    rm -rf "$T/.volec"
     # shellcheck disable=SC2086
-    (cd "$T" && SHIM_MODE=nobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" $args \
+    (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" $args \
         > "$T/o" 2> "$T/e")
     ne=$(grep -c "$W" "$T/e")
     no=$(grep -c "$W" "$T/o")
-    if [ "$ne" -ne 1 ] || [ "$no" -ne 0 ]; then
-        echo "main-stack: FAIL: SHIM_MODE=nobig volec $args: the warning $ne times on stderr, $no on stdout (1 and 0 wanted)"
+    if [ "$ne" -ne "$want" ] || [ "$no" -ne 0 ]; then
+        echo "main-stack: FAIL: SHIM_MODE=$mode volec $args: the warning $ne times on stderr, $no on stdout ($want and 0 wanted)"
         cat "$T/o" "$T/e"; bad=1
     fi
+    case "$args" in
+        try*)
+            if [ "$(cat "$T/o")" != "i32 = 3" ]; then
+                echo "main-stack: FAIL: SHIM_MODE=$mode volec $args: try's answer is not its type and value: $(cat "$T/o")"; bad=1
+            fi ;;
+    esac
 done <<LINES
-query show main t.vl
-query context f t.vl
-query effects main t.vl
-fmt --check t.vl
-fix --suggested --dry-run bad.vl
-check --each bad.vl
-test t.vl
-try 1+2
+nobig 1 query show main t.vl
+nobig 1 query context f t.vl
+nobig 1 query effects main t.vl
+nobig 1 fmt --check t.vl
+nobig 1 fix --suggested --dry-run bad.vl
+nobig 1 check --each bad.vl
+nobig 1 test t.vl
+nobig 1 try 1+2
+nobig 1 probe t.vl:5 f()
+nosize 1 test t.vl
+nosize 1 try 1+2
+nosize 1 probe t.vl:5 f()
+nosize 1 bad.vl -o bad
+childnobig 1 try 1+2
+childnobig 1 --json try 1+2
+childnobig 1 test t.vl
+childnobig 1 probe t.vl:5 f()
+childnobig 0 check t.vl
+childnobig 0 t.vl -o t
+childnobig 0 bad.vl -o bad
+eagernobig 1 bad.vl -o bad
+eagernobig 0 check t.vl
 LINES
-if [ "$(cat "$T/o")" != "i32 = 3" ]; then
-    echo "main-stack: FAIL: try's answer is not its type and value: $(cat "$T/o")"; bad=1
-fi
+# (0.30.1, the fourth review's) a user's program gets none of the
+# variables volec sets for itself (VOLEC_NESTED, VOLEC_EDIT_TAG,
+# VOLEC_MAIN_STACK_SAID, tools::proc::program_argv), under run, test,
+# probe and try alike, with the fallback (which sets the last) and without
+mkdir -p "$T/leak"
+cat > "$T/leak/main.vl" <<'VL'
+fn leaks(gpa: Gpa) -> i64 {
+    let mut n: i64 = 0;
+    for name in ["VOLEC_NESTED", "VOLEC_EDIT_TAG", "VOLEC_MAIN_STACK_SAID"] {
+        if std::env::var_in(name, gpa).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+#[test]
+fn t(gpa: Gpa) {
+    assert_eq(leaks(gpa), 0);
+}
+
+fn main(gpa: Gpa) {
+    let n = leaks(gpa);
+    println("leaks {}", n);
+}
+VL
+L='let mut n = 0; for v in ["VOLEC_NESTED", "VOLEC_EDIT_TAG", "VOLEC_MAIN_STACK_SAID"] { if std::env::var_in(v, gpa).is_ok() { n += 1; } } n'
+for mode in nobig none; do
+    (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" run leak > "$T/o" 2> "$T/e")
+    grep -qx "leaks 0" "$T/o" || { echo "main-stack: FAIL: SHIM_MODE=$mode volec run: the program sees volec's variables: $(cat "$T/o")"; bad=1; }
+    (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" test leak/main.vl > "$T/o" 2> "$T/e")
+    grep -q "1 passed" "$T/o" || { echo "main-stack: FAIL: SHIM_MODE=$mode volec test: the test sees volec's variables:"; cat "$T/o"; bad=1; }
+    (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" probe leak/main.vl:18 n > "$T/o" 2> "$T/e")
+    grep -q "#1  n = 0" "$T/o" || { echo "main-stack: FAIL: SHIM_MODE=$mode volec probe: the program sees volec's variables:"; cat "$T/o"; bad=1; }
+    (cd "$T" && SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" try "$L" > "$T/o" 2> "$T/e")
+    [ "$(cat "$T/o")" = "i32 = 0" ] || { echo "main-stack: FAIL: SHIM_MODE=$mode volec try: the snippet sees volec's variables: $(cat "$T/o")"; bad=1; }
+done
 for args in "--version" "explain lex.utf8" "explain thread.main-stack" "guide --list"; do
     # shellcheck disable=SC2086
     SHIM_MODE=nobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" $args > "$T/o" 2> "$T/e"
@@ -156,4 +219,4 @@ done
 if [ $bad -ne 0 ]; then
     exit 1
 fi
-echo "main-stack: ok: the compiler's own thread, and its planted refusals said once on stderr, before an overflow, by every command that reads a program and by no other; no worker's stack, a -j 4 build still builds"
+echo "main-stack: ok: the compiler's own thread, and its planted refusals said once on stderr, before an overflow, by every command that reads a program and by no other, whichever volec fell back; no worker's stack, a -j 4 build still builds; a user's program gets none of volec's own variables"

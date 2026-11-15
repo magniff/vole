@@ -1,7 +1,10 @@
 /* tests/main_stack.sh: a planted failure of the compiler's own thread.
    Interposed on pthread_attr_setstacksize and pthread_create (macOS
    DYLD_INSERT_LIBRARIES): SHIM_MODE=nosize refuses every stack size,
-   nobig refuses to create a thread whose stack is 1 GiB or more. */
+   nobig refuses to create a thread whose stack is 1 GiB or more;
+   childnobig refuses it only in a volec another volec started
+   (VOLEC_NESTED, set after the first volec made its own thread), and
+   eagernobig only in a lazy std's build made again (VOLE_STD_EAGER). */
 #include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -16,7 +19,10 @@ static int shim_create(pthread_t *t, const pthread_attr_t *a, void *(*f)(void *)
     size_t size = 0;
     const char *m = getenv("SHIM_MODE");
     if (a) pthread_attr_getstacksize(a, &size);
-    if (m && !strcmp(m, "nobig") && size >= ((size_t)1 << 30)) return EAGAIN;
+    int big = size >= ((size_t)1 << 30);
+    if (m && !strcmp(m, "nobig") && big) return EAGAIN;
+    if (m && !strcmp(m, "childnobig") && big && getenv("VOLEC_NESTED")) return EAGAIN;
+    if (m && !strcmp(m, "eagernobig") && big && getenv("VOLE_STD_EAGER")) return EAGAIN;
     return pthread_create(t, a, f, arg);
 }
 

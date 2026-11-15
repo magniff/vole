@@ -266,6 +266,22 @@ tables), `--trace` (0.17: a failure prints its line and callers),
 (the IR after the optimizer, after instruction selection) print to
 stdout, or to `-o FILE`. `volec guide TOPIC` for the language.
 
+## The variables volec sets for itself
+
+volec marks the volec processes it starts (a tool's check or build,
+try's and test's, a lazy std's build made again) in their environment;
+a program volec runs (`run`, `test`, `probe`, `try`) gets none of them:
+
+| variable | means |
+|---|---|
+| `VOLEC_NESTED=1` | started by another volec: no `ok:` line, no colour |
+| `VOLEC_EDIT_TAG=PID` | the first volec's pid: the copies its edits check |
+| `VOLEC_MAIN_STACK_SAID=1` | (0.30.1) a volec on the first thread's stack started this one and said `warning thread.main-stack` for both |
+
+Set by hand they act the same: `VOLEC_NESTED=1` drops the `ok:` line;
+two shells with one `VOLEC_EDIT_TAG` share edit copies (a bad idea);
+`VOLEC_MAIN_STACK_SAID=1` hides that warning.
+
 ## Seeing what the optimizer did
 
 `volec build --help` lists these (0.30); each prints on stderr.
