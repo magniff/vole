@@ -345,6 +345,21 @@ printf 'try 1+2\ntry 2+3\ncheck t.vl\n' > "$T/sy/cmds"
 if [ "$(grep -c "$W" "$T/e")" -ne 1 ] || grep -q "$W" "$T/o"; then
     echo "main-stack: FAIL: SHIM_MODE=childnobig volec batch: the warning $(grep -c "$W" "$T/e") times on stderr (1 wanted), $(grep -c "$W" "$T/o") in its answer (0 wanted)"; bad=1
 fi
+# (0.30.1) a volec that execs itself (a query answered by another
+# program, tools::query::roots::other_root: the same pid) stays the file's
+# owner (its pid in the name, tools::proc::keep_main_stack_file): the
+# file is gone after it, and the warning, which both images fall back
+# for, is said once
+mkdir -p "$T/oth/ex/demo" "$T/oth/td"
+printf 'mod sim;\nfn main() {\n    println("{}", sim::snap_shot());\n}\n' > "$T/oth/ex/demo/main.vl"
+printf 'pub fn snap_shot() -> i64 {\n    1\n}\n' > "$T/oth/ex/demo/sim.vl"
+for mode in none nobig; do
+    (cd "$T/oth" && TMPDIR="$T/oth/td" SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" query show sim.vl::snap_shot > "$T/o" 2> "$T/e")
+    want=0; [ $mode = nobig ] && want=1
+    if ! grep -q "crate::sim::snap_shot" "$T/o" || [ "$(grep -c "$W" "$T/e")" -ne $want ] || ls "$T/oth/td" | grep -q volec-main-stack; then
+        echo "main-stack: FAIL: SHIM_MODE=$mode a query asked again of another program: the warning $(grep -c "$W" "$T/e") times ($want wanted), left: $(ls "$T/oth/td")"; cat "$T/o" "$T/e"; bad=1
+    fi
+done
 for args in "--version" "explain lex.utf8" "explain thread.main-stack" "guide --list"; do
     # shellcheck disable=SC2086
     SHIM_MODE=nobig DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" $args > "$T/o" 2> "$T/e"
