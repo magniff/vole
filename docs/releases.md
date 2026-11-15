@@ -130,14 +130,19 @@ the bytes of a cold one when a function's number of calls changes.
   realloc C makes, the C library's own included (`malloc_logger`,
   libmalloc's hook, the program's own logger still called first): a
   block of the program's that getline grows or `reallocf` frees is
-  forgotten then, and C's free of a block the program freed is reported
-  (`a freed block freed again, by C`; a realloc's log, which comes after
-  C freed the old memory, only forgets). A program that replaces
-  `malloc_logger` after the check set it takes that sight away, and a
-  report then says so. Under the check, C's `memcpy`, `memmove` and
-  `memset` check their bytes first, both ends: by link symbol, called
-  or through a function pointer (as `malloc` and `free` are), the
-  program's calls and std's (`ptr::copy`,
+  forgotten then. A log only ever makes the check forget a block, never
+  report one: libmalloc writes some after the memory is C's again (a
+  realloc's, after it freed the old block), when another thread may
+  have been given it already, so no log is taken to come first. (A
+  block C frees after the program freed it is forgotten, not reported.)
+  A program that replaces `malloc_logger` takes that sight away; the
+  check notices at each of its entries (each block allocated or freed)
+  and at each report, and a report then says so. Under the check, an
+  extern function's address is its wrapper's (`malloc`, `free`, ...,
+  and C's `memcpy`, `memmove` and `memset`, which check their bytes
+  first, both ends), wherever the program names it: a call, a function
+  pointer, a const or an array of them. So the program's calls and
+  std's (`ptr::copy`,
   `copy_nonoverlapping` and `fill_copies` of 4 elements or more), which
   0.30.0 did not check (`unsafe access out of bounds: 17 bytes at offset
   0 of a block of 16 bytes`, `--> memcpy, its destination`). Other C
@@ -223,13 +228,13 @@ the bytes of a cold one when a function's number of calls changes.
 
 - **Gate floors** ("The gate"): `bootstrap/gate-floors.sh` reads the
   log of every row that passed. A row whose count is missing, or is
-  below its floor, fails. The rows that also run in the Linux
-  containers are judged by what they report against the tree: the suite
-  rows plan every case the tree lists and fail none, and skip by name
-  just the cases the tree's REQUIRES lines skip on the host (tests/run.sh
-  prints a `cases:` line, the cases apart from the suites' checks, and a
-  `skip case` line for each); objcheck compiles four of each program and
-  all are the same. The other floors
+  below its floor, fails. The suite rows and objcheck are judged from
+  records, one per case (tests/run.sh: `NAME STATUS BCK REASON CC`) and
+  one per compilation (tests/objcheck.sh: `PROGRAM SETTING STATUS CC`),
+  never from a count: every case the tree lists has its record and none
+  failed, a skip names the REQUIRES that does not hold on the host and
+  every such case is skipped; each program of tests/run objcheck
+  compiles is the tree's, at the four settings, and all are the same. The other floors
   are 0.30.0's counts less a margin, on macOS only. The SKIPs a release
   accepts are listed there with what each leaves unverified.
   `tests/gate_floors.sh` checks every floor against a zero count, a
@@ -7988,20 +7993,19 @@ count: `bootstrap/gate-floors.sh` reads the log of every step that passed,
 and one whose count line is missing, or whose count is below its floor,
 fails (`floor STEP: ...`, the last line of its log). The rows the Linux
 containers also run are judged by what they report against the tree, the
-same on every host: a suite row's one plan (`plan: N cases`) is every
-case `tests/run.sh -l` lists, its one `cases:` line (the cases alone;
-the table's total, at least as much, adds the suites' checks) counts
-them all and names them (`names CRC-LENGTH`, the digest of the sorted
-names run, which must be `-l`'s: each case once), none failed, and the
-skipped ones, each named (`skip case NAME: REQUIRES ...`), are exactly
-the cases the tree's REQUIRES lines skip on the host (`metal` off
-aarch64-macos, the examples' 25 included, `macos` off macOS, and
-`clang` when the log's `cc:` line says the host's cc is not clang);
-objcheck's N of M are all the same, its tests/run programs by name the
-tree's (tests/objcheck.sh prints their digest, each compiled at four
-settings; the floor finds the tree's by one grep per directive, the same
-set as `tests/objcheck.sh --list`), M at least four (-O0 and -O2, with
--g and without) of each; incremental's series are its plan, the
+same on every host. The suite rows and objcheck are judged from records,
+one per case and one per compilation, never from a count in the log: a
+suite row's records (`NAME STATUS BCK REASON CC`, tests/run.sh's, which
+gate.sh keeps as `STEP.results`) are one for each case `tests/run.sh -l`
+lists and none other, none failed, a skipped case's REASON the REQUIRES
+word that does not hold on the host (`requires:metal` off aarch64-macos,
+the examples' 25 included, `requires:macos` off macOS,
+`requires:clang` where the records' CC is `cc:other`), and every case
+whose REQUIRES does not hold skipped; objcheck's records (`PROGRAM
+SETTING STATUS CC`, tests/objcheck.sh's) are each ok, none twice, and
+its programs of tests/run the tree's (the floor finds them by one grep
+per directive, the same set as `tests/objcheck.sh --list`), each at the
+four settings (-O0 and -O2, with -g and without); incremental's series are its plan, the
 same on every host, at least 150, each rebuilt the same or skipped with
 its reason (at most 4). The other floors are 0.30.0's
 release gate's counts less a margin for cases that come and go (threads 14000,
@@ -8030,13 +8034,15 @@ Linux machine: that the containers' logs print the lines the floors read
 (the same scripts print them there), and how many programs objcheck
 compiles there (its floor is the tree's, which holds anywhere the suite
 runs whole). `tests/gate_floors.sh` shows each floor failing a zero
-count, a quarter of it and a log without its line, a suite row failing
-a plan short of the tree (a container's 1501 cases), a skip the tree
-does not make or one it makes missing (a clang case skipped where cc is
-clang), a case run twice and another left out, a table total below the
-cases', two plans or two `cases:` lines, a missing `cases:` line, a Linux
-row passing with its 37 skips named, objcheck failing 7000 of 7000 and a
-right count of programs not the tree's, a macOS-only row failing on Linux, incremental
+count, a quarter of it and a log without its line, a suite row failing on
+records with a skip the tree does not make or one it makes missing (a
+clang case skipped where cc is clang), a skip for the wrong REQUIRES, a
+case twice and another with none, a case the tree does not list, a
+failure, a record short of a field, two cc's, or no records beside a
+log whose counts are right; a Linux row passing with its 37 skips;
+objcheck's records failing with a setting missing, a compilation that
+differs or is recorded twice, a program missing or one it leaves out
+compiled, and 1750 programs; a macOS-only row failing on Linux, incremental
 failing 134 skipped series and passing 4 named ones, and the skipped
 oracle a SKIP while an oracle that does not build fails.
 
