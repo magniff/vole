@@ -1104,7 +1104,11 @@ the first instance of a generic one). (0.30.1) The functions the
 compiler made from it with its text come after it, each with its own
 drops: an `ensures`'s `f$body`, which holds the body (f is then the
 wrapper that calls it and checks), a `requires`'s `f$pre`, a
-`#[multiversion]` copy (tests/query/drops0301.q). A line in no function with a body
+`#[multiversion]` copy (tests/query/drops0301.q); a generic
+function's instances stay one, the first shown, and a closure shown
+twice (its copy in a `#[multiversion]` version) is named with the
+function each is in (`closure(D) -> i64 at main.vl:43:13, in h$mv0`).
+A line in no function with a body
 (a generic one never instantiated, C's, one with errors): `error
 query.no-match`, `try:` the item at that line. `check --emit-places`
 prints the whole IR; `--emit-shims` the drop shims a `[kept]` drop

@@ -18,3 +18,14 @@ drops0301/main.vl:22 in f$body
   23:5  drop(_3) [removed]  __for_seq: Vec<D, Gpa>
   23:6  drop(_6) [kept]  a temporary (21:5): Option<D>
   25:1  drop(_1) [removed]  a: Vec<D, Gpa>
+## (round 2) a generic function's instances are one, shown by the first
+## (as before 0.30.1); a #[multiversion] function's closure and its
+## copy in the version are named with the function each is in.
+$ drops main.vl:35
+drops0301/main.vl:35 in g<i64>
+  37:1  drop(_1) [kept]  v: Vec<i64, Gpa>
+$ drops main.vl:43 -C target-cpu=generic
+drops0301/main.vl:43 in closure(D) -> i64 at drops0301/main.vl:43:13, in h
+  43:22  drop(_1) [kept]  d: D
+drops0301/main.vl:43 in closure(D) -> i64 at drops0301/main.vl:43:13, in h$mv0
+  43:22  drop(_1) [kept]  d: D
