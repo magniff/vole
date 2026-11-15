@@ -40,15 +40,16 @@ crate::clamp	none
 crate::scaled	none
 crate::smoothed	panic
 crate::score	panic
-crate::bucket	none
+crate::bucket	panic
 crate::histogram	panic
 crate::peak	none
 crate::outliers	alloc(Gpa) panic
 crate::main	alloc(Gpa) io static panic
 ```
 
-`clamp`, `scaled` and `bucket` do nothing but compute: `none`.
-`smoothed` indexes (`s[i + 1]` may be out of range: `panic`), and so
+`clamp` and `scaled` do nothing but compute: `none` (`scaled`'s `/ 10`
+divides by a constant, which cannot be 0). `bucket` is `panic`: `x /
+width` stops the program when `width` is 0. `smoothed` indexes (`s[i + 1]` may be out of range: `panic`), and so
 does `score`, which calls it; `#[pure]` allows that. `peak` is `none`:
 it reads its slice with `get(0)` (an `Option`) and `for &x in s`, neither
 of which can fail. `outliers` takes no allocator, yet it is `alloc(Gpa)`:
