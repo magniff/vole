@@ -122,11 +122,11 @@ fn main(gpa: Gpa) -> i32 {
     let mut seen: HashMap<&str, i64, Gpa, FixedState> = HashMap::new_in(gpa);
     for _ in 0..n {
         let name = toks.next().unwrap();       // Option<&str>: a slice of input
-        let qty = toks.next().unwrap_or("").parse().unwrap_or(0);
+        let qty = toks.next().unwrap_or("").parse::<i64>().unwrap_or(0);
         items.push(Item { name, qty });
         seen.insert(name, qty);                // also contains_key(k), remove(k)
     }
-    items.sort_by(|a, b| b.qty.cmp(&a.qty));   // a, b: &Item; an Ordering
+    items.sort_by(|a, b| b.qty.cmp(&a.qty));   // a, b: &Item
     for (i, it) in items.iter().enumerate() { print("{i}:{} ", it.name); }
     let line = lines.next().unwrap_or("").trim();
     let total: i64 = line.split(',').map(|w| w.trim().parse::<i64>().unwrap_or(0)).sum();

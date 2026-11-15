@@ -969,6 +969,47 @@ bounds instantiated (`Scope<'scope, 'env: 'scope>` gives `'env ⊒
 'scope`) and its inferred requirements (D4.6), and recurses into `τ`. Values: `val('u) = Pts ∪ {end('v) |
 'u ⊒ 'v}`; in particular `val('static) = Pts ∪ Ends`.
 
+*(0.30.1) A type parameter's outlives bound at a call* (rustc E0310). A
+callee's (or a struct's) `P: 'static` is met by a concrete argument
+through its lifetimes (its slots, D3.6 at the call); by the caller's own
+type parameter `T` (an Ω in the opaque instance, D4.4 (d), which has no
+slots) only through `T`'s declared bounds, `T: 'static` in its list or a
+`where`; and by a type holding a `T` (a tuple, a closure capturing one,
+a struct's or enum's argument, a reference to one) only when each such
+`T` has it. Else `error borrowck.param_outlives`, at the call or the
+type, made by the front (`front/traits.vl: check_bounds,
+check_outlives`; an Ω copies its parameter's lifetime bounds,
+`front/opaque.vl: omega_of`). 0.30.0 checked neither: `fn start<T:
+FnOnce() -> usize + Send>(t: T) -> JoinHandle<..> { spawn_in(t, gpa) }`
+was accepted, and its concrete instance's check reads the closure's
+captured borrow as a substitution's region, whose violations D4.4 (g)
+leaves to the template. A bound `P: 'a` of a named lifetime is not
+checked so yet (the Ω has no region to relate): a gap, rustc's E0309.
+*Cases:* `rt_008_static_bound_through_generic`,
+`rust_b_param_outlives_err`, `rust_b_param_outlives_ok`.
+(0.30.1, the review) The bound is required wherever it is declared: a
+trait method's own type parameter called through a bound (`x.f(t)`, its
+virtual function's copy of the declaration keeps the parameters'
+lifetime bounds), a `where Self: 'static` or `where I::Item: 'static`
+of the callee (kept on the predicate's subject, checked with the
+predicate), an `impl Tr + 'static` result (its hidden type). And an Ω
+has it as rustc reads it without writing it on the parameter: the
+implied bound of a parameter's `&'static T`, a lifetime `'a: 'static`
+with `T: 'a`, a bound's trait declared `trait St: 'static` (or a
+supertrait so), an associated type declared `type Out: 'static`, a
+`where` predicate on a projection; the opaque instance takes its
+template's `where` predicates as its Ωs' bounds (front/traits.vl:
+assume_where_preds) and is no longer unsure for having one (0.27.3's
+model dropped such an instance's errors: `where I::Item: Copy` turned
+the check off). A walk deeper than its limit is no yes: the limits of
+places/impl_regions.vl `walk`, regions.vl `slots_in`, `bind_walk`,
+`decl_pairs`, `copy_in`, `slot_variances_in`, `var_walk` and
+fn_values.vl `needs_static` are gone (each walks a finite type tree;
+25 nested `Option<&'a str>` were accepted where `&'static str` was
+declared). *Cases:* `rust_b_param_outlives_bound_err`,
+`rust_b_param_outlives_bound_ok`, `rust_b_deep_types_err`,
+`rust_b_deep_types_fn_err`, `rust_b_deep_types_ok`.
+
 **D4.6 (implied bounds, as rustc's well-formedness; 0.27.2.1).** D4.5's
 walk is completed by four readings, each rustc's (a type in a signature
 or an impl header is assumed well-formed, so what its well-formedness
@@ -1103,6 +1144,30 @@ D3.6).
   universal and the closure's `|acc, p| p` requirement was dropped: a use
   after free in safe code. *Cases:* `rust_b_err_adapter_item_copied`,
   `rust_b_err_adapter_item_map`, `rust_b_err_adapter_item_user`.
+
+**D4.7 (a function item used as a value; 0.30.1, RT-M2-2).** A call
+through a `fn` value, or through a type parameter its `Fn*` bound reads,
+is checked with the erased type (R6, `indirect_call`; D4.2 for a
+bound): every argument may be a reference of any lifetime. A function
+item used as a value (an `OK_FN` operand: a `let f: fn(&T) = item`, an
+argument `run(item)` for `F: Fn(&T)`, a field, a result) is therefore
+refused when a parameter's type needs a lifetime to be `'static`: a
+`'static` written in it (`&'static T`, `S<'static>`, `&'static str`, in
+`Self` as the impl's header writes it), a named lifetime bounded by
+`'static` (its own, its `where`'s, its impl's, transitively), or a type
+parameter bounded `T: 'static` whose argument has a region slot. Else
+the item keeps a borrow of the caller's local (a thread, a static)
+past its end, a use after free. The check reads the parameter types'
+AST nodes; a `fn` type or a bound inside one is not looked into (its
+references are what the item gives). It is stricter than rustc where
+the value's type itself says `'static` (`let f: fn(&'static T) =
+item`), which the erased type cannot say; rustc's E0308 ("one type is
+more general than the other") covers the rest. A result's lifetimes
+need nothing: a call through the value ties its result to every
+argument (R6). `error borrowck.fn_value_static`, at the value.
+*Anchor:* `places/fn_values.vl: check_fn_value`, `places/build.vl:
+operand`. *Cases:* `rt_m2_002_fn_static_param`,
+`rust_b_fn_value_static_err`, `rust_b_fn_value_static_ok`.
 
 ## 5. Variance (S5)
 
@@ -2016,6 +2081,8 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.dropped_borrowed` | D2.5: `WD` vs a loan; D9.2 | E0597, E0713 | "declare `x` before `v`" when both are locals of one block (the reorder is mechanical: `fix` moves the `let`) |
 | `borrowck.return_local` | D6.2.2 | E0515 | none; the help suggests returning an owned value |
 | `borrowck.outlives` | D6.2.1; D19.10 case 1 | E0621, E0623, E0521 | "add `'a: 'b`", or "name the lifetime `'a` on `x`" when the blame path ends at two parameters of elided regions (E2 failed): `fix --suggested` writes `<'a>` on both |
+| `borrowck.param_outlives` | D4.5 (0.30.1) | E0310 | none mechanical; the help says to add `T: 'static` |
+| `borrowck.fn_value_static` | D4.7 (0.30.1) | E0308 | none mechanical; the help says to call it by name, or take `&T` |
 | `borrowck.elision` | E4 at the signature (ir271) | E0106 | writes `<'a>` and `&'a` on the only reference parameter when there is one |
 | `borrowck.unused_param` | D5.3 (ir271) | E0392 | adds a `PhantomData<&'a ()>` field |
 | `borrowck.use_moved` | M1, M5 | E0382 | `.clone()` when `Clone` (as `own.moved`'s) |
