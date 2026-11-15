@@ -294,8 +294,29 @@ fn synth_cast(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             return nonnull_cast(n, operand, to_ty, pcx);
         }
         // (0.20) bytes become std's `str` only checked, outside std
-        if to_ty == pcx.str_type && from == from_ty && !within_std(pcx.cur_mod, pcx) {
+        // (0.30.1: and `&mut [u8] as &mut str`, which would write the
+        // str's bytes; a raw pointer's cast, `*mut [u8] as *mut str`, is
+        // unsafe to use: rustc's too)
+        if (to_ty == pcx.str_type || crate::front::distinct::is_view_distinct(to_ty, pcx)
+            && !crate::front::types::is_raw_view(to, pcx))
+            && from == from_ty && !within_std(pcx.cur_mod, pcx) {
             bytes_as_str_error(n, operand, pcx);
+        }
+        // RULE: F29.4 (0.30.1: `&mut str as &mut [u8]` would let safe code
+        // write bytes that are not UTF-8 into a str; `&str as &[u8]` only
+        // reads them)
+        if to == to_ty && crate::front::distinct::is_view_distinct(from_ty, pcx)
+            && crate::front::types::is_mut_slice(from_ty, pcx) {
+            ref_cast_error(operand, from_ty, to_ty, c"a str is UTF-8, and a `&mut [u8]` writes any byte: change the text through the str's own methods (`make_ascii_uppercase`), or build a new one (`String::from_utf8` of the changed bytes checks them)", pcx);
+            return to_ty;
+        }
+        // RULE: F29.4 (0.30.1: `&str as &[u8]`, rustc E0605: the bytes are
+        // `s.as_bytes()`; one language, Rust's surface)
+        if to == to_ty && crate::front::distinct::is_view_distinct(from_ty, pcx)
+            && !crate::front::types::is_raw_view(from, pcx) && !within_std(pcx.cur_mod, pcx) {
+            ref_cast_error(operand, from_ty, to_ty,
+                c"a str's bytes are `s.as_bytes()` (rustc E0605: a non-primitive cast)", pcx);
+            return to_ty;
         }
         pcx.nodes[n as usize] = pcx.nodes[operand as usize];
         return to_ty;
@@ -363,6 +384,25 @@ fn synth_cast(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         pcx.err_kind = saved_kind;
         return to_ty;
     }
+    // RULE: F29.4 (0.30.1: `as` makes a reference only of a reference to
+    // the same type, `&mut T as &T`: not of a raw pointer, not of a `&T`
+    // to a `&mut T`, not of a reference to another type, a transmute;
+    // rustc E0605, E0606)
+    if from > 0 && to > 0 && pcx.types[from as usize].kind == TyKind::Ptr
+        && pcx.types[to as usize].kind == TyKind::Ptr && pcx.types[to as usize].b != 0 {
+        if pcx.types[from as usize].b == 0 {
+            ref_cast_error(operand, from_ty, to_ty, c"a raw pointer becomes a reference by `&*p` (`&mut *p`) in an unsafe block whose SAFETY says the pointee lives and is valid; `as` checks none of it", pcx);
+            return to_ty;
+        }
+        if pcx.types[from as usize].a != pcx.types[to as usize].a {
+            ref_cast_error(operand, from_ty, to_ty, c"that would be a transmute: convert the value (`*r as U`, `U::from(*r)`), or cast to a raw pointer (`r as *const T as *const U`) and read it in an unsafe block that says why it is a valid U", pcx);
+            return to_ty;
+        }
+        if pcx.types[from as usize].b == REF_SHARED && pcx.types[to as usize].b == REF_MUT {
+            ref_cast_error(operand, from_ty, to_ty, c"a shared reference does not become an exclusive one: borrow the place `&mut` where the reference is made", pcx);
+            return to_ty;
+        }
+    }
     if !is_valid_cast(from, to, pcx)
         || ref_to_raw {
         err_begin(pcx.nodes[operand as usize].start, pcx);
@@ -397,6 +437,22 @@ fn bytes_as_str_error(n: i64, operand: i64, pcx: &mut Ctx<Comp>) {
         err_help(c"; not with '?' here: the function does not return a Result whose error takes a Utf8Error (match the Result, or make the value a str where it comes from)", pcx);
     }
     err_end_soft(pcx);
+}
+
+// RULE: F29.4 (0.30.1) a cast that would make a reference of another type:
+// `as` is no transmute (rustc E0605, E0606).
+fn ref_cast_error(operand: i64, from_ty: i64, to_ty: i64, help: *const u8, pcx: &mut Ctx<Comp>) {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"type.ref_cast";
+    err_begin(pcx.nodes[operand as usize].start, pcx);
+    err_str(c"cannot cast '", pcx);
+    err_type(from_ty, pcx);
+    err_str(c"' to the reference '", pcx);
+    err_type(to_ty, pcx);
+    err_str(c"': `as` makes no reference of another type", pcx);
+    err_help(help, pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved_kind;
 }
 
 // `n as E` for a fieldless enum E (0.4), checked: it becomes
@@ -577,9 +633,9 @@ fn synth_index(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     }
     // RULE: Z9.1b (0.28.0: a program's `s[a..b]` of a `&str`: std's
     // Index, checked to fall between characters; 0.30.1, RT-21: std's own
-    // too, which were its bytes' slice, unchecked: `"é".split_at(1)` gave
-    // a str that is not UTF-8, from safe code. Every range of a str is
-    // this one call, so none is cut off a character's boundary.)
+    // too, as Rust's: str::split_at and String::remove sliced a caller's
+    // index unchecked, a str that is not UTF-8 from safe code. Every range
+    // of a `&str` is this one call; a `&mut str`'s is not yet, RT-42.)
     if base_ty == pcx.str_type && pcx.str_type > 0 && pcx.nodes[index as usize].kind == Range {
         pcx.nodes[base as usize].p |= NODE_CHECKED;
         // (the ends are usize, which a literal takes: SliceIndex<str> is

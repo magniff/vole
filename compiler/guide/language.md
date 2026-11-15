@@ -100,12 +100,12 @@ fn greet(name: &str, times: i64, sep: &str) {
 }
 
 fn main() -> i32 {
-    let mut total = 0;
+    let mut total: i64 = 0;
     for i in 0..10 {              // 0..10 and 0..=9; (0..10).rev(), .step_by(2)
         if i % 2 == 0 { continue; }
         total += i;
     }
-    let mut k = 0;
+    let mut k: i64 = 0;
     while k < 3 { k += 1; }
     let found = loop {            // loop's value comes from `break value`
         k += 1;

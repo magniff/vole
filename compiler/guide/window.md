@@ -239,7 +239,7 @@ fn draw(dev: &gpu::Device<Gpa>, queue: &mut gpu::Queue, view: &TextureView) {
 }
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
-    let (w, h) = (64, 32);
+    let (w, h): (i64, i64) = (64, 32);
     let inst = gpu::Instance::new_in(gpa);
     let (dev, mut queue) = inst.adapter(gpu::Power::High)?.device(gpu::Limits::default())?;
     let mut surf = inst.surface(&dev, RawSurface::Headless)?; // frames, no window
