@@ -6,7 +6,8 @@
 // x8 the result pointer) and x19-x28 (callee-saved) are allocated; x16
 // holds the callee of indirect calls and is the parallel moves' temporary;
 // x17 breaks parallel move cycles and is the temporary for addresses and
-// constants here; x18 is reserved by the platform. d0-d29 are allocated
+// constants here (taken through ma_scratch, which refuses it while it holds
+// a cycle's save: RT-CG-7); x18 is reserved by the platform. d0-d29 are allocated
 // (d8-d15 callee-saved); d30 and d31 are the parallel moves' registers.
 //
 // Here: registers and memory operands, moves, constants, loads, stores,
@@ -19,7 +20,7 @@ pub mod arch;
 pub mod atomic;
 
 use crate::back::mc_arm64::vector::ma_v;
-use crate::base::{buf_len, buf_truncate};
+use crate::base::{buf_len, buf_truncate, die};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::consteval::{f32_bits, f64_of_bits};
@@ -117,13 +118,14 @@ pub fn ma_load_fimm(cx: &mut FnCtx<Comp>, dst: i64, bits: i64, ty: i64, pcx: &Ct
         o(cx, if ty == TY_F32 { c", wzr\n" } else { c", xzr\n" });
         return;
     }
+    let t = ma_scratch(cx);
     if ty == TY_F32 {
-        a64_load_imm(cx, 17, f32_bits(f64_of_bits(bits)) as u64);
+        a64_load_imm(cx, t, f32_bits(f64_of_bits(bits)) as u64);
         o(cx, c"    fmov ");
         ma_f(cx, dst, ty, pcx);
         o(cx, c", w17\n");
     } else {
-        a64_load_imm(cx, 17, bits as u64);
+        a64_load_imm(cx, t, bits as u64);
         o(cx, c"    fmov ");
         ma_f(cx, dst, ty, pcx);
         o(cx, c", x17\n");
@@ -148,8 +150,25 @@ pub fn ma_lea(cx: &mut FnCtx<Comp>, dst: i64, base: i64, offset: i64) {
         o_back_imm(cx, 0 - offset);
         return;
     }
-    a64_load_imm(cx, 17, offset as u64);
-    ma_rrr(cx, c"add", dst, base, 17);
+    let t = ma_scratch(cx);
+    a64_load_imm(cx, t, offset as u64);
+    ma_rrr(cx, c"add", dst, base, t);
+}
+
+// (0.30.1, RT-CG-7) x17, as the scratch register of one instruction: an
+// address or a constant it cannot encode (ma_address, ma_lea,
+// ma_load_fimm, ma_copy). While x17 holds a value the code still needs
+// (cx.scratch_held: the steps of a parallel move, where x17 is the integer
+// cycle register, and the piece of a stack argument's copy in flight),
+// taking it would overwrite that value: an internal error, never code.
+// Spill slots never need it (spill_access_type), so a move's steps never
+// ask; before 0.30.1 an f32 slot past 16 KB took it in the middle of a
+// cycle and the saved integer became the slot's address.
+fn ma_scratch(cx: &mut FnCtx<Comp>) -> i64 {
+    if cx.scratch_held {
+        die(c"internal error: x17 taken as a scratch register while it holds a value (a parallel move's save or a copy's piece)");
+    }
+    17
 }
 
 // Replaces the newline just written with ", #<value>\n".
@@ -167,7 +186,8 @@ fn ma_address(cx: &mut FnCtx<Comp>, base: i64, offset: i64, size: i64) -> i64 {
     if offset >= 0 && offset % size == 0 && offset / size < 4096 {
         return offset;
     }
-    ma_lea(cx, 17, base, offset);
+    let t = ma_scratch(cx);
+    ma_lea(cx, t, base, offset);
     -1
 }
 
@@ -227,6 +247,13 @@ fn pair_with_last(cx: &mut FnCtx<Comp>, load: bool, ty: i64, r: i64, base: i64, 
     if buf_len(cx.code) == cx.pair_end && kind == cx.pair_kind
         && base == cx.pair_base && offset == cx.pair_offset + size
         && !(load && (cx.pair_reg == base || cx.pair_reg == r)) {
+        if cx.pm_running && cx.pair_start < cx.pm_code_start {
+            // (0.30.1, RT-CG-7) the first step of a parallel move paired
+            // with the access before it: the steps' code begins with this
+            // pair, whose first half is not theirs (regalloc/movecode.vl)
+            cx.pm_code_start = cx.pair_start;
+            cx.pm_code_paired = true;
+        }
         buf_truncate(cx.code, cx.pair_start);
         o(cx, if load { c"    ldp " } else { c"    stp " });
         if kind == 1 || kind == -1 {
@@ -425,6 +452,7 @@ pub fn ma_frame_unlink(cx: &mut FnCtx<Comp>) {
 }
 
 pub fn ma_copy(cx: &mut FnCtx<Comp>, dst: i64, src: i64, size: i64) {
+    let _ = ma_scratch(cx);
     let mut offset: i64 = 0;
     while offset + 8 <= size {
         ma_copy_chunk(cx, c"ldr x17", c"str x17", dst, src, offset);

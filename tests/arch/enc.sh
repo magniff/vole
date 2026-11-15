@@ -126,8 +126,68 @@ x86_64-macos|popcntq %xmm1, %rax
 x86_64-macos|paddsb %rax, %xmm1
 x86_64-macos|vpmovmskb %xmm1, %xmm2
 x86_64-macos|andnq %xmm1, %rax, %rcx
+x86_64-macos|leaq 3000000032(%rsp), %rdi
+x86_64-macos|subq $3000001744, %rsp
+x86_64-macos|movl %eax, -2147483649(%rbp)
+x86_64-macos|addq $4294967295, %rax
+x86_64-macos|andq $-2147483649, %rcx
+x86_64-macos|testq $2147483648, %rax
+x86_64-macos|testq $2147483648, %rcx
+x86_64-macos|movq $2147483648, %rax
+x86_64-macos|movq $2147483648, 8(%rsp)
+x86_64-macos|movl $4294967296, %eax
+x86_64-macos|movw $65536, %ax
+x86_64-macos|movb $256, %al
+aarch64-macos|movz x0, #70000
+aarch64-macos|movk x0, #1, lsl #8
+aarch64-macos|movz w0, #1, lsl #32
+aarch64-macos|ldp x0, x1, [sp, #1024]
+aarch64-macos|stp x0, x1, [sp, #-1024]!
+aarch64-macos|ldp x0, x1, [sp], #1024
+aarch64-macos|ldp x0, x1, [sp, #4]
+aarch64-macos|ldp q0, q1, [sp, #1024]
 EOF
-echo "enc: $refused registers of the wrong class or number refused"
+echo "enc: $refused registers of the wrong class or number, and immediates and offsets their fields cannot hold, refused"
+# (0.30.1, RT-CG-7) The fields at their limits, as cc writes them:
+# x86-64's displacements and a 64-bit operation's immediate are signed 32
+# bits (0.30.0 wrote a frame past 2 GB's `subq $3000001744, %rsp` and
+# `leaq 3000000032(%rsp)` with their low 32 bits), a 32-bit operation's
+# immediate any 32 bits; AArch64's pairs reach -64 to 63 units, movz and
+# movk 16 bits at a shift of 0 to 48 (0.30.0 kept the low bits of both).
+printf '.text\n.globl _f\n_f:\n    leaq 2147483647(%%rsp), %%rdi\n    leaq -2147483648(%%rsp), %%rdi\n    subq $-2147483648, %%rsp\n    addq $2147483647, %%rax\n    andq $2147483647, %%rcx\n    testq $-1, %%rax\n    movq $-2147483648, %%rax\n    movq $2147483647, 8(%%rsp)\n    movl $4294967295, %%eax\n    movl $3000000000, %%r9d\n    movw $65535, %%ax\n    movb $255, %%al\n    movl %%eax, -2147483648(%%rbp)\n    ret\n' >"$OUT/x86lim.s"
+if cc -target x86_64-apple-macos -c "$OUT/x86lim.s" -o "$OUT/x86lim.cc.o" 2>/dev/null; then
+    if ! "$COMPILER" assemble --target x86_64-macos "$OUT/x86lim.s" -o "$OUT/x86lim.o" >"$OUT/x86lim.log" 2>&1; then
+        echo "enc: FAIL x86lim: $(head -1 "$OUT/x86lim.log")"
+        status=1
+    else
+        objdump -d --no-leading-addr "$OUT/x86lim.o" | sed -n '/^ /p' >"$OUT/x86lim.ours"
+        objdump -d --no-leading-addr "$OUT/x86lim.cc.o" | sed -n '/^ /p' >"$OUT/x86lim.theirs"
+        if ! cmp -s "$OUT/x86lim.ours" "$OUT/x86lim.theirs"; then
+            echo "enc: FAIL x86lim: the encodings differ from cc's (< ours, > cc's):"
+            diff "$OUT/x86lim.ours" "$OUT/x86lim.theirs" | head -10
+            status=1
+        else
+            echo "enc: x86-64 displacements and immediates at their limits: the same bytes as cc's"
+        fi
+    fi
+fi
+printf '.text\n.globl _f\n_f:\n    ldp x0, x1, [sp, #504]\n    stp x0, x1, [sp, #-512]!\n    ldp x0, x1, [sp], #504\n    ldp q0, q1, [sp, #1008]\n    ldp d0, d1, [sp, #-512]\n    movz x0, #65535, lsl #48\n    movk w0, #65535, lsl #16\n    ret\n' >"$OUT/a64lim.s"
+if cc -target arm64-apple-macos -c "$OUT/a64lim.s" -o "$OUT/a64lim.cc.o" 2>/dev/null; then
+    if ! "$COMPILER" assemble --target aarch64-macos "$OUT/a64lim.s" -o "$OUT/a64lim.o" >"$OUT/a64lim.log" 2>&1; then
+        echo "enc: FAIL a64lim: $(head -1 "$OUT/a64lim.log")"
+        status=1
+    else
+        objdump -d --no-leading-addr "$OUT/a64lim.o" | sed -n '/^ /p' >"$OUT/a64lim.ours"
+        objdump -d --no-leading-addr "$OUT/a64lim.cc.o" | sed -n '/^ /p' >"$OUT/a64lim.theirs"
+        if ! cmp -s "$OUT/a64lim.ours" "$OUT/a64lim.theirs"; then
+            echo "enc: FAIL a64lim: the encodings differ from cc's (< ours, > cc's):"
+            diff "$OUT/a64lim.ours" "$OUT/a64lim.theirs" | head -10
+            status=1
+        else
+            echo "enc: AArch64 pairs and movz/movk at their limits: the same bytes as cc's"
+        fi
+    fi
+fi
 # The moves of an xmm register to and from memory, as cc writes them.
 printf '.text\n.globl _f\n_f:\n    movq %%xmm15, 16(%%rsp)\n    movq 16(%%rsp), %%xmm15\n    movq %%xmm0, (%%rax)\n    movq (%%r12,%%rax,8), %%xmm9\n    movq %%xmm3, %%rax\n    movq %%rbx, %%xmm2\n    movd %%xmm3, 8(%%rsp)\n    movd 8(%%rsp), %%xmm3\n    ret\n' >"$OUT/movq.s"
 if cc -target x86_64-apple-macos -c "$OUT/movq.s" -o "$OUT/movq.cc.o" 2>/dev/null; then

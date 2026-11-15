@@ -3,20 +3,22 @@
 // and the parallel moves that put values in place.
 
 use crate::back::emit::machine::{
-    m_extern_addr, m_lea, m_load, m_load_fimm, m_load_imm, m_mov, m_store, m_string_addr,
-    m_symbol_addr, reg_cycle, reg_fp, reg_move_temp, reg_sp, spill_offset, spill_type,
+    m_extern_addr, m_lea, m_load, m_load_fimm, m_load_imm, m_mov, m_spill_load, m_spill_store,
+    m_store, m_string_addr, m_symbol_addr, reg_cycle, reg_fp, reg_move_temp, reg_sp, spill_type,
 };
 use crate::back::regalloc::{LOC_NONE, LOC_REMAT};
 use crate::back::regalloc::locations::{
     plan_end_moves, plan_gap_moves, plan_start_moves, stored_at_def, vloc,
 };
+use crate::back::regalloc::movecode::{check_moves_code, moves_code_begin};
 use crate::back::regalloc::prepare::tracked;
 use crate::base::{buf_byte, die};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::front::types::{TY_F64, in_fregs, is_float, is_vector, type_size};
+use crate::base::target::get_x86;
+use crate::front::types::{TY_F64, TY_U64, in_fregs, is_float, is_vector, type_size};
 use crate::gen0::gen::{fn_symbol_prefix, static_symbol_prefix};
-use crate::gen0::target::{oi, on};
+use crate::gen0::target::{ins, oi, on};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::Op;
 use crate::middle::ir::Op::{Const, GAddr, Param, Phi, SAddr, Slot};
@@ -100,11 +102,7 @@ pub fn use_any(cx: &mut FnCtx<Comp>, v: i64, pos: i64, scratch: i64, pcx: &Ctx<C
     if loc >= 0 {
         return loc;
     }
-    let spill_type_v = spill_type((cx.insts[v as usize]).ty, pcx);
-    let reg_sp_v = reg_sp();
-    let spill_offset_v = spill_offset(cx, loc);
-    m_load(cx, spill_type_v, scratch, reg_sp_v, spill_offset_v,
-        pcx);
+    m_spill_load(cx, (cx.insts[v as usize]).ty, scratch, loc, pcx);
     scratch
 }
 
@@ -139,11 +137,7 @@ pub fn result_reg(cx: &mut FnCtx<Comp>, v: i64) -> i64 {
 pub fn result_done(cx: &mut FnCtx<Comp>, v: i64, r: i64, pcx: &Ctx<Comp>) {
     let t = tracked(cx, v);
     if t >= 0 && stored_at_def(cx, t) {
-        let spill_type_v = spill_type((cx.insts[v as usize]).ty, pcx);
-        let reg_sp_v = reg_sp();
-        let spill_offset_v = spill_offset(cx, 0 - (1 + cx.rv_slot[t as usize]));
-        m_store(cx, spill_type_v, r, reg_sp_v,
-            spill_offset_v, pcx);
+        m_spill_store(cx, (cx.insts[v as usize]).ty, r, 0 - (1 + cx.rv_slot[t as usize]), pcx);
     }
 }
 
@@ -210,25 +204,34 @@ fn move_loc(cx: &mut FnCtx<Comp>, dst: i64, src: i64, ty: i64, pcx: &Ctx<Comp>) 
     if dst == src {
         return;
     }
-    let st = spill_type(ty, pcx);
     if dst >= 0 && src >= 0 {
         m_mov(cx, dst, src, ty, pcx);
     } else if dst >= 0 {
-        let reg_sp_v = reg_sp();
-        let spill_offset_v = spill_offset(cx, src);
-        m_load(cx, st, dst, reg_sp_v, spill_offset_v, pcx);
+        m_spill_load(cx, ty, dst, src, pcx);
     } else if src >= 0 {
-        let reg_sp_v1 = reg_sp();
-        let spill_offset_v1 = spill_offset(cx, dst);
-        m_store(cx, st, src, reg_sp_v1, spill_offset_v1, pcx);
+        m_spill_store(cx, ty, src, dst, pcx);
+        if pcx.plant_rt_cg_7 == 4 {
+            // (tests only) a store to a byte of the frame no move writes
+            let at = cx.save_base;
+            m_store(cx, if in_fregs(ty, pcx) { TY_F64 } else { TY_U64 }, src, reg_sp(), at, pcx);
+        }
     } else {
-        let temp = reg_move_temp(in_fregs(ty, pcx));
-        let reg_sp_v2 = reg_sp();
-        let spill_offset_v2 = spill_offset(cx, src);
-        m_load(cx, st, temp, reg_sp_v2, spill_offset_v2, pcx);
-        let reg_sp_v3 = reg_sp();
-        let spill_offset_v3 = spill_offset(cx, dst);
-        m_store(cx, st, temp, reg_sp_v3, spill_offset_v3, pcx);
+        // (0.30.1, RT-CG-7) through the moves' temporary of the class,
+        // which only a call's moves write as a destination (x16, r11: the
+        // callee of an indirect call), and those all go to registers
+        let mut temp = reg_move_temp(in_fregs(ty, pcx));
+        let n = cx.pm.len() as i64 / PM_FIELDS;
+        for i in 0..n {
+            if pm_dst(cx, i) == temp {
+                die(c"internal error: a parallel move between spill slots while the moves' temporary is a destination");
+            }
+        }
+        if pcx.plant_rt_cg_7 == 2 {
+            // (tests only) through an allocated register instead
+            temp = if in_fregs(ty, pcx) { 32 + 7 } else if get_x86() { 1 } else { 28 };
+        }
+        m_spill_load(cx, ty, temp, src, pcx);
+        m_spill_store(cx, ty, temp, dst, pcx);
     }
 }
 
@@ -613,10 +616,27 @@ pub fn pm_plan(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) -> Vec<i64, Comp> {
 pub fn pm_resolve(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
     let n = cx.pm.len() as i64 / PM_FIELDS;
     let steps = pm_plan(cx, pcx);
+    // (0.30.1, RT-CG-7) While the steps run, x17 (AArch64's integer cycle
+    // register) may hold a save: no step may take it as a scratch
+    // (ma_scratch); their spill accesses need none (spill_access_type).
+    // --verify-regalloc then follows the code they emitted.
+    let pre = moves_code_begin(cx);
+    cx.pm_code_start = pre[0];
+    cx.pm_code_paired = false;
+    cx.pm_running = true;
+    cx.scratch_held = pcx.plant_rt_cg_7 != 1;
     let mut k: usize = 0;
     while k < steps.len() {
         move_loc(cx, steps[k], steps[k + 1], steps[k + 2], pcx);
+        if pcx.plant_rt_cg_7 == 3 {
+            ins(cx, c"nop");
+        }
         k += 3;
+    }
+    cx.pm_running = false;
+    cx.scratch_held = false;
+    if pcx.verify_regalloc && steps.len() > 0 {
+        check_moves_code(cx, &pre, pcx);
     }
     for i in 0..n {
         if pm_done(cx, i) || pm_kind(cx, i) == PM_LOC {
@@ -638,10 +658,7 @@ pub fn pm_resolve(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
             m_load(cx, ty, r, reg_fp_v1, pm_src_v3, pcx);
         }
         if dst < 0 {
-            let spill_type_v = spill_type(ty, pcx);
-            let reg_sp_v = reg_sp();
-            let spill_offset_v = spill_offset(cx, dst);
-            m_store(cx, spill_type_v, r, reg_sp_v, spill_offset_v, pcx);
+            m_spill_store(cx, ty, r, dst, pcx);
         }
     }
     cx.pm.clear();
