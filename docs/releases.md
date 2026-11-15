@@ -188,6 +188,14 @@ the bytes of a cold one when a function's number of calls changes.
   and prints `stopped by signal 11` (10, SIGBUS, for a spawned thread on
   macOS) and the frames where it printed nothing. A thread made by C's
   `pthread_create` has no such stack: its overflow prints nothing.
+- **`std::thread::Builder`**, Rust's, with `stack_size`:
+  `thread::Builder::new().stack_size(1 << 30).spawn_in(f, gpa)` starts
+  the thread on a stack of that size (rounded up to a multiple of 64 KiB,
+  128 KiB at least) and gives an `io::Result`: when no thread is made
+  (the size refused, its memory not had) an Err, the closure dropped and
+  not run. `name` is left out (nothing reads it back). std's own threads
+  (`spawn_in`, `Scope::spawn`) now look at pthread's answer to their
+  stack size too. 0.30.2's compiler starts its own thread with it.
 
 #### Bugs fixed
 
