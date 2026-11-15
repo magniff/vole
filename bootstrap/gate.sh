@@ -1165,8 +1165,10 @@ start() { # <step>
         run_step "$1" </dev/null >"$RUN/$1.log" 2>&1
         rc=$?
         # (0.30.1) a row that passed has counted what it exists to count:
-        # its floor (bootstrap/gate-floors.sh), or it fails
-        if [ $rc -eq 0 ] && [ -z "${VOLE_GATE_STUB:-}" ]; then
+        # its floor (bootstrap/gate-floors.sh), or it fails. Not in the
+        # self-test's gates: their compiler is /bin/sh and their tools
+        # fakes, which count nothing (a stubbed gate's neither)
+        if [ $rc -eq 0 ] && [ -z "${VOLE_GATE_STUB:-}" ] && [ -z "${VOLE_GATE_SELFTEST:-}" ]; then
             case "$1" in
                 selftest-*) ;;
                 *) sh "$ROOT/bootstrap/gate-floors.sh" "$1" "$RUN/$1.log" "$FZ" "$AB" "$SFZ" \
