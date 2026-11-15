@@ -2,6 +2,11 @@
 // pthreads, and its only code that runs on more than one thread without
 // a context of its own (docs/optimizer.md, "0.18.1: threads").
 //
+// (0.30.1, RT-28) "The main thread", here and in the statics' comments,
+// is the compiler's own thread: main starts it (run_on_thread, a 1 GiB
+// stack) and the whole compilation runs on it; the process's first
+// thread only waits for it to end.
+//
 // A pool of pool_threads - 1 workers beside the main thread, made at the
 // first parallel phase and kept to the end of code generation. Each
 // thread has its own FnCtx (the pool's contexts, made by the main thread
@@ -72,25 +77,32 @@ pub fn processors(macos: bool) -> i64 {
     if n < 1 { 1 } else { n }
 }
 
-// Starts a thread with the workers' stack: `start(arg)` runs on it. Its
-// id, or None when the system makes no thread.
-fn start_thread(start: extern "C" fn(*mut u8) -> *mut u8, arg: *mut u8) -> Option<u64> {
+// Starts a thread with a stack of `size` bytes (a worker's, STACK_SIZE;
+// the compiler's own, MAIN_STACK): `start(arg)` runs on it. Its id, or
+// None when the system makes no thread.
+fn start_thread(start: extern "C" fn(*mut u8) -> *mut u8, arg: *mut u8, size: i64)
+    -> Option<u64> {
     let mut attr = [0u64; ATTR_WORDS];
     let mut id: u64 = 0;
     // UNSAFE: pthreads is C: std's threads take a closure that owns what it
     // captures and give no stack size, and a task's thread needs 64 MB and
-    // reaches a pool and contexts that outlive it.
+    // reaches a pool and contexts that outlive it (the compiler's own
+    // thread, 1 GiB: run_on_thread).
     // SAFETY: attr is room for a pthread_attr_t (ATTR_WORDS words, aligned
     // as one), initialized by pthread_attr_init before the two calls that
     // read it and destroyed after; id is a live u64, which pthread_create
     // writes the thread's id to (a pthread_t is a pointer on macOS, an
-    // unsigned long on Linux: 8 bytes on both). `arg` goes to `start`
-    // unread; what it must be is start's contract with its one caller
-    // (worker_main: pool_start; asm_thread_main: asm_thread_start).
+    // unsigned long on Linux: 8 bytes on both); size is a positive
+    // multiple of the page size (both callers' constants), which
+    // pthread_attr_setstacksize takes, or it fails and the default stack
+    // is used. `arg` goes to `start` unread; what it must be is start's
+    // contract with its one caller (worker_main: pool_start;
+    // asm_thread_main: asm_thread_start; main_thread: main, through
+    // run_on_thread).
     let rc = unsafe {
         let a = &mut attr as *mut [u64; ATTR_WORDS] as *mut u8;
         pthread_attr_init(a);
-        pthread_attr_setstacksize(a, STACK_SIZE as u64);
+        pthread_attr_setstacksize(a, size as u64);
         let rc = pthread_create(&mut id, a, start, arg);
         pthread_attr_destroy(a);
         rc
@@ -103,10 +115,33 @@ fn join_thread(id: u64) {
     // UNSAFE: pthread_join is C (see start_thread).
     // SAFETY: id is a thread start_thread made, joined once (pool_stop
     // empties the list it joins; asm_thread_finish follows one
-    // asm_thread_start); no result is asked for (a null pointer, which
+    // asm_thread_start; run_on_thread joins the one it started); no result is asked for (a null pointer, which
     // pthread_join allows).
     unsafe {
         pthread_join(id, 0 as *mut u8);
+    }
+}
+
+// (0.30.1, RT-28) The stack the compiler runs on (main: the whole
+// compilation, on a thread of its own; "the main thread" in this tree is
+// that thread): the front end's passes recurse over expressions, some
+// 1.2 KB a level, and the process's own main thread, 8 MB on macOS
+// (Linux: the soft RLIMIT_STACK, 8 MB by default), took a chain of
+// about 7000 operators, `1 + 1 + ... + 1`, and died by SIGSEGV at 8000.
+// 1 GiB is reserved, not touched until it is used (a thread's stack is
+// mapped on demand), and takes some 800 000 levels.
+pub const MAIN_STACK: i64 = 1024 * 1024 * 1024;
+
+// Runs start(arg) on a new thread with a stack of `size` bytes and waits
+// for it to end: false when the system makes no thread, and start did not
+// run.
+pub fn run_on_thread(size: i64, start: extern "C" fn(*mut u8) -> *mut u8, arg: *mut u8) -> bool {
+    match start_thread(start, arg, size) {
+        Some(id) => {
+            join_thread(id);
+            true
+        }
+        None => false,
     }
 }
 
@@ -173,7 +208,7 @@ pub fn pool_start(threads: i64, pcx: &mut Ctx<Comp>) {
     for i in 1..threads {
         // (the worker's argument: the pool, which the context's Arc keeps
         // for as long as the process runs)
-        match start_thread(worker_main, Arc::as_ptr(&pool) as *mut u8) {
+        match start_thread(worker_main, Arc::as_ptr(&pool) as *mut u8, STACK_SIZE) {
             Some(id) => pcx.threads.push(id),
             None => die(c"cannot start a code generation thread (try -j1)"),
         }
@@ -420,7 +455,7 @@ pub fn asm_thread_start(pcx: &mut Ctx<Comp>, cx: &mut FnCtx<Comp>) {
     // (the growth mode, read once, before the thread reads it)
     crate::base::stress_grow();
     // (the thread's argument: its queue, which the context's Arc keeps)
-    match start_thread(asm_thread_main, Arc::as_ptr(&asm) as *mut u8) {
+    match start_thread(asm_thread_main, Arc::as_ptr(&asm) as *mut u8, STACK_SIZE) {
         Some(id) => pcx.a_thread = id,
         None => die(c"cannot start the assembler's thread (try -j1)"),
     }

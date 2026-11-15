@@ -223,6 +223,27 @@ the bytes of a cold one when a function's number of calls changes.
   now add modulo 2^64 (`wrapping_add`). Found by reading the source: a
   compiler built at -O0, whose arithmetic is checked, would panic there
   on an offset near 2^63, where one built at -O2 wraps.
+- A long chain of operators (RT-28): `1 + 1 + ... + 1` of 8000 terms,
+  or 10000 nested `-`, overflowed the compiler's stack, and `check` and
+  every build died by SIGSEGV with no message. The front end's passes
+  recurse over an expression, about 1.2 KB a level, and the process's
+  main thread has 8 MB. The compilation now runs on a thread of its own
+  with a 1 GiB stack, reserved and used only as deep as it goes: a chain
+  of 60000 terms builds at -O0 and -O2. A far deeper one (some 800 000
+  levels) still overflows it with no error. Such a function is also one
+  whose body the borrow checker's liveness holds in memory quadratic in
+  its statements (a chain of 60000 terms takes 8.5 GB; a flat body of
+  30000 statements took 3.3 GB on 0.30.0 too).
+- E1.8 and the borrow checker's hidden bindings: a format argument (`{}`
+  and `{i}`) became a borrow of its place, which the effect walk did not
+  see, so a counted loop that printed its counter, or a guarded divisor
+  printed before its division, lost its proof (a false `diverge` or
+  `panic`): 14 borrows in the tests and examples. The places IR now says
+  where each borrow's reference goes, from the built body: one only read
+  through gives the place's value and needs no site of the walk's (E1.8,
+  "Where the reference goes, from the IR"). `tests/e18_loans.sh` counts
+  every borrow, reports a crash of the check with its file, and has a
+  `--self-test`.
 
 #### The safety nets
 
