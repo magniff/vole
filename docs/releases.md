@@ -90,8 +90,227 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.28.0 | `v0.28.0` | 0.27.8 | aarch64-macos | one language: the MVS edition, the translator, the own pass and the old std removed (compiler/std2 is compiler/std); no default arguments; an index is a `usize`; a panic is only `panic`, `#[terminates]`, `Hash::hash` `#[pure]`, the tools name `static`; six bugs of 0.27.8 fixed (an endless loop compiled away, a `&mut` field written through `&self`); the tools' cache bounded |
 | 0.29.0 | `v0.29.0` | 0.28.0 | aarch64-macos | the safety release: the compiler's unsafe sites 3281 to 316, each justified, none unneeded, no `static mut` (its tables are `Vec`s, the global ones a compilation context's), and unjustified unsafe an error for its source (`check --deny=unsafe`); `*const T` and `*mut T` two types, a slice without fields; `~x` refused; a map's hasher written (`FixedState` in the prelude); if-let temporaries by Rust 2024's rule; a generic call's temporary dropped (a leak) and three checker holes closed; `--edition` and the std2 name gone; the inliner's room per caller, std's block copies; the gate schedules itself, fuzz-sem back; the self-build dearer than 0.28.0's |
 | 0.30.0 | `v0.30.0` | 0.29.0 | aarch64-macos | the speed release: the self-build a sixth cheaper than 0.29.0's with every check kept (-O2 within 1% of 0.28.0's), iterator chains the loops written by hand, std's text by blocks, `sort` an introsort; `*p = v` through a raw pointer drops the old value, as in Rust (`ptr::write` does not), and through a `Box`, a guard or `DerefMut` too (a leak); two use-after-frees in safe code closed; a union field's borrow is `unsafe` (E0133), two indexes of a place may alias, a captured `FnMut` called must be `mut`; `use.redundant` a tools' warning; `println` one write a line; edits in batches, `check --std`, `refactor fold`; XFAIL 730 to 717, unsafe 316 to 299; a hello world's compile +31% |
+| 0.30.1 | `v0.30.1` | 0.30.0 | aarch64-macos | the safety nets: `--check-unsafe` sees std's allocator (every Vec, String and Box), checks an address as Rust's `add` and locks its tables; a C function is the symbol it links to, never its vole name (-O2 removed the calls of an allocator named `malloc`); `--trace` reports a stack overflow; a warm -O2 build the bytes of a cold one when a call count changes; every gate row has a floor, every safety net a canary |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.30.1
+
+The safety nets' release: checks that passed without looking, found
+after `--check-unsafe` turned out to be blind to std's allocator. Each
+net now has a case that it must catch (a canary), and each gate row a
+count below which it fails. `--check-unsafe` sees every Vec, String
+and Box, and the compiler builds itself under it with no report. A C
+function is known by the symbol it links to and never by its vole name:
+-O2 removed the calls of a program's own allocator declared as
+`malloc`. `--trace` reports a stack overflow, and a warm -O2 build has
+the bytes of a cold one when a function's number of calls changes.
+
+#### What changes for a program
+
+- **`--check-unsafe` checks std's memory.** From 0.28.0 to 0.30.0 it
+  saw only blocks a program got from C's `malloc` by that name. It
+  missed every block of std's `Gpa` (`#[link_name = "malloc"] fn
+  gpa_c_malloc`), so a raw pointer into a Vec, String or Box read freed
+  memory, or past the end, unchecked. Such reads are now stopped. A
+  program that ran clean under `--check-unsafe` may now stop with
+  `unsafe access after free` or `unsafe access out of bounds`, naming
+  the line. Blocks aligned above 16 (`posix_memalign`) are recorded too.
+  Memory the check did not see allocated is not reported as freed: a
+  block the program frees is held back from C's allocator while the
+  check counts it freed (the last 4096 blocks, at most 64 MB of C's,
+  its size for each block with the red zone and rounding: a block that
+  alone is more is given back at once, and only it, so a use of it after
+  the free is not seen), and every block has 16 bytes after its end that
+  no one is given (its red zone). So C's own mallocs (strdup's,
+  opendir's) neither reuse a freed block nor start where a block ends,
+  and a program under the check uses that much more memory. A `realloc`
+  of a block moves it.
+- **C's own frees and copies.** On macOS the check sees every free and
+  realloc C makes, the C library's own included (`malloc_logger`,
+  libmalloc's hook, the program's own logger still called first): a
+  block of the program's that getline grows or `reallocf` frees is
+  forgotten then. A log only ever makes the check forget a block, never
+  report one: libmalloc writes some after the memory is C's again (a
+  realloc's, after it freed the old block), when another thread may
+  have been given it already, so no log is taken to come first. (A
+  block C frees after the program freed it is forgotten, not reported.)
+  A program that replaces `malloc_logger` takes that sight away; the
+  check notices at each of its entries (each block allocated or freed)
+  and at each report, and a report then says so. Under the check, an
+  extern function's address is its wrapper's (`malloc`, `free`, ...,
+  and C's `memcpy`, `memmove` and `memset`, which check their bytes
+  first, both ends), wherever the program names it: a call, a function
+  pointer, a const or an array of them. So the program's calls and
+  std's (`ptr::copy`,
+  `copy_nonoverlapping` and `fill_copies` of 4 elements or more), which
+  0.30.0 did not check (`unsafe access out of bounds: 17 bytes at offset
+  0 of a block of 16 bytes`, `--> memcpy, its destination`). Other C
+  writes (strcpy's, sprintf's) are not checked; one over a block's red
+  zone is noted when the block is next reported (`note: the 16 bytes
+  after the block, which no one is given, were written over before`).
+  On glibc, which has no such hook, a block whose size by C's allocator
+  changed (`malloc_usable_size`: getline's in place) is forgotten at a
+  report; one C freed and gave out again at its size is reported, the
+  note saying that it may not be the program's ("Known issues"). The
+  check's allocator costs more than 0.30.0's: about +10% on strdup and
+  free, +21% on Box churn, +25% on Vec clones, +90% on `push_str`.
+- **An address is not an access** under `--check-unsafe`, as in Rust:
+  `&p[i]`, `p.add(i)` and `p.sub(i)` of a pointer into a live block must
+  stay in that block or one past its end (`unsafe address out of
+  bounds: offset 800 of a block of 32 bytes (an address from offset
+  0)`), and only a read or a write through the pointer is checked as an
+  access. 0.30.0 checked `NonNull::add`'s one-past-the-end address as a
+  read of the element there. std's `*const T::add` and `sub` are now
+  that address (`&p[count]`) and not integer arithmetic. Their offset
+  in bytes is computed first with the program's overflow checks, as
+  Rust's debug `add` asserts: at -O0 a count whose product with the
+  size overflows panics (`attempt to multiply with overflow`), as in
+  0.30.0. Under `--check-unsafe`, at every level, an offset that does
+  not fit an isize is refused (`an offset of N elements of 8 bytes
+  overflows`), add's and sub's apart at every element size, a byte's
+  too: `p.add(usize::MAX)` is refused, though the address it wraps to
+  is `p.sub(1)`'s.
+- **`#[link_name]` names the C function** for every check and
+  optimization, both ways. `#[link_name = "my_alloc"] fn malloc` is not
+  C's malloc: -O2 kept its calls (0.30.0 removed them as a heap
+  allocation it could put on the stack). `#[link_name = "exit"] fn
+  leave` is C's exit: `#[no_io]` refuses it. The same holds for libm's
+  functions (`#[link_name = "sqrt"] fn root` is an fsqrt at -O2),
+  `setjmp` (returns twice by its symbol), a function pointer to an
+  extern (0.30.0's -O2 took the calls through one for C's malloc and
+  free by the vole names) and a C static's symbol. An extern named like a C function the compiler itself calls
+  (`memcpy`, `fmod`) with a `#[link_name]` no longer takes over those
+  calls (RT-6).
+- **`--trace` reports a stack overflow** (RT-14): its SIGSEGV and
+  SIGBUS handler runs on a stack of its own (`sigaltstack`), one for
+  each thread std::thread spawns (64 KB, freed when the thread ends),
+  and prints `stopped by signal 11` (10, SIGBUS, for a spawned thread on
+  macOS) and the frames where it printed nothing. A thread made by C's
+  `pthread_create` has no such stack: its overflow prints nothing.
+
+#### Bugs fixed
+
+- The code cache (RT-CG-3): a warm -O2 build after an edit that
+  changed a function's number of calls (a call added, removed, or made
+  unreachable) reused code optimized for the other count. The code was
+  right in every case seen, but its bytes were not a cold build's. A
+  function's own one-call fact is now in its key. tests/incremental.sh
+  missed this because its edits never changed a call count. It now has
+  three edit kinds that do (a call made twice, taken out, copied into
+  `if false { }`). Before its series it builds pairs of programs warm
+  after each other and compares them with cold builds:
+  tests/incremental/*.vl.txt, both orders, -O1 and -O2, -S and -c.
+  0.30.0 fails 8 of RT-CG-3's 24. An edit the compiler refuses with a
+  diagnostic is taken back and another made; a crash of the compiler on
+  one fails the row.
+- The code cache (RT-TL-2): a changed `#[link_name]` of an extern
+  function or static was hashed only as being there, so a warm -O1 or
+  -O2 build reused code calling, or reading, the old symbol. The name in
+  the hash is now the link name (a C function is named by its symbol).
+  Its pairs in tests/incremental fail all 16 of their builds on 0.30.0;
+  no other fact of a declaration that changes code is hashed only as
+  being there (`#[target_feature]`'s string is read by the front end's
+  checks alone, `#[multiversion]` makes functions whose IR is hashed).
+- `--check-unsafe`'s tables were sorted arrays, unlocked, moved by
+  `memmove` on every block: quadratic in the number of live blocks, and
+  raced by a program's threads. They are treaps behind a lock, with the
+  last hit kept. A block passed to C that C freed is forgotten when a
+  new block overlaps it, and is not reported.
+- Two more places in the compiler computed addresses with a checked
+  `+`, like `middle::lsr`'s fixed at 0.30.0's tag: `middle::fold`'s
+  address offsets and `back::isel`'s pairing of loads and stores. They
+  now add modulo 2^64 (`wrapping_add`). Found by reading the source: a
+  compiler built at -O0, whose arithmetic is checked, would panic there
+  on an offset near 2^63, where one built at -O2 wraps.
+
+#### The safety nets
+
+- **Gate floors** ("The gate"): `bootstrap/gate-floors.sh` reads the
+  log of every row that passed. A row whose count is missing, or is
+  below its floor, fails. The suite rows and objcheck are judged from
+  records, one per case (tests/run.sh: `NAME STATUS BCK REASON CC`) and
+  one per compilation (tests/objcheck.sh: `PROGRAM SETTING STATUS CC`),
+  never from a count: every case the tree lists has its record and none
+  failed, a skip names the REQUIRES that does not hold on the host and
+  every such case is skipped; each program of tests/run objcheck
+  compiles is the tree's, at the four settings, and all are the same. The other floors
+  are 0.30.0's counts less a margin, on macOS only. The SKIPs a release
+  accepts are listed there with what each leaves unverified.
+  `tests/gate_floors.sh` checks every floor against a zero count, a
+  quarter of the count, and a missing line.
+- tests/incremental.sh reads its builds' exit status always: a compiler
+  that writes its object and then crashes (storing to the cache, say)
+  fails the row, as does a program that does not build unedited (a
+  skip in 0.30.0). tests/runner/run.sh plants the faults: a stand-in
+  compiler that crashes before its object, after it, and after it on a
+  warm build only, each failing the series and the pairs.
+- voltty-fuzz is a SKIP only without cargo: an oracle that does not
+  build fails the row.
+- **Canaries**: a case for every net that must catch it.
+  - Bounds of a slice, a Vec, a String and an array:
+    `canary_bounds_*`, at every level.
+  - `#[no_panic]`, `#[no_alloc]`, `#[no_io]`, `#[pure]`: seven
+    violations each, each reported (`canary_effects_*`), and a program
+    that keeps them all, accepted.
+  - `--check-alloc`'s leak report: `canary_checkalloc_leak`, live where
+    `checkalloc_leaks` is XFAIL.
+  - `--check-unsafe` on Gpa's memory: `check_unsafe_gpa_*`.
+  - The unsafe audit (`tests/unsafe_audit.sh`) first audits a program
+    with planted sites. It must report 4 unjustified and 1 unneeded,
+    each at its line, before it reads the compiler's count.
+- `chain-diverse` prints its same-output count, which its floor reads.
+- The red team's cases are tracked apart from the XFAIL census
+  (docs/xfail.md). RT-6, RT-14, RT-CG-3 and RT-TL-2 are fixed here.
+- `--check-unsafe`'s own: C's strdup after a freed Box or Vec, its copy
+  read and freed (`check_unsafe_c_reuse_*`), ten thousand blocks and
+  96 MB through the quarantine (`check_unsafe_quarantine`), four Vecs of
+  96 MB one at a time (`check_unsafe_quarantine_cap`: the peak is one),
+  a small Box's use after free past a 96 MB block given back
+  (`check_unsafe_quarantine_big`), C's bytes held
+  (`check_unsafe_quarantine_c_size`), strcpy's NUL past the end then
+  read (`check_unsafe_c_strcpy_past`), std's copies and the program's
+  memset (`check_unsafe_copy_into`, `check_unsafe_copy_freed`,
+  `check_unsafe_memset_over`),
+  getline's and reallocf's blocks, valid programs that run clean
+  (`check_unsafe_c_getline`, `check_unsafe_c_reallocf`), offsets that
+  overflow (`check_unsafe_add_overflow`, `check_unsafe_add_max`,
+  `check_unsafe_add_isize`, `ovf_o0_ptr_add_count`).
+- `--trace`'s stacks for its handler, freed with their threads:
+  `trace_thread_altstack_freed`.
+
+#### Known issues
+
+- A struct assigned field by field before it is initialized (`let mut
+  p: P; p.a = 1;`) is accepted; rustc refuses it (E0381). A census
+  XFAIL, `rust_b_err_mv_assign_part_uninit`.
+- `volec FILE --deny=unsafe` (a build) ignores `--deny=unsafe`: only
+  `volec check` honours it.
+- `--check-unsafe` reports an address out of bounds made by std's
+  `add`, `sub` or `NonNull::add` at std's line (`<std>: line N`), not at
+  the program's call: vole has no caller location for std's functions
+  (Rust's `#[track_caller]`). The message's numbers are the block's and
+  the offset's; the line is the one in std.
+- `--check-unsafe` on glibc does not see C's own frees: a block of the
+  program's that C frees inside the C library (`reallocf`) and gives to
+  an allocation of its own of the same size is still the program's to
+  the check, and a read of the new owner past the old end is reported,
+  with a note that the block's red zone was written over or C gave the
+  memory out again (`check_unsafe_c_reallocf`, XFAIL on Linux). A
+  block C freed may keep its size there, and `malloc_usable_size` of a
+  large block C has unmapped may crash the program. Only macOS ran.
+- A program that sets `malloc_logger` after its first malloc replaces the
+  check's: C's own frees are not seen from then on, and a block C freed
+  and gave out again may be reported, the report saying the program
+  replaced the logger (`check_unsafe_c_logger_replaced`). Set before the
+  first malloc, the program's logger is kept and called.
+- On macOS a block that C reallocates in another thread at the moment
+  another thread allocates the old memory may lose that new block's
+  record (the hook reports a realloc after it): the block is then
+  unchecked, never reported wrongly (`check_unsafe_c_realloc_race`).
+- `--check-unsafe` refuses `p.offset(isize::MIN / size)`, whose offset
+  in bytes is exactly isize::MIN, which Rust allows: std's offset of a
+  negative count is a sub of its magnitude, which does not fit.
 
 ### What's new in 0.30.0
 
@@ -7768,6 +7987,85 @@ From 0.16 the gate gives each test program a minute (`VOLE_TEST_TIMEOUT`,
 60; tests/run.sh's own default stays 20 s): its steps run side by side
 with the Linux container, and the heavier examples at -O0 took longer
 than 20 s on a loaded machine (the examples-checkalloc step: 2 minutes).
+
+(0.30.1) **Floors.** A step that passes has also counted what it exists to
+count: `bootstrap/gate-floors.sh` reads the log of every step that passed,
+and one whose count line is missing, or whose count is below its floor,
+fails (`floor STEP: ...`, the last line of its log). The rows the Linux
+containers also run are judged by what they report against the tree, the
+same on every host. The suite rows and objcheck are judged from records,
+one per case and one per compilation, never from a count in the log: a
+suite row's records (`NAME STATUS BCK REASON CC`, tests/run.sh's, which
+gate.sh keeps as `STEP.results`) are one for each case `tests/run.sh -l`
+lists and none other, none failed, a skipped case's REASON the REQUIRES
+word that does not hold on the host (`requires:metal` off aarch64-macos,
+the examples' 25 included, `requires:macos` off macOS,
+`requires:clang` where the records' CC is `cc:other`), and every case
+whose REQUIRES does not hold skipped; objcheck's records (`PROGRAM
+SETTING STATUS CC`, tests/objcheck.sh's) are each ok, none twice, and
+its programs of tests/run the tree's (the floor finds them by one grep
+per directive, the same set as `tests/objcheck.sh --list`), each at the
+four settings (-O0 and -O2, with -g and without); incremental's series are its plan, the
+same on every host, at least 150, each rebuilt the same or skipped with
+its reason (at most 4). The other floors are 0.30.0's
+release gate's counts less a margin for cases that come and go (threads 14000,
+incremental 150 edit series, cachediff 150 transcripts, compiler-memcheck
+700, std-check 3500 bodies, std-tests 1400, borrowck-twin 420,
+examples-checkalloc 175, stdtools 38, layout 100 records (30 in a
+container), chain-fresh 52
+releases, chain-diverse 50000 compilations of the corpus), or what the
+step was asked for (each fuzz row's and ABI row's programs, all of them:
+`-n`; fuzz-sem's five runs; voltty-fuzz's 200 scripts, which the row asks
+for on top of its minute, so that no load lowers the count; incremental's
+48 warm builds of its pairs); `unsafe-audit` must report its canary
+caught, `debug` both levels, `compile-cost` its four programs, `chain`
+the fixpoint. A row whose input changed under it once passed on 4
+records of 111 (layout, 0.28.0, which then got its own floor): this is
+such a floor for every row. A row that skips what it counts for a reason
+the release accepts (voltty-fuzz's `skip oracle (no cargo)`) is a SKIP
+(the floor exits 77), not a pass and not a failure; an oracle that does
+not build fails. A gate of the self-test or of stubs is not judged.
+
+No floor is a fraction of another host's count. 0.30.0's counts are
+aarch64-macos's, the only host its gate ran on: a row with such a floor
+runs on the macOS host only, and on any other it fails (`no floor for
+HOST`) until a gate there gives it one. What cannot be checked without a
+Linux machine: that the containers' logs print the lines the floors read
+(the same scripts print them there), and how many programs objcheck
+compiles there (its floor is the tree's, which holds anywhere the suite
+runs whole). `tests/gate_floors.sh` shows each floor failing a zero
+count, a quarter of it and a log without its line, a suite row failing on
+records with a skip the tree does not make or one it makes missing (a
+clang case skipped where cc is clang), a skip for the wrong REQUIRES, a
+case twice and another with none, a case the tree does not list, a
+failure, a record short of a field, two cc's, or no records beside a
+log whose counts are right; a Linux row passing with its 37 skips;
+objcheck's records failing with a setting missing, a compilation that
+differs or is recorded twice, a program missing or one it leaves out
+compiled, and 1750 programs; a macOS-only row failing on Linux, incremental
+failing 134 skipped series and passing 4 named ones, and the skipped
+oracle a SKIP while an oracle that does not build fails.
+
+(0.30.1) **The SKIPs a release accepts**, and what each leaves unverified:
+
+- `linux-aarch64`, `linux-x86_64`, `linux-smoke`, and `valgrind` (which runs
+  in the aarch64-linux container): not run on the release machine, by the
+  owner's choice (no containers there). Unverified: everything about
+  aarch64-linux and x86_64-linux (the compiler built for them and their
+  suites, glibc's ABI and headers, the ELF writer and linker, the LSP and
+  the examples there), and the compiler under valgrind's memcheck (the
+  macOS row `compiler-memcheck`, under Guard Malloc and `--check-alloc`,
+  covers the compiler's heap on macOS only).
+- the suite's one skipped case: a std::gpu case whose shader is checked by
+  `spirv-val` when the machine has it (Vulkan's SPIR-V validator; not
+  installed). Unverified: that the SPIR-V the WGSL compiler emits for it is
+  valid by Khronos's validator (the Metal path is run).
+- `voltty-fuzz` and `borrowck-twin` SKIP without cargo and without rustc;
+  the release machine has both, so a release does not accept these.
+- x86_64-macos runs under Rosetta and is not a row by default (`--with-x86`);
+  `objcheck-x86-arch` compiles and assembles x86-64's intrinsics both ways
+  and runs nothing. Unverified: x86-64 code run (but by the fuzzers' and
+  the suite's x86 cases when `--with-x86` is given).
 
 ## Trusting the chain
 

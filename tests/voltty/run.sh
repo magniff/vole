@@ -16,7 +16,9 @@
 # usage: tests/voltty/run.sh [-c COMPILER] [-n SCRIPTS] [-s SECONDS] [-f FIRST]
 #                            [-k DIR] [-u]
 #   -n SCRIPTS   oracle scripts (default 20; each 20 terminals)
-#   -s SECONDS   instead, as many as fit in SECONDS (the gate: 60)
+#   -s SECONDS   instead, as many as fit in SECONDS (the gate: 60); with
+#                -n too (0.30.1), at least SCRIPTS, however long they take:
+#                the gate's floor is that count, which no load lowers
 #   -f FIRST     the first seed (default: from the time, so runs differ)
 #   -k DIR       where reduced differences go (default tests/voltty/failures)
 #   -u           rewrite seeds.txt and regress/*.dump from the oracle
@@ -31,6 +33,7 @@ HERE="$ROOT/tests/voltty"
 CORE="$ROOT/examples/voltty/core"
 COMPILER="$ROOT/target/volec"
 SCRIPTS=20
+SCRIPTS_GIVEN=0
 SECONDS_LIMIT=""
 FIRST=""
 KEEP="$HERE/failures"
@@ -38,7 +41,7 @@ UPDATE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) COMPILER=$2; shift 2 ;;
-        -n) SCRIPTS=$2; shift 2 ;;
+        -n) SCRIPTS=$2; SCRIPTS_GIVEN=1; shift 2 ;;
         -s) SECONDS_LIMIT=$2; shift 2 ;;
         -f) FIRST=$2; shift 2 ;;
         -k) KEEP=$2; shift 2 ;;
@@ -60,9 +63,14 @@ else
     exit 1
 fi
 
+# (0.30.1) Without cargo the oracle is skipped (`skip oracle (no cargo)`:
+# the gate's SKIP); with cargo, an oracle that does not build is a FAIL
+# (the gate must not pass on it).
 ORACLE=""
-if command -v cargo >/dev/null 2>&1 \
-    && (cd "$CORE/oracle" && cargo build --release --offline --quiet) >"$W/cargo.log" 2>&1; then
+NO_CARGO=0
+if ! command -v cargo >/dev/null 2>&1; then
+    NO_CARGO=1
+elif (cd "$CORE/oracle" && cargo build --release --offline --quiet) >"$W/cargo.log" 2>&1; then
     ORACLE="$CORE/oracle/target/release/voltty-oracle"
 fi
 
@@ -101,8 +109,10 @@ while read -r seed cases sum size; do
 done <"$HERE/seeds.txt"
 if [ -z "$bad" ]; then pass seeds; else fail seeds "seeds$bad differ from the oracle's dumps (run: $W/gen SEED 10 | voltty --script)"; fi
 
-if [ -z "$ORACLE" ]; then
-    echo "skip oracle (no cargo, or the oracle does not build offline)"
+if [ "$NO_CARGO" = 1 ]; then
+    echo "skip oracle (no cargo)"
+elif [ -z "$ORACLE" ]; then
+    fail oracle "the oracle does not build (cargo build --release --offline): $(tail -3 "$W/cargo.log" | tr '\n' ' ')"
 else
     [ -n "$FIRST" ] || FIRST=$(( $(date +%s) % 1000000 ))
     t0=$(date +%s)
@@ -111,7 +121,8 @@ else
     seed=$FIRST
     while :; do
         if [ -n "$SECONDS_LIMIT" ]; then
-            [ $(( $(date +%s) - t0 )) -lt "$SECONDS_LIMIT" ] || break
+            [ $(( $(date +%s) - t0 )) -lt "$SECONDS_LIMIT" ] \
+                || { [ "$SCRIPTS_GIVEN" = 1 ] && [ "$n" -lt "$SCRIPTS" ]; } || break
         else
             [ "$n" -lt "$SCRIPTS" ] || break
         fi

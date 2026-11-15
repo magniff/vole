@@ -53,6 +53,49 @@ BASELINE=docs/unsafe-baseline.md
 SRC_CMD="volec query unsafe --summary --no-std"
 STD_CMD="volec query unsafe --summary std"
 
+# (0.30.1) The canary: a program with an extern block, an `unsafe fn`,
+# an `unsafe impl` and an unsafe block without their comments, and an
+# unsafe block with nothing unsafe inside, must be counted 4 unjustified
+# and 1 unneeded, each at its line, or the audit below could pass because
+# it does not look.
+CANARY=$(mktemp -d "${TMPDIR:-/tmp}/unsafe_canary.XXXXXX")
+trap 'rm -rf "$CANARY"' EXIT
+cat >"$CANARY/main.vl" <<'EOF_CANARY'
+extern "C" {
+    fn abs(x: i32) -> i32;
+}
+
+unsafe fn raw_read(p: *const i64) -> i64 {
+    *p
+}
+
+struct Wrap {
+    p: *mut i64,
+}
+
+unsafe impl Send for Wrap {}
+
+fn main() {
+    let x: i64 = 5;
+    // UNSAFE: the canary's one justified site.
+    // SAFETY: x is alive.
+    let v = unsafe { raw_read(&x as *const i64) };
+    let w = unsafe { abs(-3) };
+    // UNSAFE: an unneeded block, planted.
+    // SAFETY: nothing in it.
+    let u = unsafe { 1 + 2 };
+    let _s = Wrap { p: 0 as *mut i64 };
+    println("{} {} {}", v, w, u);
+}
+EOF_CANARY
+can=$(cd "$CANARY" && "$C" query unsafe --summary main.vl 2>&1 | grep '^sites:')
+can_at=$(cd "$CANARY" && "$C" check --deny=unsafe main.vl 2>&1 | sed -n 's/^main\.vl:\([0-9]*\):[0-9]*: error\[unsafe\.\([a-z]*\)\].*$/\1 \2/p' | tr '\n' ' ')
+if [ "$can" != "sites: 6 (4 blocks, 1 unsafe fns, 1 extern blocks); unjustified: 4; unneeded: 1" ] \
+    || [ "$can_at" != "1 unjustified 5 unjustified 13 unjustified 20 unjustified 23 unneeded " ]; then
+    echo "unsafe-audit: the canary (4 unjustified sites planted, 1 unneeded block) is not caught: '$can'; check --deny=unsafe: '$can_at'"
+    exit 1
+fi
+
 # shellcheck disable=SC2086
 src=$("$C" ${SRC_CMD#volec } 2>&1) || { echo "unsafe-audit: $SRC_CMD failed:"; echo "$src" | tail -5; exit 1; }
 # shellcheck disable=SC2086
@@ -166,7 +209,7 @@ if [ "$n_std" -ne 0 ] || { [ $STD_EXACT -eq 1 ] && [ "$u_std" -ne 0 ]; }; then
     list_std
 fi
 if [ $STD_EXACT -eq 1 ]; then
-    echo "unsafe-audit: compiler/src $(sites "$src") sites, $n_src unjustified, $u_src unneeded; std $(sites "$std") sites, $n_std unjustified, $u_std unneeded"
+    echo "unsafe-audit: compiler/src $(sites "$src") sites, $n_src unjustified, $u_src unneeded; std $(sites "$std") sites, $n_std unjustified, $u_std unneeded; the canary caught (4 unjustified, 1 unneeded)"
 else
     echo "unsafe-audit: compiler/src $(sites "$src") sites, $n_src unjustified, $u_src unneeded; std $(sites "$std") sites, $n_std unjustified ($u_std listed unneeded, not judged: this compiler, before 0.30, does not check the generic functions of std that the compiler does not instantiate)"
 fi
