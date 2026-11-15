@@ -118,19 +118,31 @@ the bytes of a cold one when a function's number of calls changes.
   the line. Blocks aligned above 16 (`posix_memalign`) are recorded too.
   Memory the check did not see allocated is not reported as freed: a
   block the program frees is held back from C's allocator while the
-  check counts it freed (the last 4096 blocks, at most 64 MB: a block
-  that alone is more is given back at once, and a use of it after the
-  free is then not seen), and every block has 16 bytes after its end
-  that no one is given. So C's own mallocs (strdup's, opendir's) neither
-  reuse a freed block nor start where a block ends, and a program under
-  the check uses that much more memory. A `realloc` of a block moves it.
-  A block C reallocates or frees inside the C library (getline's buffer,
-  `reallocf`) is not seen; before any report the check asks C's
-  allocator for the block's size (`malloc_size`, glibc's
-  `malloc_usable_size`) and reads its 16 bytes after the end, a tag it
-  wrote there: a size that changed or a tag written over means C gave
-  the memory out again, and the block is forgotten, not reported. What
-  this leaves is in "Known issues".
+  check counts it freed (the last 4096 blocks, at most 64 MB of C's,
+  its size for each block with the red zone and rounding: a block that
+  alone is more is given back at once, and only it, so a use of it after
+  the free is not seen), and every block has 16 bytes after its end that
+  no one is given (its red zone). So C's own mallocs (strdup's,
+  opendir's) neither reuse a freed block nor start where a block ends,
+  and a program under the check uses that much more memory. A `realloc`
+  of a block moves it.
+- **C's own frees and copies.** On macOS the check sees every free and
+  realloc C makes, the C library's own included (`malloc_logger`,
+  libmalloc's hook): a block of the program's that getline grows or
+  `reallocf` frees is forgotten then, and C freeing a block the program
+  freed is reported (`a freed block freed again, by C`). Under the
+  check, C's `memcpy`, `memmove` and `memset` check their bytes first,
+  both ends: the program's calls and std's (`ptr::copy`,
+  `copy_nonoverlapping` and `fill_copies` of 4 elements or more), which
+  0.30.0 did not check (`unsafe access out of bounds: 17 bytes at offset
+  0 of a block of 16 bytes`, `--> memcpy, its destination`). Other C
+  writes (strcpy's, sprintf's) are not checked; one over a block's red
+  zone is noted when the block is next reported (`note: the 16 bytes
+  after the block, which no one is given, were written over before`).
+  On glibc, which has no such hook, a block whose size by C's allocator
+  changed (`malloc_usable_size`: getline's in place) is forgotten at a
+  report; one C freed and gave out again at its size is reported, the
+  note saying that it may not be the program's ("Known issues").
 - **An address is not an access** under `--check-unsafe`, as in Rust:
   `&p[i]`, `p.add(i)` and `p.sub(i)` of a pointer into a live block must
   stay in that block or one past its end (`unsafe address out of
@@ -206,9 +218,11 @@ the bytes of a cold one when a function's number of calls changes.
   log of every row that passed. A row whose count is missing, or is
   below its floor, fails. The rows that also run in the Linux
   containers are judged by what they report against the tree: the suite
-  rows plan every case the tree lists and fail none (tests/run.sh prints
-  a `cases:` line, the cases apart from the suites' checks); objcheck
-  compiles two of each program and all are the same. The other floors
+  rows plan every case the tree lists and fail none, and skip by name
+  just the cases the tree's REQUIRES lines skip on the host (tests/run.sh
+  prints a `cases:` line, the cases apart from the suites' checks, and a
+  `skip case` line for each); objcheck compiles four of each program and
+  all are the same. The other floors
   are 0.30.0's counts less a margin, on macOS only. The SKIPs a release
   accepts are listed there with what each leaves unverified.
   `tests/gate_floors.sh` checks every floor against a zero count, a
@@ -240,6 +254,12 @@ the bytes of a cold one when a function's number of calls changes.
   read and freed (`check_unsafe_c_reuse_*`), ten thousand blocks and
   96 MB through the quarantine (`check_unsafe_quarantine`), four Vecs of
   96 MB one at a time (`check_unsafe_quarantine_cap`: the peak is one),
+  a small Box's use after free past a 96 MB block given back
+  (`check_unsafe_quarantine_big`), C's bytes held
+  (`check_unsafe_quarantine_c_size`), strcpy's NUL past the end then
+  read (`check_unsafe_c_strcpy_past`), std's copies and the program's
+  memset (`check_unsafe_copy_into`, `check_unsafe_copy_freed`,
+  `check_unsafe_memset_over`),
   getline's and reallocf's blocks, valid programs that run clean
   (`check_unsafe_c_getline`, `check_unsafe_c_reallocf`), offsets that
   overflow (`check_unsafe_add_overflow`, `check_unsafe_add_max`,
@@ -259,12 +279,18 @@ the bytes of a cold one when a function's number of calls changes.
   the program's call: vole has no caller location for std's functions
   (Rust's `#[track_caller]`). The message's numbers are the block's and
   the offset's; the line is the one in std.
-- `--check-unsafe` can still report a block C freed inside the C library
-  and gave to one of its own allocations of the same size by C's
-  allocator, when the program reads bytes past the old block's end that
-  C did not write (the tag is still there). On glibc a block C freed may
-  keep its size there, and `malloc_usable_size` of a large block C has
-  unmapped may crash the program. Only macOS ran.
+- `--check-unsafe` on glibc does not see C's own frees: a block of the
+  program's that C frees inside the C library (`reallocf`) and gives to
+  an allocation of its own of the same size is still the program's to
+  the check, and a read of the new owner past the old end is reported,
+  with a note that the block's red zone was written over or C gave the
+  memory out again (`check_unsafe_c_reallocf` runs on macOS only). A
+  block C freed may keep its size there, and `malloc_usable_size` of a
+  large block C has unmapped may crash the program. Only macOS ran.
+- On macOS a block that C reallocates in another thread at the moment
+  another thread allocates the old memory may lose that new block's
+  record (the hook reports a realloc after it): the block is then
+  unchecked, never reported wrongly.
 - `--check-unsafe` refuses `p.offset(isize::MIN / size)`, whose offset
   in bytes is exactly isize::MIN, which Rust allows: std's offset of a
   negative count is a sub of its magnitude, which does not fit.
@@ -7950,12 +7976,15 @@ count: `bootstrap/gate-floors.sh` reads the log of every step that passed,
 and one whose count line is missing, or whose count is below its floor,
 fails (`floor STEP: ...`, the last line of its log). The rows the Linux
 containers also run are judged by what they report against the tree, the
-same on every host: a suite row's plan (`plan: N cases`) is every case
-`tests/run.sh -l` lists, its `cases:` line (the cases alone; the table's
-total adds the suites' checks) counts them all, none failed, and no more
-skipped than the tree has cases with a `// REQUIRES:` line; objcheck's N
-of M are all the same, M at least two (-O0, -O2) of each program of
-tests/run the suite compiles; incremental's series are its plan, the
+same on every host: a suite row's one plan (`plan: N cases`) is every
+case `tests/run.sh -l` lists, its one `cases:` line (the cases alone;
+the table's total adds the suites' checks) counts them all, none
+failed, and the skipped ones, each named (`skip case NAME: REQUIRES
+...`), are exactly the cases the tree's REQUIRES lines skip on the host
+(`metal` off aarch64-macos, the examples' 25 included, and `macos` off
+macOS; `clang` either way, as the host's cc is clang or not); objcheck's
+N of M are all the same, M at least four (-O0 and -O2, with -g and
+without) of each program of tests/run the suite compiles; incremental's series are its plan, the
 same on every host, at least 150, each rebuilt the same or skipped with
 its reason (at most 4). The other floors are 0.30.0's
 release gate's counts less a margin for cases that come and go (threads 14000,
@@ -7985,8 +8014,10 @@ Linux machine: that the containers' logs print the lines the floors read
 compiles there (its floor is the tree's, which holds anywhere the suite
 runs whole). `tests/gate_floors.sh` shows each floor failing a zero
 count, a quarter of it and a log without its line, a suite row failing
-a plan short of the tree (a container's 1501 cases), too many skips or a
-missing `cases:` line, a macOS-only row failing on Linux, incremental
+a plan short of the tree (a container's 1501 cases), a skip the tree
+does not make or one it makes missing, two plans or two `cases:` lines,
+a missing `cases:` line, a Linux row passing with its 37 skips named,
+objcheck failing 7000 of 7000, a macOS-only row failing on Linux, incremental
 failing 134 skipped series and passing 4 named ones, and the skipped
 oracle a SKIP while an oracle that does not build fails.
 
