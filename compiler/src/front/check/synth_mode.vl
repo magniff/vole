@@ -1774,6 +1774,11 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         // asked before the call is checked into a Call)
         let index_mut = pcx.nodes[operand as usize].kind == NodeKind::MethodCall
             && sym_is_c(pcx.nodes[operand as usize].b, c"index_mut", pcx);
+        // (0.30.1: the operand of a `&mut`, which marks it, below)
+        let under_mut = pcx.view_deref == -n;
+        if under_mut {
+            pcx.view_deref = 0;
+        }
         let ty = synth_expr(operand, pcx);
         // (0.17, issue #1: `(*f)(10)` on a fn value, C's habit: the
         // value is called as it is)
@@ -1795,12 +1800,15 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         }
         // RULE: Z4.1 (0.27.2, std: `*s` of a shared view, `&str` or `&[T]`,
         // is the unsized place, read as the view itself: `&**self` in Debug
-        // for &T with T = str; an exclusive one stays an error until Z9.1)
+        // for &T with T = str; an exclusive one stays an error until Z9.1,
+        // but as the operand of a `&mut`, `&mut *v`, the reborrow the `&`
+        // makes, below, 0.30.1)
         let view = if ty > 0
             && pcx.types[ty as usize].kind == TyKind::Distinct { pcx.types[ty as usize].a }
             else { ty };
         if view > 0 && pcx.types[view as usize].kind == TyKind::Slice
-            && (pcx.types[view as usize].b == 0 || index_mut) {
+            && (pcx.types[view as usize].b == 0 || index_mut
+                || under_mut && pcx.types[view as usize].b == REF_MUT) {
             pcx.nodes[n as usize] = pcx.nodes[operand as usize];
             // (0.27.5: as a receiver, the place: synth_method)
             pcx.view_deref = n;
@@ -1850,8 +1858,47 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         && pcx.nodes[operand as usize].op == Tok::Star;
     let written_call = pcx.nodes[operand as usize].kind == NodeKind::Call
         || pcx.nodes[operand as usize].kind == NodeKind::MethodCall;
+    if mutable && star {
+        pcx.view_deref = -operand;
+    }
     let ty = synth_expr(operand, pcx);
+    if pcx.view_deref == -operand {
+        pcx.view_deref = 0;
+    }
     pcx.mut_place = outer_place;
+    // RULE: D2.7 (0.30.1, RT-33) `&mut *s` of a view s (Z4.1's `*s`, the
+    // view read as its place) reborrows its referent: the slicing `&mut
+    // s[..]`, whose `&mut` the borrow checker asks of the referent
+    // (places/borrowck/moves.vl referent_why): through a shared view it is
+    // E0596, through a `&mut [T]` place the reborrow. Before, the shared
+    // view was retyped `&mut [T]` and written through. A mutable view's
+    // value, `&mut *f()`, is its own reborrow.
+    if mutable && star && pcx.view_deref == operand {
+        let view = if ty > 0
+            && pcx.types[ty as usize].kind == TyKind::Distinct { pcx.types[ty as usize].a }
+            else { ty };
+        let shared_view = view > 0 && pcx.types[view as usize].kind == TyKind::Slice
+            && pcx.types[view as usize].b == 0;
+        let mut_view = view > 0 && pcx.types[view as usize].kind == TyKind::Slice
+            && pcx.types[view as usize].b == REF_MUT;
+        if shared_view || mut_view && is_place(operand, pcx) {
+            let mt = if mut_view { ty } else { crate::front::types::mut_view_of(ty, pcx) };
+            let start = pcx.nodes[n as usize].start;
+            let end = pcx.nodes[n as usize].end;
+            let range = new_node(Range, start, end, pcx);
+            let ix = new_node(Index, start, end, pcx);
+            pcx.nodes[ix as usize].a = operand;
+            pcx.nodes[ix as usize].b = range;
+            pcx.nodes[ix as usize].ty = mt;
+            pcx.nodes[ix as usize].p |= NODE_CHECKED | NODE_REF_MUT;
+            pcx.nodes[n as usize] = pcx.nodes[ix as usize];
+            return mt;
+        }
+        if mut_view {
+            pcx.nodes[n as usize] = pcx.nodes[operand as usize];
+            return ty;
+        }
+    }
     // RULE: F19.7 (0.30: a union field borrowed is unsafe, rustc E0133)
     crate::front::check::unsafety::union_borrow(operand, pcx);
     // RULE: Z9.3 (0.27.2: `&*p`, `&mut *p` of a fat raw pointer: the view,

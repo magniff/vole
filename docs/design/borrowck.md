@@ -419,7 +419,32 @@ kind `BK_MUT`, a two-phase autoref `&mut self` included) only if it is
   (`|| { *r.p = 9; }` with `r: &P`, `|| clobber(r.s, gpa)`: E0594,
   E0596; moves.vl env_inner). Before, every place under the env counted
   as mutable: a write under a live `&i64` and a use after free. *Cases:*
-  `rust_b_err_closure_through_shared`, `rust_b_closure_capture_write_ok`.
+  `rust_b_err_closure_through_shared`, `rust_b_closure_capture_write_ok`;
+- (0.30.1, RT-33) a `&mut` of a view's *referent*, what a slicing
+  borrows: `&mut s[..]`, `&mut s[a..b]`, `&mut *s` (the front makes it
+  the slicing `&mut s[..]`), a `&mut self` method of `[T]` or `str`
+  called on a view (an IR call's view argument where the parameter is
+  `&mut [T]`, and a `requires` call's binding of it, `&mut s[..]`, D7.4),
+  is the `&mut` of the place `(*s)[..]`, rustc's walk with the view's own
+  deref: through a `&mut [T]` the referent is mutable as the view's path
+  is (its binding need not be `mut`); through a raw view always; through
+  a shared view `&[T]`, `&str`, never (E0596); an array is its own
+  referent, the place itself is asked (`a[..1].swap(0, 0)` of a `let a`:
+  not declared as mutable). A temporary view the lowering made, which
+  the front types as a shared view whatever it slices (`v[..2]` in
+  `v[..2][..1].swap(0, 1)` of a `v: &mut [T]`), is what its assignments
+  make it: each a slicing or a copy of a place whose referent is then
+  asked; a call's value is its type's. The same question backs every
+  other way the IR could make a `&mut [T]` of a shared view: a copy of
+  one written to a `&mut [T]` place, a call's shared view written to one
+  (none is built: the front makes each a slicing, and the contract
+  desugar retypes only a place, D7.4). Before, the slicing's base was
+  asked as a place: `&mut b[..]` of a `b: &[u8]` wrote into a read-only
+  literal (SIGBUS), `s.as_bytes().swap(1, 2)` made a `&str` invalid
+  UTF-8, and four scoped threads swapped one shared `&[Box<i64>]`.
+  *Anchor:* `places/borrowck/moves.vl: referent_why`. *Cases:*
+  `rust_b_err_shared_slice_*`, `rust_b_shared_slice_ok_reborrows`,
+  `err_readonly_slice_arg`.
 The `static mut` and `static` cases are D6.2.5's. A write to a place
 that is not mutable is `borrowck.assign_immutable` (rustc E0594,
 "cannot assign to `*s`, which is behind a `&` reference"); an exclusive
@@ -1293,7 +1318,14 @@ E0499. Before, an argument that was a simple read (a local, a literal,
 arguments had run: `v.swap(i, { i = 2; 1 })` swapped other elements than
 rustc's, `f(x, { x = 7; 2 })` passed the new x, `f(&x, { x = 7; 2 })`
 was accepted, and `f(s, { s = t; 1 }); s` was refused. A contract never
-changes the order of evaluation. Seen, not fixed: a mutable view given
+changes the order of evaluation. (RT-33) The `&mut` the binding of a view
+makes is D2.7's of its referent, so `s.swap(0, 1)` of an `s: &[T]` is
+E0596 as without the contract; the shared argument exclusive_view_arg
+retypes as the receiver's exclusive view is a place only (a slicing, a
+local, a field, a deref), never a call's value (`s.as_bytes().swap(1,
+2)`: the binding stays the shared view, and the call is E0596). A
+message names a binding `?aI` as the argument it binds (`*s`, not
+`*?a0`: diag.vl buf_src_place). Seen, not fixed: a mutable view given
 to an ordinary call is copied into it, read as its reborrow from the
 call on (I7), so a later argument that writes through it is accepted
 (rustc E0506; case `rust_b_err_view_arg_written`, XFAIL).

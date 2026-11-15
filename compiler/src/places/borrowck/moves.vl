@@ -257,10 +257,16 @@ fn mutability(bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
                     // (a user's local: a temporary the lowering made, a
                     // reslice `self[..mid]` of a `&mut [T]`, is typed by
                     // the front as a shared view)
-                    if l >= 0 && (pbody.locals[l as usize].flags
-                        & (crate::places::ir::LF_USER | crate::places::ir::LF_PARAM)) != 0
-                        && exclusive_ty(crate::front::types::fn_param(st.c, i, pcx), pcx)
-                        && shared_ty(crate::places::ir::full_place_type(l, p, pbody, pcx), pcx) {
+                    // RULE: D2.7 (0.30.1, RT-33) a temporary view is what
+                    // its assignments make it (referent_why): before,
+                    // `s.as_bytes()[1..].reverse()` of an `s: &str` passed
+                    // the shared bytes as the `&mut [u8]`
+                    let pt = crate::places::ir::full_place_type(l, p, pbody, pcx);
+                    if l >= 0 && exclusive_ty(crate::front::types::fn_param(st.c, i, pcx), pcx)
+                        && shared_ty(pt, pcx)
+                        && ((pbody.locals[l as usize].flags
+                            & (crate::places::ir::LF_USER | crate::places::ir::LF_PARAM)) != 0
+                            || is_view(pt, pcx) && referent_why(l, p, 0, pbody, pcx) == 1) {
                         report_immutable(loc, l, p, 1, 1, true, bck, pbody, pcx);
                     }
                 }
@@ -270,17 +276,37 @@ fn mutability(bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
             // slices must not be behind a shared reference (rustc E0596;
             // before, `two(r1.s, r2.s)` of two `&W` passed one `&mut [T]`
             // twice). A view base's own binding need not be `mut`.
-            if k == SK_ASSIGN && st.c == crate::places::ir::RV_SLICE && st.a >= 0 && st.nops > 0
-                && crate::places::ir::op_is_place(op_kind(st.ops, 0, pbody)) {
-                let dt = undistinct(local_ty(st.a, pbody), pcx);
-                if dt > 0 && pcx.types[dt as usize].kind == TyKind::Slice
-                    && pcx.types[dt as usize].b == crate::front::types::REF_MUT {
-                    let l = op_a(st.ops, 0, pbody);
-                    let p = op_b(st.ops, 0, pbody);
-                    if immutable_why(l, p, pbody, pcx) == 1 {
-                        report_immutable(loc, l, p, 0, 1, true, bck, pbody, pcx);
-                    }
+            // RULE: D2.7 (0.30.1, RT-33) it is the view's referent that is
+            // borrowed (referent_why): a shared view's is behind its `&`,
+            // `&mut s[..]` of an `s: &[T]` and `s.swap(0, 1)`'s contract
+            // binding (rustc E0596); an array's is the array, which must be
+            // mutable (`a[..1].swap(0, 0)` of a `let a`). Also the backstop
+            // for every other way a mutable view could be made of a shared
+            // one: a copy of it to a `&mut [T]` place, a call's shared view
+            // written to one (none is built today: the front makes each a
+            // slicing).
+            let mut_dest = (k == SK_ASSIGN || k == SK_CALL) && st.a >= 0
+                && crate::front::types::is_mut_slice(
+                    crate::places::ir::full_place_type(st.a, st.b, pbody, pcx), pcx);
+            if mut_dest && k == SK_ASSIGN && st.nops > 0
+                && crate::places::ir::op_is_place(op_kind(st.ops, 0, pbody))
+                && (st.c == crate::places::ir::RV_SLICE || st.c == crate::places::ir::RV_USE
+                    && shared_ty(crate::places::ir::full_place_type(op_a(st.ops, 0, pbody),
+                        op_b(st.ops, 0, pbody), pbody, pcx), pcx)) {
+                let l = op_a(st.ops, 0, pbody);
+                let p = op_b(st.ops, 0, pbody);
+                let why = referent_why(l, p, 0, pbody, pcx);
+                if why != 0 {
+                    report_immutable(loc, l, p,
+                        if is_view(crate::places::ir::full_place_type(l, p, pbody, pcx), pcx) { 1 }
+                        else { 0 }, why, true, bck, pbody, pcx);
                 }
+            }
+            if mut_dest && k == SK_CALL && st.c >= 0
+                && is_view(pcx.fns[st.c as usize].ret, pcx)
+                && !crate::front::types::is_mut_slice(pcx.fns[st.c as usize].ret, pcx)
+                && !crate::front::types::is_raw_view(pcx.fns[st.c as usize].ret, pcx) {
+                report_immutable(loc, st.a, st.b, 1, 1, true, bck, pbody, pcx);
             }
             if k == SK_ASSIGN && st.c == crate::places::ir::RV_REF
                 && (st.d == crate::places::ir::BK_MUT || st.d == crate::places::ir::BK_MUT2
@@ -451,6 +477,76 @@ fn immutable_why(l: i64, p: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64
         && (f & LF_BORROWED) == 0 && (f & LF_STATIC) == 0 {
         2
     } else { 0 }
+}
+
+// RULE: D2.7 (0.30.1, RT-33) Why the referent of place (l, p), a view, a
+// reference or an array, may not be borrowed mutably (a slicing's `&mut`,
+// `&mut s[..]`, `&mut s[1..]`, `&mut *s`, a mutable view argument's or a
+// contract binding's reborrow): 0 it may; 1 it is behind a shared
+// reference; 2 the root is a user's local not declared `mut`. rustc's walk
+// of the place with the view's own deref, `&mut (*s)[..]`: through a
+// `&mut` the referent is mutable unless the view itself is behind a
+// shared reference (its binding need not be `mut`); through a raw view or
+// pointer always; through a shared one never (E0596). Before, the slicing's
+// base was asked as a place, and `&mut b[..]` of a `b: &[u8]` wrote into a
+// read-only literal. An array is its own referent: the place itself is
+// asked. A temporary view the lowering made (no binding, no parameter,
+// whole) is typed by the front as a shared view whatever it slices
+// (`v[..2]` of a `v: &mut [T]` in `v[..2][..1].swap(0, 1)`): it is what
+// its assignments make it, each the slicing or the copy of a place whose
+// referent is then asked (a call's value, or anything else, is its
+// type's: shared). A chain longer than the body has locals is 1, an
+// error, never a yes.
+fn referent_why(l: i64, p: i64, depth: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    if l < 0 {
+        return 0;
+    }
+    let t = undistinct(crate::places::ir::full_place_type(l, p, pbody, pcx), pcx);
+    if t <= 0 || pcx.types[t as usize].kind != TyKind::Slice
+        && pcx.types[t as usize].kind != TyKind::Ptr {
+        return immutable_why(l, p, pbody, pcx);
+    }
+    let rb = pcx.types[t as usize].b;
+    if rb == crate::front::types::REF_MUT {
+        return if immutable_why(l, p, pbody, pcx) == 1 { 1 } else { 0 };
+    }
+    if !shared_ty(t, pcx) {
+        return 0;
+    }
+    if p != 0 || pcx.types[t as usize].kind != TyKind::Slice
+        || (pbody.locals[l as usize].flags
+            & (LF_USER | LF_PARAM | LF_STATIC | LF_BORROWED)) != 0 {
+        return 1;
+    }
+    if depth > pbody.locals.len() as i64 {
+        return 1;
+    }
+    let mut found = false;
+    for s in 0..pbody.stmts.len() as i64 {
+        let st = pbody.stmts[s as usize];
+        if !(st.kind == SK_ASSIGN || st.kind == SK_CALL || st.kind == SK_INTRINSIC) || st.a != l
+            || st.b != 0 {
+            continue;
+        }
+        found = true;
+        if !(st.kind == SK_ASSIGN
+            && (st.c == crate::places::ir::RV_SLICE || st.c == crate::places::ir::RV_USE)
+            && st.nops > 0 && crate::places::ir::op_is_place(op_kind(st.ops, 0, pbody))) {
+            return 1;
+        }
+        let w = referent_why(op_a(st.ops, 0, pbody), op_b(st.ops, 0, pbody), depth + 1, pbody,
+            pcx);
+        if w != 0 {
+            return w;
+        }
+    }
+    if found { 0 } else { 1 }
+}
+
+// Whether type t is a view, `[T]` of any kind or a str.
+fn is_view(t0: i64, pcx: &Ctx<Comp>) -> bool {
+    let t = undistinct(t0, pcx);
+    t > 0 && pcx.types[t as usize].kind == TyKind::Slice
 }
 
 // RULE: D2.7 (0.30.1) The last of the closure's own projections of place
