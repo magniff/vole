@@ -48,7 +48,6 @@ check() { # <step> <count> <line>...
         fi
     done
 }
-check suite-O2 6556 "  total       @N@    717     0     1"
 check fuzz-loops 60 "fuzz: @N@ programs for aarch64-macos, 0 failing"
 check fuzz-seed 60 "fuzz: @N@ programs for aarch64-macos, 0 failing"
 check abi-plain 100 "abi: @N@ programs (992 signatures) for aarch64-macos, 0 failing"
@@ -71,21 +70,67 @@ check voltty-fuzz 1610 "pass oracle (@N@ scripts from seed 672166)"
 unset LOW
 # (a skipped oracle is a SKIP, exit 77: not a pass, not a failure)
 rows=$((rows + 1))
-printf 'pass build\npass seeds\nskip oracle (no cargo, or the oracle does not build offline)\nvoltty: all passed\n' >"$W/voltty.skip.log"
+printf 'pass build\npass seeds\nskip oracle (no cargo)\nvoltty: all passed\n' >"$W/voltty.skip.log"
 out=$(sh "$F" voltty-fuzz "$W/voltty.skip.log" 60 100 300 2>&1)
 rc=$?
 [ $rc -eq 77 ] || { echo "FAIL voltty-fuzz: a skipped oracle exits $rc, not 77: $out"; failed=1; }
+# (0.30.0's line, an oracle that did not build, is no skip: a FAIL)
+rows=$((rows + 1))
+printf 'pass build\npass seeds\nskip oracle (no cargo, or the oracle does not build offline)\nvoltty: all passed\n' >"$W/voltty.nobuild.log"
+out=$(sh "$F" voltty-fuzz "$W/voltty.nobuild.log" 60 100 300 2>&1)
+rc=$?
+[ $rc -eq 1 ] || { echo "FAIL voltty-fuzz: an oracle that does not build exits $rc, not 1: $out"; failed=1; }
 check incremental 172 "incremental pairs: 48 of 48 warm builds the same as clean builds" "incremental: @N@ of @N@ edit series rebuilt the same as clean builds (aarch64-macos, hits 86%)"
-# (on another host than aarch64-macos, 0.30.0's counts are floors at a
-# quarter: a Linux suite that passed 1600 cases passes, 0 or 1400 fail;
-# layout's floor there is 30 records)
-for c in 1600:0 0:1 1400:1; do
+# (0.30.1's review: the suite rows are judged against the tree's cases on
+# every host, never a fraction of macOS's count. L the cases the tree
+# lists, R those with a REQUIRES line. Each line: the host, the plan, the
+# `cases:` line's pass, xfail, fail and skip, the exit wanted; the table's
+# total, which counts the suites' checks too, is 400 more and not read.)
+L=$(sh "$ROOT/tests/run.sh" -l 2>/dev/null | grep -c '^case ')
+R=$(grep -l '^// REQUIRES:' "$ROOT"/tests/run/*.vl | wc -l | tr -d ' ')
+while read -r host plan pass xf fl sk want; do
     rows=$((rows + 1))
-    printf '  total       %s    0     0     0\n' "${c%:*}" >"$W/linux.log"
-    sh "$F" suite-O2 "$W/linux.log" 60 100 300 aarch64-linux >/dev/null 2>&1
+    { [ "$plan" = none ] || echo "plan: $plan cases, 26 suites (query), -j 4, $host"
+      printf '  total       %s    %s     %s     %s\n' "$((pass + 400))" "$xf" "$fl" "$sk"
+      echo "cases: $pass passed, $xf xfail, $fl failed, $sk skipped of $((pass + xf + fl + sk))"; } >"$W/suite.log"
+    out=$(sh "$F" suite-O2 "$W/suite.log" 60 100 300 "$host" 2>&1)
     rc=$?
-    [ $rc -eq "${c#*:}" ] || { echo "FAIL suite-O2 on aarch64-linux: ${c%:*} cases passed exits $rc"; failed=1; }
-done
+    [ $rc -eq "$want" ] || { echo "FAIL suite-O2 on $host, plan $plan, $pass $xf $fl $sk: exits $rc, not $want: $out"; failed=1; }
+done <<EOT
+aarch64-macos $L $((L - 718)) 717 0 1 0
+aarch64-linux $L $((L - 717 - R)) 717 0 $R 0
+aarch64-linux 1501 1501 0 0 0 1
+aarch64-linux $L 1501 0 0 $((L - 1501)) 1
+aarch64-macos $((L - 1)) $((L - 718)) 717 0 0 1
+aarch64-macos $L $((L - 719)) 717 1 1 1
+aarch64-macos none $((L - 718)) 717 0 1 1
+x86_64-macos $L $((L - 718)) 717 0 1 0
+EOT
+# (a log with the table and no `cases:` line fails)
+rows=$((rows + 1))
+{ echo "plan: $L cases, 26 suites (query), -j 4, aarch64-macos"
+  printf '  total       %s    717     0     1\n' "$((L - 718 + 400))"; } >"$W/suite.log"
+sh "$F" suite-O2 "$W/suite.log" 60 100 300 >/dev/null 2>&1 \
+    && { echo "FAIL suite-O2: a log without its cases line passes"; failed=1; }
+# (a row that runs on the macOS host only has no floor elsewhere: it fails)
+rows=$((rows + 1))
+printf 'threads: 16015 of 16015 compilations the same at -j1 and -j8 (aarch64-linux)\n' >"$W/threads.log"
+sh "$F" threads "$W/threads.log" 60 100 300 aarch64-linux >/dev/null 2>&1 \
+    && { echo "FAIL threads on aarch64-linux: passes on a floor of macOS's"; failed=1; }
+# (incremental: the review's 38 of 172 with 134 skipped fails; 4 skipped,
+# each named, passes)
+rows=$((rows + 1))
+printf 'incremental pairs: 48 of 48 warm builds the same as clean builds\nincremental: 38 of 172 edit series rebuilt the same as clean builds (aarch64-linux, hits 86%%), 134 skipped\n' >"$W/inc.log"
+sh "$F" incremental "$W/inc.log" 60 100 300 aarch64-linux >/dev/null 2>&1 \
+    && { echo "FAIL incremental: 38 of 172 with 134 skipped passes"; failed=1; }
+printf 'incremental pairs: 48 of 48 warm builds the same as clean builds\nskip a: 20 edits in a row at 2 do not build (x)\nskip b: 20 edits in a row at 2 do not build (x)\nskip c: 20 edits in a row at 2 do not build (x)\nskip d: 20 edits in a row at 2 do not build (x)\nincremental: 168 of 172 edit series rebuilt the same as clean builds (aarch64-linux, hits 86%%), 4 skipped\n' >"$W/inc4.log"
+sh "$F" incremental "$W/inc4.log" 60 100 300 aarch64-linux >/dev/null 2>&1 \
+    || { echo "FAIL incremental: 168 of 172 with 4 named skips fails"; failed=1; }
+# (objcheck: one compilation that differs fails)
+rows=$((rows + 1))
+printf 'objcheck: 13047 of 13048 compilations for aarch64-linux give the same program as cc -c, 1 differ\n' >"$W/obj.log"
+sh "$F" objcheck "$W/obj.log" 60 100 300 aarch64-linux >/dev/null 2>&1 \
+    && { echo "FAIL objcheck: 13047 of 13048 passes"; failed=1; }
 printf 'layout: 40 records, 200 fields agree\n' >"$W/linuxl.log"
 sh "$F" layout "$W/linuxl.log" 60 100 300 x86_64-linux >/dev/null 2>&1 \
     || { echo "FAIL layout on x86_64-linux: 40 records fails"; failed=1; }

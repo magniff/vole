@@ -63,9 +63,14 @@ else
     exit 1
 fi
 
+# (0.30.1) Without cargo the oracle is skipped (`skip oracle (no cargo)`:
+# the gate's SKIP); with cargo, an oracle that does not build is a FAIL
+# (the gate must not pass on it).
 ORACLE=""
-if command -v cargo >/dev/null 2>&1 \
-    && (cd "$CORE/oracle" && cargo build --release --offline --quiet) >"$W/cargo.log" 2>&1; then
+NO_CARGO=0
+if ! command -v cargo >/dev/null 2>&1; then
+    NO_CARGO=1
+elif (cd "$CORE/oracle" && cargo build --release --offline --quiet) >"$W/cargo.log" 2>&1; then
     ORACLE="$CORE/oracle/target/release/voltty-oracle"
 fi
 
@@ -104,8 +109,10 @@ while read -r seed cases sum size; do
 done <"$HERE/seeds.txt"
 if [ -z "$bad" ]; then pass seeds; else fail seeds "seeds$bad differ from the oracle's dumps (run: $W/gen SEED 10 | voltty --script)"; fi
 
-if [ -z "$ORACLE" ]; then
-    echo "skip oracle (no cargo, or the oracle does not build offline)"
+if [ "$NO_CARGO" = 1 ]; then
+    echo "skip oracle (no cargo)"
+elif [ -z "$ORACLE" ]; then
+    fail oracle "the oracle does not build (cargo build --release --offline): $(tail -3 "$W/cargo.log" | tr '\n' ' ')"
 else
     [ -n "$FIRST" ] || FIRST=$(( $(date +%s) % 1000000 ))
     t0=$(date +%s)

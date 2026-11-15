@@ -17,17 +17,30 @@
 #   HOST   where the row ran (default aarch64-macos): gate.sh's $HOST,
 #          inside the Linux containers aarch64-linux or x86_64-linux
 #
-# Per platform: a floor that is 0.30.0's count is aarch64-macos's (the
-# only host its gate ran on). Elsewhere it is a quarter of it (hfloor):
-# the containers run the same corpora less what is the platform's own
-# (the 8 cases of `// REQUIRES: metal` or `clang`, the examples of
-# std::gpu and std::window, another set of intrinsics' programs on x86-64,
-# glibc's headers for layout), which no count of macOS's gives exactly;
-# a quarter still fails a row that ran next to nothing. layout has its
-# row's own floor there (30). The floors that are a count the row was
-# asked for (fuzz, ABI, value semantics, voltty's scripts), a corpus the
-# same everywhere read whole (the pairs, the unsafe audit's canary) or
-# one line (debug, compile-cost, chain, stress-grow) hold on every host.
+# Per platform (0.30.1's review): no floor is a fraction of another
+# host's count. The rows the Linux containers run (gate.sh --inside: the
+# suite rows, fuzz, ABI, layout, objcheck, debug, valgrind, smoke) are
+# judged by what they report against the tree, on every host:
+#   suite-O*   its plan is every case the tree lists (tests/run.sh -l),
+#              each passed, xfailed or skipped, none failed, and at most
+#              as many skipped as the tree has cases with a REQUIRES line
+#              (the only reason a case is skipped);
+#   objcheck   every compilation the same as cc's (N of N), and N at
+#              least two (-O0, -O2) of each program of tests/run the
+#              suite runs and compiles (no XFAIL, REQUIRES, ERROR,
+#              WARNING or FIX* directive);
+#   layout     its row's own floor for the host (100 macOS, 30 Linux);
+#   fuzz, ABI, value semantics, voltty: the count the row was asked for;
+#   debug, compile-cost, chain, stress-grow, unsafe-audit: their lines.
+# incremental's plan is the tree's (its programs and levels), the same on
+# every host: N of M with at most 4 skipped (each with its reason) and
+# the rest rebuilt the same, M at least 150. The other rows run on the
+# macOS host only, and their floors are 0.30.0's counts there
+# (aarch64-macos); on any other host such a row fails, `no floor for
+# HOST`, until it has one of its own (a gate there would otherwise pass
+# it on any count). What this cannot check without a Linux machine: that
+# the containers' logs print these lines as macOS's do (the same scripts
+# print them), and the corpus objcheck compiles there.
 # Prints one line, `floor STEP: ...`; exits 1 when the row is below its
 # floor, 77 when the row skipped what it counts and said so (a SKIP).
 #
@@ -44,6 +57,7 @@ AB=$4
 SFZ=$5
 HOST=${6:-aarch64-macos}
 [ -f "$LOG" ] || { echo "floor $STEP: no log $LOG"; exit 1; }
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 # The first number after the text $1 on the last line of the log that
 # matches the pattern $1 (an extended regular expression ending where the
@@ -51,10 +65,20 @@ HOST=${6:-aarch64-macos}
 count() {
     grep -E "$1" "$LOG" | tail -1 | sed -E "s/^.*$1([0-9]+).*$/\\1/" | grep -E '^[0-9]+$'
 }
-# Floor $1, 0.30.0's count on aarch64-macos, for this host: the same
-# there, a quarter elsewhere (the header).
+# Floor $1, 0.30.0's count on aarch64-macos, of a row that runs on the
+# macOS host only: elsewhere the row fails (the header).
 hfloor() {
-    if [ "$HOST" = aarch64-macos ]; then echo "$1"; else echo $(($1 / 4)); fi
+    if [ "$HOST" != aarch64-macos ]; then
+        echo "floor $STEP: no floor for $HOST: its floor is aarch64-macos's count; give it one from a gate of this host" >&2
+        echo 999999999
+        return
+    fi
+    echo "$1"
+}
+# The fail of the row: message $1.
+refuse() {
+    echo "floor $STEP: $1"
+    exit 1
 }
 # The number of lines of the log matching $1.
 lines() {
@@ -77,9 +101,25 @@ judge() { # <count> <floor> <what>
 }
 
 case "$STEP" in
-    # (0.30.0: 6556 passed of 7274 at each level)
+    # (0.30.0: 6556 passed of 7274 at each level; 0.30.1: judged against
+    # the tree, the header)
     suite-O0|suite-O1|suite-O2)
-        judge "$(grep -E '^ +total +[0-9]+' "$LOG" | tail -1 | awk '{print $2}')" "$(hfloor 6000)" "cases passed" ;;
+        # (tests/run.sh's `cases:` line: the cases alone, not the suites'
+        # checks the table's total adds)
+        plan=$(grep -E '^plan: [0-9]+ cases' "$LOG" | tail -1 | awk '{print $2}')
+        tot=$(grep -E '^cases: [0-9]+ passed, [0-9]+ xfail, [0-9]+ failed, [0-9]+ skipped of [0-9]+$' "$LOG" | tail -1)
+        [ -n "$plan" ] && [ -n "$tot" ] || refuse "no plan or no cases line in its log: the row passed without saying what it checked"
+        listed=$(sh "$ROOT/tests/run.sh" -l 2>/dev/null | grep -c '^case ')
+        req=$(grep -l '^// REQUIRES:' "$ROOT"/tests/run/*.vl 2>/dev/null | wc -l | tr -d ' ')
+        set -- $(echo "$tot" | tr -dc '0-9 \n' | tr -s ' ')
+        pass=$1; xf=$2; fl=$3; sk=$4; ran=$5
+        [ "$plan" -eq "$listed" ] || refuse "it planned $plan cases of the tree's $listed"
+        [ "$ran" -eq "$plan" ] && [ $((pass + xf + fl + sk)) -eq "$plan" ] \
+            || refuse "$pass passed, $xf xfail, $fl failed and $sk skipped of $ran are not its $plan cases"
+        [ "$fl" -eq 0 ] || refuse "$fl cases failed"
+        [ "$sk" -le "$req" ] || refuse "$sk cases skipped, more than the tree's $req with a REQUIRES line"
+        echo "floor $STEP: $pass passed, $xf xfail, $sk skipped of the tree's $plan cases (at most $req skipped)"
+        exit 0 ;;
     # (each program asked for is counted: -n FZ)
     fuzz-plain|fuzz-loops|fuzz-generics|fuzz-pressure|fuzz-calls|fuzz-lang06|fuzz-vector|fuzz-div|fuzz-range|fuzz-arch|fuzz-guard|fuzz-seed)
         judge "$(count 'fuzz: ')" "$FZ" "programs" ;;
@@ -89,9 +129,18 @@ case "$STEP" in
         judge "$n" 5 "runs of $SFZ value-semantics programs all checked" ;;
     abi-plain|abi-import|abi-header)
         judge "$(count 'abi: ')" "$AB" "programs" ;;
-    # (0.30.0: 13048 of 13048)
+    # (0.30.0: 13048 of 13048; 0.30.1: against the tree, the header)
     objcheck)
-        judge "$(count 'objcheck: ')" "$(hfloor 12000)" "compilations compared with cc -c" ;;
+        line=$(grep -E '^objcheck: [0-9]+ of [0-9]+ ' "$LOG" | tail -1)
+        [ -n "$line" ] || refuse "no count of compilations in its log"
+        ok=$(echo "$line" | awk '{print $2}')
+        all=$(echo "$line" | awk '{print $4}')
+        [ "$ok" -eq "$all" ] || refuse "$ok of $all compilations the same"
+        progs=0
+        for f in "$ROOT"/tests/run/*.vl; do
+            grep -qE '^// (XFAIL|REQUIRES|ERROR|WARNING|FIX)' "$f" || progs=$((progs + 1))
+        done
+        judge "$all" $((2 * progs)) "compilations compared with cc -c (2 of each of the tree's $progs programs at least)" ;;
     # (0.30.0: 260)
     objcheck-x86-arch)
         judge "$(count 'objcheck: ')" "$(hfloor 230)" "compilations compared with cc -c" ;;
@@ -107,11 +156,22 @@ case "$STEP" in
     threads)
         judge "$(count 'threads: ')" "$(hfloor 14000)" "compilations compared at -j1 and -j8" ;;
     # (0.30.0: 172 series; 0.30.1: and the pairs, 48 builds: six programs
-    # in two versions, both orders, -O1 and -O2, -S and -c)
+    # in two versions, both orders, -O1 and -O2, -S and -c. Its plan is the
+    # tree's, on every host: N of M, at most 4 skipped, each named.)
     incremental)
         p=$(count 'incremental pairs: ')
-        [ -n "$p" ] && [ "$p" -ge 48 ] || { echo "floor $STEP: ${p:-no} warm builds of the pairs, below its floor of 48"; exit 1; }
-        judge "$(count 'incremental: ')" "$(hfloor 150)" "edit series (and $p warm builds of the pairs)" ;;
+        [ -n "$p" ] && [ "$p" -ge 48 ] || refuse "${p:-no} warm builds of the pairs, below its floor of 48"
+        line=$(grep -E '^incremental: [0-9]+ of [0-9]+ edit series' "$LOG" | tail -1)
+        [ -n "$line" ] || refuse "no count of edit series in its log"
+        ok=$(echo "$line" | awk '{print $2}')
+        all=$(echo "$line" | awk '{print $4}')
+        sk=$(echo "$line" | sed -nE 's/.*, ([0-9]+) skipped.*/\1/p')
+        sk=${sk:-0}
+        named=$(grep -cE '^skip .*: .+' "$LOG")
+        [ "$sk" -le 4 ] || refuse "$sk edit series skipped, more than 4"
+        [ "$named" -ge "$sk" ] || refuse "$sk series skipped, $named with a reason"
+        [ $((ok + sk)) -eq "$all" ] || refuse "$ok of $all series the same and $sk skipped"
+        judge "$all" 150 "edit series of the tree, $ok the same, $sk skipped (and $p warm builds of the pairs)" ;;
     # (four measures: hello, std, check, regions)
     compile-cost)
         judge "$(lines 'M instructions, was ')" 4 "programs measured" ;;
@@ -149,9 +209,11 @@ case "$STEP" in
     # least 200 however long they take (tests/voltty/run.sh -n 200 -s 60),
     # so no load lowers the count below its floor. Without cargo the
     # oracle is skipped, which the log says: the row is a SKIP, not a pass
-    # and not a failure.)
+    # and not a failure; any other `skip oracle` line is not a skip.)
     voltty-fuzz)
-        if grep -q '^skip oracle' "$LOG"; then
+        # (only a missing cargo is a skip: an oracle that does not build
+        # is the row's FAIL, tests/voltty/run.sh)
+        if grep -q '^skip oracle (no cargo)$' "$LOG"; then
             echo "floor $STEP: SKIP: $(grep '^skip oracle' "$LOG" | tail -1)"
             exit 77
         fi

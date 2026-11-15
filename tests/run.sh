@@ -1455,12 +1455,16 @@ if [ "$BLESS" = 1 ]; then
 fi
 
 count=0
+: >"$WORK/casetally"
 while read -r name file; do
     dir="$WORK/$name"
     category=${name%%_*}
     [ -s "$dir/errors" ] && category=error
     status=fail
     [ -f "$dir/status" ] && read -r status <"$dir/status"
+    # (0.30.1) the cases' own outcomes, apart from the suites' (the
+    # `cases:` line, which the gate's floors read)
+    case "$status" in pass|xfail|skip) echo "$status" ;; *) echo fail ;; esac >>"$WORK/casetally"
     if [ "$status" = xpass ]; then
         echo "$category fail" >>"$TALLY"
         echo "XPASS $name: passes but is marked XFAIL ($(cat "$dir/xfail")); remove the directive" >>"$FAILURES"
@@ -2077,6 +2081,9 @@ awk '
             printf "  (%d skipped, not passed: the SKIP lines above say why)\n", total["skip"]
     }
 ' "$TALLY"
+# (0.30.1) The cases alone (the table's rows count the suites' checks too).
+[ -f "$WORK/casetally" ] && awk '{ n[$1]++ } END {
+    printf "cases: %d passed, %d xfail, %d failed, %d skipped of %d\n", n["pass"], n["xfail"], n["fail"], n["skip"], NR }' "$WORK/casetally"
 # (0.25.5) The failing cases alone, in the form zsh leaves as it is
 # (`=NAME` is its path expansion; '=NAME' quoted works too).
 if [ -s "$WORK/failed-cases" ]; then
