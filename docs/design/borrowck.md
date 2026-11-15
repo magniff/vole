@@ -1342,7 +1342,14 @@ must be live when a value of type `T` is dropped:
   same names), for which it is `∪ dropck(τ)` over the *element* type
   arguments plus `set(slots(A))` of the allocator argument (an
   allocator reference must be live to free). `Allocator::FREES` does
-  not change it: a non-freeing allocator's container still has glue;
+  not change it: a non-freeing allocator's container still has glue.
+  (Until 0.30.1 the allocator argument went through `dropck(A)` like an
+  element's, and `dropck(&'a Arena) = ∅`, a reference having no glue:
+  `ar.reset()` while a `Vec<Box<T>, &Arena>` lived was accepted and the
+  drop freed what the arena had handed out again, RT-M2-14. The
+  allocator is the argument `container_alloc` names, `String`'s first,
+  a map's third, every other container's second; a map's hasher `S` is
+  an element in this sense, dropped by its own `dropck`.);
 - a closure type: `∪ dropck(type(xₖ))` over its by-value captures (a
   struct without `impl Drop`, D3.3).
 
