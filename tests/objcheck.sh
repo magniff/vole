@@ -24,13 +24,16 @@
 # tests/run.sh builds it, and a case marked XFAIL is left out: both read by
 # tests/directives.awk, the suite's own reader.
 #
-# usage: tests/objcheck.sh [-c COMPILER] [-t TARGET] [-j JOBS] [FILTER]
+# usage: tests/objcheck.sh [-c COMPILER] [-t TARGET] [-j JOBS] [--list] [FILTER]
 #
 #   -c COMPILER   the volec to check (default: target/volec)
 #   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or
 #                 x86_64-macos (default: the host)
 #   -j JOBS       programs checked at once (default: the number of CPUs,
 #                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
+#   --list        (0.30.1) print the corpus's programs, one a line, and
+#                 compile nothing (the gate's floor compares its digest
+#                 with the row's)
 #   FILTER        only the programs whose path contains FILTER
 
 set -u
@@ -42,6 +45,7 @@ COMPILER="$ROOT/target/volec"
 TARGET=""
 JOBS=""
 FILTER=""
+LIST=0
 CC=${CC:-cc}
 
 while [ $# -gt 0 ]; do
@@ -49,6 +53,7 @@ while [ $# -gt 0 ]; do
         -c) COMPILER=$2; shift 2 ;;
         -t) TARGET=$2; shift 2 ;;
         -j) JOBS=$2; shift 2 ;;
+        --list) LIST=1; shift ;;
         -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
         *) FILTER=$1; shift ;;
@@ -64,6 +69,7 @@ case "$TARGET" in
     x86_64-macos) LINK_FLAGS="-arch x86_64" ;;
 esac
 WORK="$ROOT/target/objcheck/$TARGET"
+[ $LIST = 1 ] && WORK="$WORK.list"
 mkdir -p "$WORK"
 
 # The C compiler, once more when it crashed (a signal, or gcc's "internal
@@ -261,6 +267,11 @@ for f in tests/run/*.vl tests/run/*/main.vl examples/*/main.vl examples/*/*/main
     case "$TARGET:$f" in *-macos:*) ;; *:examples/voltty/app/*) continue ;; esac
     echo "$f" >>"$list"
 done
+if [ $LIST = 1 ]; then
+    cat "$list"
+    exit 0
+fi
+cp "$list" "$WORK/corpus"
 # (0.19) The intrinsics' generated programs (tests/arch/gen.sh), of the
 # target's architecture and the portable ones: every intrinsic, each
 # constant parameter at its extremes, encoded by the compiler and by cc.
@@ -293,9 +304,11 @@ else
     done
 fi
 n=0
+rm -f "$WORK"/*.file
 while read -r f; do
     for og in 0 2 0g 2g; do
         n=$((n + 1))
+        echo "$f" >"$WORK/$n.file"
         o=${og%g}
         g=""
         [ "$o" = "$og" ] || g=-g
@@ -318,4 +331,12 @@ while [ "$i" -le "$n" ]; do
     i=$((i + 1))
 done
 echo "objcheck: $ok of $n compilations for $TARGET give the same program as cc -c, $failed differ"
+# (0.30.1) Each program of the corpus compiled at the four settings, and
+# the corpus's names as a digest (cksum of the sorted paths, `--list`'s),
+# which the gate's floor compares with the tree's.
+cat "$WORK"/*.file 2>/dev/null | sort | uniq -c | awk '$1 != 4 { print "FAIL objcheck: " $2 " compiled " $1 " times, not 4"; bad = 1 } END { exit bad }' \
+    || failed=$((failed + 1))
+grep '^tests/run/' "$WORK/corpus" | sort >"$WORK/corpus.run"
+"$CC" --version 2>/dev/null | grep -qi clang && echo "cc: clang" || echo "cc: not clang"
+echo "objcheck programs: $(wc -l <"$WORK/corpus" | tr -d ' '), each at 4 settings, names $(sort "$WORK/corpus" | cksum | tr ' ' -); of tests/run $(wc -l <"$WORK/corpus.run" | tr -d ' '), names $(cksum <"$WORK/corpus.run" | tr ' ' -)"
 [ "$failed" -eq 0 ] && [ "${gen_failed:-0}" = 0 ]

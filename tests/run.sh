@@ -1457,6 +1457,7 @@ fi
 count=0
 : >"$WORK/casetally"
 : >"$WORK/caseskips"
+: >"$WORK/casenames"
 while read -r name file; do
     dir="$WORK/$name"
     category=${name%%_*}
@@ -1466,6 +1467,7 @@ while read -r name file; do
     # (0.30.1) the cases' own outcomes, apart from the suites' (the
     # `cases:` line, which the gate's floors read)
     case "$status" in pass|xfail|skip) echo "$status" ;; *) echo fail ;; esac >>"$WORK/casetally"
+    echo "$name" >>"$WORK/casenames"
     # (each skipped case by name, with what it requires, for the floors)
     [ "$status" = skip ] && echo "skip case $name: REQUIRES$(cat "$dir/requires" 2>/dev/null)" >>"$WORK/caseskips"
     if [ "$status" = xpass ]; then
@@ -2084,9 +2086,13 @@ awk '
             printf "  (%d skipped, not passed: the SKIP lines above say why)\n", total["skip"]
     }
 ' "$TALLY"
-# (0.30.1) The cases alone (the table's rows count the suites' checks too).
-[ -f "$WORK/casetally" ] && awk '{ n[$1]++ } END {
-    printf "cases: %d passed, %d xfail, %d failed, %d skipped of %d\n", n["pass"], n["xfail"], n["fail"], n["skip"], NR }' "$WORK/casetally"
+# (0.30.1) Whether `// REQUIRES: clang` held, for the floors.
+[ $CC_IS_CLANG -eq 1 ] && echo "cc: clang" || echo "cc: not clang"
+# (0.30.1) The cases alone (the table's rows count the suites' checks too),
+# and the names run, as a digest (`names CRC-LENGTH`: cksum of the sorted
+# names, each on its line; the floors compare it with tests/run.sh -l's).
+[ -f "$WORK/casetally" ] && awk -v names="$(sort "$WORK/casenames" 2>/dev/null | cksum | tr ' ' -)" '{ n[$1]++ } END {
+    printf "cases: %d passed, %d xfail, %d failed, %d skipped of %d, names %s\n", n["pass"], n["xfail"], n["fail"], n["skip"], NR, names }' "$WORK/casetally"
 [ -f "$WORK/caseskips" ] && cat "$WORK/caseskips"
 # (0.25.5) The failing cases alone, in the form zsh leaves as it is
 # (`=NAME` is its path expansion; '=NAME' quoted works too).
