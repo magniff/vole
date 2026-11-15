@@ -5,7 +5,7 @@
 #
 # usage: tests/fuzz/run.sh [-c COMPILER] [-s SEED] [-t TARGET] [-n COUNT]
 #                          [-f FIRST] [-k DIR] [-j JOBS] [-l] [-g] [-p] [-C] [-N]
-#                          [-V] [-D] [-R] [-A] [-G] [-M]
+#                          [-V] [-D] [-R] [-A] [-G] [-M] [-F]
 #
 #   -c COMPILER   the volec to test (default: target/volec)
 #   -s SEED       also compare with the seed binary (divisors are then
@@ -43,6 +43,12 @@
 #                 slots shared by an integer, a float and a vector);
 #                 with -V, the 8-, 16- and 32-byte vectors among them;
 #                 each built with --verify-regalloc
+#   -F            (0.30.1, RT-CG-7) -M with a large frame: main first
+#                 defines 2048 to 3071 f32 values live to its end
+#                 (genmoves.awk's pad), so the moves' spill slots lie past
+#                 16 KB, where an AArch64 f32 slot's offset needs more than
+#                 one ldr or str can encode; the values rotated are
+#                 i64, i32 and f32 (with -V: the vectors, padded)
 #   -j JOBS       programs tested at once (default: the number of CPUs,
 #                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
 
@@ -77,8 +83,9 @@ while [ $# -gt 0 ]; do
         -A) ARCHMODE=1; shift ;;
         -G) GUARDS=1; shift ;;
         -M) MOVES=1; shift ;;
+        -F) MOVES=1; PAD=1; shift ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 VERIFY_RA=""
@@ -129,7 +136,13 @@ test_seed() {
     seed=$1
     program="$WORK/p$seed.vl"
     if [ "${MOVES:-0}" = 1 ]; then
-        awk -v seed="$seed" -v vectors="${VECTOR:-0}" -f "$ROOT/tests/fuzz/genmoves.awk" >"$program"
+        pad=0
+        types=""
+        if [ "${PAD:-0}" = 1 ]; then
+            pad=$((2048 + seed * 37 % 1024))
+            types="i64 i32 f32 f32"
+        fi
+        awk -v seed="$seed" -v vectors="${VECTOR:-0}" -v pad="$pad" -v types="$types" -f "$ROOT/tests/fuzz/genmoves.awk" >"$program"
     elif [ "${VECTOR:-0}" = 1 ]; then
         awk -v seed="$seed" -f "$ROOT/tests/fuzz/genvec.awk" >"$program"
     elif [ "${ARCHMODE:-0}" = 1 ]; then
