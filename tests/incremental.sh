@@ -27,7 +27,9 @@
 #
 # An edit the program does not build with (a call made twice that moves a
 # value twice) is taken back and the next one made (`rejected` counts
-# them). (0.30.1) Before the series, each pair of tests/incremental/
+# them): only one refused with a diagnostic (exit 1 and an error); a
+# crash of the compiler on it (a signal, a panic's 101, any other exit)
+# fails the row. (0.30.1) Before the series, each pair of tests/incremental/
 # (a program in two versions, NAME.vl.txt: `// VARIANTS: X Y`, its `@V@`
 # replaced by X, then Y, `-` for nothing) is built one version after the other with one
 # cache, both orders, at -O1 and -O2, to assembly and to an object, and
@@ -183,10 +185,20 @@ build() { # <tree> <root> <level> <threads> <out> <cache> <directives>
     [ -f "$7/flags" ] && flags=$(sed "s|@ROOT@|$ROOT|g" "$7/flags")
     no=--cache=on
     [ "$6" = yes ] || no=--no-cache
+    # (0.30.1: no object of an earlier build is taken for this one's)
+    rm -f "$5"
     # shellcheck disable=SC2086
     (cd "$1" && VOLE_CODE_CACHE=on VOLE_CACHE="$1.cache" VOLE_CACHE_SYNC=1 \
         VOLE_CACHE_TRACE="$1.trace" \
         "$COMPILER" --target "$TARGET" "-O$3" "-j$4" $flags $no -c "$2" -o "$5") >"$5.out" 2>&1
+    echo $? >"$5.rc"
+}
+
+# (0.30.1) Whether the build into $1 failed as a compiler that works
+# fails: exit 1 with an error message (a diagnostic). Not a signal, nor
+# 101 (a panic of the compiler), nor any other exit: a crash.
+diagnosed() { # <out>
+    [ "$(cat "$1.rc" 2>/dev/null)" = 1 ] && grep -q 'error' "$1.out"
 }
 
 # One program at one level and thread count: the cold build, the edits,
@@ -205,6 +217,10 @@ check() { # <program> <level> <threads> <edits> <n>
     what="$1 -O$2 -j$3"
     build "$w/tree" "$root" "$2" "$3" "$w/ref.o" no "$dd"
     if [ ! -f "$w/ref.o" ]; then
+        if ! diagnosed "$w/ref.o"; then
+            echo "FAIL $what: the compiler crashed on it: exit $(cat "$w/ref.o.rc"), $(head -1 "$w/ref.o.out")"
+            return
+        fi
         echo "skip $what: it does not build ($(head -1 "$w/ref.o.out"))"
         return
     fi
@@ -223,8 +239,13 @@ check() { # <program> <level> <threads> <edits> <n>
         e=$(edit "$w/tree" "$((i + 1000 * tries))" "$SEED")
         build "$w/tree" "$root" "$2" "$3" "$w/ref.o" no "$dd"
         if [ ! -f "$w/ref.o" ]; then
-            # (an edit the program does not build with: taken back, and
-            # another made; 0.30.1)
+            # (an edit the compiler refuses with a diagnostic: taken back,
+            # and another made; 0.30.1. A crash on it fails the row: it is
+            # what the series exists to find)
+            if ! diagnosed "$w/ref.o"; then
+                echo "FAIL $what: the compiler crashed on edit $i ($e): exit $(cat "$w/ref.o.rc"), $(head -1 "$w/ref.o.out"); kept in $w"
+                return
+            fi
             rm -rf "$w/tree"
             mv "$w/before" "$w/tree"
             rejected=$((rejected + 1))
