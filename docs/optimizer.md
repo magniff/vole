@@ -288,9 +288,9 @@ of `h` and `b` registers are encoded by their size, not as q. A symbol
 is never a register: an operand is a symbol where the instruction takes
 one (`b`, `bl`, `b.cond`, `adr`, `adrp`, `cbz`, `tbz` and a relocation),
 so a C function named `d5` or `w7` links. On x86-64 the table's
-instructions (`compiler/arch/insn_x86.def`) carry each operand's class
-(`r:` the classes in order, `x` vector, `g` general, `i` either), and
-the assembler refuses a register of the other class there, in an atomic
+instructions (`compiler/arch/insn_x86.def`) carry each operand's
+class (`r:` the classes in order, `x` vector, `g` general, `i` an
+immediate), and the assembler refuses a register of the other class there, in an atomic
 (`xadd`, `cmpxchg`: a general register into memory) and in an indirect
 `call`/`jmp`. The moves `ma_move` and `mx_move` and the jump table's
 registers go through `m_check_reg` as the loads and stores do.
