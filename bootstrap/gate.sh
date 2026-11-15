@@ -74,7 +74,9 @@
 # and fuzz-moves-vec (0.30.1: values of every class and width rotated
 # around loops, the edges' moves through shared spill slots, built with
 # --verify-regalloc; at least 20 programs in every mode, and again for
-# x86_64-macos under Rosetta: fuzz-moves-x86, fuzz-moves-vec-x86), fuzz-seed
+# x86_64-macos under Rosetta: fuzz-moves-x86, fuzz-moves-vec-x86;
+# RT-CG-7: fuzz-moves-frame and fuzz-moves-frame-x86, the same in a frame
+# whose spill slots lie past 16 KB), fuzz-seed
 # (against the Rust seed), fuzz-sem (0.25: value semantics, drops and
 # leaks against tools/semfuzz/semfuzz.py's model; not in 0.28, back in
 # 0.29 with its programs in the one language); abi-plain,
@@ -311,7 +313,7 @@ esac
 MFZ=$FZ
 [ "$MFZ" -ge 20 ] || MFZ=20
 
-FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-moves fuzz-moves-vec fuzz-moves-x86 fuzz-moves-vec-x86 fuzz-seed fuzz-sem"
+FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-moves fuzz-moves-vec fuzz-moves-x86 fuzz-moves-vec-x86 fuzz-moves-frame fuzz-moves-frame-x86 fuzz-seed fuzz-sem"
 ABI_STEPS="abi-plain abi-import abi-header"
 HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin stdtools std-check std-tests cachediff"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
@@ -902,15 +904,19 @@ run_step() {
         # slots shared by integers, floats, structs and vectors
         fuzz-moves) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$MFZ" -k "$k" -M ;;
         fuzz-moves-vec) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$MFZ" -k "$k" -M -V ;;
+        # (0.30.1, RT-CG-7) and in a frame past 16 KB (-F), where an
+        # AArch64 f32 slot's offset needs more than one ldr or str encodes
+        fuzz-moves-frame) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$MFZ" -k "$k" -F ;;
         # (0.30.1) the same for x86-64, where 0.30.0 failed more of them,
         # run by Rosetta; a host without it is a SKIP the log names
-        fuzz-moves-x86|fuzz-moves-vec-x86)
+        fuzz-moves-x86|fuzz-moves-vec-x86|fuzz-moves-frame-x86)
             if [ "$(uname -s)" != Darwin ] || ! arch -x86_64 /usr/bin/true 2>/dev/null; then
                 echo "skip: no x86_64-macos here (Rosetta: softwareupdate --install-rosetta)"
                 return 0
             fi
             v=""
             [ "$1" = fuzz-moves-vec-x86 ] && v=-V
+            [ "$1" = fuzz-moves-frame-x86 ] && v=-F
             # shellcheck disable=SC2086
             sh "$ROOT/tests/fuzz/run.sh" -c "$C" -t x86_64-macos -n "$MFZ" -k "$k" -M $v ;;
         # (0.25) value semantics: seeded (the same programs every run of

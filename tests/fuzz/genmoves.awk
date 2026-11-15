@@ -8,7 +8,17 @@
 # must be the same at every level (tests/fuzz/run.sh -M; -M -V for the
 # vectors). From the generators of the review of RT-CG-5.
 #
-# usage: awk -v seed=N [-v vectors=1] -f tests/fuzz/genmoves.awk
+# (0.30.1, RT-CG-7) With pad=N, main first defines N f32 values, live to
+# its end (summed and printed last): its spill slots then reach past 16 KB
+# (N = 2100: 16800 bytes), where an AArch64 f32 slot's offset is no
+# longer one ldr/str can encode, and the loop's moves go between such
+# slots (tests/fuzz/run.sh -F). With types="T...", the values' types are
+# drawn from that list (scalars only; -F: "i64 i32 f32 f32", where integer
+# cycles and f32 slot moves meet on one edge more often: 13 of 100
+# programs at pad=2100 failed on the build with RT-CG-7, against 1 of 100
+# with every type).
+#
+# usage: awk -v seed=N [-v vectors=1] [-v pad=N] [-v types=T...] -f tests/fuzz/genmoves.awk
 
 function rnd(n) { return int(rand() * n) }          # 0 .. n-1
 function between(a, b) { return a + rnd(b - a + 1) } # a .. b
@@ -85,7 +95,7 @@ BEGIN {
         IV["v4i32"] = "i32"; IV["v8u8"] = "u8"; IV["v8i32"] = "i32"; IV["v2i64"] = "i64"
         ntypes = split("v2f64 v1f64 v4f64 v4f32 v4i32 v8u8 v8i32 v2i64 i64 f64", TYPES, " ")
     } else {
-        ntypes = split("i64 i32 u8 bool f64 f32 P", TYPES, " ")
+        ntypes = split(types != "" ? types : "i64 i32 u8 bool f64 f32 P", TYPES, " ")
     }
     npool = between(4, 12)
     for (i = 0; i < npool; i++) { pname[i] = "v" i; ptype[i] = TYPES[1 + rnd(ntypes)] }
@@ -111,6 +121,7 @@ BEGIN {
     print "    a ^ 5"
     print "}"
     print "fn main() {"
+    for (k = 0; k < pad; k++) printf "    let p%d = (g(%d) as f32) * 0.5;\n", k, k % 50
     print "    let lim = (g(7) & 15) + 3;"
     for (k = 0; k < na; k++) print "    let a" k " = g(" (k + 20) ");"
     for (k = 0; k < nb; k++) print "    let b" k " = (g(" (k + 40) ") as f64) * 0.5;"
@@ -142,5 +153,10 @@ BEGIN {
         else print "    println(\"{}\", " pname[i] ");"
     }
     print "    println(\"{} {}\", s, sf);"
+    if (pad > 0) {
+        print "    let mut ps: f32 = 0.0;"
+        for (k = 0; k < pad; k++) print "    ps += p" k ";"
+        print "    println(\"{}\", ps);"
+    }
     print "}"
 }
