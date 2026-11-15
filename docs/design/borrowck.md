@@ -1413,13 +1413,15 @@ its cut-offs.)
   initializes what rustc's `gather_init` does (elab.vl `init_path`, the
   one rule for the check's sets, drop elaboration's and its flags'):
   its place's path, but a field of a union initializes the union, its
-  immediate base, and only when that base has a path of its own;
-  nothing under a union's field has one (a move out of it moves the
-  outermost union), so `o.i.a = 7`, i a union field of a union o,
-  initializes nothing (0.30.1: before, o, and `let w = o;` in a loop
-  read o's other field's uninitialized bytes; straight on or after a
-  branch's move it hid E0382; `rust_b_err_union_nested`,
-  `rust_b_ok_union_nested`). `Q = (L, 0)`: no requirement (reinitialization), and it
+  immediate base, and only a place that is its path's own place
+  (rustc's exact lookup): a union's field has the union's path (a move
+  out of it moves the union), so `o.i.a = 7`, i a union field of a
+  union o, initializes nothing (0.30.1: before, o, and `let w = o;` in a
+  loop read o's other field's uninitialized bytes; straight on or after
+  a branch's move it hid E0382; `rust_b_err_union_nested`,
+  `rust_b_ok_union_nested`); a struct's field under a union's, `u.p.d`
+  moved alone, has a path of its own and its assignment initializes it
+  (`rust_b_ok_union_drop_field_reinit`). `Q = (L, 0)`: no requirement (reinitialization), and it
   kills `L`'s loans through a deref (D2.3). One E0381 per local, its
   first (rustc's `uninitialized_error_reported`), naming the binding, not
   the place read through it. The walk back for the reaching move follows
