@@ -239,11 +239,23 @@ got=$(sh "$ROOT/tests/run.sh" -l -n readme_sync -n example_helloworld | sort | t
 # that fails every case)
 printf '#!/bin/sh\necho "error: no" >&2\nexit 1\n' >"$WORK/failing-volec"
 chmod +x "$WORK/failing-volec"
-# (0.30.1: not the outer run's note of lazy std's reruns, which it would
-# print last when this runs inside tests/run.sh)
-got=$(env -u VOLE_STD_RERUN_NOTE sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n abi_callee_alignment -n abi_extern_small_struct 2>&1 | tail -1)
+got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n abi_callee_alignment -n abi_extern_small_struct 2>&1 | tail -1)
 [ "$got" = "try: tests/run.sh -n abi_callee_alignment -n abi_extern_small_struct   (the failing cases alone)" ] \
     && ok filters_try_dash_n || bad filters_try_dash_n "got '$got'"
+# (0.30.1) The files a run's caller gives it (VOLE_TEST_RESULTS, the
+# gate's records; VOLE_TEST_XFAIL_WHY; VOLE_STD_RERUN_NOTE) are that
+# run's: it writes one record a case, and nothing it starts inherits
+# them (this suite's runs inside the gate's suite rows wrote two records
+# of these cases into the gate's, which the gate refused)
+printf '#!/bin/sh\nprintf "%%s %%s %%s\\n" "${VOLE_TEST_RESULTS-unset}" "${VOLE_TEST_XFAIL_WHY-unset}" "${VOLE_STD_RERUN_NOTE-unset}" >>"%s/seen"\necho "error: no" >&2\nexit 1\n' "$WORK" >"$WORK/seeing-volec"
+chmod +x "$WORK/seeing-volec"
+VOLE_TEST_RESULTS="$WORK/outer.results" VOLE_TEST_XFAIL_WHY="$WORK/outer.why" VOLE_STD_RERUN_NOTE="$WORK/outer.reruns" \
+    sh "$ROOT/tests/run.sh" -c "$WORK/seeing-volec" -j 2 -n abi_callee_alignment >/dev/null 2>&1
+got="$(cut -d' ' -f1,2 "$WORK/outer.results" 2>/dev/null | tr '\n' ',')|$(sort -u "$WORK/seen" 2>/dev/null | sed "s|$WORK|W|g" | tr '\n' ',')|$([ -e "$WORK/outer.reruns" ] && echo reruns-written)"
+case "$got" in
+    "abi_callee_alignment fail,|unset unset "*"/vole-tests."*"/reruns,|") ok caller_files_not_inherited ;;
+    *) bad caller_files_not_inherited "got '$got'" ;;
+esac
 # ---- the transcript runners' jobs (0.30: tests/jobs.sh) ----
 
 # A FILTER selects the transcripts and checks whose name contains it, -n

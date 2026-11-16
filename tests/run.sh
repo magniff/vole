@@ -216,6 +216,15 @@
 set -u
 LC_ALL=C
 export LC_ALL
+# (0.30.1) The files this run's caller gives it are this run's: taken
+# here and out of the environment, so that no tests/run.sh started below
+# (the runner suite's own runs, on a compiler that fails on purpose)
+# writes its records into this one's (the gate's suite rows judge every
+# case by its one record) or its XFAIL triage. The same for the note of
+# lazy std's reruns, below.
+RESULTS_FILE=${VOLE_TEST_RESULTS:-}
+XFAIL_WHY_FILE=${VOLE_TEST_XFAIL_WHY:-}
+unset VOLE_TEST_RESULTS VOLE_TEST_XFAIL_WHY
 # (0.18.1) Without the code cache (back::codecache), unless the caller
 # says (gate.sh's suite-O2 row): its programs are small, and a cache per
 # program and compiler would fill target/volec-cache.
@@ -457,7 +466,11 @@ TALLY="$WORK/tally"
 # (0.28.0) A build whose lazy read of std failed and whose whole read passed
 # (a rerun: three or four times the work) says so on stderr and is listed
 # here (front/modules/stdlazy.vl: rerun_note); the summary counts them.
-RERUNS="${VOLE_STD_RERUN_NOTE:-$WORK/reruns}"
+# (0.30.1) This run's own file, always: a file named by the environment
+# is an outer tests/run.sh's (no one else sets it), whose summary would
+# count this run's reruns. Only `1` (the note on stderr, no file) is kept.
+RERUNS="$WORK/reruns"
+[ "${VOLE_STD_RERUN_NOTE:-}" = 1 ] && RERUNS=1
 export VOLE_STD_RERUN_NOTE="$RERUNS"
 # (0.25.2) The skipped checks that say why (a `skip NAME: why` line of a
 # runner below, like the window tests' without a display giving frames):
@@ -1485,9 +1498,9 @@ while read -r name file; do
         echo "$category $status" >>"$TALLY"
         # (0.27.2) VOLE_TEST_XFAIL_WHY=FILE: each XFAIL case's failure,
         # its name, the first line of why and its first error, for a triage
-        if [ "$status" = xfail ] && [ -n "${VOLE_TEST_XFAIL_WHY:-}" ]; then
+        if [ "$status" = xfail ] && [ -n "$XFAIL_WHY_FILE" ]; then
             printf '%s\t%s\t%s\n' "$name" "$(head -1 "$dir/why" 2>/dev/null | tr '\t' ' ')" \
-                "$(grep -m1 'error' "$dir/why" 2>/dev/null | tr '\t' ' ')" >>"$VOLE_TEST_XFAIL_WHY"
+                "$(grep -m1 'error' "$dir/why" 2>/dev/null | tr '\t' ' ')" >>"$XFAIL_WHY_FILE"
         fi
     fi
     # (0.27.2.1) VOLE_TEST_RESULTS=FILE: each case's name, its status
@@ -1505,7 +1518,7 @@ while read -r name file; do
     [ "$status" = skip ] && [ -s "$dir/skipwhy" ] && why=$(cat "$dir/skipwhy")
     record="$name $status $bck $why cc:$([ $CC_IS_CLANG -eq 1 ] && echo clang || echo other)"
     echo "$record" >>"$WORK/records"
-    [ -z "${VOLE_TEST_RESULTS:-}" ] || echo "$record" >>"$VOLE_TEST_RESULTS"
+    [ -z "$RESULTS_FILE" ] || echo "$record" >>"$RESULTS_FILE"
     count=$((count + 1))
 done <"$CASES"
 
