@@ -3084,6 +3084,150 @@ fn copy_field_error(ty: i64, field: i64, fty: i64, variant: i64, index: i64,
     err_end_soft(pcx);
 }
 
+// RULE: F19.8 (0.30.2, RT-43; rustc E0740) A union's field never needs
+// drop: its type is Copy, a reference (`&mut T` too), std's
+// `ManuallyDrop<T>`, or a tuple or an array of such types. A union drops
+// none of its fields (F19.7): which one holds a value is the program's to
+// know, so a field that needed drop would be dropped by nothing, or, as
+// it was, by an assignment to a part of it, `u.p.d = v`, which dropped
+// the old `d` read from the bytes another field wrote (places/elab.vl
+// within_union is that drop's own guard). Every union the program has is
+// asked, an instance of a generic one too (an opaque instance's field
+// `T` is Copy only by its bounds); std's ManuallyDrop, the one union whose
+// field may need drop, is known by its path (front/known.vl), not its
+// name. The error is at the field, once for a declaration.
+pub fn check_union_fields(pcx: &mut Ctx<Comp>) {
+    let copy = std_trait(c"Copy", pcx);
+    let md = manually_drop_struct(pcx);
+    // (each generic union of the program, std's under `check --std`, by
+    // its Ω instance too: omega_union)
+    let templates = pcx.structs.len() as i64;
+    for s in 0..templates {
+        let info = pcx.structs[s as usize];
+        if (info.repr & crate::front::ast::REPR_UNION) != 0 && info.generic != 0
+            && info.tmpl == 0 && info.closure == 0 && info.node > 0 && s != md
+            && (crate::front::conv::user_at(pcx.nodes[info.node as usize].start, pcx)
+                || pcx.check_std) {
+            let mark = crate::base::diag::errors_mark(pcx);
+            if !attempt(Try::OmegaUnion, s, pcx) {
+                crate::base::diag::errors_forget(mark, pcx);
+            }
+        }
+    }
+    let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for s in 0..pcx.structs.len() as i64 {
+        let info = pcx.structs[s as usize];
+        if (info.repr & crate::front::ast::REPR_UNION) == 0 || info.generic != 0
+            || info.closure != 0 || info.node <= 0
+            || pcx.nodes[info.node as usize].kind != NodeKind::Struct
+            || info.field_count != pcx.nodes[info.node as usize].count
+            || seen.contains(&info.node) || md >= 0 && (s == md || info.tmpl - 1 == md) {
+            continue;
+        }
+        for k in 0..info.field_count {
+            let fty = pcx.fields[(info.fields + k) as usize].ty;
+            if !union_field_ok(fty, copy, md, pcx) {
+                union_field_error(s, child(info.node, k, pcx), fty, pcx);
+                seen.push(info.node);
+                break;
+            }
+        }
+    }
+}
+
+// The struct of std's `ManuallyDrop` (its template), or -1.
+fn manually_drop_struct(pcx: &mut Ctx<Comp>) -> i64 {
+    if pcx.std_module < 0 {
+        return -1;
+    }
+    let key = std_item_key(intern_c(c"ManuallyDrop", pcx), pcx);
+    if key < 0 { -1 } else { pcx.sym_struct[key as usize] - 1 }
+}
+
+// RULE: F19.8, D22.1 (0.30.2) Generic union template s's opaque instance,
+// each type parameter an Ω (front/opaque.vl: a type with the parameter's
+// bounds only), for check_union_fields to ask: rustc checks a union's
+// declaration (`union U<T> { t: T }` without `T: Copy` is E0740) whether
+// or not an instance is used. Made only when every parameter is a plain
+// type parameter, as build_opaque_instances' functions; an error in
+// making it is the model's, forgotten (check_union_fields).
+pub fn omega_union(s: i64, pcx: &mut Ctx<Comp>) {
+    let node = pcx.structs[s as usize].node;
+    let g = pcx.nodes[node as usize].g;
+    if g <= 0 || pcx.nodes[g as usize].count != pcx.structs[s as usize].generic {
+        return;
+    }
+    for k in 0..pcx.nodes[g as usize].count {
+        let p = child(g, k, pcx);
+        if pcx.nodes[p as usize].kind != NodeKind::TyName
+            || crate::front::generics::instantiate::array_len_name(p, pcx) != 0
+            || pcx.nodes[p as usize].end <= pcx.nodes[p as usize].start {
+            return;
+        }
+    }
+    let mut omegas = Vec::<i64, Comp>::new_in(Comp {});
+    for k in 0..pcx.nodes[g as usize].count {
+        omegas.push(crate::front::opaque::omega_of(child(g, k, pcx), pcx));
+    }
+    let m = pcx.tscratch.len() as i64;
+    for &t in omegas.as_slice() {
+        pcx.tscratch.push(t);
+    }
+    crate::front::generics::template_instance(s + 1, m, pcx.nodes[node as usize].start, pcx);
+}
+
+// rustc's allowed_union_field: a reference, a tuple or an array of
+// allowed types, a ManuallyDrop (template md), a Copy type, or one whose
+// error was reported.
+fn union_field_ok(t: i64, copy: i64, md: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if t <= 0 || has_error_type(t, pcx) {
+        return true;
+    }
+    let u = crate::places::ir::undistinct(t, pcx);
+    let k = pcx.types[u as usize].kind;
+    if (k == TyKind::Ptr || k == TyKind::Slice)
+        && (pcx.types[u as usize].b == crate::front::types::REF_SHARED
+            || pcx.types[u as usize].b == crate::front::types::REF_MUT) {
+        return true;
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[u as usize].count {
+            if !union_field_ok(type_elem(u, i, pcx), copy, md, pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == TyKind::Array {
+        return union_field_ok(pcx.types[u as usize].a, copy, md, pcx);
+    }
+    if k == TyKind::Struct && md >= 0 {
+        let s = pcx.types[u as usize].a;
+        if s == md || pcx.structs[s as usize].tmpl - 1 == md {
+            return true;
+        }
+    }
+    copy >= 0 && implements(copy, t, pcx)
+}
+
+// "a union's field must be Copy, a reference or a `ManuallyDrop<T>`:
+// field 'p' of union 'U' has type 'P' (rustc E0740)", at the field.
+fn union_field_error(s: i64, field: i64, fty: i64, pcx: &mut Ctx<Comp>) {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"union.field";
+    err_begin(pcx.nodes[field as usize].start, pcx);
+    err_fmt(
+        format_args("a union's field must be Copy, a reference or a `ManuallyDrop<T>`: field '{}' of union '",
+            str::from_utf8(sym_text(pcx.nodes[field as usize].a, pcx)).unwrap()), pcx);
+    err_sym(pcx.structs[s as usize].name, pcx);
+    err_str(c"' has type '", pcx);
+    err_type(fty, pcx);
+    err_str(c"' (rustc E0740)", pcx);
+    err_help(c"a union drops none of its fields, so a field's type may not need drop: wrap it, `std::mem::ManuallyDrop<T>` (its value is dropped by `ManuallyDrop::drop` or `into_inner`, when the program knows the field holds it), or make the type Copy", pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved_kind;
+}
+
 // (0.15) For t an instance of a generic type with an impl of tr: 0 when
 // the impl's bounds hold, else the type argument that misses them (`U` of
 // `Vec<U>` for Eq), or t when none alone does. 0 too when no generic
