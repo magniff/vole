@@ -2682,6 +2682,13 @@ builds. Before, they had no `X_C` (a closure's signature indexed
 `CSLOTS` past its type's slots: a compiler panic) and no D19.2 (a
 capture its body moved stayed a borrow: a double drop). Cases
 `rt_044_*`.
+(0.30.2, RT-91) A closure type's slots are its env's and its `X_C`
+(`slot_count`), so a closure's `X_C` is made after the `X_C` of every
+closure its signature or its env holds (`front/closures/kinds.vl:
+sig_slots_ordered`, depth first over the types). Before, they were made
+in the closures' order, and an outer closure made before the inner one
+its result holds (`flat_map(|y| v.iter().map(|x| ..))`) counted the
+inner type's slots without them. Cases `rt_091_*`.
 
 *Soundness.* No position of `slots(Env(C))` is contravariant (a `fn`
 type has no slot, R6); `X_C`'s have `fn` variance. Every later value
