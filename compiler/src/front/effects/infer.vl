@@ -584,13 +584,28 @@ fn node_locals(f: i64, pcx: &mut Ctx<Comp>) -> Effects {
     if intr >= 0 && pcx.nodes[pcx.fns[f as usize].node as usize].c == 0 {
         // (a raw:: pointer form, one parameter fewer, is unsafe)
         let raw = pcx.fns[f as usize].param_count < (pcx.intrs[intr as usize]).nparams;
-        return Effects { bits: if raw { EFF_UNSAFE } else { intrinsic_effect_bits(intr, pcx) },
-            allocs: 0 };
+        // (0.30.2, RT-38g: a raw:: form's store writes through its pointer)
+        let mem = (pcx.intrs[intr as usize]).mem;
+        let writes = raw && mem != crate::arch::MEM_LOAD || mem == crate::arch::MEM_RAW;
+        return Effects {
+            bits: (if raw { EFF_UNSAFE } else { intrinsic_effect_bits(intr, pcx) })
+                | (if writes { crate::front::effects::EFF_RAW_WRITE } else { 0 }),
+            allocs: 0,
+        };
     }
     // (0.21: std's atomic intrinsics synchronize, and their bodies
-    // are never compiled; unsafe stays with their callers)
-    if atomic_intrinsic(f, pcx) >= 0 {
-        return Effects { bits: EFF_SYNC | EFF_UNSAFE, allocs: 0 };
+    // are never compiled; unsafe stays with their callers; 0.30.2,
+    // RT-38g: all but a load and a fence write through their pointer)
+    let atomic = atomic_intrinsic(f, pcx);
+    if atomic >= 0 {
+        let writes = atomic != crate::middle::ir::atomic::ATOMIC_LOAD
+            && atomic != crate::middle::lower::atomic::INTR_FENCE
+            && atomic != crate::middle::lower::atomic::INTR_COMPILER_FENCE;
+        return Effects {
+            bits: EFF_SYNC | EFF_UNSAFE
+                | (if writes { crate::front::effects::EFF_RAW_WRITE } else { 0 }),
+            allocs: 0,
+        };
     }
     // (0.21: the lock std's printing holds once threads run is part of
     // its io, as waiting for a pipe is; 0.26.1: its state is an
@@ -747,6 +762,36 @@ fn local(n: i64, bits: i64, allocs: i64, pcx: &mut Ctx<Comp>) {
     pcx.acc.allocs |= allocs;
 }
 
+// RULE: C3.4 (0.30.2, RT-38g) Raw place n (a deref of a raw pointer, a
+// field or an element through one) walked as a written place, an
+// assignment's target or what a `&mut`, a raw borrow or a `ref mut`
+// lends (static_write): a write through a raw pointer may happen
+// (EFF_RAW_WRITE, which a contract condition may not have).
+fn raw_write(n: i64, pcx: &mut Ctx<Comp>) {
+    if pcx.static_write > 0 {
+        local(n, crate::front::effects::EFF_RAW_WRITE, 0, pcx);
+    }
+}
+
+// RULE: C3.4 (0.30.2, RT-38g) Local n walked as a written place, or typed
+// `&mut [T]`: when it is `*q` of a fat raw pointer q (`*mut [T]`), or `&mut
+// *q`, which the checker makes a copy of q's Ident typed as the view it
+// points to (synth_unary, Z9.3), `(*q)[0] = v` writes through the raw
+// pointer, and `&mut *q` lends what it points to `&mut`.
+fn raw_view_write(n: i64, pcx: &mut Ctx<Comp>) {
+    let y = pcx.nodes[n as usize].y;
+    if y >= 0 && y < pcx.locals.len() as i64 && is_raw_view(pcx.locals[y as usize].ty, pcx)
+        && !is_raw_view(pcx.nodes[n as usize].ty, pcx) {
+        local(n, crate::front::effects::EFF_RAW_WRITE, 0, pcx);
+    }
+}
+
+// Whether t is `&mut [T]` (`&mut str`).
+fn is_mut_view(t: i64, pcx: &Ctx<Comp>) -> bool {
+    t > 0 && pcx.types[t as usize].kind == TyKind::Slice
+        && pcx.types[t as usize].b == crate::front::types::REF_MUT
+}
+
 // RULE: E1.6 (0.28.0) Node n calls std's panic: `panic`, its
 // own (a search finds it there, with no callee to go into).
 fn panic_here(n: i64, pcx: &mut Ctx<Comp>) {
@@ -830,6 +875,9 @@ fn walk(n: i64, pcx: &mut Ctx<Comp>) {
         note_coerced(n, pcx);
     }
     if kind == NodeKind::Ident && pcx.nodes[n as usize].res == Res::Local {
+        if pcx.static_write > 0 || is_mut_view(pcx.nodes[n as usize].ty, pcx) {
+            raw_view_write(n, pcx);
+        }
         // (0.28.0: unless a loop's end hangs on it, walk_loop, walk_while)
         if pcx.loops.len() as i64 > 0 {
             local_used(n, pcx);
@@ -895,6 +943,7 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
         NodeKind::Unary => {
             if (pcx.nodes[n as usize].p & NODE_RAW) != 0 {
                 local(n, EFF_UNSAFE, 0, pcx);
+                raw_write(n, pcx);
             }
             // (0.25) `&place` exclusive or raw, a receiver too: the
             // place may change (static_access)
@@ -978,6 +1027,9 @@ fn walk_node(n: i64, pcx: &mut Ctx<Comp>) {
         NodeKind::FieldAccess => {
             if (pcx.nodes[n as usize].p & NODE_RAW) != 0 || reads_union(n, pcx) {
                 local(n, EFF_UNSAFE, 0, pcx);
+            }
+            if (pcx.nodes[n as usize].p & NODE_RAW) != 0 {
+                raw_write(n, pcx);
             }
             // (E1.8: a union's read may make a pointer of a reference)
             if reads_union(n, pcx) {
@@ -1624,6 +1676,84 @@ pub fn holds_ref(t: i64, raw: bool, depth: i64, pcx: &Ctx<Comp>) -> bool {
             let vi = pcx.variants[enum_variant(en, v, pcx) as usize];
             for j in 0..vi.field_count {
                 if holds_ref((pcx.tlists[(vi.fields + j) as usize]), raw, depth + 1, pcx) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    true
+}
+
+// RULE: C3.4 (0.30.2, RT-38g) Whether a C function given a value of type t
+// may write through it (EFF_RAW_WRITE): t may hold a `*mut T`, a
+// reference (`&mut T`; a `&T` too: C keeps no rule for a cell behind it),
+// a `&mut [T]`, a fat raw pointer (its constness is not kept), an opaque
+// type or a type not known, at any depth. A `*const T` is not written
+// through (F30.5), what it points to may hold one: memcmp's `*const u8`s
+// are no write, a `*const *mut u8` may be. Yes beyond a depth of 16.
+pub fn holds_mut(t: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if t <= 0 || depth > 16 || crate::front::opaque::is_opaque(t, pcx) {
+        return true;
+    }
+    let u = undistinct(t, pcx);
+    if u <= 0 {
+        return true;
+    }
+    let k = pcx.types[u as usize].kind;
+    if k == TyKind::Prim || k == TyKind::Fn {
+        return false;
+    }
+    if k == TyKind::Ptr {
+        if !crate::front::types::is_const_ptr(u, pcx) {
+            return true;
+        }
+        return holds_mut(pcx.types[u as usize].a, depth + 1, pcx);
+    }
+    if k == TyKind::Slice {
+        if pcx.types[u as usize].b != 0 {
+            return true;
+        }
+        return holds_mut(pcx.types[u as usize].a, depth + 1, pcx);
+    }
+    if k == TyKind::Array || k == TyKind::Vector {
+        return holds_mut(pcx.types[u as usize].a, depth + 1, pcx);
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[u as usize].count {
+            if holds_mut(type_elem(u, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == TyKind::Struct {
+        let st = pcx.types[u as usize].a;
+        for i in 0..pcx.structs[st as usize].field_count {
+            if holds_mut((struct_field(st, i, pcx)).ty, depth + 1, pcx) {
+                return true;
+            }
+        }
+        for i in 0..pcx.structs[st as usize].targ_count {
+            if holds_mut((pcx.tlists[(pcx.structs[st as usize].targs + i) as usize]), depth + 1,
+                pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == TyKind::Enum {
+        let en = pcx.types[u as usize].a;
+        for i in 0..(pcx.enums[en as usize]).targ_count {
+            if holds_mut((pcx.tlists[((pcx.enums[en as usize]).targs + i) as usize]), depth + 1,
+                pcx) {
+                return true;
+            }
+        }
+        for v in 0..(pcx.enums[en as usize]).variant_count {
+            let vi = pcx.variants[enum_variant(en, v, pcx) as usize];
+            for j in 0..vi.field_count {
+                if holds_mut((pcx.tlists[(vi.fields + j) as usize]), depth + 1, pcx) {
                     return true;
                 }
             }
@@ -2593,6 +2723,10 @@ fn walk_index(n: i64, pcx: &mut Ctx<Comp>) {
     walk(base, pcx);
     let bt = pcx.nodes[base as usize].ty;
     let raw = bt > 0 && pcx.types[bt as usize].kind == TyKind::Ptr;
+    // (0.30.2: a raw pointer's or a raw slice's element written, RT-38g)
+    if crate::front::types::is_raw_ptr(bt, pcx) || crate::front::types::is_raw_view(bt, pcx) {
+        raw_write(n, pcx);
+    }
     if pcx.nodes[index as usize].kind == NodeKind::Range {
         walk(pcx.nodes[index as usize].a, pcx);
         walk(pcx.nodes[index as usize].b, pcx);
@@ -3410,7 +3544,7 @@ fn signature_of(m: i64, pcx: &mut Ctx<Comp>) {
         d.allocs = if d.allocs < 0 { i.allocs } else { d.allocs & i.allocs };
     }
     let hidden = EFF_RAW_PANIC | EFF_RAW_DIVERGE | EFF_RAW_GLOBAL | EFF_INTERIOR | EFF_UNSAFE
-        | EFF_ADDR;
+        | EFF_ADDR | crate::front::effects::EFF_RAW_WRITE;
     let debt = if std { i.bits & (EFF_TLS | EFF_THREAD | EFF_SYNC) } else { 0 };
     if track {
         // (a list allows a cell's write, set_bound: that is no write of
@@ -3422,7 +3556,9 @@ fn signature_of(m: i64, pcx: &mut Ctx<Comp>) {
         // declared_error's debt; what the body does of them stays in the
         // signature, or E3.3c's callers lost them: spawn_in's thread)
         fixed.bits |= debt;
-        fixed.bits = (fixed.bits & !EFF_INTERIOR) | ((i.bits | pf.bits) & EFF_INTERIOR);
+        // (0.30.2: and a raw write's, as a cell's, RT-38g)
+        let writes = EFF_INTERIOR | crate::front::effects::EFF_RAW_WRITE;
+        fixed.bits = (fixed.bits & !writes) | ((i.bits | pf.bits) & writes);
         (pcx.fx_fixed[m as usize]) = fixed;
         (pcx.fx_dyn[m as usize]) = pd;
     }

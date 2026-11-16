@@ -69,14 +69,20 @@ is taken may do).
 Owned parameters are read in place, never moved or dropped.
 A clause is a predicate: it never writes, lends `&mut` or moves what
 the caller owns, nor what `result` holds. It reads the parameters and
-`result` as through a `&` reference, so `o = None`, `o.take()`,
+`result` as through a `&` reference, whatever their types are written
+as (an alias of a `&mut T`, an associated type, `self` of an impl for
+`&mut T`), so `o = None`, `o.take()`,
 `mem::replace(&mut o, ..)`, a `mut self` method, `*r.0 = 1` through a
 `&mut` they hold, and the same inside `old(..)` are
 `borrowck.assign_immutable` / `borrowck.borrow_immutable` ("a borrowed
 copy"), and a by-value binding of a part that is not `Copy`
 (`match o { Some(w) => .. }`, `let (a, _) = t;`) is `contract.move`:
 match on `&o`, or bind `ref w`. What a clause makes itself (a `let mut
-n`) it may change. So a contract never changes what the program does:
+n`) it may change, but never through a raw pointer or a cell, its own
+neither: `unsafe { *p = 1 }`, `p.write(1)`, `&mut *p`, `c.set(1)` or a
+call of a function that does one (std's `take`, `mem::replace`,
+`mem::swap`) are `contract.effect` (a read through a raw pointer is
+allowed). So a contract never changes what the program does:
 `--debug-contracts` on or off prints the same for a program that
 passes its contracts.
 
