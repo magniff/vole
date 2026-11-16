@@ -1743,10 +1743,34 @@ extern_effects` (no `raw_global`). Cases `rust_f_f19_static_mut_err`,
 position has no drop glue of its own fields (an `impl Drop for U` of its
 own runs): which field holds a value is the program's to know, as in
 Rust. A field read out by value (in `unsafe`) moves the union: a union's
-field has the union's own move path (borrowck.md D8.3). Not yet: rustc's
-E0740 for a field that is neither `Copy` nor `ManuallyDrop` (FL12).
+field has the union's own move path (borrowck.md D8.3). No drop reads a
+union's field's bytes (0.30.2, RT-43): a drop of a place in a union's
+field (up to the first `*`), an assignment's old value (`u.p.d = v`),
+is removed, and a union has no parts dropped apart (`places/elab.vl:
+within_union`, the drops' own guard, whatever the declarations).
 *Anchor:* `front/own/glue.vl: glue_of`, `places/elab.vl: path_of,
-rust_union`. Case `rust_f_f19_union_no_drop`.
+rust_union, within_union`. Case `rust_f_f19_union_no_drop`.
+
+An assignment's place is written without being read only up to its
+first deref (0.30.2, RT-43; rustc's assignment_info ends at a Deref):
+`u.r.k = v` through a reference field (`u.s.r.k`, `u.t.0` of a `&mut`
+tuple, `u.rr.k` of a `&mut &mut P`, `&raw mut u.r.k`), and `u.m.k = v`
+through ManuallyDrop's DerefMut, read the union's field, unsafe (E0133).
+*Anchor:* `front/check/unsafety.vl: union_read_through`. Cases
+`rt_043g_union_write_through_field`, `rt_043h_union_manually_drop_deref`,
+`rt_043i_union_copy_part_write`.
+
+**F19.8 (a union's field needs no drop; 0.30.2, RT-43).** A union's field
+is Copy, a reference (`&mut T` too), std's `ManuallyDrop<T>` (known by its
+path, front/known.vl), or a tuple or an array of those, rustc's
+allowed_union_field; else `union.field` (E0740), at the field, once for a
+declaration. Every union is asked, each instance of a generic one, and a
+generic one of the program also by its opaque instance (D22.1), so
+`union U<T> { t: T }` without `T: Copy` is refused whatever its uses.
+std's ManuallyDrop, a union over its `T`, is the one union whose field may
+need drop. *Anchor:* `front/traits.vl: check_union_fields,
+union_field_ok, omega_union`. Cases `rt_043_union_field_assign_drop`,
+`rt_043b`..`rt_043f`.
 
 A pattern that matches a union's field by anything but `_` (`let U { r,
 .. } = u;`, a `match` arm, `if let`, a closure's parameter) reads the
@@ -2386,6 +2410,7 @@ where a `try:` is named, a case in `tests/borrowck-try`'s shape under
 | `type.ref_cast` | F29.4 | E0605, E0606 | none (the help names `&*p`, `as_bytes`, a conversion) |
 | `type.widen_i32` | F29.3 (0.30.1) | none (rustc infers i64) | none: the help names the annotation and `i64::from` |
 | `type.transmute` | F19.5 | E0512 | none; names both sizes |
+| `union.field` | F19.8 (0.30.2) | E0740 | none: the help names `ManuallyDrop<T>` and Copy |
 | `generic.unbounded_use` | D22.3, F26.2 | E0599, E0369, E0609 | adds `T: Tr` when unique |
 | `generic.count` | F19.1 | E0107 | removes or completes the turbofish |
 | `pattern.refutable` | F27.1 | E0005 | `if let` |
@@ -2530,11 +2555,15 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   no opaque instance. Cases `rust_b_opaque_err_type_mismatch`,
   `rust_b_opaque_err_bound_args`, `rust_b_opaque_ok_model`.
 
-- **FL12 (a union's field that needs a drop; 0.27.3).** rustc rejects a
-  union field that is neither `Copy` nor `ManuallyDrop<_>` (E0740, a
-  generic `T` too); vole accepts it and drops no field (F19.7), so std2
-  can write `ManuallyDrop<T>` as a union over a `T`. Case
-  `rust_f_f19_union_no_drop` (`// RUSTC: none FL12`).
+- **FL12 (a union's field that needs a drop; 0.27.3, closed 0.30.2).**
+  rustc rejects a union field that is neither `Copy` nor `ManuallyDrop<_>`
+  (E0740, a generic `T` too); vole accepted it until 0.30.2, when F19.8
+  refuses it as rustc does (RT-43). std's `ManuallyDrop<T>` stays a union
+  over a `T`, the one exception, known by its path. Still apart: rustc
+  also refuses the implicit DerefMut of a ManuallyDrop union field (`u.m.k
+  = v`, "not automatically applying `DerefMut`"), where vole requires
+  `unsafe` (F19.7) and then drops the old value as rustc's explicit
+  `(*u.m).k = v` does.
 - **FL13 (an array's by-value iterator; 0.27.3, until const generics,
   0.29).** Rust's `std::array::IntoIter<T, const N: usize>` is std2's
   `IntoIter<T, Arr>` with `Arr = [T; N]` (`IntoIter<i64, [i64; 3]>`),

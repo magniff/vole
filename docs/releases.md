@@ -94,6 +94,60 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.30.2
+
+#### What the checkers now refuse
+
+- **A union's field needs no drop** (RT-43; rustc E0740, `union.field`).
+  A union's field is Copy, a reference (`&mut T` too), std's
+  `ManuallyDrop<T>`, or a tuple or an array of those. Before, a field of
+  any type was accepted, and `u.x = 5; u.p.d = D { v: 3 };`, with no
+  `unsafe`, dropped the old `d` read from the bytes `u.x` wrote (with an
+  owning field, a free of a garbage pointer). A generic union is checked
+  by its opaque instance too: `union U<T> { t: T }` needs `T: Copy`
+  whatever its uses. The fix is the field's type in `ManuallyDrop<..>`,
+  whose value `ManuallyDrop::drop` or `into_inner` takes where the
+  program knows the field holds it. Independently of the declarations, no
+  drop reads a union's field: an assignment's old value under one is
+  never dropped.
+- **An assignment through a union's field reads it** (RT-43, E0133). A
+  place is written without being read only up to its first deref: `u.r.k
+  = v` with `r: &mut P` (also through a Copy struct's reference, a
+  `&mut` tuple, a `&mut &mut P`, `&raw mut u.r.k`) and `u.m.k = v`
+  through a ManuallyDrop's DerefMut read the union's field, and need
+  `unsafe`. They were accepted in safe code: a write through a pointer
+  made of another field's bytes.
+- **A contract's clause writes nothing it did not make, whatever the
+  types are written as** (RT-38f). Every parameter a clause mentions is
+  read through a view, before the body and after it: a parameter whose
+  `&mut` is hidden in an alias (`type R<'a> = &'a mut i64`), an
+  associated type or `self` of `impl Bump for &mut i64` had none after
+  the body, so `ensures { *p = 9; true }` wrote the caller's value (with
+  a `debug ensures`, the output changed with `--debug-contracts`).
+- **A clause writes through no raw pointer** (RT-38g, `contract.effect`).
+  `unsafe { *p = 5 }`, `(*p).f = 5`, a raw slice's element, `&mut *p`,
+  `p.write(5)`, a C function given a pointer, or a call of a function
+  that does one: refused as a cell's `set` is. A read through a raw
+  pointer is allowed; a write through one the clause made itself is
+  refused too, as the effects cannot tell what a pointer points to: so
+  are std's `Option::take`, `mem::replace` and `mem::swap`, which write
+  through raw pointers, on the clause's own values too. A C function
+  given only `*const` pointers to what holds no other (`memcmp`) does
+  not count. `query effects F --why raw_write` shows the chain.
+
+#### Bugs fixed
+
+- **A closure in a generic Drop impl's instance** (RT-44): `impl<T> Drop
+  for W<T> { fn drop(&mut self) { thread::scope(|s| { s.spawn(|| 1i64);
+  }); } }` made the compiler panic (places/regions.vl, index out of
+  bounds), and so did such a closure in what only that `drop` calls (a
+  generic function, a trait's default method, a generic trait's impl
+  method). The instance is made while the bodies are built, after every
+  closure's kind and signature slots were decided, and its closures had
+  none; one whose body moved a capture kept it borrowed and dropped the
+  value twice. They now get both, and their bodies are built before the
+  bodies that make them.
+
 ### What's new in 0.30.1
 
 The safety nets' release: checks that passed without looking, found
