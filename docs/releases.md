@@ -136,6 +136,20 @@ A correctness release, its branches merged as each is reviewed clean.
   and `&mut [T]` parameters keep their facts: the compiler's source
   built at -O2 by 0.30.1 and by 0.30.2 gives the same assembly, byte
   for byte. `--no-noalias` was the workaround.
+- **A path call adjusted its first argument as a method receiver
+  (RT-159), since 0.28.0, unsound from safe code.** `Tr::m(arg)` was
+  made the method call `arg.m()`, whose probe adds and removes
+  references and takes a `&` for a `&mut`: `T0::g(&s)` of a `g(&mut
+  self)` mutated s through a shared reference, `T0::h(s)` of an
+  `h(&self)` borrowed s instead of moving it, and `T0::f(&s)` of an
+  `f(self)` ran S's impl, not `&S`'s. Now a path call is never a method
+  call: Self is the first argument's type as written (the parameter
+  holding Self read against it, `&Self` against a `&S` gives S), and the
+  arguments are checked as any call's, with only the coercions any
+  argument has (`&mut S` where `&S` goes). `&*v` of a view (`&str`,
+  `&[T]`) is the view, as rustc's, so `Show::show(&**self)` in an impl
+  for `&T` calls T's. rustc's errors for the rest: E0277 (`&S: T0`
+  unmet), E0308 (the argument not of the parameter's shape).
 - **Refused where rustc accepts, fixed with it (RT-C301-9, RT-87):**
   `<T as B>::m` as a value in a generic function, `<S as Conv<i64>>::c`
   of a generic trait with two impls for S, `T::mk()` under `T: Tr<i64>`

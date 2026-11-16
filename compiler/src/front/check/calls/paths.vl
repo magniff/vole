@@ -49,8 +49,8 @@ use crate::front::modules::lookup::{
 };
 use crate::front::traits::{bounded_param, require_in_bounds};
 use crate::front::types::{
-    TY_F32, TY_F64, TyKind, buf_type, enum_type, err_type, find_variant, is_ffi_safe, is_fn_type,
-    is_integer, is_pointer, is_vector, item_node_of, type_elem, variant_field,
+    TY_F32, TY_F64, TY_NEVER, TyKind, buf_type, enum_type, err_type, find_variant, is_ffi_safe,
+    is_fn_type, is_integer, is_pointer, is_vector, item_node_of, type_elem, variant_field,
 };
 use crate::tools::query::command_line::{qnote, qnote_module};
 
@@ -739,69 +739,74 @@ fn self_in_result(ret: i64, expected: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i
     0
 }
 
-// RULE: F8.2 (0.27.6) The type a trait function's Self is from call n's
-// arguments, for a function without a receiver whose parameter's written
-// type holds Self (`Self`, `&Self`, `&mut Self`, `&[Self]`, `[Self]`):
-// from the type the argument has without being checked (a local, `&e`,
-// `&mut e`, `e[a..b]` of one), as rustc infers it (`Hash::hash_slice(self,
-// state)` with `self: &[T]` is `<T as Hash>::hash_slice`); 0 when none says.
-fn self_from_args(f: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
+// RULE: F8.2 (0.30.2, RT-159) The type Self is in `Tr::f(args)`, a
+// trait's function f by a path that names no Self: the type of the first
+// argument whose parameter's written type holds Self (`self`, `&self`,
+// `&mut self`, `Self`, `&Self`, `&[Self]`), that argument synthesized as
+// written and then checked as the call's (check_arg: no autoref, no
+// autoderef, no `&` for `&mut`; only the coercions any argument has).
+// rustc's inference: `Tr::h(&s)` of `h(&self)` is `<S as Tr>::h`,
+// `Tr::f(&s)` of `f(self)` `<&S as Tr>::f`, `Hash::hash_slice(v, state)`
+// with `v: &[T]` `<T as Hash>::hash_slice`. An argument without the
+// parameter's shape (`Tr::h(s)` of `h(&self)`, rustc E0308) is an error,
+// and -1 then; 0 when no parameter holds Self, or its argument is a
+// closure (typed from its parameter).
+fn self_from_written_args(f: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let count = if pcx.nodes[n as usize].count
         < pcx.nodes[f as usize].count { pcx.nodes[n as usize].count }
         else { pcx.nodes[f as usize].count };
     for i in 0..count {
-        let param_ty = pcx.nodes[child(f, i, pcx) as usize].b;
-        let t = quiet_type(child(n, i, pcx), 0, pcx);
-        let s = self_in_param(param_ty, t, 0, pcx);
-        if s > 0 {
-            return s;
+        let p = child(f, i, pcx);
+        let param_ty = pcx.nodes[p as usize].b;
+        // (`self` by value: Self itself)
+        let by_value_self = param_ty == 0 && pcx.nodes[p as usize].a == pcx.self_sym;
+        if !by_value_self && !holds_self(param_ty, 0, pcx) {
+            continue;
         }
+        let arg = child(n, i, pcx);
+        if crate::front::closures::fn_bounds::is_deferred_arg(arg, pcx) {
+            return 0;
+        }
+        let t = synth_expr(arg, pcx);
+        crate::front::generics::mark_synthed(arg, pcx);
+        if t <= 0 || t == TY_NEVER || crate::front::check::has_error_type(t, pcx) {
+            return -1;
+        }
+        let s = if by_value_self { t } else { self_in_param(param_ty, t, 0, pcx) };
+        if s <= 0 {
+            err_begin(pcx.nodes[arg as usize].start, pcx);
+            err_str(c"mismatched types: the argument is '", pcx);
+            err_type(t, pcx);
+            err_str(c"', not of the parameter's shape (a reference where it is `&self` or `&Self`): a path call takes Self from its argument as written, and takes or removes no reference (rustc E0308)", pcx);
+            err_help(c"pass the argument the parameter's type: `&x` for `&self`, `&mut x` for `&mut self`, `x` for `self`", pcx);
+            err_end(pcx);
+        }
+        return s;
     }
     0
 }
 
-// The type of expression e known without checking it: a local's, `&e` and
-// `&mut e` of one, `e[a..b]` of an array, a slice or a Vec; 0 otherwise.
-fn quiet_type(e: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    if e <= 0 || depth > 4 {
-        return 0;
+// Whether the written type ty holds Self where self_in_param finds it.
+fn holds_self(ty: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if ty <= 0 || depth > 4 {
+        return false;
     }
-    let k = pcx.nodes[e as usize].kind;
-    if k == NodeKind::Ident && pcx.nodes[e as usize].count == 0 {
-        return match lookup_local(pcx.nodes[e as usize].a, pcx) {
-            Option::Some(l) => pcx.locals[l as usize].ty,
-            Option::None => 0,
-        };
+    let k = pcx.nodes[ty as usize].kind;
+    if k == NodeKind::TyName {
+        return pcx.nodes[ty as usize].a == pcx.self_type_sym && pcx.nodes[ty as usize].count == 0
+            && pcx.nodes[ty as usize].g == 0;
     }
-    if k == NodeKind::Unary && pcx.nodes[e as usize].op == Tok::Amp {
-        let t = quiet_type(pcx.nodes[e as usize].b, depth + 1, pcx);
-        if t <= 0 {
-            return 0;
-        }
-        if pcx.types[t as usize].kind == TyKind::Slice {
-            return t;
-        }
-        return crate::front::types::ref_to(t,
-            if (pcx.nodes[e as usize].p & NODE_REF_MUT) != 0 { crate::front::types::REF_MUT }
-            else { crate::front::types::REF_SHARED }, pcx);
+    if k == NodeKind::TyPtr || k == NodeKind::TySlice {
+        return holds_self(pcx.nodes[ty as usize].a, depth + 1, pcx);
     }
-    if k == NodeKind::Index && pcx.nodes[pcx.nodes[e as usize].b as usize].kind == NodeKind::Range {
-        let mut t = quiet_type(pcx.nodes[e as usize].a, depth + 1, pcx);
-        while t > 0 && pcx.types[t as usize].kind == TyKind::Ptr {
-            t = pcx.types[t as usize].a;
-        }
-        if t > 0
-            && (pcx.types[t as usize].kind == TyKind::Array
-                || pcx.types[t as usize].kind == TyKind::Slice) {
-            return crate::front::types::slice_of(pcx.types[t as usize].a, pcx);
-        }
-    }
-    0
+    false
 }
 
 // The type Self is when a parameter written `ty` (a type node) takes a
-// value of type t: `Self` itself, through `&`, `&mut` and `[..]`; 0 when
-// ty does not hold Self in those.
+// value of type t: `Self` itself, through `&`, `&mut` and `[..]` (`&[Self]`
+// of a slice view `&[S]`); 0 when ty does not hold Self in those, or t
+// lacks their shape. The reference's kind is not compared: the argument
+// is checked against the parameter after (check_arg).
 fn self_in_param(ty: i64, t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if ty <= 0 || t <= 0 || depth > 4 {
         return 0;
@@ -813,6 +818,19 @@ fn self_in_param(ty: i64, t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
     }
     if k == NodeKind::TyPtr && pcx.types[t as usize].kind == TyKind::Ptr {
         return self_in_param(pcx.nodes[ty as usize].a, pcx.types[t as usize].a, depth + 1, pcx);
+    }
+    // (`&[Self]`: a slice is its own view type)
+    if k == NodeKind::TyPtr && pcx.types[t as usize].kind == TyKind::Slice
+        && pcx.nodes[pcx.nodes[ty as usize].a as usize].kind == NodeKind::TySlice {
+        return self_in_param(pcx.nodes[ty as usize].a, t, depth + 1, pcx);
+    }
+    // (`&Self` of a view, `&str`, `&[T]`: Self is the place it refers to,
+    // `str`, `[T]`, as rustc's `<str as AsRef<U>>`)
+    if k == NodeKind::TyPtr {
+        let place = crate::front::types::place_of_view(t, pcx);
+        if place > 0 {
+            return self_in_param(pcx.nodes[ty as usize].a, place, depth + 1, pcx);
+        }
     }
     if k == NodeKind::TySlice && pcx.types[t as usize].kind == TyKind::Slice {
         return self_in_param(pcx.nodes[ty as usize].a, pcx.types[t as usize].a, depth + 1, pcx);
@@ -830,77 +848,37 @@ fn synth_path_call(n: i64, callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return vector_assoc_call(n, callee,
             (pcx.sym_primitive[pcx.nodes[callee as usize].a as usize]), pcx);
     }
-    // RULE: F8.2 (0.27.2: `Tr::m(x, args)`, a trait's method with its
-    // receiver explicit, is `x.m(args)`, probed as a method call is;
-    // 0.27.2 M3: by its path too, `std::clone::Clone::clone(x)`, as
-    // the derives write it, F17.1)
-    // RULE: F8.4 (0.30.2: `<S as Tr>::f(args)`, Tr's function for S, is
-    // the item qualified::path_trait and trait_fn_of find below, called
-    // with its arguments as written, as rustc's; 0.30.1 made one with a
-    // receiver the method call `Tr::f(x)` is, and dropped the trait's
-    // arguments: `<S as Conv<i64>>::c(&s)` was ambiguous)
+    // RULE: F8.2, F8.4 (0.30.2, RT-159: `Tr::f(args)`, a trait's function
+    // by a path, std::clone::Clone::clone(x) as the derives write it too,
+    // is `<Self as Tr>::f(args)`: Self the expected type's
+    // (trait_assoc_self, before) or the first argument's whose parameter
+    // holds Self, as written; the item is then qualified::path_trait's,
+    // below, and its arguments are checked as any call's, with no autoref,
+    // autoderef or `&` taken for `&mut`. 0.27.2 to 0.30.1 made `Tr::m(x,
+    // args)` the method call `x.m(args)`, whose probe adjusts a receiver:
+    // `Tr::g(&s)` of a `g(&mut self)` mutated s through a `&`, and
+    // `Tr::h(s)` of an `h(&self)` borrowed s. A path call is never a method
+    // call: no MethodCall is made of it, and nothing tells the probe of
+    // one)
+    // RULE: F8.4 (0.30.2: `<S as Tr>::f(args)` likewise, its arguments as
+    // written; 0.30.1 dropped the trait's arguments, `<S as
+    // Conv<i64>>::c(&s)` was ambiguous)
     let qn = crate::front::parser::rust::lifetimes_of(crate::front::parser::rust::qpath_key(callee),
         pcx);
-    // (0.27.6, Z9.1c: `A::m(x)` of a bounded parameter A was the method
-    // call `Tr::m(x)` of the first bound declaring m; 0.30.2: the item of
-    // the one bound that declares it, qualified::path_trait, below)
     if qn == 0 && pcx.nodes[callee as usize].y == 0 && pcx.nodes[n as usize].count > 0 {
-        let mut tr = trait_path_key(callee, pcx);
-        // RULE: F8.2 (0.27.6: a function of the trait without a receiver,
-        // its Self from an argument, `Hash::hash_slice(self, state)`:
-        // `<T as Hash>::hash_slice`, path_target reads y)
-        let f: i64 = if tr
-            != 0 { crate::front::traits::trait_fn(tr - 1, pcx.nodes[callee as usize].b, pcx) }
-            else { 0 };
-        let receiver = f != 0 && pcx.nodes[f as usize].count > 0
-            && pcx.nodes[child(f, 0, pcx) as usize].a == pcx.self_sym;
-        let s: i64 = if f != 0 && !receiver { self_from_args(f, n, pcx) } else { 0 };
-        if s > 0 {
-            pcx.nodes[callee as usize].y = s;
-            tr = 0;
-        }
-        // RULE: F8.2 (0.30.1) A method with a receiver: Self is what the
-        // argument's type is against the receiver's written type (`&Self`,
-        // `&mut Self`, `Self`), as rustc unifies them, with no autoderef:
-        // `Tr::f(&r)` of an `r: &S` is `<&S as Tr>::f`, `Tr::g(&s)` of a
-        // `g(self)` `<&S as Tr>::g`. When that Self is a reference, the
-        // method probe below would find S's impl first (0.27.2: it did, and
-        // `Tr::g(&d)` moved d out); so the argument stays the receiver as
-        // written, `(&r).f()`, probed through Tr only (via_trait: not
-        // `<&S as Display>` for `Debug::fmt`). Any other Self is what the
-        // probe finds from the argument without its `&`.
-        let mut self_ref = false;
-        if tr != 0 && receiver {
-            let t = quiet_type(child(n, 0, pcx), 0, pcx);
-            let rs = self_in_param(pcx.nodes[child(f, 0, pcx) as usize].b, t, 0, pcx);
-            self_ref = rs > 0 && pcx.types[rs as usize].kind == TyKind::Ptr
-                && crate::front::types::is_ref(rs, pcx);
-        }
-        if tr != 0 {
-            let mut first = child(n, 0, pcx);
-            // (`Display::fmt(&x, f)`: the receiver x, the method's
-            // `&self` borrows it again; 0.30.1: not a `self` taken by
-            // value, whose Self is then the reference, `Tr::g(&v[0])` the
-            // impl for &T, which the probe finds first for `(&v[0]).g()`)
-            let by_value = f != 0 && receiver && pcx.nodes[child(f, 0, pcx) as usize].b > 0
-                && pcx.nodes[pcx.nodes[child(f, 0, pcx) as usize].b as usize].kind
-                != NodeKind::TyPtr;
-            if pcx.nodes[first as usize].kind == NodeKind::Unary
-                && pcx.nodes[first as usize].op == Tok::Amp && !by_value && !self_ref {
-                first = pcx.nodes[first as usize].b;
+        let tr = trait_path_key(callee, pcx);
+        let f: i64 = if tr != 0 {
+            crate::front::check::calls::qualified::declared_fn(tr - 1,
+                pcx.nodes[callee as usize].b, pcx)
+        } else { 0 };
+        if f != 0 {
+            let s = self_from_written_args(f, n, pcx);
+            if s < 0 {
+                return pcx.ty_error;
             }
-            let mark = list_begin(pcx);
-            for k in 1..pcx.nodes[n as usize].count {
-                list_push(child(n, k, pcx), pcx);
+            if s > 0 {
+                pcx.nodes[callee as usize].y = s;
             }
-            list_end(n, mark, pcx);
-            pcx.nodes[n as usize].kind = NodeKind::MethodCall;
-            pcx.nodes[n as usize].a = first;
-            pcx.nodes[n as usize].b = pcx.nodes[callee as usize].b;
-            pcx.nodes[n as usize].g = pcx.nodes[callee as usize].h;
-            pcx.via_node = n;
-            pcx.via_trait = tr - 1;
-            return synth_expr(n, pcx);
         }
     }
     let mut t = path_target(callee, pcx);
