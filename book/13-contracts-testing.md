@@ -194,7 +194,7 @@ fn main() {
 ```
 
 ```err
-error[contract.effect]: the 'requires' of 'first' calls 'checked', which does io: a condition may not do io, allocate, touch statics or write through a shared reference
+error[contract.effect]: the 'requires' of 'first' calls 'checked', which does io: a condition may not do io, allocate, touch statics or write through a shared reference or a raw pointer
  --> main.vl: line 7, column 14
   = help: a check that passes must not change what the program does: compute the value in the body, or check it with assert there
   = try: volec query effects checked --why io main.vl
