@@ -116,7 +116,12 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   check of its step, and after the loop as its last value; any other
   reader (a store, a comparison, a call, an address, a conversion,
   another carried value, a branch) makes it a scan, which stays scalar.
-  The run-time unroller, whose rule that was, asks the same function.
+  The run-time unroller, whose rule that was, asks the same function;
+  that rule judged each value at its first visit, in block order, so a
+  step `acc = acc + u` whose u was made from acc in an earlier block
+  visited later was split into partial sums (RT-89, in 0.30.1 at -O2;
+  `--no-unroll-runtime` was the workaround). The set is now grown whole
+  before any of it is judged.
   Floats were never vectorized as reductions; the outer-loop vectorizer
   and SLP compute each lane exactly and were right. Seen on 0.28.0 (the
   first release that builds the case) to 0.30.1; `--no-vectorize` was
