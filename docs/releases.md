@@ -94,6 +94,45 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.30.2
+
+A correctness release, its branches merged as each is reviewed clean.
+
+#### Miscompiles fixed
+
+- **A qualified path to a trait's item (RT-C301-8), at every level, in
+  0.30.0 and 0.30.1.** When a type implements two traits that each have
+  a function or an associated constant of one name, a path that names
+  one trait took the other's: `let f = <S as B>::m;` ran `A::m`, and
+  `<S as A>::K` was `B::K`; so did `T::K` and `T::mk()` in an instance
+  of `fn f<T: A>()` whose type also implements B, and `Self::K` in a
+  trait's default function. The checker read the path's trait for a
+  call with a receiver only, and found the value's or the constant's
+  item by its name on the type. Now one function decides the trait of
+  every path's item, from what the path says (`<X as Tr>`, a type
+  parameter's bound, a trait default's own trait), and the item is
+  found in that trait's impl only, with the trait's arguments as
+  written (`<S as Conv<i64>>::c`), for a call, a value and a constant
+  alike (front-rust.md F8.3, F8.4; `front/check/calls/qualified.vl`).
+- **Refused where rustc accepts, fixed with it (RT-C301-9):**
+  `<T as B>::m` as a value in a generic function, `<S as Conv<i64>>::c`
+  of a generic trait with two impls for S, and `<T as B>::Out` beside
+  `<T as A>::Out` in a generic body (one opaque type for both before).
+
+#### What the checkers now refuse
+
+- A path `S::m`, `S::K` or `Self::K` naming a function or constant two
+  traits give S (none inherent, both in scope), and `T::m` or `T::K`
+  of a parameter two of whose bounds declare it: error
+  `method.ambiguous` (rustc E0034), with a `try: <S as A>::m` per
+  trait. 0.30.1 took one of them silently.
+- `T::Out` through two bounds that both declare `Out`: error
+  `type.ambiguous` (rustc E0221); 0.30.1 took the first bound's.
+- `<S as Tr>::f(args)` calls Tr's function with its arguments as
+  written, with no autoref (rustc's); `<S as B>::m` where B declares no
+  `m` is `name.unknown` (E0576), and one where S has no impl of B is
+  `trait.unmet` (E0277).
+
 ### What's new in 0.30.1
 
 The safety nets' release: checks that passed without looking, found
@@ -575,6 +614,7 @@ none at 0.30.0's tag; the census's own cases went from 712 to 705).
   same name, a qualified path used as a value takes one trait's for
   both: `let f = <S as B>::m;` runs `A::m`, and `<S as A>::K` is `B::K`.
   A call through the path, `<S as B>::m(&s)` or `B::m(&s)`, is right.
+  Fixed in 0.30.2 ("What's new in 0.30.2", Miscompiles fixed).
 - **Unsound in safe code:**
   - indexing a raw slice pointer (`*mut [T]`, `*const [T]`) needs no
     `unsafe` (RT-39);

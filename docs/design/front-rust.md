@@ -1351,15 +1351,38 @@ then, with `τ` concrete, the traits in scope (F9.2) that `τ` implements
 and that declare `name`; with `τ` a parameter, its bounds (F0.4a).
 Ambiguity is F9.3's. `<τ>::name` with an explicit type is what
 disambiguates a primitive (`<i64>::MAX`, `<[T]>::len`).
+(0.30.2) With `τ` a parameter (its Ω in the generic body, the type it
+stands for in an instance) the trait is the one of its bounds, or of
+their supertraits, that declares `name`, whatever other traits the
+instance's type implements: `T::K` with `T: A` is A's K though S also
+has B's. `Self::name` in a trait's default function is the trait's (or
+a supertrait's), not another trait's of S. With `τ` concrete, two traits
+that give `τ` a function or constant `name` (none inherent) are error
+`method.ambiguous` (E0034), unless only one is in scope (F9.2); two
+bounds declaring it likewise; for an associated type, `T::Out` through
+two bounds is `type.ambiguous` (E0221). *Anchor:*
+`front/check/calls/qualified.vl: path_trait, concrete_trait,
+bound_assoc_trait`.
 
 **F8.4 (`<τ as Tr>::name` in an expression).** With `τ` a name
-(`<i32 as FromStr>::from_str("-7")`, `<W as Make>::make()`), the path
-`τ::name` (F8.3), with Tr kept (0.30.1, the review: 0.27.2.1 parsed it
-and dropped it, so `<S as B>::m(&s)` ran A's m, and S's inherent m over
-B's): with a receiver it is `Tr::name(x)` (F8.2), through Tr only;
-without one, τ's impl of Tr (`<S as B>::mk()`); a `τ` that is not a name (`<Vec<T> as
-Tr>::f`) is a parser error. *Anchor:* `front/parser/exprs.vl:
-parse_primary`. Case `rust_f_f8_qualified_call_ok`.
+(`<i32 as FromStr>::from_str("-7")`, `<W as Make>::make()`), the item
+`name` of Tr (Tr itself declares it, else E0576), from τ's impl of Tr
+with the trait's arguments as written (`<S as Conv<i64>>::c`), its own
+item or Tr's default copied into it; τ a parameter's Ω: the bound's
+virtual function or constant. It is the same item whether the path is
+called, used as a value (`let f = <S as B>::m;`) or is a constant
+(`<S as A>::K`); a call passes its arguments as written, with no autoref
+(rustc's). 0.27.2.1 parsed the trait and dropped it; 0.30.1 kept it for
+a call only, so a value or a constant through the path was the other
+trait's (RT-C301-8, a miscompile), and `<T as B>::m` as a value in a
+generic body, or `<S as Conv<i64>>::c`, was refused (RT-C301-9). 0.30.2:
+one function decides the trait of every path's item,
+`qualified::path_trait` (else `concrete_trait`), and the item is found
+in that trait only (`trait_fn_of`, `trait_const_of`); nothing finds a
+trait's item of a path by its name alone. A `τ` that is not a name
+(`<Vec<T> as Tr>::f`, `<&S as Tr>::f`) is a parser error. *Anchor:*
+`front/parser/exprs.vl: parse_primary`, `front/check/calls/qualified.vl`.
+Cases `rust_f_f8_qualified_call_ok`, `rt_c301_008_*`, `rt_c301_009_*`.
 
 ### F9 Method name clash
 

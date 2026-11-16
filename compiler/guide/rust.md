@@ -203,4 +203,5 @@ window`), the arenas of `std::alloc`, and `embed wgsl` blocks with
 | `matches!(x, P)` | `match x { P => true, _ => false }` |
 | `let mut v = Vec::new_in(gpa);` typed by a later `v.push(x)` | the type is written: `let mut v: Vec<T, Gpa> = Vec::new_in(gpa);` |
 | a closure parameter `\|&&x\|`; `std::cmp::Reverse(k)` by its path | `\|x\| **x > 0`; `use std::cmp::Reverse;` then `Reverse(k)` |
+| `<&S as Tr>::f`, `<Vec<T> as Tr>::f` in an expression (the type not a name) | a parser error: call `Tr::f(x)` (Self from x's type); `<S as Tr>::f` and `<T as Tr<U>>::K` are Rust's |
 | crates, `Cargo.toml` | a program is its root file and its `mod x;` files (`guide modules`); std is the only library |
