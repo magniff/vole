@@ -754,6 +754,37 @@ const_value, eval_array_len`, `front/assoc.vl: inherent_const_value`,
 `front/check/mod.vl: lookup_local`. *Cases:* `rust_f_f34_const_values`,
 `rust_f_f34_const_len_err`, `rust_f_f34_const_hygiene`.
 
+### F35 Array repeat
+
+**F35.1 (the value is Copy).** (0.30.2, RT-148) An array repeat `[e;
+N]` with N above 1 copies the value of e into each element, so its type
+must be Copy (`places/regions.vl: rust_copy`, the one Copy test; an
+`impl Trait` is Copy when a bound says so, a type parameter when its
+bounds do): else `error trait.repeat_copy`, rustc's E0277. The test is
+made where the places IR makes the copy (`RV_REPEAT`), so every
+repeat meets it whatever wrote it: a generic body (reported once, for
+the template, as the checker's errors are), a closure, a default
+method, a nested repeat (`[[d; 1]; 2]`: `[D; 1]` is not Copy). N of 1
+moves e into the one element; N of 0 drops e at once, as Rust does
+(before 0.30.2 it was never dropped). Since 0.28.0 a value that was
+not Copy was copied bitwise and each copy dropped: a double free for a
+Vec, a Drop run N times. *Anchor:* `places/build.vl: expr_into,
+repeat_copy_error`. *Cases:* `rt_148_array_repeat_not_copy`,
+`rt_148_repeat_copy_refused`, `rt_148_repeat_copy_ok`.
+
+**F35.2 (a constant).** (0.30.2) The one other form Rust allows is a
+path to a constant (a free one, an inherent or a trait's associated
+one). A constant is made at each use (F34.2), so `[C; N]` of a
+constant whose type is not Copy becomes `[C, C, ..]`, N uses, each
+its own value: a constant whose value calls a function calls it once
+per element, as vole's constants do at each use (rustc computes the
+constant once and copies it, which a `const fn` makes the same). At
+most 4096 elements: a longer one is `trait.repeat_copy`, never a copy.
+A Copy constant is repeated as any Copy value. *Anchor:*
+`front/check/synth_mode.vl: repeat_literal` (both modes' Repeat arms),
+`front/ast.vl: NODE_CONST_USE`. *Cases:* `rt_148_repeat_const_each`,
+`rt_148_repeat_const_limit`.
+
 ## 2. Traits
 
 ### F2 Supertraits
@@ -2370,6 +2401,7 @@ where a `try:` is named, a case in `tests/borrowck-try`'s shape under
 | `trait.overlap` | F4.2 | E0119 | none; the message gives the witness types |
 | `trait.unconstrained` | F14.1 | E0207 | none; names the parameter |
 | `trait.unmet` | F2.3, F10.2, F11.1, F13.2 (none applies), F16.2, F20.4, F22.1 | E0277 | the missing impl's header, or `use` of the trait when an impl exists in a module not in scope |
+| `trait.repeat_copy` | F35.1, F35.2 (0.30.2) | E0277 | none: the help names a constant, the elements, a Vec |
 | `trait.impl_lifetimes` | F5.5 (0.30.1) | E0308, E0195 | none: the trait's lifetimes, written in the impl's signature |
 | `trait.impl_generics` | F5.5 (0.30.1) | E0049, E0276, E0308 | none: the trait's type parameters and bounds, written in the impl |
 | `trait.sealed` | F5.6 (0.30.1) | E0658 (Pattern, Step), a sealed trait | none: one of std's impls |

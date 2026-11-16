@@ -98,6 +98,23 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 A correctness release, its branches merged as each is reviewed clean.
 
+#### Soundness holes closed
+
+- **An array repeat of a value that is not Copy (RT-148), at every -O,
+  since 0.28.0.** `[v; 2]` of a Vec, `[D { k: 1 }; 3]` of a type with a
+  Drop impl, a generic `[t; 2]` and `[f; 2]` of an `impl FnMut` were
+  built: the value was copied bit for bit into each element and each
+  copy dropped, a double free (a use after free once one closure's Vec
+  grew) or a Drop run N times, from safe code. Neither the checker's
+  Repeat arms nor the places IR asked for Copy. Now the places IR asks
+  `rust_copy`, the one Copy test, where it makes the copies
+  (`RV_REPEAT`), so every repeat meets it: `error trait.repeat_copy`,
+  rustc's E0277 (front-rust.md F35.1). Rust's other form, a path to a
+  constant, makes each element from the constant, one use each (F35.2:
+  vole makes a constant at each use, so one whose value calls a function
+  calls it once per element), at most 4096. `[x; 0]` now drops x at once
+  (it leaked), `[x; 1]` moves it.
+
 #### Miscompiles fixed
 
 - **A raw slice parameter taken for a `&[T]` (RT-46), at -O1 and -O2,
