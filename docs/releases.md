@@ -90,7 +90,7 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.28.0 | `v0.28.0` | 0.27.8 | aarch64-macos | one language: the MVS edition, the translator, the own pass and the old std removed (compiler/std2 is compiler/std); no default arguments; an index is a `usize`; a panic is only `panic`, `#[terminates]`, `Hash::hash` `#[pure]`, the tools name `static`; six bugs of 0.27.8 fixed (an endless loop compiled away, a `&mut` field written through `&self`); the tools' cache bounded |
 | 0.29.0 | `v0.29.0` | 0.28.0 | aarch64-macos | the safety release: the compiler's unsafe sites 3281 to 316, each justified, none unneeded, no `static mut` (its tables are `Vec`s, the global ones a compilation context's), and unjustified unsafe an error for its source (`check --deny=unsafe`); `*const T` and `*mut T` two types, a slice without fields; `~x` refused; a map's hasher written (`FixedState` in the prelude); if-let temporaries by Rust 2024's rule; a generic call's temporary dropped (a leak) and three checker holes closed; `--edition` and the std2 name gone; the inliner's room per caller, std's block copies; the gate schedules itself, fuzz-sem back; the self-build dearer than 0.28.0's |
 | 0.30.0 | `v0.30.0` | 0.29.0 | aarch64-macos | the speed release: the self-build a sixth cheaper than 0.29.0's with every check kept (-O2 within 1% of 0.28.0's), iterator chains the loops written by hand, std's text by blocks, `sort` an introsort; `*p = v` through a raw pointer drops the old value, as in Rust (`ptr::write` does not), and through a `Box`, a guard or `DerefMut` too (a leak); two use-after-frees in safe code closed; a union field's borrow is `unsafe` (E0133), two indexes of a place may alias, a captured `FnMut` called must be `mut`; `use.redundant` a tools' warning; `println` one write a line; edits in batches, `check --std`, `refactor fold`; XFAIL 730 to 717, unsafe 316 to 299; a hello world's compile +31% |
-| 0.30.1 | `v0.30.1` | 0.30.0 | aarch64-macos | the safety nets: `--check-unsafe` sees std's allocator (every Vec, String and Box), checks an address as Rust's `add` and locks its tables; a C function is the symbol it links to, never its vole name (-O2 removed the calls of an allocator named `malloc`); `--trace` reports a stack overflow; a warm -O2 build the bytes of a cold one when a call count changes; every gate row has a floor, every safety net a canary |
+| 0.30.1 | `v0.30.1` | 0.30.0 | aarch64-macos | three -O1/-O2 miscompiles of 0.30.0's register allocator fixed (use 0.30.1); moves, initialization, `&mut`, closure kinds, impls and Drop impls checked as rustc checks them; a contract clause writes nothing it did not make; str literals UTF-8; the safety nets: `--check-unsafe` sees std's allocator (every Vec, String and Box), checks an address as Rust's `add` and locks its tables; a C function is the symbol it links to, never its vole name (-O2 removed the calls of an allocator named `malloc`); `--trace` reports a stack overflow; a warm -O2 build the bytes of a cold one when a call count changes; every gate row has a floor, every safety net a canary |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
@@ -105,8 +105,16 @@ function is known by the symbol it links to and never by its vole name:
 -O2 removed the calls of a program's own allocator declared as
 `malloc`. `--trace` reports a stack overflow, and a warm -O2 build has
 the bytes of a cold one when a function's number of calls changes.
-Two silent miscompiles of 0.30.0's register allocator at -O1 and -O2
-are fixed, with the assemblers' holes that let them through.
+
+**0.30.0 can compile a program at -O1 or -O2 to code that prints wrong
+values, with no error: use 0.30.1.** Three silent miscompiles of its
+register allocator are fixed (RT-CG-5, -6 and -7, below), with the
+assemblers' holes that let them through; -O0 was right. The borrow and
+type checkers refuse more of what rustc refuses ("What the checkers
+now refuse"): a program 0.30.0 accepted may get an error that names
+its fix. One more miscompile, of a qualified path to a trait's method
+or constant, is in 0.30.0 and still in 0.30.1 at every level
+(RT-C301-8, "Known issues"); 0.30.2 fixes it first.
 
 #### Miscompiles fixed
 
@@ -326,6 +334,50 @@ that keeps few values live is unlikely to make such moves.
   (`spawn_in`, `Scope::spawn`) now look at pthread's answer to their
   stack size too. 0.30.2's compiler starts its own thread with it.
 
+#### What the checkers now refuse
+
+Each of these was accepted by 0.30.0 and is refused by rustc; the
+error names the place and, where there is one, the fix (`try:`). The
+codes in parentheses are rustc's for the same refusal; vole's error
+names its kind (`closure.kind`, `borrowck.move_out`, `type error`).
+
+- **Moves and initialization follow rustc's move paths** (RT-31). A
+  `let x;` assigned later has a move path of its own; an assignment to
+  `a.b.c` checks that `a` and `a.b` are not moved (E0382), as rustc's
+  `check_if_assigned_path_is_moved`; the error names the move that
+  reaches the use, not an earlier one; and a union is reinitialized only
+  by an assignment that follows its move. An assignment initializes the
+  place it names, as rustc's `gather_init`: a field of a union only its
+  own union, never a union around it. A move out of a static is one
+  E0507, at the static, with a `try:` that builds.
+- **A binding of a static owns what it reads.** `let x = S.part;` copies
+  a Copy part (so `let mut state = H0; state[0] = 1;` changes the copy,
+  not `H0`) and moves a part that is not Copy, which is E0507. Formatting
+  or comparing a static that is not Copy borrows it, as in Rust.
+- **A `&mut` is made only from a place that may be written** (RT-33,
+  RT-36). An assignment's target, `&mut e`, a `&mut self` receiver, a
+  `match` on a place that binds by `ref mut`, and a reborrow walk the
+  place's projections as rustc's `is_mutable` does: a slice reached
+  through a `&[T]`, a `&T` or a type with `Index` and no `IndexMut` is
+  never made mutable (E0596), and `IndexMut` and `DerefMut` are called
+  exactly where rustc calls them.
+- **A closure's kind is inferred from what its body does**, nested
+  closures included: one that writes a capture is `FnMut`, one that moves
+  it out `FnOnce`. A capture of an `Fn` closure cannot be written (two
+  threads may call one at once), and a closure given where `Fn` is
+  wanted that needs `FnMut` is E0525, with the line that needs it.
+- **Impls are checked against their declarations.** An impl's method
+  must have the trait's signature, a generic impl's too (E0053, E0050,
+  E0195); a bound is met only by an impl whose own `where` predicates
+  hold (E0277); a trait's supertrait predicates (E0478) and an impl's
+  unconstrained parameters (E0207) are checked; an elided lifetime in an
+  impl's header is checked in each instance (RT-35).
+- **A Drop impl is as general as its type** (E0366, E0367, E0120): no
+  concrete type or lifetime argument, no bound the type does not have,
+  and its self type a struct, an enum or a union.
+- **A contract clause writes nothing it did not make** (RT-34, RT-38,
+  under "Bugs fixed").
+
 #### Bugs fixed
 
 - The code cache (RT-CG-3): a warm -O2 build after an edit that
@@ -496,6 +548,56 @@ that keeps few values live is unlikely to make such moves.
 
 #### Known issues
 
+The reviews of this release's work found these. Each is in 0.30.0 too
+unless it says otherwise, and each is a case in `tests/run` held as
+XFAIL under its name (the red team's cases, docs/xfail.md: 73 open,
+none at 0.30.0's tag; the census's own cases went from 712 to 705).
+0.30.x fixes them before 0.31.
+
+- **A miscompile at every level (RT-C301-8).** When a type implements
+  two traits that each have a method or an associated constant of the
+  same name, a qualified path used as a value takes one trait's for
+  both: `let f = <S as B>::m;` runs `A::m`, and `<S as A>::K` is `B::K`.
+  A call through the path, `<S as B>::m(&s)` or `B::m(&s)`, is right.
+- **Unsound in safe code:**
+  - indexing a raw slice pointer (`*mut [T]`, `*const [T]`) needs no
+    `unsafe` (RT-39);
+  - indexing a `&mut str`, a `&&str` or a `&mut &str` does not check
+    char boundaries, and `m[0] = 0xFF` through a `&mut str` writes a
+    byte, so a str that is not UTF-8 is made (RT-42, RT-42b, RT-42c);
+  - an assignment to a union field's part drops an old value read from
+    the bytes another field wrote (RT-43; rustc refuses the shape);
+  - a generic function may return `&'static U` from `Box::leak` of a
+    `U` that may hold a shorter reference (RT-C301-12; rustc's E0310);
+  - a struct's declared outlives are not proved where a value is built
+    (RT-37), and a Drop impl's associated-type binding may add an
+    outlives its type lacks (RT-40);
+  - an `ensures` can write through a `&mut` parameter whose type is not
+    written `&mut T` (an alias, an associated type, `self` of an impl
+    for `&mut i64`), so the contract changes the result (RT-38f), and a
+    clause can write through a raw pointer in `unsafe` (RT-38g).
+- **The borrow checker, open edges of RT-31:** a value a statement
+  discards (`p;`, a block's or a branch's tail) is not moved (RT-31c);
+  `let _ = { x };` of an uninitialized `x` is not E0381 (RT-31d); a
+  loan of a static is live at every point (RT-31b).
+- **A compiler panic** on a closure inside a generic Drop impl
+  (RT-44, `places/regions.vl`).
+- **Refused where rustc accepts** (each with its case): RT-41 (an
+  inherent `index` method is called for `w[i]`, not `Index::index`),
+  RT-C301-16 to -19 (outlives the checker cannot yet prove, from a Drop
+  impl, a type's `where`, a projection, a `'static` alias), RT-B301-3
+  to -13 and RT-C301-1 to -15 (the type and borrow checkers' open
+  cases, docs/xfail.md).
+- **The test runner** counts a `#[test]` killed by a signal as passed,
+  and reports a test's `exit(3)` as 101 (T-SIG,
+  `tests/refactor/t_sig.t`).
+- **`volec assemble`**, the assembler as a command, encodes x86-64
+  `pushq`/`popq` of a memory or immediate operand as another register's
+  push and accepts `popq $5`; AArch64 `ldr x0, [x1, #-257]!` is
+  encoded as `#255`. The compiler emits none of these forms (its objects
+  are cc's, byte for byte, in objcheck).
+- **"too many spill slots"**, an internal error, on a valid function
+  whose spills pass 32760 bytes (both targets).
 - The compiler's own thread (RT-28) reserves 1 GiB of address space for
   its stack. It is not memory used: pages are touched only as deep as
   the passes recurse. But a limit on address space counts it: on Linux
