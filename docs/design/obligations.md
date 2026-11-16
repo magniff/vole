@@ -1,6 +1,8 @@
 # Trait obligations: one place proves `T: Trait<Args>` (design, 0.30.2)
 
-Status: design, no code. It is the root fix for the class of soundness
+Status: **M1 in** (0.30.2, the selection table; §11 says where the code
+differs from this text), M2 next; M3 onwards in a later round. It is the
+root fix for the class of soundness
 findings reviews 3–5 of 0.30.1 kept finding (an impl's predicate assumed
 in its body and required nowhere). Each 0.30.1 fix closed one path
 through which an obligation was discharged. This design removes the
@@ -319,3 +321,69 @@ A test suite (`tests/run/rust_o_*`) states each invariant with must-fail
 cases, one per path of §1. A canary in the gate counts the callers of
 `select` against the callers of `match_type` on impls (0 outside
 `select`).
+
+## 11. Status and where the code differs (0.30.2)
+
+**M1, the selection table: in.** `front/obligations.vl`'s `select(tr, t,
+targs)` is the one function that chooses an impl for a trait reference.
+It tries every impl of `tr` (its chain, `impls_start`) and keeps each
+whose header matches `t` and whose bounds hold (`impl_applies`), whose
+trait arguments are `targs` (`impl_targs`, or completed from them,
+`complete_impl_targs_by`), and, for a parameter only the trait arguments
+bind, whose bounds hold for the whole binding (`U: From<T>` of
+`impl<T, U: From<T>> Into<U> for T`, which `impl_applies` leaves
+unchecked). One is the choice; two are `SEL_AMBIG`; none after a depth
+limit cut a search short is `SEL_LIMIT` (never a no). The front's
+`has_impl` and `implements_with` ask it (their own builtins, an Ω's
+bounds, `Into` by `From`, the intrinsics, are unchanged, before it). The
+places' `impl_bound_ties` (`places/regions.vl`) takes the impl from it for
+an instance's bound, for each supertrait (its arguments read with the
+bound's and `Self`, `super_args`) and for each bound of the chosen impl's
+parameters (read with the impl's bindings), and `trait_arg_ties` too;
+`impl_class`, `may_apply` and `param_bound_predicates` are deleted, and
+with them the class order and the "every candidate's predicates"
+stopgap of 0.30.1's round 6.
+
+Where the code differs from §3:
+
+- **The table's key is the trait reference** (trait, self type, the
+  context's `Self`, the trait arguments), not (use node or instance,
+  bound index): an instance's types are concrete, so its reference is
+  what the use determines, and uses that share one share the choice
+  (`Ctx.sel_map`, `Ctx.sel_rows`). A choice is recorded only when made at
+  the top of a search (`assoc_depth` 0, every impl known), with no depth
+  limit met inside it (`Ctx.depth_cuts`, counted at each limit of the
+  front's searches) and of types with no inference variable, Ω, opaque,
+  error or closure type in them; a new impl empties the table. Every
+  later ask of the same reference, the front's and the places', reads it.
+- **The places' code is in `places/regions.vl`** (`impl_bound_ties`,
+  `chosen`), not yet `places/obligations.vl`: M2 moves it there with the
+  confirmation walk.
+- **A bound whose arguments the places cannot read** (one naming what
+  does not resolve with the instance's types and `Self`, the instance's
+  impl type) is asked with no arguments (`targs` -1): one impl is the
+  choice; several are each required, their predicates and their
+  parameters' bounds', the 0.30.1 stopgap kept for this case alone. A
+  bound written without arguments on a trait that has some (`T:
+  PartialEq`) is asked with the trait's defaults (`PartialEq<T>`), and
+  with none when no impl proves those (the front reads such a bound as
+  "any arguments").
+- **`trait.ambiguous`** (two impls for a reference whose arguments are
+  known) and **`trait.overflow`** (a chain of nested bounds deeper than
+  `MAX_ASSOC_DEPTH`) are reported at the call that made the instance.
+  Neither occurs in the suite or in our own code: coherence leaves one
+  impl per reference, and the front's own search meets the depth limit
+  first (it then says the trait is not implemented).
+- **Not yet through `select`:** the front's method dispatch in an
+  instance (`convert::dispatch`, `has_generic_trait_fn`): `t.up()`
+  through `T: Sub` with `trait Sub: Sup<i32>`, for a type with impls of
+  Sup<i32> and Sup<i64>, is refused as ambiguous (rustc takes the bound's
+  impl); the projections' impls (`direct_impl`, `proj_walk`, M4) and the
+  impl-level checks of `impl_regions` (M5).
+
+M1's cases: `tests/run/rt_c301_015_*` (review 5's m01, m03, m04, m13),
+`tests/run/rust_o_m1_*` (the A4 forms m05, m10, m11; trait arguments
+told apart by a nested type, a blanket impl beside a concrete one, a
+supertrait's arguments, an impl parameter's bound with arguments three
+levels down, impls told apart only by a region or `&'a T` beside
+`&'static T`, which coherence refuses).

@@ -94,6 +94,33 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.30.2
+
+(The release's summary is written with its gate.)
+
+#### Bugs fixed
+
+- **An impl is chosen by its whole trait reference** (the trait
+  obligation engine's selection, docs/design/obligations.md, M1). Where
+  the region checker met an instance's bound `T: Tr<A>`, it chose the
+  impl of Tr for the type without reading A, and since 0.30.1 required
+  the predicates of every impl that might be the one: beside `impl<'a:
+  'static> Tr<i32> for W<'a>`, a bound `T: Tr<i64>` met by `impl<'a>
+  Tr<i64> for W<'a>` refused a W of a short borrow (RT-C301-15), and a
+  bound `T: Sub` with `trait Sub: Sup<i32>` required Sup<i64>'s impl too.
+  One function, `front::obligations::select`, now chooses the impl for a
+  trait reference, by its type and its trait arguments with lifetimes
+  erased, as rustc selects; the front's bound checks ask it, it records
+  its choice, and the region checker reads that choice for each bound of
+  an instance, each supertrait and each bound of the chosen impl's
+  parameters, never choosing again. An impl whose parameter only the
+  trait arguments bind has that parameter's bounds checked too (`impl<U:
+  Bound> Tr<U> for W` is no impl of `Tr<B>` when B is no Bound, refused
+  at the bound that needs it, rustc E0277). A reference two impls prove
+  where an instance needs it is error `trait.ambiguous` (rustc E0283),
+  and a chain of impls deeper than the limit `trait.overflow` (E0275):
+  neither is a yes.
+
 ### What's new in 0.30.1
 
 The safety nets' release: checks that passed without looking, found
