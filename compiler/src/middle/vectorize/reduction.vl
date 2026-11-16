@@ -48,8 +48,10 @@ pub fn uses_set(cx: &mut FnCtx<Comp>, w: i64, set: &[i64]) -> bool {
 // refuses it: an instruction's operand (a store, a comparison, a call, an
 // address, a conversion, another header phi), a branch's condition; and so
 // does a read after the loop of any but nx (outs: the exit's values).
-// Returns the operation (as i64; Add for + and -), -1 for a minimum or
-// maximum, or 0.
+// The set is grown whole first, then each member is judged against all of
+// it, so the order the loop's blocks are visited in decides nothing
+// (RT-89). Returns the operation (as i64; Add for + and -), -1 for a
+// minimum or maximum, or 0.
 pub fn reduction_set(cx: &mut FnCtx<Comp>, l: i64, r: i64, nx: i64, outs: &[i64],
     set: &mut Vec<i64, Comp>, checks: &mut Vec<i64, Comp>) -> i64 {
     set.clear();
@@ -83,49 +85,24 @@ pub fn reduction_set(cx: &mut FnCtx<Comp>, l: i64, r: i64, nx: i64, outs: &[i64]
         }
     }
     let mut ok = true;
-    let mut grew = true;
-    while ok && grew && !minmax {
+    // (0.30.2, RT-89) First the whole set: every instruction of the loop
+    // that reads one of its values joins it (an overflow check goes to
+    // `checks`), until it grows no more; no reader is judged while the set
+    // still grows, since an operand may join it after its reader was seen
+    // (an earlier block visited after the latch). The header's phi r is
+    // its start and is not read again.
+    let mut grew = !minmax;
+    while grew {
         grew = false;
         for i in 0..loop_size(cx, l) {
             let mut w = { let at_ix = loop_block(cx, l, i) as usize; cx.blocks[at_ix].first };
-            while w != 0 && ok {
-                if w != r && !in_set(set.as_slice(), w) && uses_set(cx, w, set.as_slice()) {
-                    let op = (cx.insts[w as usize]).op;
-                    let mut member = true;
-                    if op == Phi {
-                        ok = (cx.insts[w as usize]).block != h;
-                        for a in 0..(cx.insts[w as usize]).nargs {
-                            let ir_arg_v = ir_arg(cx, w, a);
-                            let x = ir_val(cx, ir_arg_v);
-                            ok = ok && in_set(set.as_slice(), x);
-                        }
-                    } else if op == Op::Sel {
-                        let c = ir_val(cx, (cx.insts[w as usize]).a);
-                        let x = ir_val(cx, (cx.insts[w as usize]).b);
-                        let y = ir_val(cx, (cx.insts[w as usize]).c);
-                        ok = !in_set(set.as_slice(), c) && in_set(set.as_slice(), x)
-                            && in_set(set.as_slice(), y);
-                    } else if (op == Add || op == Sub || op == Xor || op == Or || op == And
-                        || op == Mul) && (cx.insts[w as usize]).ty == ty {
-                        let f = if op == Sub { Add as i64 } else { op as i64 };
-                        let x = ir_val(cx, (cx.insts[w as usize]).a);
-                        let y = ir_val(cx, (cx.insts[w as usize]).b);
-                        ok = in_set(set.as_slice(), x) != in_set(set.as_slice(), y)
-                            && (op != Sub || in_set(set.as_slice(), x))
-                            && (family == 0 || family == f);
-                        family = f;
-                    } else if op == Op::Ovf {
+            while w != 0 {
+                if w != r && !in_set(set.as_slice(), w) && !in_set(checks.as_slice(), w)
+                    && uses_set(cx, w, set.as_slice()) {
+                    if (cx.insts[w as usize]).op == Op::Ovf {
                         // An overflow check: the caller's to judge.
-                        if !in_set(checks.as_slice(), w) {
-                            checks.push(w);
-                        }
-                        member = false;
+                        checks.push(w);
                     } else {
-                        // A store, a comparison, a call, a conversion, an
-                        // address, a load: it sees a partial value.
-                        ok = false;
-                    }
-                    if ok && member {
                         set.push(w);
                         grew = true;
                     }
@@ -133,6 +110,43 @@ pub fn reduction_set(cx: &mut FnCtx<Comp>, l: i64, r: i64, nx: i64, outs: &[i64]
                 w = (cx.insts[w as usize]).next;
             }
         }
+    }
+    // Then every member against the whole set: each is a step of the
+    // reduction, or the reduction is refused.
+    let mut m: i64 = 1;
+    while !minmax && ok && m < set.len() as i64 {
+        let w = set[m as usize];
+        let op = (cx.insts[w as usize]).op;
+        if op == Phi {
+            // (another header's phi is another carried value)
+            ok = (cx.insts[w as usize]).block != h;
+            for a in 0..(cx.insts[w as usize]).nargs {
+                let ir_arg_v = ir_arg(cx, w, a);
+                let x = ir_val(cx, ir_arg_v);
+                ok = ok && in_set(set.as_slice(), x);
+            }
+        } else if op == Op::Sel {
+            let c = ir_val(cx, (cx.insts[w as usize]).a);
+            let x = ir_val(cx, (cx.insts[w as usize]).b);
+            let y = ir_val(cx, (cx.insts[w as usize]).c);
+            ok = !in_set(set.as_slice(), c) && in_set(set.as_slice(), x)
+                && in_set(set.as_slice(), y);
+        } else if (op == Add || op == Sub || op == Xor || op == Or || op == And || op == Mul)
+            && (cx.insts[w as usize]).ty == ty {
+            // One operand of the set, the other from outside it (a + a,
+            // or a + f(a), is no step of one associative operation).
+            let f = if op == Sub { Add as i64 } else { op as i64 };
+            let x = ir_val(cx, (cx.insts[w as usize]).a);
+            let y = ir_val(cx, (cx.insts[w as usize]).b);
+            ok = in_set(set.as_slice(), x) != in_set(set.as_slice(), y)
+                && (op != Sub || in_set(set.as_slice(), x)) && (family == 0 || family == f);
+            family = f;
+        } else {
+            // A store, a comparison, a call, a conversion, an address, a
+            // load: it sees a partial value.
+            ok = false;
+        }
+        m += 1;
     }
     // Nothing else uses the set inside the loop (a minimum's compare and
     // select only each other and r), nor a branch, nor anything after the
