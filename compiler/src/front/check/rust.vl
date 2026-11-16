@@ -62,6 +62,8 @@ pub fn keep_alt(p: i64, alt: i64, pcx: &mut Ctx<Comp>) {
 // by `&mut`, so the places under it are made mutable in turn (the
 // receiver's autoref calls this again).
 pub fn place_to_mut(e: i64, pcx: &mut Ctx<Comp>) {
+    // RULE: D2.7 (0.30.1) and each slicing on its path a mutable one
+    mut_slicing(e, pcx);
     let mut p = e;
     for _ in 0..1000 {
         if p <= 0 {
@@ -69,12 +71,20 @@ pub fn place_to_mut(e: i64, pcx: &mut Ctx<Comp>) {
         }
         let k = pcx.nodes[p as usize].kind;
         let deref = k == NodeKind::Unary && pcx.nodes[p as usize].op == Tok::Star;
+        let alt = pcx.mut_alt.get(p + 1) - 1;
+        // RULE: F20.6, Z4.1 (0.30.1) a deref of a view, `*w.index(r)` of an
+        // overloaded slicing, `*d.deref()` of a `Deref<Target = [T]>`, is
+        // read as the view itself: its node became the call
+        // (synth_unary). Used mutably, it becomes the IndexMut or DerefMut
+        // call as a deref does, `w[0..3].reverse()`: before, the shared
+        // view the Index call made was passed where `&mut [T]` is
+        let collapsed = alt > 0 && !deref && k != NodeKind::Index
+            && k != NodeKind::FieldAccess && k != NodeKind::TupleField;
         if !deref && k != NodeKind::FieldAccess && k != NodeKind::TupleField
-            && k != NodeKind::Index {
+            && k != NodeKind::Index && !collapsed {
             return;
         }
-        let alt = pcx.mut_alt.get(p + 1) - 1;
-        if alt > 0 && (deref || k == NodeKind::Index) {
+        if alt > 0 && (deref || k == NodeKind::Index || collapsed) {
             pcx.mut_alt.put(p + 1, 0);
             // (its receiver and arguments, checked with the call it
             // replaces, the receiver of its type then, keep_alt)
@@ -88,6 +98,11 @@ pub fn place_to_mut(e: i64, pcx: &mut Ctx<Comp>) {
                 let c = child(alt, i, pcx);
                 pcx.nodes[c as usize].p |= crate::front::ast::NODE_CHECKED;
             }
+            if collapsed {
+                crate::front::check::synth_mode::synth_expr(alt, pcx);
+                pcx.nodes[p as usize] = pcx.nodes[alt as usize];
+                return;
+            }
             if deref {
                 pcx.nodes[p as usize].b = alt;
             } else {
@@ -98,6 +113,111 @@ pub fn place_to_mut(e: i64, pcx: &mut Ctx<Comp>) {
         }
         p = if deref { pcx.nodes[p as usize].b } else { pcx.nodes[p as usize].a };
     }
+}
+
+// RULE: D2.7 (0.30.1) Place e, of a stored exclusive reference (`&mut T`,
+// a mutable view) that is reborrowed (given where one goes, a view
+// method's `&mut self` receiver, a `let` with its type): its path made
+// mutable (place_to_mut: IndexMut, DerefMut), as rustc's is. A Box's
+// DerefMut on it needs no `mut` binding of the Box: rustc's Box deref is
+// built in, and a reborrow through a `&mut` reached through it is
+// LocalMutationIsAllowed::Yes; any other container's needs its place
+// mutable (`let mut v` for `fill(v[0].s)`, rustc E0596).
+pub fn reborrow_to_mut(e: i64, pcx: &mut Ctx<Comp>) {
+    let k = pcx.nodes[e as usize].kind;
+    let deref = k == NodeKind::Unary && pcx.nodes[e as usize].op == Tok::Star;
+    // (a view method's receiver `*v`, the place of view v, Z9.1c: v's path)
+    let inner = if deref { pcx.nodes[e as usize].b } else { 0 };
+    if inner > 0 && crate::front::types::is_mut_slice(pcx.nodes[inner as usize].ty, pcx) {
+        reborrow_to_mut(inner, pcx);
+        return;
+    }
+    if !deref && k != NodeKind::FieldAccess && k != NodeKind::TupleField
+        && (k != NodeKind::Index
+            || pcx.nodes[pcx.nodes[e as usize].b as usize].kind == NodeKind::Range) {
+        return;
+    }
+    let t = pcx.nodes[e as usize].ty;
+    let s = if t > 0 && pcx.types[t as usize].kind == TyKind::Distinct { pcx.types[t as usize].a }
+        else { t };
+    if s <= 0 || pcx.types[s as usize].b != REF_MUT
+        || pcx.types[s as usize].kind != TyKind::Ptr
+        && pcx.types[s as usize].kind != TyKind::Slice {
+        return;
+    }
+    let saved = pcx.box_unique;
+    pcx.box_unique = true;
+    place_to_mut(e, pcx);
+    pcx.box_unique = saved;
+}
+
+// RULE: D2.7 (0.30.1, RT-33) Slicing e, `v[a..b]`, used as a mutable view
+// (a `&mut self` receiver of `[T]`, `v[..2].reverse()`; a requires call's
+// argument the callee takes as `&mut [T]`; `&mut v[..2][..1]`'s inner
+// slicing): it and each slicing it slices become mutable slicings, typed
+// `&mut [T]` with the `&mut` mark, so the places IR makes each an exclusive
+// slicing of its base place, which the borrow checker asks as any `&mut`
+// (moves.vl mutability: the referent's mutability; the loan's conflicts).
+// The front types a slicing as a shared view until its use is known.
+// A slicing written with `&`, `(&v[..2])`, is the shared view the program
+// asked for: it and what it slices stay shared, and a `&mut` use of it is
+// refused (rustc E0596). Returns whether e was made mutable.
+pub fn mut_slicing(e: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mut p = e;
+    let mut made = false;
+    // (each projection of the place, as rustc's place has them: a
+    // field, an element, a slicing; a deref ends it, its pointer decides,
+    // `a[1..][0][..1].reverse()`, `a[1..][0].b[..]`, `a[1..][0][0] = 9`)
+    for _ in 0..pcx.nodes.len() {
+        if p <= 0 {
+            break;
+        }
+        let k = pcx.nodes[p as usize].kind;
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField
+            || k == NodeKind::Index && pcx.nodes[pcx.nodes[p as usize].b as usize].kind
+            != NodeKind::Range {
+            p = pcx.nodes[p as usize].a;
+            continue;
+        }
+        if k != NodeKind::Index {
+            break;
+        }
+        let f = pcx.nodes[p as usize].p;
+        if (f & crate::front::ast::NODE_REF) != 0 && (f & crate::front::ast::NODE_REF_MUT) == 0 {
+            break;
+        }
+        let t = pcx.nodes[p as usize].ty;
+        let v = if t > 0
+            && pcx.types[t as usize].kind == TyKind::Distinct { pcx.types[t as usize].a }
+            else { t };
+        if v <= 0 || pcx.types[v as usize].kind != TyKind::Slice {
+            break;
+        }
+        if pcx.types[v as usize].b == 0 {
+            pcx.nodes[p as usize].ty = crate::front::types::mut_view_of(t, pcx);
+        } else if pcx.types[v as usize].b != REF_MUT {
+            break;
+        }
+        pcx.nodes[p as usize].p |= crate::front::ast::NODE_REF_MUT;
+        if p == e {
+            made = true;
+        }
+        p = pcx.nodes[p as usize].a;
+    }
+    made
+}
+
+// Whether t is std's Box.
+pub fn std_box(t: i64, pcx: &Ctx<Comp>) -> bool {
+    if t <= 0 || pcx.types[t as usize].kind != TyKind::Struct {
+        return false;
+    }
+    let s = pcx.types[t as usize].a;
+    if !crate::front::modules::within_std(pcx.structs[s as usize].module, pcx) {
+        return false;
+    }
+    let tmpl = if pcx.structs[s as usize].tmpl > 0 { pcx.structs[s as usize].tmpl - 1 } else { s };
+    sym_text(pcx.structs[tmpl as usize].name, pcx) == b"Box"
 }
 
 // Whether a value of type t has method `name` (its impls', a trait's

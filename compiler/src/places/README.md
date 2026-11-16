@@ -15,7 +15,7 @@ every drop, the own pass's drop half deleted (places-ir.md §5, step 7).
 | `cfg.vl` | predecessors, reverse postorder, immediate dominators of the body held |
 | `print.vl` | `--emit-places`: a body as text, what `// PLACES:` lines match |
 | `verify.vl` | `--verify-places`: the form, the places, the copy rule, `as V` dominance, storage |
-| `build.vl` | the builder: a checked body to the IR, in evaluation order, its temporaries and assignment drops its own (0.26.2), reading the own pass's statement temporaries as what they stand for; a construct it does not build makes the body a fallback (`--verify-places` names it; none left in 0.26.0) |
+| `build.vl` | the builder: a checked body to the IR, in evaluation order, its temporaries and assignment drops its own (0.26.2), reading the own pass's statement temporaries as what they stand for; a construct it does not build makes the body a fallback (`--verify-places` names it; none left in 0.26.0); in a Rust-surface program a body the builder cannot build is an error, `places.not_built` (0.30.1: a fallback was never borrow-checked, so it was silent; a closure's `&mut *v` of a captured view was one) |
 | `elab.vl` | drop elaboration: move paths, maybe-initialized and maybe-uninitialized (and the variants an enum may hold) over the reverse postorder, each drop kept, removed, under a flag or opened; the flags' writes |
 | `diff.vl` | what is left for after the own pass: the move-out backstop (`own.move_out`) and `--places-diff` (where each drop runs, its flag) |
 | `keep.vl` | kept bodies (0.26.1, R1): at a build whose code generators read the IR, each elaborated body's six tables copied whole, each of its exact size (`keep_body`), put back into the `P_*` tables (`load_body(f) -> bool`) and freed once generated (`free_body(f)`) |
@@ -268,6 +268,11 @@ code generators' agent (0.26.1) sees what moved.
   temporary leaked when lent or read (`obs(&dup(&t))`, `dup(&t).v`), and
   never held for a `let` of the same call. Code that reads a second owner
   out of a raw pointer forgets it itself (`mem::forget`, `ManuallyDrop`).
+- 0.30.1 (E1.8): Ctx.fx_ir_loans' entries are IR_LOAN_WORDS words, the
+  two new ones the IR local the reference is written to and where it
+  goes (LOAN_ANY, LOAN_READ, LOAN_READ_PLAIN), decided from the built
+  body (build.vl settle_loans) and read by the effect inference
+  (front/effects/infer.vl ir_unseen).
 
 ## `--places-diff`
 

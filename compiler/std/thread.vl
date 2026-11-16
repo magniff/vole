@@ -76,6 +76,10 @@ const ACQ_REL: i64 = 3;
 // _SC_NPROCESSORS_ONLN (macOS's number; 84 on Linux).
 const SC_NPROCESSORS_ONLN: i32 = 58;
 
+// ENOMEM (12 on macOS and Linux): start_thread's error when C's heap has
+// no room for a thread's Start record.
+const THREAD_ENOMEM: i32 = 12;
+
 // The stack of a new thread: 8 MiB (macOS's default past the first
 // thread is 512 KiB), as MVS's.
 const THREAD_STACK: usize = 8388608;
@@ -206,33 +210,70 @@ fn thread_run<F: FnOnce() -> T, T, A: Allocator>(data: *mut u8, start: *mut u8) 
     }
 }
 
-// Starts a thread running f, its records on a: its pthread_t and its
-// result's place.
-fn start_thread<F: FnOnce() -> T, T, A: Allocator>(f: F, a: A) -> (u64, *mut Out<T, A>) {
-    let out = new_record(&a, Out::<T, A> { result: Option::<T>::None, done: 0, refs: 2, alloc: a });
-    // UNSAFE: the records reached through raw pointers, and pthread_create.
-    // SAFETY: out is live (refs 2); the Packet and the Start go to the new
-    // thread only; attr is 128 bytes, more than a pthread_attr_t.
+// Starts a thread running f on a stack of size bytes, its records on a:
+// its pthread_t and its result's place. When pthread makes no thread
+// (the size refused, no memory for the stack, no thread left), Err(the
+// error number it gave), and nothing is left: f is dropped, a's blocks
+// given back (0.30.1: before, a refused size was not looked at, and the
+// thread got pthread's default stack).
+fn start_thread<F: FnOnce() -> T, T, A: Allocator>(f: F, a: A, size: usize)
+    -> crate::result::Result<(u64, *mut Out<T, A>), i32> {
+    let mut attr: [u64; 16] = [0; 16];
+    let ap = &mut attr[0] as *mut u64 as *mut u8;
+    // UNSAFE: pthread's attribute calls and pthread_create, and the records
+    // reached through raw pointers.
+    // SAFETY: attr is 128 bytes, more than a pthread_attr_t, initialized
+    // before it is set and destroyed on every way out after it (a
+    // new_record that finds no memory panics, which ends the process,
+    // decision 18); out is live (refs 2); the Packet and the Start go to
+    // the new thread only, or, when none is made (C's heap had no room for
+    // the Start, ENOMEM, or pthread_create refused), are taken back here
+    // once: the Start freed when there is one, the Packet moved out (f
+    // dropped) and freed, out released.
     unsafe {
+        let rc = thread_c_attr_init(ap);
+        if rc != 0 {
+            return crate::result::Result::Err(rc);
+        }
+        let rc = thread_c_attr_setstacksize(ap, size);
+        if rc != 0 {
+            thread_c_attr_destroy(ap);
+            return crate::result::Result::Err(rc);
+        }
+        let out = new_record(&a,
+            Out::<T, A> { result: Option::<T>::None, done: 0, refs: 2, alloc: a });
         let q = new_record(&*(&(*out).alloc), Packet { f: f, out: out });
         let s = thread_c_malloc(Layout::new::<Start>().size()) as *mut Start;
-        if s.is_null() {
-            let msg: &str = "memory allocation failed";
-            crate::panic::panic(msg);
-        }
-        crate::ptr::write(s, Start { run: thread_run::<F, T, A>, data: q as *mut u8 });
-        let mut attr: [u64; 16] = [0; 16];
-        let ap = &mut attr[0] as *mut u64 as *mut u8;
-        thread_c_attr_init(ap);
-        thread_c_attr_setstacksize(ap, THREAD_STACK);
+        let mut rc = THREAD_ENOMEM;
         let mut t: u64 = 0;
-        let rc = thread_c_create(&mut t as *mut u64, ap as *const u8, thread_start, s as *mut u8);
+        if !s.is_null() {
+            crate::ptr::write(s, Start { run: thread_run::<F, T, A>, data: q as *mut u8 });
+            rc = thread_c_create(&mut t as *mut u64, ap as *const u8, thread_start, s as *mut u8);
+        }
         thread_c_attr_destroy(ap);
         if rc != 0 {
-            let msg: &str = "failed to spawn thread";
-            crate::panic::panic(msg);
+            if !s.is_null() {
+                thread_c_free(s as *mut u8);
+            }
+            let p = crate::ptr::read(q as *const Packet<F, T, A>);
+            free_record(&*(&(*out).alloc), q);
+            crate::mem::drop(p);
+            release_out(out);
+            return crate::result::Result::Err(rc);
         }
-        (t, out)
+        crate::result::Result::Ok((t, out))
+    }
+}
+
+// A thread std starts itself: spawn_in's and Scope::spawn's, on
+// THREAD_STACK; none made panics, as Rust's spawn.
+fn start_or_panic<F: FnOnce() -> T, T, A: Allocator>(f: F, a: A) -> (u64, *mut Out<T, A>) {
+    match start_thread(f, a, THREAD_STACK) {
+        crate::result::Result::Ok(r) => r,
+        crate::result::Result::Err(_) => {
+            let msg: &str = "failed to spawn thread";
+            crate::panic::panic(msg)
+        }
     }
 }
 
@@ -341,13 +382,13 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     // with Scope invariant in 'scope, is what keeps f's borrows alive.
     // std: changed: &self, FnOnce, Send, a 'scope bound (MVS: inout self, FnMut)
     // later: auto_trait
-    #[effects(alloc(CHeap), panic, diverge, F, T)]
+    #[effects(alloc(CHeap, extern), thread, sync, panic, diverge, F, T)]
     pub fn spawn<F, T>(&self, f: F) -> ScopedJoinHandle<'scope, T>
         where
             F: FnOnce() -> T + Send + 'scope,
             T: Send + 'scope,
     {
-        let (t, out) = start_thread(f, CHeap { sealed: () });
+        let (t, out) = start_or_panic(f, CHeap { sealed: () });
         let node = new_record(&CHeap { sealed: () }, ScopeNode {
             native: t,
             joined: false,
@@ -381,7 +422,7 @@ unsafe impl<'scope, T> Sync for ScopedJoinHandle<'scope, T> {}
 impl<'scope, T> ScopedJoinHandle<'scope, T> {
     // Waits for the thread and returns its value (always Ok).
     // std: changed: a thread::Result
-    #[effects(unsafe, T)]
+    #[effects(alloc(CHeap), sync, panic, unsafe, T)]
     pub fn join(self) -> Result<T> {
         // UNSAFE: the scope's node and the thread's result through raw
         // pointers.
@@ -395,7 +436,7 @@ impl<'scope, T> ScopedJoinHandle<'scope, T> {
     }
 
     // Whether the thread has finished (join would not wait).
-    #[effects(unsafe, T)]
+    #[effects(sync, unsafe, T)]
     pub fn is_finished(&self) -> bool {
         // UNSAFE: an atomic read of the result's place.
         // SAFETY: out lives until the thread is joined, by this handle's
@@ -409,15 +450,86 @@ impl<'scope, T> ScopedJoinHandle<'scope, T> {
 // mvs: spawn
 // std: changed: an allocator, FnOnce, Send and 'static (MVS: spawn(f), through C)
 // later: auto_trait
-#[effects(F, T, A)]
+#[effects(alloc(extern), thread, sync, panic, F, T, A)]
 pub fn spawn_in<F, T, A>(f: F, a: A) -> JoinHandle<T, A>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
         A: Allocator + Send + 'static,
 {
-    let (t, out) = start_thread(f, a);
+    let (t, out) = start_or_panic(f, a);
     JoinHandle { native: t, out: out }
+}
+
+// What Builder::stack_size's size is rounded up to: a multiple of 64 KiB
+// (every target's page divides it; pthread takes only whole pages on
+// macOS) and at least 128 KiB (PTHREAD_STACK_MIN: 16 KiB on macOS, 128
+// KiB on Linux aarch64).
+const STACK_GRAIN: usize = 65536;
+const STACK_MIN: usize = 131072;
+
+// A thread's settings before it starts: its stack's size. Rust's
+// `name` is left out: nothing reads a thread's name back (there is no
+// thread::current), and setting it is a call that differs between macOS
+// and Linux (0.30.1).
+// std: changed: no name; spawn_in, with an allocator
+#[derive(Clone, Copy)]
+pub struct Builder {
+    stack: Option<usize>,
+}
+
+impl Builder {
+    // A thread as spawn_in starts it: THREAD_STACK's 8 MiB stack.
+    #[effects()]
+    pub fn new() -> Builder {
+        Builder { stack: Option::None }
+    }
+
+    // The new thread's stack: size bytes at least (rounded up to a
+    // multiple of 64 KiB, and to 128 KiB at least, so that every target's
+    // pthread takes it).
+    #[effects()]
+    pub fn stack_size(self, size: usize) -> Builder {
+        Builder { stack: Option::Some(size) }
+    }
+
+    // Runs f on a new thread as spawn_in does, with this builder's stack;
+    // Err when no thread is made: a size that cannot be rounded up
+    // (InvalidInput), or pthread's error (the stack's memory not had, no
+    // thread left), and then f is dropped. Rust's spawn, with spawn_in's
+    // allocator.
+    // std: changed: spawn_in, with an allocator
+    // later: auto_trait
+    #[effects(alloc(extern), thread, sync, panic, F, T, A)]
+    pub fn spawn_in<F, T, A>(self, f: F, a: A) -> crate::io::Result<JoinHandle<T, A>>
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static,
+            A: Allocator + Send + 'static,
+    {
+        let size = match self.stack {
+            Option::None => THREAD_STACK,
+            Option::Some(n) => if n <= STACK_MIN {
+                STACK_MIN
+            } else {
+                match n.checked_add(STACK_GRAIN - 1) {
+                    Option::Some(m) => m / STACK_GRAIN * STACK_GRAIN,
+                    Option::None => {
+                        return crate::result::Result::Err(crate::io::Error::new(
+                            crate::io::ErrorKind::InvalidInput,
+                            "the thread's stack size is too large"));
+                    }
+                }
+            },
+        };
+        match start_thread(f, a, size) {
+            crate::result::Result::Ok((t, out)) => crate::result::Result::Ok(JoinHandle {
+                native: t, out: out,
+            }),
+            crate::result::Result::Err(rc) => crate::result::Result::Err(
+                crate::io::Error::from_raw_os_error(rc)),
+        }
+    }
 }
 
 // A spawned thread.
@@ -451,7 +563,7 @@ impl<T, A: Allocator> JoinHandle<T, A> {
         crate::result::Result::Ok(unsafe { join_thread(t, out) })
     }
 
-    #[effects(unsafe, T, A)]
+    #[effects(sync, unsafe, T, A)]
     pub fn is_finished(&self) -> bool {
         // UNSAFE: an atomic read of the result's place.
         // SAFETY: the handle holds a ref, so out is live.

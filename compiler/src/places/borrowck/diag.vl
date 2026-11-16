@@ -9,6 +9,7 @@ use crate::base::{
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{buf_position, report_error_tries};
+use crate::front::ast::NodeKind;
 use crate::front::types::TyKind;
 use crate::places::borrowck::{Bck, LOAN_WORDS};
 use crate::places::borrowck::access::{
@@ -16,8 +17,8 @@ use crate::places::borrowck::access::{
     C_MUT_TWICE, C_RETURN_LOCAL, C_USE_BORROWED,
 };
 use crate::places::ir::{
-    BK_MUT, BK_MUT2, Body, LF_PARAM, LF_USER, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION,
-    PJ_VARIANT, SK_DEAD, proj_kind, proj_parent, proj_val, struct_field_count,
+    BK_MUT, BK_MUT2, Body, LF_PARAM, LF_STATIC, LF_USER, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX,
+    PJ_UNION, PJ_VARIANT, SK_DEAD, proj_kind, proj_parent, proj_val, struct_field_count,
 };
 
 // A write through a shared reference at location loc (D2.6, L6: a guard's
@@ -51,7 +52,7 @@ pub fn report_shared_write(loc: i64, l: i64, p: i64, bck: &mut Bck<Comp>, pbody:
 }
 
 // A `try:` line that rewrites node n's text t as `pre t post` on its line
-// (as the own pass's: `volec edit patch FILE:LINE --old 'LINE' --new 'LINE'`,
+// (`volec edit patch --at FILE:LINE --old 'LINE' --new 'LINE'`,
 // the line without its indentation); the command in a buffer, or -1 for a
 // node over several lines or in std.
 pub fn try_wrap(n: i64, pre: *const u8, post: *const u8, pcx: &Ctx<Comp>) -> i64 {
@@ -83,8 +84,11 @@ pub fn try_wrap(n: i64, pre: *const u8, post: *const u8, pcx: &Ctx<Comp>) -> i64
         && (get_src()[(le - 1) as usize] == b' ' || get_src()[(le - 1) as usize] == b'\t') {
         le -= 1;
     }
+    // (0.30.1: by position, `--at FILE:LINE`, OLD on that line only; the
+    // target FILE:LINE names the item, where a line written twice, `match
+    // SE {`, is patch.ambiguous)
     let args = buf_new();
-    buf_str(args, c"edit patch ");
+    buf_str(args, c"edit patch --at ");
     buf_str(args,
         c_plain_path(path));
     crate::base::buf_byte(args, b':');
@@ -385,7 +389,7 @@ pub fn report(code: i64, kind: i64, loc: i64, j: i64, l: i64, p: i64, deref: i64
 }
 
 // The place as the user names it, as rustc's messages do: the root's
-// source name when it has one (a user local, a parameter) and the path in
+// source name when it has one (a user local, a parameter, a static) and the path in
 // source form (`s.n`, `*r`, `v[_]`, `(o as Some).0`: a deref before a
 // field or an index is the auto-deref and not written); the IR's form for
 // a temporary's place.
@@ -394,7 +398,8 @@ pub fn buf_place(m: i64, l: i64, p: i64, deref: i64, pbody: &Body<Comp>, pcx: &C
         buf_str(m, c"*");
     }
     let lc = pbody.locals[l as usize];
-    if (lc.flags & (LF_USER | LF_PARAM)) != 0 && lc.src >= 0 {
+    if (lc.flags & (LF_USER | LF_PARAM)) != 0 && lc.src >= 0
+        || (lc.flags & LF_STATIC) != 0 && lc.src > 0 || temp_name(l, pbody, pcx).len() > 0 {
         buf_src_place(m, l, p, false, pbody, pcx);
         return;
     }
@@ -405,8 +410,55 @@ pub fn buf_place(m: i64, l: i64, p: i64, deref: i64, pbody: &Body<Comp>, pcx: &C
 // outside it is a field or an index (a deref there is not written).
 fn buf_src_place(m: i64, l: i64, p: i64, auto: bool, pbody: &Body<Comp>, pcx: &Ctx<Comp>) {
     if p == 0 {
-        let name = pcx.locals[pbody.locals[l as usize].src as usize].name;
-        crate::base::buf_bytes(m, sym_text(name, pcx));
+        let src = pbody.locals[l as usize].src;
+        // (src is a LOCALS index only for a user's local or a parameter: a
+        // static's is its symbol)
+        if src > 0 && (pbody.locals[l as usize].flags & LF_STATIC) != 0 {
+            // (a module's static, symbol `m.MD`, is named `MD`, as rustc
+            // names it)
+            let text = sym_text(src, pcx);
+            let mut from: usize = 0;
+            for i in 0..text.len() {
+                if text[i] == b'.' {
+                    from = i + 1;
+                }
+            }
+            crate::base::buf_bytes(m, &text[from..]);
+            return;
+        }
+        if src < 0 || (pbody.locals[l as usize].flags & (LF_USER | LF_PARAM)) == 0 {
+            crate::base::buf_bytes(m, &temp_name(l, pbody, pcx));
+            return;
+        }
+        let name = sym_text(pcx.locals[src as usize].name, pcx);
+        // RULE: D7.4 (0.30.1, RT-33) a requires call's binding of an
+        // argument, `?aI` (LF_CONTRACT_ARG, a flag), is named as the
+        // argument it binds, the text of its pattern's span (`*s`, not
+        // `*?a0`), its first 40 bytes and `..` for a longer one (a message
+        // is one line); report_immutable names its source place
+        // (named_source)
+        if (pbody.locals[l as usize].flags & crate::places::ir::LF_CONTRACT_ARG) != 0
+            && pbody.locals[l as usize].node > 0 {
+            let mut out = Vec::<u8, Comp>::new_in(Comp {});
+            span_text(pbody.locals[l as usize].node, &mut out, pcx);
+            if out.len() > 40 {
+                out.truncate(40);
+                // (at a character's start: a UTF-8 sequence is not cut)
+                while out.len() > 0 && (out[out.len() - 1] & 0xC0) == 0x80 {
+                    out.pop();
+                }
+                if out.len() > 0 && out[out.len() - 1] >= 0xC0 {
+                    out.pop();
+                }
+                out.push(b'.');
+                out.push(b'.');
+            }
+            if out.len() > 0 {
+                crate::base::buf_bytes(m, &out);
+                return;
+            }
+        }
+        crate::base::buf_bytes(m, name);
         return;
     }
     let k = proj_kind(p, pbody);
@@ -459,6 +511,185 @@ fn buf_src_place(m: i64, l: i64, p: i64, auto: bool, pbody: &Body<Comp>, pcx: &C
         crate::base::buf_int(m, v);
         buf_str(m, c"]");
     }
+}
+
+// RULE: D2.7 (0.30.1) The name of temporary local l's place root in a
+// message: the source of the expression it holds (`b` of `b.deref()`'s
+// `&W`, `mk(w)`), an Index call the front made written as its receiver's
+// index, `g[_]` (`g.index(0)`'s span is g's); whitespace runs one space.
+// Empty, so the IR's form is printed, for a user's local, a temporary of
+// no text, and a text over 40 bytes (a block, `{ let q = w; q }`): a
+// message is one line (the `FILE:L:C: error[...]` prefix, `--json`'s
+// message). A message then names `b.s`, not `(*_6).0`.
+fn temp_name(l: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> Vec<u8, Comp> {
+    let mut out = Vec::<u8, Comp>::new_in(Comp {});
+    let lc = pbody.locals[l as usize];
+    if lc.src >= 0 || lc.node <= 0 {
+        return out;
+    }
+    let mut n = lc.node;
+    let mut indexes: i64 = 0;
+    // (a call the front made of an index or a deref has its receiver's
+    // span: the receiver named, an index written after it)
+    while pcx.nodes[n as usize].kind == NodeKind::MethodCall && pcx.nodes[n as usize].a > 0
+        && pcx.nodes[pcx.nodes[n as usize].a as usize].start == pcx.nodes[n as usize].start
+        && pcx.nodes[pcx.nodes[n as usize].a as usize].end == pcx.nodes[n as usize].end {
+        if pcx.nodes[n as usize].count > 0 {
+            indexes += 1;
+        }
+        n = pcx.nodes[n as usize].a;
+    }
+    span_text(n, &mut out, pcx);
+    if out.len() == 0 {
+        return out;
+    }
+    for _ in 0..indexes {
+        out.push(b'[');
+        out.push(b'_');
+        out.push(b']');
+    }
+    if out.len() > 40 {
+        out.clear();
+    }
+    out
+}
+
+// The source text of node n, its whitespace runs one space, appended to
+// out (nothing for a node of no span).
+fn span_text(n: i64, out: &mut Vec<u8, Comp>, pcx: &Ctx<Comp>) {
+    let start = pcx.nodes[n as usize].start;
+    let end = pcx.nodes[n as usize].end;
+    let src = crate::base::get_src();
+    if start < 0 || end <= start || end as usize > src.len() {
+        return;
+    }
+    let mut space = false;
+    for i in start..end {
+        let c = src[i as usize];
+        if c == b' ' || c == b'\n' || c == b'\t' || c == b'\r' {
+            space = true;
+            continue;
+        }
+        if space && out.len() > 0 {
+            out.push(b' ');
+        }
+        space = false;
+        out.push(c);
+    }
+}
+
+// RULE: D7.4, D2.7 (0.30.1, RT-33) The place a message names for place
+// (l, p) (deref: its referent): a temporary, or a requires call's binding
+// of an argument (LF_CONTRACT_ARG), is named by what its one assignment
+// made it of: a copy or a move of a place is that place, a slicing of a
+// view is that view (`*s` for `?a0 = s[..]`), and the referent of a `&mut`
+// of a place is the place (`*?a0` for `?a0 = &mut2 v` is `v`). Returns the
+// place and its deref, or l = -1 (p: the callee of a call's value, else -1) when it is no place of the program's (a
+// call's value, a slicing a written `&` made, `(&v[..])`, an `if`'s
+// value, a binding of one): rustc's "data in a `&` reference". Each step
+// goes to a place assigned before; a chain longer than the body has
+// locals is no place, -1.
+pub fn named_source(l0: i64, p0: i64, deref0: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>)
+    -> (i64, i64, i64) {
+    let mut l = l0;
+    let mut p = p0;
+    let mut deref = deref0;
+    for _ in 0..pbody.locals.len() + 1 {
+        if l < 0 || p != 0 {
+            return (l, p, deref);
+        }
+        let f = pbody.locals[l as usize].flags;
+        let contract = (f & crate::places::ir::LF_CONTRACT_ARG) != 0;
+        if !contract && ((f & (LF_USER | LF_PARAM)) != 0 && pbody.locals[l as usize].src >= 0
+            || (f & crate::places::ir::LF_STATIC) != 0) {
+            return (l, p, deref);
+        }
+        let s = only_def(l, pbody);
+        let st = if s >= 0 { pbody.stmts[s as usize] } else { pbody.stmts[0] };
+        // (a call's value: the callee, in p, -1 for any other)
+        if s >= 0 && st.kind == crate::places::ir::SK_CALL {
+            return (-1, st.c, 0);
+        }
+        if s < 0 || st.kind != crate::places::ir::SK_ASSIGN || st.nops == 0
+            || !crate::places::ir::op_is_place(crate::places::ir::op_kind(st.ops, 0, pbody)) {
+            return (-1, 0, 0);
+        }
+        let l2 = crate::places::ir::op_a(st.ops, 0, pbody);
+        let p2 = crate::places::ir::op_b(st.ops, 0, pbody);
+        if st.c == crate::places::ir::RV_USE {
+            l = l2;
+            p = p2;
+        } else if st.c == crate::places::ir::RV_SLICE && l2 >= 0 && shared_slice(
+            crate::places::ir::full_place_type(l2, p2, pbody, pcx), pcx) {
+            l = l2;
+            p = p2;
+        } else if st.c == crate::places::ir::RV_REF && deref == 1 {
+            l = l2;
+            p = p2;
+            deref = 0;
+        } else {
+            return (-1, 0, 0);
+        }
+    }
+    (-1, -1, 0)
+}
+
+// (0.30.1) Whether function f is a method of an `impl Index` or `impl
+// Deref` (moves.vl report_immutable: the view a `&mut` cannot reach): 1
+// Index, 2 Deref, 0 another. By the trait of the impl it is resolved to
+// (its template's, for an instance), not its name: an inherent `fn index`
+// is no Index (rustc's "data in a `&` reference" then).
+pub fn overloaded_call(f: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if f < 0 || f >= pcx.fns.len() as i64 || pcx.fns[f as usize].param_count == 0 {
+        return 0;
+    }
+    let mut im = crate::front::traits::impl_of_fn(f, pcx);
+    if im < 0 && pcx.fns[f as usize].tmpl > 0 {
+        im = crate::front::traits::impl_of_fn(pcx.fns[f as usize].tmpl - 1, pcx);
+    }
+    if im < 0 || im >= pcx.traits_impls.len() as i64 {
+        return 0;
+    }
+    let tr = pcx.traits_impls[im as usize].tr;
+    if tr >= 0 && tr == crate::front::traits::std_trait(c"Index", pcx) {
+        return 1;
+    }
+    if tr >= 0 && tr == crate::front::traits::std_trait(c"Deref", pcx) {
+        return 2;
+    }
+    0
+}
+
+// The type an overloaded_call indexes or derefs: its `&self`'s.
+pub fn overloaded_self(f: i64, pcx: &Ctx<Comp>) -> i64 {
+    let t = crate::front::types::fn_param(f, 0, pcx);
+    if t > 0 && pcx.types[t as usize].kind == TyKind::Ptr { pcx.types[t as usize].a } else { t }
+}
+
+// The one statement that assigns local l whole, or -1 (none, or several).
+fn only_def(l: i64, pbody: &Body<Comp>) -> i64 {
+    let mut found: i64 = -1;
+    for s in 0..pbody.stmts.len() as i64 {
+        let st = pbody.stmts[s as usize];
+        if (st.kind == crate::places::ir::SK_ASSIGN || st.kind == crate::places::ir::SK_CALL
+            || st.kind == crate::places::ir::SK_INTRINSIC) && st.a == l && st.b == 0 {
+            if found >= 0 {
+                return -1;
+            }
+            found = s;
+        }
+    }
+    found
+}
+
+// Whether type t is a shared view, `&[T]` or a `&str` (a slicing of one
+// is named as it: its referent is the view's; a `&` of a mutable view's
+// slicing made the shared one, "data in a `&` reference").
+fn shared_slice(t: i64, pcx: &Ctx<Comp>) -> bool {
+    let u = crate::places::ir::undistinct(t, pcx);
+    u > 0 && pcx.types[u as usize].kind == TyKind::Slice
+        && pcx.types[u as usize].b != crate::front::types::REF_MUT
+        && pcx.types[u as usize].b != crate::front::types::REF_RAW
 }
 
 // The struct (STRUCTS) place (l, p) is, through its derefs; -1 for any
@@ -517,14 +748,26 @@ fn named_place_ty(l: i64, p: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> i64 {
     0
 }
 
+// (0.30.1) Whether IR local l is the env parameter of the closure whose
+// body pbody is: a parameter whose LOCALS index is that closure's env
+// local (closures' mark). Its name, `{env}`, is only the quick filter; a
+// local that is not a parameter (a static, whose src is a symbol) is
+// never read as a LOCALS index.
+pub fn is_env(l: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> bool {
+    let lc = pbody.locals[l as usize];
+    if (lc.flags & LF_PARAM) == 0 || lc.src < 0 || lc.src >= pcx.locals.len() as i64
+        || pcx.locals[lc.src as usize].name != pcx.env_sym {
+        return false;
+    }
+    let c = crate::places::regions::closure_of_fn(pbody.fn_, pcx);
+    c >= 0 && pcx.closures[c as usize].mark == lc.src
+}
+
 // The CAPTURE_LIST index of the (local, by_ref) pair that place (l, p) of
 // a closure body is the env's field for, `(*_1).k` or `_1.k` (a by-value
 // env), the env the `{env}` parameter; -1 for any other place.
 fn env_capture(l: i64, p: i64, pbody: &Body<Comp>, pcx: &Ctx<Comp>) -> i64 {
-    if p == 0 || proj_kind(p, pbody) != PJ_FIELD || pbody.locals[l as usize].src < 0 {
-        return -1;
-    }
-    if (pcx.locals[pbody.locals[l as usize].src as usize].name) != pcx.env_sym {
+    if p == 0 || proj_kind(p, pbody) != PJ_FIELD || !is_env(l, pbody, pcx) {
         return -1;
     }
     let mut t = pbody.locals[l as usize].ty;

@@ -242,7 +242,7 @@ This is a breaking change, and A0 does it now, with its `fix` rule (§5). It als
 
 | type | is | owns | made by |
 |---|---|---|---|
-| `[u8]` | bytes, any content | no (a view) | slicing, literals with `\x80`+ escapes, I/O buffers |
+| `[u8]` | bytes, any content | no (a view) | slicing, byte strings `b"..."` (`\x80`+ escapes), I/O buffers |
 | `str` | UTF-8 bytes | no (a view) | literals, `str::from_utf8(b)?`, `&string`, `s[a..b]` |
 | `String<A = Gpa>` | UTF-8 bytes, growable | yes (a `Vec<u8, A>` inside) | `String::new_in(gpa)`, `format_in`, `to_string_in`, `String::from_utf8(v)?` |
 | `Buf<A = Gpa>` | bytes, growable, with text helpers | yes | as today; it is Rust's `Vec<u8>` used as `io::Write` |

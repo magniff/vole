@@ -91,7 +91,11 @@ fn expand(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     }
     let out = intern_c(c"__out", pcx);
     let lets = list_begin(pcx);
-    push_hole_lets(n, pcx);
+    // RULE: D2.9 (0.30.1: a format_args value holds `&arg` for each place
+    // argument, as rustc's Arguments<'a>: its closure captures the borrow,
+    // so the value's region keeps the place borrowed while it lives)
+    let mut refs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    push_hole_lets(n, true, &mut refs, pcx);
     let block = new_node(NodeKind::Block, start, end, pcx);
     list_end(block, lets, pcx);
     // The closure's body.
@@ -99,7 +103,7 @@ fn expand(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // F16.3's through `__out: &mut std::fmt::Formatter`, and the value is
     // `std::__rt::Interp { f: closure }`)
     let stmts = list_begin(pcx);
-    push_writes_std(n, out, true, pcx);
+    push_writes_std(n, out, true, &refs, pcx);
     let body = new_node(NodeKind::Block, start, end, pcx);
     list_end(body, stmts, pcx);
     // move |__out: &mut std::fmt::Formatter| body
@@ -234,16 +238,24 @@ fn count_ok(n: i64, c: i64, pcx: &mut Ctx<Comp>) -> bool {
 }
 
 // `let __fN = eN;` for each hole of f-string n, into the list being made
-// (0.26.2: not for a hole that reads another's).
-fn push_hole_lets(n: i64, pcx: &mut Ctx<Comp>) {
+// (0.26.2: not for a hole that reads another's). by_ref (a format_args
+// value's, expand's): a hole that is a place owning memory is bound to
+// its borrow, `let __fN = &eN;` (hole_by_ref), N pushed onto refs.
+fn push_hole_lets(n: i64, by_ref: bool, refs: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
     let mut holes: i64 = 0;
     for i in 0..pcx.nodes[n as usize].count {
         let item = child(n, i, pcx);
         if pcx.nodes[item as usize].kind == NodeKind::InterpHole {
             if hole_alias(item, pcx) < 0 {
-                list_push(let_node(hidden(c"=f", holes, pcx), pcx.nodes[item as usize].a, item,
-                    false, pcx),
-                    pcx);
+                let mut value = pcx.nodes[item as usize].a;
+                if by_ref && hole_by_ref(value, pcx) {
+                    let t = pcx.nodes[value as usize].ty;
+                    value = unary(Tok::Amp, value, pcx);
+                    pcx.nodes[value as usize].ty = crate::front::types::ref_to(t,
+                        crate::front::types::REF_SHARED, pcx);
+                    refs.push(holes);
+                }
+                list_push(let_node(hidden(c"=f", holes, pcx), value, item, false, pcx), pcx);
             }
             holes += 1;
         }
@@ -546,9 +558,13 @@ pub fn direct_call(n: i64, f: i64, k: i64, recv: i64, pcx: &mut Ctx<Comp>) -> i6
     if ok {
         let lets = list_begin(pcx);
         if recv != 0 {
-            list_push(let_node(intern_c(c"__r", pcx), recv, n, false, pcx), pcx);
+            let lr = let_node(intern_c(c"__r", pcx), recv, n, false, pcx);
+            let rb = pcx.nodes[lr as usize].a;
+            pcx.nodes[rb as usize].p |= crate::front::ast::PAT_WRITER_RECV;
+            list_push(lr, pcx);
         }
-        push_hole_lets(fs, pcx);
+        let mut refs: Vec<i64, Comp> = Vec::new_in(Comp {});
+        push_hole_lets(fs, false, &mut refs, pcx);
         if alloc != 0 {
             list_push(let_node(intern_c(c"__a", pcx), alloc, n, false, pcx), pcx);
         }
@@ -772,7 +788,7 @@ fn direct_body_std(fs: i64, k: i64, n: i64, io: bool, pcx: &mut Ctx<Comp>) -> i6
         pcx.nodes[at as usize].a = crate::front::lexer::add_string(&crate::base::buf_copy(b), pcx);
         list_push(stmt(call1(ident(out, n, pcx), c"write_str", at, pcx), pcx), pcx);
     }
-    push_writes_std(fs, out, false, pcx);
+    push_writes_std(fs, out, false, &[], pcx);
     if k == D_PRINTLN || k == D_EPRINTLN {
         let nl = new_node(NodeKind::Str, pcx.nodes[n as usize].start, pcx.nodes[n as usize].end,
             pcx);
@@ -823,7 +839,8 @@ fn direct_body_std(fs: i64, k: i64, n: i64, io: bool, pcx: &mut Ctx<Comp>) -> i6
 // `out.write_str("..")`, each hole `std::fmt::Tr::fmt(&__fN, &mut out)` with
 // its spec set before it and cleared after; `by_ref`: out is a `&mut
 // Formatter` already (format_args's closure parameter), passed as it is.
-fn push_writes_std(fs: i64, out: i64, by_ref: bool, pcx: &mut Ctx<Comp>) {
+// refs: the holes push_hole_lets bound to a borrow (read through it).
+fn push_writes_std(fs: i64, out: i64, by_ref: bool, refs: &[i64], pcx: &mut Ctx<Comp>) {
     let mut holes: i64 = 0;
     for i in 0..pcx.nodes[fs as usize].count {
         let item = child(fs, i, pcx);
@@ -836,8 +853,9 @@ fn push_writes_std(fs: i64, out: i64, by_ref: bool, pcx: &mut Ctx<Comp>) {
             continue;
         }
         let alias = hole_alias(item, pcx);
-        let name = hidden(c"=f", if alias >= 0 { alias } else { holes }, pcx);
-        let write = hole_write(item, name, out, by_ref, pcx);
+        let k = if alias >= 0 { alias } else { holes };
+        let name = hidden(c"=f", k, pcx);
+        let write = hole_write(item, name, out, by_ref, refs.contains(&k), pcx);
         // (the hole's spec on the Formatter for its value, then cleared)
         let spec = hole_has_spec(item, pcx);
         if spec {
@@ -872,7 +890,10 @@ fn push_writes_std(fs: i64, out: i64, by_ref: bool, pcx: &mut Ctx<Comp>) {
 // The write of hole item through std's Formatter `out` (push_writes_std),
 // its value `name`: `std::fmt::Tr::fmt(&name, &mut out)`, Tr the trait its
 // spec names.
-fn hole_write(item: i64, name: i64, out: i64, by_ref: bool, pcx: &mut Ctx<Comp>) -> i64 {
+// deref: name is a borrow of the value (push_hole_lets' by_ref), read
+// through it, `&*name`.
+fn hole_write(item: i64, name: i64, out: i64, by_ref: bool, deref: bool, pcx: &mut Ctx<Comp>)
+    -> i64 {
     let flags = pcx.nodes[item as usize].p;
     // (`{:p}` of a pointer: its Display; of a type with Pointer: that)
     let tr = if (flags & FMT_PTR) != 0 && !spec_trait_impl(item, pcx.nodes[item as usize].ty, pcx) {
@@ -880,7 +901,7 @@ fn hole_write(item: i64, name: i64, out: i64, by_ref: bool, pcx: &mut Ctx<Comp>)
     } else {
         spec_trait(item, pcx)
     };
-    let mut value = unary(Tok::Amp, ident(name, item, pcx), pcx);
+    let mut value = unary(Tok::Amp, hole_name(name, item, deref, pcx), pcx);
     if (flags & crate::front::check::format::FMT_AS_SLICE) != 0 {
         // (`&__fN[..]`, `&(*__fN)[..]` for a reference to an array)
         let full = new_node(NodeKind::Range, pcx.nodes[item as usize].start,
@@ -889,9 +910,9 @@ fn hole_write(item: i64, name: i64, out: i64, by_ref: bool, pcx: &mut Ctx<Comp>)
             pcx.nodes[item as usize].end, pcx);
         let ht = pcx.nodes[item as usize].ty;
         pcx.nodes[ix as usize].a = if ht > 0 && pcx.types[ht as usize].kind == TyKind::Ptr {
-            unary(Tok::Star, ident(name, item, pcx), pcx)
+            unary(Tok::Star, hole_name(name, item, deref, pcx), pcx)
         } else {
-            ident(name, item, pcx)
+            hole_name(name, item, deref, pcx)
         };
         pcx.nodes[ix as usize].b = full;
         value = unary(Tok::Amp, ix, pcx);
@@ -899,6 +920,62 @@ fn hole_write(item: i64, name: i64, out: i64, by_ref: bool, pcx: &mut Ctx<Comp>)
     let dst = if by_ref { ident(out, item, pcx) }
         else { amp_mut(ident(out, item, pcx), pcx) };
     std_path_call(c"fmt", tr, c"fmt", value, dst, item, pcx)
+}
+
+// The value of a hole's write: its name, or `*name` when it is bound to a
+// borrow (deref).
+fn hole_name(name: i64, item: i64, deref: bool, pcx: &mut Ctx<Comp>) -> i64 {
+    let id = ident(name, item, pcx);
+    if deref { unary(Tok::Star, id, pcx) } else { id }
+}
+
+// RULE: D2.9 (0.30.1) Whether a format_args value's hole e (checked) is
+// bound to its borrow: a place reached from a local or a static (by
+// fields, indexes and derefs: no temporary's part) whose type is not
+// Copy. A copy of its words in the value's closure would have no region
+// to keep it borrowed: `let b = format_args("{}", t); drop(t);` read the
+// freed block, and a struct holding a `&mut` was aliased by the copy
+// while the reference was written through. (A Copy place stays a copy,
+// as its value is the hole's; a `&T`'s region is in its copy already.)
+fn hole_by_ref(e: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let t = pcx.nodes[e as usize].ty;
+    t > 0 && t != pcx.ty_error && rooted_place(e, pcx)
+        && !crate::places::regions::rust_copy(t, pcx)
+}
+
+// Whether e is a place reached from a local or a static by fields,
+// indexes and derefs (a deref's operand any value: what it points to is
+// no temporary of the statement's). An index of a slice or through a
+// reference is a deref of it: `v[i]` of a Vec, `v.as_slice()[i]` as the
+// checker writes it, is an element of v's block, whatever the slice's
+// own expression.
+fn rooted_place(e: i64, pcx: &Ctx<Comp>) -> bool {
+    let mut x = e;
+    loop {
+        let k = pcx.nodes[x as usize].kind;
+        if k == NodeKind::Ident {
+            return pcx.nodes[x as usize].res == Res::Local
+                || pcx.nodes[x as usize].res == Res::Static;
+        }
+        if k == NodeKind::Unary {
+            return pcx.nodes[x as usize].op == Tok::Star;
+        }
+        if k == NodeKind::Index
+            && pcx.nodes[pcx.nodes[x as usize].b as usize].kind == NodeKind::Range {
+            return false;
+        }
+        if k != NodeKind::FieldAccess && k != NodeKind::TupleField && k != NodeKind::Index {
+            return false;
+        }
+        x = pcx.nodes[x as usize].a;
+        if k == NodeKind::Index {
+            let bt = pcx.nodes[x as usize].ty;
+            if bt > 0 && (pcx.types[bt as usize].kind == TyKind::Slice
+                || pcx.types[bt as usize].kind == TyKind::Ptr) {
+                return true;
+            }
+        }
+    }
 }
 
 // The hole of f-string fs whose value hole item writes: item, or the one
@@ -941,7 +1018,7 @@ pub fn hole_retype(m: i64, t: i64, pcx: &mut Ctx<Comp>) {
     pcx.locals[value as usize].ty = t;
     pcx.nodes[item as usize].ty = t;
     let write = hole_write(item, pcx.nodes[m as usize].y, pcx.nodes[oid as usize].a,
-        pcx.nodes[m as usize].x != 0, pcx);
+        pcx.nodes[m as usize].x != 0, false, pcx);
     // (the value and the Formatter by their locals, wherever this is)
     let saved_env = pcx.env.len() as i64;
     let saved_keep = pcx.open_keep;

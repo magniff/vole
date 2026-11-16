@@ -54,7 +54,10 @@ SKIP = ("tests/", "evals/", "compiler/src/front/stdsrc.vl")
 
 
 def git(*args):
-    return subprocess.run(["git"] + list(args), capture_output=True, text=True).stdout
+    # A source may hold bytes that are not UTF-8 (a case about them does):
+    # they are kept as surrogates, and the checks read only ASCII words.
+    return subprocess.run(["git"] + list(args), capture_output=True, text=True,
+                          errors="surrogateescape").stdout
 
 
 def code_part(line):
@@ -122,7 +125,7 @@ def tool_sites(volecs, paths):
     for group in program_groups(paths):
         for volec in volecs:
             r = subprocess.run([volec, "query", "unsafe", "--json"] + group,
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="surrogateescape")
             if r.returncode == 0:
                 break
         else:

@@ -294,8 +294,29 @@ fn synth_cast(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             return nonnull_cast(n, operand, to_ty, pcx);
         }
         // (0.20) bytes become std's `str` only checked, outside std
-        if to_ty == pcx.str_type && from == from_ty && !within_std(pcx.cur_mod, pcx) {
+        // (0.30.1: and `&mut [u8] as &mut str`, which would write the
+        // str's bytes; a raw pointer's cast, `*mut [u8] as *mut str`, is
+        // unsafe to use: rustc's too)
+        if (to_ty == pcx.str_type || crate::front::distinct::is_view_distinct(to_ty, pcx)
+            && !crate::front::types::is_raw_view(to, pcx))
+            && from == from_ty && !within_std(pcx.cur_mod, pcx) {
             bytes_as_str_error(n, operand, pcx);
+        }
+        // RULE: F29.4 (0.30.1: `&mut str as &mut [u8]` would let safe code
+        // write bytes that are not UTF-8 into a str; `&str as &[u8]` only
+        // reads them)
+        if to == to_ty && crate::front::distinct::is_view_distinct(from_ty, pcx)
+            && crate::front::types::is_mut_slice(from_ty, pcx) {
+            ref_cast_error(operand, from_ty, to_ty, c"a str is UTF-8, and a `&mut [u8]` writes any byte: change the text through the str's own methods (`make_ascii_uppercase`), or build a new one (`String::from_utf8` of the changed bytes checks them)", pcx);
+            return to_ty;
+        }
+        // RULE: F29.4 (0.30.1: `&str as &[u8]`, rustc E0605: the bytes are
+        // `s.as_bytes()`; one language, Rust's surface)
+        if to == to_ty && crate::front::distinct::is_view_distinct(from_ty, pcx)
+            && !crate::front::types::is_raw_view(from, pcx) && !within_std(pcx.cur_mod, pcx) {
+            ref_cast_error(operand, from_ty, to_ty,
+                c"a str's bytes are `s.as_bytes()` (rustc E0605: a non-primitive cast)", pcx);
+            return to_ty;
         }
         pcx.nodes[n as usize] = pcx.nodes[operand as usize];
         return to_ty;
@@ -363,6 +384,25 @@ fn synth_cast(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         pcx.err_kind = saved_kind;
         return to_ty;
     }
+    // RULE: F29.4 (0.30.1: `as` makes a reference only of a reference to
+    // the same type, `&mut T as &T`: not of a raw pointer, not of a `&T`
+    // to a `&mut T`, not of a reference to another type, a transmute;
+    // rustc E0605, E0606)
+    if from > 0 && to > 0 && pcx.types[from as usize].kind == TyKind::Ptr
+        && pcx.types[to as usize].kind == TyKind::Ptr && pcx.types[to as usize].b != 0 {
+        if pcx.types[from as usize].b == 0 {
+            ref_cast_error(operand, from_ty, to_ty, c"a raw pointer becomes a reference by `&*p` (`&mut *p`) in an unsafe block whose SAFETY says the pointee lives and is valid; `as` checks none of it", pcx);
+            return to_ty;
+        }
+        if pcx.types[from as usize].a != pcx.types[to as usize].a {
+            ref_cast_error(operand, from_ty, to_ty, c"that would be a transmute: convert the value (`*r as U`, `U::from(*r)`), or cast to a raw pointer (`r as *const T as *const U`) and read it in an unsafe block that says why it is a valid U", pcx);
+            return to_ty;
+        }
+        if pcx.types[from as usize].b == REF_SHARED && pcx.types[to as usize].b == REF_MUT {
+            ref_cast_error(operand, from_ty, to_ty, c"a shared reference does not become an exclusive one: borrow the place `&mut` where the reference is made", pcx);
+            return to_ty;
+        }
+    }
     if !is_valid_cast(from, to, pcx)
         || ref_to_raw {
         err_begin(pcx.nodes[operand as usize].start, pcx);
@@ -397,6 +437,22 @@ fn bytes_as_str_error(n: i64, operand: i64, pcx: &mut Ctx<Comp>) {
         err_help(c"; not with '?' here: the function does not return a Result whose error takes a Utf8Error (match the Result, or make the value a str where it comes from)", pcx);
     }
     err_end_soft(pcx);
+}
+
+// RULE: F29.4 (0.30.1) a cast that would make a reference of another type:
+// `as` is no transmute (rustc E0605, E0606).
+fn ref_cast_error(operand: i64, from_ty: i64, to_ty: i64, help: *const u8, pcx: &mut Ctx<Comp>) {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"type.ref_cast";
+    err_begin(pcx.nodes[operand as usize].start, pcx);
+    err_str(c"cannot cast '", pcx);
+    err_type(from_ty, pcx);
+    err_str(c"' to the reference '", pcx);
+    err_type(to_ty, pcx);
+    err_str(c"': `as` makes no reference of another type", pcx);
+    err_help(help, pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved_kind;
 }
 
 // `n as E` for a fieldless enum E (0.4), checked: it becomes
@@ -576,9 +632,13 @@ fn synth_index(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         }
     }
     // RULE: Z9.1b (0.28.0: a program's `s[a..b]` of a `&str`: std's
-    // Index, checked to fall between characters)
-    if base_ty == pcx.str_type && pcx.str_type > 0 && pcx.nodes[index as usize].kind == Range
-        && !crate::front::modules::within_std(pcx.cur_mod, pcx) {
+    // Index, checked to fall between characters; 0.30.1, RT-21: std's own
+    // too, as Rust's: str::split_at and String::remove sliced a caller's
+    // index unchecked, a str that is not UTF-8 from safe code. Only a base
+    // whose type is str_type itself, a `&str`, comes here: a `&mut str`
+    // (RT-42, RT-42b) and a reference to a `&str` (`&&str`, `&mut &str`,
+    // the path below, RT-42c) are indexed with no boundary check yet.)
+    if base_ty == pcx.str_type && pcx.str_type > 0 && pcx.nodes[index as usize].kind == Range {
         pcx.nodes[base as usize].p |= NODE_CHECKED;
         // (the ends are usize, which a literal takes: SliceIndex<str> is
         // for ranges of usize alone)
@@ -1774,6 +1834,11 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         // asked before the call is checked into a Call)
         let index_mut = pcx.nodes[operand as usize].kind == NodeKind::MethodCall
             && sym_is_c(pcx.nodes[operand as usize].b, c"index_mut", pcx);
+        // (0.30.1: the operand of a `&mut`, which marks it, below)
+        let under_mut = pcx.view_deref == -n;
+        if under_mut {
+            pcx.view_deref = 0;
+        }
         let ty = synth_expr(operand, pcx);
         // (0.17, issue #1: `(*f)(10)` on a fn value, C's habit: the
         // value is called as it is)
@@ -1786,7 +1851,7 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         // unsized places)
         if crate::front::types::is_raw_view(ty, pcx) {
             unsafe_through(n, operand, U_DEREF, c"dereference of a raw pointer is unsafe", pcx);
-            pcx.nodes[n as usize] = pcx.nodes[operand as usize];
+            copy_use(n, operand, pcx);
             return crate::front::types::raw_view_target(ty, pcx);
         }
         if !is_pointer(ty, pcx) && crate::front::check::rust::deref_operand(n, operand, ty, pcx) {
@@ -1795,13 +1860,16 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         }
         // RULE: Z4.1 (0.27.2, std: `*s` of a shared view, `&str` or `&[T]`,
         // is the unsized place, read as the view itself: `&**self` in Debug
-        // for &T with T = str; an exclusive one stays an error until Z9.1)
+        // for &T with T = str; an exclusive one stays an error until Z9.1,
+        // but as the operand of a `&mut`, `&mut *v`, the reborrow the `&`
+        // makes, below, 0.30.1)
         let view = if ty > 0
             && pcx.types[ty as usize].kind == TyKind::Distinct { pcx.types[ty as usize].a }
             else { ty };
         if view > 0 && pcx.types[view as usize].kind == TyKind::Slice
-            && (pcx.types[view as usize].b == 0 || index_mut) {
-            pcx.nodes[n as usize] = pcx.nodes[operand as usize];
+            && (pcx.types[view as usize].b == 0 || index_mut
+                || under_mut && pcx.types[view as usize].b == REF_MUT) {
+            copy_use(n, operand, pcx);
             // (0.27.5: as a receiver, the place: synth_method)
             pcx.view_deref = n;
             return ty;
@@ -1850,8 +1918,52 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         && pcx.nodes[operand as usize].op == Tok::Star;
     let written_call = pcx.nodes[operand as usize].kind == NodeKind::Call
         || pcx.nodes[operand as usize].kind == NodeKind::MethodCall;
+    if mutable && star {
+        pcx.view_deref = -operand;
+    }
     let ty = synth_expr(operand, pcx);
+    if pcx.view_deref == -operand {
+        pcx.view_deref = 0;
+    }
     pcx.mut_place = outer_place;
+    // RULE: D2.7 (0.30.1: `&mut a[1..][0]`: each slicing on the place's
+    // path a mutable one, rust::mut_slicing)
+    if mutable {
+        crate::front::check::rust::mut_slicing(operand, pcx);
+    }
+    // RULE: D2.7 (0.30.1, RT-33) `&mut *s` of a view s (Z4.1's `*s`, the
+    // view read as its place) reborrows its referent: the slicing `&mut
+    // s[..]`, whose `&mut` the borrow checker asks of the referent
+    // (places/borrowck/moves.vl referent_why): through a shared view it is
+    // E0596, through a `&mut [T]` place the reborrow. Before, the shared
+    // view was retyped `&mut [T]` and written through. A mutable view's
+    // value, `&mut *f()`, is its own reborrow.
+    if mutable && star && pcx.view_deref == operand {
+        let view = if ty > 0
+            && pcx.types[ty as usize].kind == TyKind::Distinct { pcx.types[ty as usize].a }
+            else { ty };
+        let shared_view = view > 0 && pcx.types[view as usize].kind == TyKind::Slice
+            && pcx.types[view as usize].b == 0;
+        let mut_view = view > 0 && pcx.types[view as usize].kind == TyKind::Slice
+            && pcx.types[view as usize].b == REF_MUT;
+        if shared_view || mut_view && is_place(operand, pcx) {
+            let mt = if mut_view { ty } else { crate::front::types::mut_view_of(ty, pcx) };
+            let start = pcx.nodes[n as usize].start;
+            let end = pcx.nodes[n as usize].end;
+            let range = new_node(Range, start, end, pcx);
+            let ix = new_node(Index, start, end, pcx);
+            pcx.nodes[ix as usize].a = operand;
+            pcx.nodes[ix as usize].b = range;
+            pcx.nodes[ix as usize].ty = mt;
+            pcx.nodes[ix as usize].p |= NODE_CHECKED | NODE_REF_MUT;
+            pcx.nodes[n as usize] = pcx.nodes[ix as usize];
+            return mt;
+        }
+        if mut_view {
+            copy_use(n, operand, pcx);
+            return ty;
+        }
+    }
     // RULE: F19.7 (0.30: a union field borrowed is unsafe, rustc E0133)
     crate::front::check::unsafety::union_borrow(operand, pcx);
     // RULE: Z9.3 (0.27.2: `&*p`, `&mut *p` of a fat raw pointer: the view,
@@ -1859,7 +1971,7 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if star && pcx.nodes[operand as usize].kind != Unary
         && (pcx.types[ty as usize].kind == TyKind::Slice && pcx.types[ty as usize].b == 0
             || is_view_distinct(ty, pcx)) {
-        pcx.nodes[n as usize] = pcx.nodes[operand as usize];
+        copy_use(n, operand, pcx);
         // (`&mut *p` of a `*mut str`: `&mut str`, RULE: F0.1)
         return if mutable { crate::front::types::mut_view_of(ty, pcx) } else { ty };
     }
@@ -1895,16 +2007,49 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             // (0.20: the `&`, for `fix --only conventions`)
             pcx.slice_amps.push(pcx.nodes[n as usize].start);
             pcx.slice_amps.push(pcx.nodes[operand as usize].start);
-            pcx.nodes[n as usize] = pcx.nodes[operand as usize];
-            pcx.nodes[n as usize].p |= flags & NODE_REF_MUT;
-            return if mutable { mut_slice_of(pcx.types[ty as usize].a, pcx) } else { ty };
+            copy_use(n, operand, pcx);
+            // RULE: D2.7 (0.30.1, RT-33: NODE_REF, the view is a written
+            // `&`'s, `(&v[..]).reverse()`, never made a `&mut` by its use,
+            // rust::mut_slicing; `&mut v[..2][..1]` makes its slicings
+            // mutable, each an exclusive loan of its base)
+            pcx.nodes[n as usize].p |= flags & NODE_REF_MUT | crate::front::ast::NODE_REF;
+            if mutable {
+                let mt = mut_slice_of(pcx.types[ty as usize].a, pcx);
+                // RULE: D2.7 (0.30.1) a shared view that is no slicing, the
+                // value of a call (`&mut w[0..3]` of a W with Index only:
+                // `*w.index(r)`, read as the view it gives, Z4.1), is never
+                // retyped: its `&mut` is the slicing `&mut (view)[..]`, whose
+                // referent the borrow checker asks (E0596, at the borrow).
+                // Before, the call's shared view was typed `&mut [u8]`.
+                if pcx.nodes[n as usize].kind != Index && pcx.types[ty as usize].b == 0 {
+                    let start = pcx.nodes[n as usize].start;
+                    let end = pcx.nodes[n as usize].end;
+                    let inner = new_node(Index, start, end, pcx);
+                    pcx.nodes[inner as usize] = pcx.nodes[n as usize];
+                    pcx.nodes[inner as usize].p &= !(NODE_REF_MUT | crate::front::ast::NODE_REF);
+                    let range = new_node(Range, start, end, pcx);
+                    let ix = new_node(Index, start, end, pcx);
+                    pcx.nodes[ix as usize].a = inner;
+                    pcx.nodes[ix as usize].b = range;
+                    pcx.nodes[ix as usize].ty = mt;
+                    pcx.nodes[ix as usize].p |= NODE_CHECKED | NODE_REF_MUT;
+                    pcx.nodes[n as usize] = pcx.nodes[ix as usize];
+                    return mt;
+                }
+                pcx.nodes[n as usize].ty = mt;
+                if pcx.nodes[n as usize].kind == Index {
+                    crate::front::check::rust::mut_slicing(pcx.nodes[n as usize].a, pcx);
+                }
+                return mt;
+            }
+            return ty;
         }
         // RULE: Z9.1 (0.27.2: `&s[a..]` of a str is the str, its
         // own view, as a slice's is, until the unsized representation)
         if is_view_distinct(ty, pcx) {
             let flags = pcx.nodes[n as usize].p;
-            pcx.nodes[n as usize] = pcx.nodes[operand as usize];
-            pcx.nodes[n as usize].p |= flags & NODE_REF_MUT;
+            copy_use(n, operand, pcx);
+            pcx.nodes[n as usize].p |= flags & NODE_REF_MUT | crate::front::ast::NODE_REF;
             return ty;
         }
         // (0.17, issue #1: `&factorial`: a function's name is its
@@ -1930,6 +2075,20 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         crate::front::check::rust::const_write(operand, true, pcx);
     }
     ref_to(ty, if mutable { REF_MUT } else { REF_SHARED }, pcx)
+}
+
+// RULE: D19.2 (0.30.1) Node dst made a copy of checked node src (`*s` of a
+// view read as the view, `&*p`): a copy of a local's Ident is a use of it
+// too, so that a closure's capture rewrites it (closures::rewrite_use);
+// before, `&mut *v` of a captured `v` kept the outer local in the
+// closure's body, which the places IR could not build (a fallback body,
+// never borrow-checked).
+fn copy_use(dst: i64, src: i64, pcx: &mut Ctx<Comp>) {
+    pcx.nodes[dst as usize] = pcx.nodes[src as usize];
+    if pcx.nodes[dst as usize].kind == Ident && pcx.nodes[dst as usize].res == Res::Local
+        && pcx.nodes[dst as usize].y >= 0 {
+        crate::front::closures::note_local_use(dst, pcx.nodes[dst as usize].y, pcx);
+    }
 }
 
 // (0.25.2.2) Whether the name `t`, used at the end of `text` (its file's

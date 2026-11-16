@@ -242,6 +242,20 @@ chmod +x "$WORK/failing-volec"
 got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n abi_callee_alignment -n abi_extern_small_struct 2>&1 | tail -1)
 [ "$got" = "try: tests/run.sh -n abi_callee_alignment -n abi_extern_small_struct   (the failing cases alone)" ] \
     && ok filters_try_dash_n || bad filters_try_dash_n "got '$got'"
+# (0.30.1) The files a run's caller gives it (VOLE_TEST_RESULTS, the
+# gate's records; VOLE_TEST_XFAIL_WHY; VOLE_STD_RERUN_NOTE) are that
+# run's: it writes one record a case, and nothing it starts inherits
+# them (this suite's runs inside the gate's suite rows wrote two records
+# of these cases into the gate's, which the gate refused)
+printf '#!/bin/sh\nprintf "%%s %%s %%s\\n" "${VOLE_TEST_RESULTS-unset}" "${VOLE_TEST_XFAIL_WHY-unset}" "${VOLE_STD_RERUN_NOTE-unset}" >>"%s/seen"\necho "error: no" >&2\nexit 1\n' "$WORK" >"$WORK/seeing-volec"
+chmod +x "$WORK/seeing-volec"
+VOLE_TEST_RESULTS="$WORK/outer.results" VOLE_TEST_XFAIL_WHY="$WORK/outer.why" VOLE_STD_RERUN_NOTE="$WORK/outer.reruns" \
+    sh "$ROOT/tests/run.sh" -c "$WORK/seeing-volec" -j 2 -n abi_callee_alignment >/dev/null 2>&1
+got="$(cut -d' ' -f1,2 "$WORK/outer.results" 2>/dev/null | tr '\n' ',')|$(sort -u "$WORK/seen" 2>/dev/null | sed "s|$WORK|W|g" | tr '\n' ',')|$([ -e "$WORK/outer.reruns" ] && echo reruns-written)"
+case "$got" in
+    "abi_callee_alignment fail,|unset unset "*"/vole-tests."*"/reruns,|") ok caller_files_not_inherited ;;
+    *) bad caller_files_not_inherited "got '$got'" ;;
+esac
 # ---- the transcript runners' jobs (0.30: tests/jobs.sh) ----
 
 # A FILTER selects the transcripts and checks whose name contains it, -n
@@ -648,5 +662,58 @@ if [ -x "$BC" ]; then
 else
     echo "skip runner_book_update_out_err: no compiler (VOLE_TEST_COMPILER, target/volec)"
 fi
+
+# ---- tests/incremental.sh's crash detection (0.30.1) ----
+
+# A planted fault: a stand-in for volec (its "object" the program's bytes,
+# the same warm or clean) that crashes, VOLE_FAULT: before writing the
+# object (exit 101), after writing it (exit 139), or after writing it on
+# a build with a warm cache only. Each must fail incremental.sh, the edit
+# series (bench/fib.vl) and the pairs (link_name_fn); the stand-in
+# without a fault passes both (0.30.0's script passed a compiler that
+# wrote its object and then crashed, storing to the cache say).
+F="$WORK/incfault"
+mkdir -p "$F"
+cat >"$F/volec" <<'FAKE'
+#!/bin/sh
+case "$1" in --version) echo "volec 0.0.0 (host: aarch64-macos)"; exit 0 ;; esac
+out=""; src=""; cache=no
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out=$2; shift 2 ;;
+        --cache=on) cache=yes; shift ;;
+        --target) shift 2 ;;
+        -*) shift ;;
+        *) src=$1; shift ;;
+    esac
+done
+warm=no
+[ $cache = yes ] && [ -n "${VOLE_CACHE:-}" ] && [ -f "$VOLE_CACHE/entry" ] && warm=yes
+[ "${VOLE_FAULT:-}" = before ] && exit 101
+find "$(dirname "$src")" -name '*.vl' | sort | xargs cat | cksum >"$out"
+if [ $cache = yes ] && [ -n "${VOLE_CACHE:-}" ]; then mkdir -p "$VOLE_CACHE" && : >"$VOLE_CACHE/entry"; fi
+case "${VOLE_FAULT:-}" in
+    after) exit 139 ;;
+    warm) [ $warm = yes ] && exit 139 ;;
+esac
+exit 0
+FAKE
+chmod +x "$F/volec"
+for fault in none before after warm; do
+    for what in bench/fib.vl tests/incremental/link_name_fn; do
+        log="$F/$fault.$(basename "$what").log"
+        VOLE_INCREMENTAL_WORK="$F/work" VOLE_FAULT=$fault \
+            sh "$ROOT/tests/incremental.sh" -c "$F/volec" -n 0 -r 0 -j 2 "$what" >"$log" 2>&1
+        rc=$?
+        name="incremental_fault_${fault}_$(basename "$what" .vl)"
+        if [ $fault = none ]; then
+            if [ $rc -eq 0 ] && ! grep -q '^FAIL' "$log"; then ok "$name"; else bad "$name" "the stand-in without a fault failed (exit $rc): $(grep -m1 '^FAIL' "$log")"; fi
+        elif [ $rc -ne 0 ] && grep -q '^FAIL' "$log"; then
+            ok "$name"
+        else
+            bad "$name" "a compiler crashing ($fault) passed (exit $rc): $(tail -1 "$log")"
+        fi
+    done
+done
 
 exit $BAD

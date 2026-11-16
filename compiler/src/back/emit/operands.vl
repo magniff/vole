@@ -3,21 +3,25 @@
 // and the parallel moves that put values in place.
 
 use crate::back::emit::machine::{
-    m_extern_addr, m_lea, m_load, m_load_fimm, m_load_imm, m_mov, m_store, m_string_addr,
-    m_symbol_addr, reg_cycle, reg_fp, reg_move_temp, reg_sp, spill_offset, spill_type,
+    m_extern_addr, m_lea, m_load, m_load_fimm, m_load_imm, m_mov, m_spill_load, m_spill_store,
+    m_store, m_string_addr, m_symbol_addr, reg_cycle, reg_fp, reg_move_temp, reg_sp, spill_type,
 };
 use crate::back::regalloc::{LOC_NONE, LOC_REMAT};
-use crate::back::regalloc::locations::{stored_at_def, vloc};
+use crate::back::regalloc::locations::{
+    plan_end_moves, plan_gap_moves, plan_start_moves, stored_at_def, vloc,
+};
+use crate::back::regalloc::movecode::{check_moves_code, moves_code_begin};
 use crate::back::regalloc::prepare::tracked;
 use crate::base::{buf_byte, die};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::front::types::{TY_F64, in_fregs, is_float, is_vector};
+use crate::base::target::get_x86;
+use crate::front::types::{TY_F64, TY_U64, in_fregs, is_float, is_vector, type_size};
 use crate::gen0::gen::{fn_symbol_prefix, static_symbol_prefix};
-use crate::gen0::target::{oi, on};
+use crate::gen0::target::{ins, oi, on};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::Op;
-use crate::middle::ir::Op::{Const, GAddr, SAddr, Slot};
+use crate::middle::ir::Op::{Const, GAddr, Param, Phi, SAddr, Slot};
 
 // ---- Operands and results ----
 
@@ -98,11 +102,7 @@ pub fn use_any(cx: &mut FnCtx<Comp>, v: i64, pos: i64, scratch: i64, pcx: &Ctx<C
     if loc >= 0 {
         return loc;
     }
-    let spill_type_v = spill_type((cx.insts[v as usize]).ty, pcx);
-    let reg_sp_v = reg_sp();
-    let spill_offset_v = spill_offset(cx, loc);
-    m_load(cx, spill_type_v, scratch, reg_sp_v, spill_offset_v,
-        pcx);
+    m_spill_load(cx, (cx.insts[v as usize]).ty, scratch, loc, pcx);
     scratch
 }
 
@@ -137,11 +137,7 @@ pub fn result_reg(cx: &mut FnCtx<Comp>, v: i64) -> i64 {
 pub fn result_done(cx: &mut FnCtx<Comp>, v: i64, r: i64, pcx: &Ctx<Comp>) {
     let t = tracked(cx, v);
     if t >= 0 && stored_at_def(cx, t) {
-        let spill_type_v = spill_type((cx.insts[v as usize]).ty, pcx);
-        let reg_sp_v = reg_sp();
-        let spill_offset_v = spill_offset(cx, 0 - (1 + cx.rv_slot[t as usize]));
-        m_store(cx, spill_type_v, r, reg_sp_v,
-            spill_offset_v, pcx);
+        m_spill_store(cx, (cx.insts[v as usize]).ty, r, 0 - (1 + cx.rv_slot[t as usize]), pcx);
     }
 }
 
@@ -191,7 +187,7 @@ pub fn pm_kind(cx: &mut FnCtx<Comp>, i: i64) -> i64 { (
 pub fn pm_src(cx: &mut FnCtx<Comp>, i: i64) -> i64 { (
     cx.pm[(i * PM_FIELDS + 2) as usize]) }
 
-fn pm_ty(cx: &mut FnCtx<Comp>, i: i64) -> i64 { (cx.pm[(i * PM_FIELDS + 3) as usize]) }
+pub fn pm_ty(cx: &mut FnCtx<Comp>, i: i64) -> i64 { (cx.pm[(i * PM_FIELDS + 3) as usize]) }
 
 fn pm_done(cx: &mut FnCtx<Comp>, i: i64) -> bool {
     (cx.pm[(i * PM_FIELDS + 4) as usize]) != 0
@@ -208,64 +204,371 @@ fn move_loc(cx: &mut FnCtx<Comp>, dst: i64, src: i64, ty: i64, pcx: &Ctx<Comp>) 
     if dst == src {
         return;
     }
-    let st = spill_type(ty, pcx);
     if dst >= 0 && src >= 0 {
         m_mov(cx, dst, src, ty, pcx);
     } else if dst >= 0 {
-        let reg_sp_v = reg_sp();
-        let spill_offset_v = spill_offset(cx, src);
-        m_load(cx, st, dst, reg_sp_v, spill_offset_v, pcx);
+        m_spill_load(cx, ty, dst, src, pcx);
     } else if src >= 0 {
-        let reg_sp_v1 = reg_sp();
-        let spill_offset_v1 = spill_offset(cx, dst);
-        m_store(cx, st, src, reg_sp_v1, spill_offset_v1, pcx);
+        m_spill_store(cx, ty, src, dst, pcx);
+        if pcx.plant_rt_cg_7 == 4 {
+            // (tests only) a store to a byte of the frame no move writes
+            let at = cx.save_base;
+            m_store(cx, if in_fregs(ty, pcx) { TY_F64 } else { TY_U64 }, src, reg_sp(), at, pcx);
+        }
     } else {
-        let temp = reg_move_temp(in_fregs(ty, pcx));
-        let reg_sp_v2 = reg_sp();
-        let spill_offset_v2 = spill_offset(cx, src);
-        m_load(cx, st, temp, reg_sp_v2, spill_offset_v2, pcx);
-        let reg_sp_v3 = reg_sp();
-        let spill_offset_v3 = spill_offset(cx, dst);
-        m_store(cx, st, temp, reg_sp_v3, spill_offset_v3, pcx);
+        // (0.30.1, RT-CG-7) through the moves' temporary of the class,
+        // which only a call's moves write as a destination (x16, r11: the
+        // callee of an indirect call), and those all go to registers
+        let mut temp = reg_move_temp(in_fregs(ty, pcx));
+        let n = cx.pm.len() as i64 / PM_FIELDS;
+        for i in 0..n {
+            if pm_dst(cx, i) == temp {
+                die(c"internal error: a parallel move between spill slots while the moves' temporary is a destination");
+            }
+        }
+        if pcx.plant_rt_cg_7 == 2 {
+            // (tests only) through an allocated register instead
+            temp = if in_fregs(ty, pcx) { 32 + 7 } else if get_x86() { 1 } else { 28 };
+        }
+        m_spill_load(cx, ty, temp, src, pcx);
+        m_spill_store(cx, ty, temp, dst, pcx);
     }
 }
 
-// Whether location `loc` is the source of a pending location move other
-// than move `except`.
-fn pm_is_source(cx: &mut FnCtx<Comp>, loc: i64, except: i64) -> bool {
-    let n = cx.pm.len() as i64 / PM_FIELDS;
+// (0.30.1, RT-CG-6) A location as storage: a register is one cell; a
+// spill slot is 8 bytes, and a value wider than 8 bytes (a 128-bit vector,
+// x86-64's 256-bit one) stored at slot k takes the slots k to k + cells -
+// 1 (assign_spill_slots gives it that many, aligned). Moves, their order
+// and the allocation's check reason about these cells, never about the
+// slot number alone: a move writing slot k + 1 must wait for a 16-byte
+// read of slot k.
+pub fn loc_cells(loc: i64, ty: i64, pcx: &Ctx<Comp>) -> i64 {
+    if loc >= 0 {
+        return 1;
+    }
+    let size = type_size(spill_type(ty, pcx), pcx);
+    if size > 8 { (size + 7) / 8 } else { 1 }
+}
+
+// Whether location a (a value of type ta) and location b (of type tb)
+// share storage.
+pub fn locs_overlap(a: i64, ta: i64, b: i64, tb: i64, pcx: &Ctx<Comp>) -> bool {
+    if a >= 0 || b >= 0 {
+        return a == b;
+    }
+    // Only the lower slot's cells can reach the other (the sizes are
+    // looked up only then: this runs for every pair of an edge's moves).
+    let sa = 0 - a - 1;
+    let sb = 0 - b - 1;
+    if sa < sb {
+        sb < sa + loc_cells(a, ta, pcx)
+    } else if sb < sa {
+        sa < sb + loc_cells(b, tb, pcx)
+    } else {
+        true
+    }
+}
+
+// The pending location move other than `except` (of the first n) whose
+// source shares storage with location loc of type ty, or -1.
+fn plan_reader(cx: &mut FnCtx<Comp>, src: &[i64], done: &[bool], loc: i64, ty: i64, except: i64,
+    n: i64, pcx: &Ctx<Comp>) -> i64 {
     for j in 0..n {
-        if j != except && !pm_done(cx, j) && pm_kind(cx, j) == PM_LOC && pm_src(cx, j) == loc {
-            return true;
+        if j != except && !done[j as usize]
+            && locs_overlap(src[j as usize], pm_ty(cx, j), loc, ty, pcx) {
+            return j;
+        }
+    }
+    -1
+}
+
+// (0.30.1) A pending move's width as storage: the bytes of its spill type.
+fn plan_width(cx: &mut FnCtx<Comp>, i: i64, pcx: &Ctx<Comp>) -> i64 {
+    type_size(spill_type(pm_ty(cx, i), pcx), pcx)
+}
+
+// (0.30.1) Whether saving the source of pending move c (its readers then
+// read the save, which no destination overlaps) lets every move reading
+// that source be made before the moves stall again: the save's storage is
+// then free for the next stall.
+fn plan_save_frees(cx: &mut FnCtx<Comp>, src: &[i64], done: &[bool], c: i64, n: i64,
+    pcx: &Ctx<Comp>) -> bool {
+    let s = src[c as usize];
+    // a register number no move writes: the save
+    let saved: i64 = 1 << 40;
+    let mut src2: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut done2: Vec<bool, Comp> = Vec::new_in(Comp {});
+    for j in 0..n {
+        src2.push(if !done[j as usize] && src[j as usize] == s { saved } else { src[j as usize] });
+        done2.push(done[j as usize]);
+    }
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for i in 0..n {
+            if done2[i as usize] {
+                continue;
+            }
+            let d = pm_dst(cx, i);
+            let ty = pm_ty(cx, i);
+            if plan_reader(cx, src2.as_slice(), done2.as_slice(), d, ty, i, n, pcx) < 0 {
+                done2[i as usize] = true;
+                progress = true;
+            }
+        }
+    }
+    for j in 0..n {
+        if !done[j as usize] && src[j as usize] == s && !done2[j as usize] {
+            return false;
+        }
+    }
+    true
+}
+
+// (0.30.1) Whether saving the source of pending move c makes a pending
+// move ready at once (its readers then read the save, which no destination
+// overlaps).
+fn plan_save_progresses(cx: &mut FnCtx<Comp>, src: &[i64], done: &[bool], c: i64, n: i64,
+    pcx: &Ctx<Comp>) -> bool {
+    let s = src[c as usize];
+    let saved: i64 = 1 << 40;
+    let mut src2: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for j in 0..n {
+        src2.push(if !done[j as usize] && src[j as usize] == s { saved } else { src[j as usize] });
+    }
+    for i in 0..n {
+        if !done[i as usize] {
+            let d = pm_dst(cx, i);
+            let ty = pm_ty(cx, i);
+            if plan_reader(cx, src2.as_slice(), done, d, ty, i, n, pcx) < 0 {
+                return true;
+            }
         }
     }
     false
 }
 
-// Emits every pending move, then clears them.
-pub fn pm_resolve(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
-    let n = cx.pm.len() as i64 / PM_FIELDS;
-    for i in 0..n {
-        if pm_kind(cx, i) == PM_LOC && pm_dst(cx, i) == pm_src(cx, i) {
-            (cx.pm[(i * PM_FIELDS + 4) as usize]) = 1;
+// (0.30.1, RT-CG-6) When every pending move waits for another, the move
+// whose source is saved: in the cycle register of its class, or in the
+// cells reserve_save_cells keeps when that register holds an earlier save
+// a pending move still reads (plan_save_cell). Every save has storage, so
+// this choice is about the moves alone: a save is one more move, and the
+// choice tries to make few. Moves write disjoint locations, and a slot's
+// value takes 1, 2 or 4 cells, aligned, so two slot locations that overlap
+// are one inside the other. Without values wider than a cell, a move
+// waits for the one value its destination holds and a value is
+// overwritten by one move, the stalled moves are simple cycles, and one
+// save on a cycle frees it all; with wider values a move can wait for
+// several narrower ones, and several saves may be pending at once (the
+// reviews found edges that need two, and three, whatever is chosen). In
+// this order: the widest value whose save lets all its readers be made
+// before the next stall (plan_save_frees: its storage is then free
+// again); else the widest value whose save makes a move ready
+// (plan_save_progresses); else the value the destination of a narrowest
+// pending move overlaps, which always makes progress (that destination is
+// inside it: a value narrower than the move would have pending readers
+// narrower still), so the plan ends: a value saved is read by no pending
+// move again. tests/fuzz/pm_model.py is these functions line for line.
+fn plan_break(cx: &mut FnCtx<Comp>, src: &[i64], done: &[bool], n: i64, pcx: &Ctx<Comp>) -> i64 {
+    for rule in 0..2 {
+        let mut c: i64 = -1;
+        let mut c_width: i64 = -1;
+        for j in 0..n {
+            if done[j as usize] {
+                continue;
+            }
+            let s = src[j as usize];
+            let ty = pm_ty(cx, j);
+            // each value once: its first pending reader
+            let mut first = true;
+            for k in 0..j {
+                if !done[k as usize] && src[k as usize] == s {
+                    first = false;
+                }
+            }
+            // a value some pending move waits for
+            let mut waited = false;
+            for i in 0..n {
+                if !done[i as usize] && locs_overlap(pm_dst(cx, i), pm_ty(cx, i), s, ty, pcx) {
+                    waited = true;
+                }
+            }
+            let w = plan_width(cx, j, pcx);
+            if first && waited && w > c_width
+                && (if rule == 0 {
+                    plan_save_frees(cx, src, done, j, n, pcx)
+                } else {
+                    plan_save_progresses(cx, src, done, j, n, pcx)
+                }) {
+                    c = j;
+                    c_width = w;
+                }
+        }
+        if c >= 0 {
+            return c;
         }
     }
+    let mut m: i64 = -1;
+    for i in 0..n {
+        if !done[i as usize] && (m < 0 || plan_width(cx, i, pcx) < plan_width(cx, m, pcx)) {
+            m = i;
+        }
+    }
+    let d = pm_dst(cx, m);
+    let ty = pm_ty(cx, m);
+    let c = plan_reader(cx, src, done, d, ty, m, n, pcx);
+    if c < 0 {
+        die(c"internal error: a parallel move waits for no move");
+    }
+    c
+}
+
+// (0.30.1, RT-CG-6) Where a save of a value of type ty goes when the
+// cycle register of its class holds an earlier save that a pending move
+// still reads: the first run of cells of the reserve after the spill
+// slots (pm_save_base, a multiple of 4; the run aligned to its size) that
+// no pending move reads. While reserve_save_cells plans every edge
+// (pm_save_cells < 0) the reserve has no end, and pm_save_need records
+// how far it was used; the frame then has that many cells. Every plan is
+// made again the same way when the code is emitted (plan_break and this
+// choice depend only on the moves), so a save always finds its cells:
+// running out is an internal error, moves the dry run did not plan.
+fn plan_save_cell(cx: &mut FnCtx<Comp>, src: &[i64], done: &[bool], ty: i64, n: i64,
+    pcx: &Ctx<Comp>) -> i64 {
+    let k = loc_cells(-1, ty, pcx);
+    let mut off: i64 = 0;
+    loop {
+        if cx.pm_save_cells >= 0 && off + k > cx.pm_save_cells {
+            die(c"internal error: a parallel move's save has no cells (moves reserve_save_cells did not plan)");
+        }
+        let loc = 0 - (1 + cx.pm_save_base + off);
+        if plan_reader(cx, src, done, loc, ty, -1, n, pcx) < 0 {
+            if off + k > cx.pm_save_need {
+                cx.pm_save_need = off + k;
+            }
+            return loc;
+        }
+        off += k;
+    }
+}
+
+// (0.30.1, RT-CG-6) Plans, before the frame is laid out, every set of
+// moves emit_block_body resolves from the allocation (each block's start,
+// every gap, its end; the end even of a block that does not jump, more
+// than is emitted), with saves in cells after the spill slots without an
+// end, and keeps as many cells as they used: no edge then lacks storage
+// for a save, however many it needs at once (most need none, the cycle
+// registers being enough; some need cells for one or two). Only a function
+// with a vector on the stack can need cells, and only it is planned. The other moves
+// pm_resolve emits (the entry's parameters, a call's arguments, results and
+// pieces, the return value's) have a register as the destination or every
+// source a register, so a move waits only for a register's readers: one
+// value a destination, one move a register, the stalled moves simple
+// cycles, and one save in the cycle register at a time is enough.
+pub fn reserve_save_cells(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
+    let mut base = cx.spill_count;
+    while base % 4 != 0 {
+        base += 1;
+    }
+    cx.pm_save_base = base;
+    cx.pm_save_cells = -1;
+    cx.pm_save_need = 0;
+    // Without a vector on the stack every slot's value is one cell and
+    // every location one unit: the stalled moves are simple cycles, one
+    // save at a time (plan_break), in the cycle register. No cells, and no
+    // need to plan (planning every gap twice would cost the self-build 1%).
+    if !cx.spill_vectors {
+        cx.pm_save_cells = 0;
+        return;
+    }
+    for j in 0..cx.order.len() as i64 {
+        let b = cx.order[j as usize];
+        let k = cx.blocks[b as usize].order;
+        plan_start_moves(cx, b);
+        reserve_plan(cx, pcx);
+        let mut v = cx.blocks[b as usize].first;
+        while v != 0 {
+            let op = cx.insts[v as usize].op;
+            if op != Phi && op != Param {
+                plan_gap_moves(cx, cx.insts[v as usize].mark - 1);
+                reserve_plan(cx, pcx);
+            }
+            v = cx.insts[v as usize].next;
+        }
+        plan_gap_moves(cx, cx.bend[k as usize] - 1);
+        reserve_plan(cx, pcx);
+        plan_end_moves(cx, b);
+        reserve_plan(cx, pcx);
+    }
+    cx.pm_save_cells = cx.pm_save_need;
+    if cx.pm_save_need > 0 {
+        cx.spill_count = base + cx.pm_save_need;
+        // a 16- or 32-byte save's cells, aligned as the vectors' slots are
+        cx.spill_vectors = true;
+    }
+}
+
+// One set of pending moves planned and dropped: what reserve_save_cells
+// learns from it is the cells its saves took.
+fn reserve_plan(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
+    let _ = pm_plan(cx, pcx);
+    cx.pm.clear();
+}
+
+// (0.30.1, RT-CG-5, RT-CG-6) The order of the pending location moves,
+// as steps of three (destination, source, type), each made by move_loc:
+// what pm_resolve emits and what the allocation's check simulates. A move
+// is made once no other pending move reads any cell of its destination.
+// When only cycles are left, the source of one move (plan_break chooses
+// it) is saved in the cycle register of its type's class, or in cells
+// of the reserve after the spill slots (plan_save_cell), and the moves
+// reading that source read the save instead; that frees the moves
+// waiting for it. A source that other pending moves read only in part,
+// or as another kind of value, is an internal error (two values never
+// share a cell while both are live).
+pub fn pm_plan(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) -> Vec<i64, Comp> {
+    let n = cx.pm.len() as i64 / PM_FIELDS;
+    // Most gaps have no location move or one: its step, as the loop
+    // below would make it, without the loop's vectors.
+    let mut only: i64 = -1;
+    let mut count: i64 = 0;
+    for i in 0..n {
+        if pm_kind(cx, i) == PM_LOC && pm_dst(cx, i) != pm_src(cx, i) {
+            only = i;
+            count += 1;
+        }
+    }
+    if count <= 1 {
+        let mut steps: Vec<i64, Comp> = Vec::new_in(Comp {});
+        if count == 1 {
+            steps.push(pm_dst(cx, only));
+            steps.push(pm_src(cx, only));
+            steps.push(pm_ty(cx, only));
+        }
+        return steps;
+    }
+    let mut src: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut done: Vec<bool, Comp> = Vec::new_in(Comp {});
+    for i in 0..n {
+        src.push(pm_src(cx, i));
+        done.push(pm_kind(cx, i) != PM_LOC || pm_dst(cx, i) == pm_src(cx, i));
+    }
+    let mut steps: Vec<i64, Comp> = Vec::new_in(Comp {});
     loop {
         let mut pending = false;
         let mut progress = false;
         for i in 0..n {
-            if pm_done(cx, i) || pm_kind(cx, i) != PM_LOC {
+            if done[i as usize] {
                 continue;
             }
             pending = true;
-            let pm_dst_v1 = pm_dst(cx, i);
-            let pm_is_source_v = pm_is_source(cx, pm_dst_v1, i);
-            if !pm_is_source_v {
-                let pm_dst_v = pm_dst(cx, i);
-                let pm_src_v = pm_src(cx, i);
-                let pm_ty_v = pm_ty(cx, i);
-                move_loc(cx, pm_dst_v, pm_src_v, pm_ty_v, pcx);
-                (cx.pm[(i * PM_FIELDS + 4) as usize]) = 1;
+            let d = pm_dst(cx, i);
+            let ty = pm_ty(cx, i);
+            if plan_reader(cx, src.as_slice(), done.as_slice(), d, ty, i, n, pcx) < 0 {
+                steps.push(d);
+                steps.push(src[i as usize]);
+                steps.push(ty);
+                done[i as usize] = true;
                 progress = true;
             }
         }
@@ -275,24 +578,65 @@ pub fn pm_resolve(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
         if progress {
             continue;
         }
-        // Only cycles are left: save one destination's current value in
-        // the cycle register, and read it from there instead.
-        let mut i: i64 = 0;
-        while pm_done(cx, i) || pm_kind(cx, i) != PM_LOC {
-            i += 1;
-        }
-        let d = pm_dst(cx, i);
-        let temp = reg_cycle(in_fregs(pm_ty(cx, i), pcx));
-        if pm_is_source(cx, temp, -1) {
-            die(c"internal error: parallel move cycle register in use");
-        }
-        let pm_ty_v1 = pm_ty(cx, i);
-        move_loc(cx, temp, d, pm_ty_v1, pcx);
+        // Every pending move waits for another: c is the move whose source
+        // is saved (plan_break).
+        let c = plan_break(cx, src.as_slice(), done.as_slice(), n, pcx);
+        let s = src[c as usize];
+        let ty = pm_ty(cx, c);
         for j in 0..n {
-            if !pm_done(cx, j) && pm_kind(cx, j) == PM_LOC && pm_src(cx, j) == d {
-                (cx.pm[(j * PM_FIELDS + 2) as usize]) = temp;
+            if done[j as usize]
+                || !locs_overlap(src[j as usize], pm_ty(cx, j), s, ty, pcx) {
+                continue;
+            }
+            let tj = pm_ty(cx, j);
+            if src[j as usize] != s || in_fregs(tj, pcx) != in_fregs(ty, pcx)
+                || loc_cells(s, tj, pcx) != loc_cells(s, ty, pcx)
+                || type_size(spill_type(tj, pcx), pcx) != type_size(spill_type(ty, pcx), pcx) {
+                die(c"internal error: a parallel move cycle reads one location as two values");
             }
         }
+        let mut temp = reg_cycle(in_fregs(ty, pcx));
+        if plan_reader(cx, src.as_slice(), done.as_slice(), temp, ty, -1, n, pcx) >= 0 {
+            // the cycle register holds an earlier save a pending move reads
+            temp = plan_save_cell(cx, src.as_slice(), done.as_slice(), ty, n, pcx);
+        }
+        steps.push(temp);
+        steps.push(s);
+        steps.push(ty);
+        for j in 0..n {
+            if !done[j as usize] && src[j as usize] == s {
+                src[j as usize] = temp;
+            }
+        }
+    }
+    steps
+}
+
+// Emits every pending move, then clears them.
+pub fn pm_resolve(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
+    let n = cx.pm.len() as i64 / PM_FIELDS;
+    let steps = pm_plan(cx, pcx);
+    // (0.30.1, RT-CG-7) While the steps run, x17 (AArch64's integer cycle
+    // register) may hold a save: no step may take it as a scratch
+    // (ma_scratch); their spill accesses need none (spill_access_type).
+    // --verify-regalloc then follows the code they emitted.
+    let pre = moves_code_begin(cx);
+    cx.pm_code_start = pre[0];
+    cx.pm_code_paired = false;
+    cx.pm_running = true;
+    cx.scratch_held = pcx.plant_rt_cg_7 != 1;
+    let mut k: usize = 0;
+    while k < steps.len() {
+        move_loc(cx, steps[k], steps[k + 1], steps[k + 2], pcx);
+        if pcx.plant_rt_cg_7 == 3 {
+            ins(cx, c"nop");
+        }
+        k += 3;
+    }
+    cx.pm_running = false;
+    cx.scratch_held = false;
+    if pcx.verify_regalloc && steps.len() > 0 {
+        check_moves_code(cx, &pre, pcx);
     }
     for i in 0..n {
         if pm_done(cx, i) || pm_kind(cx, i) == PM_LOC {
@@ -314,10 +658,7 @@ pub fn pm_resolve(cx: &mut FnCtx<Comp>, pcx: &Ctx<Comp>) {
             m_load(cx, ty, r, reg_fp_v1, pm_src_v3, pcx);
         }
         if dst < 0 {
-            let spill_type_v = spill_type(ty, pcx);
-            let reg_sp_v = reg_sp();
-            let spill_offset_v = spill_offset(cx, dst);
-            m_store(cx, spill_type_v, r, reg_sp_v, spill_offset_v, pcx);
+            m_spill_store(cx, ty, r, dst, pcx);
         }
     }
     cx.pm.clear();

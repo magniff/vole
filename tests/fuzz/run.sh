@@ -5,7 +5,7 @@
 #
 # usage: tests/fuzz/run.sh [-c COMPILER] [-s SEED] [-t TARGET] [-n COUNT]
 #                          [-f FIRST] [-k DIR] [-j JOBS] [-l] [-g] [-p] [-C] [-N]
-#                          [-V] [-D] [-R] [-A] [-G]
+#                          [-V] [-D] [-R] [-A] [-G] [-M] [-F]
 #
 #   -c COMPILER   the volec to test (default: target/volec)
 #   -s SEED       also compare with the seed binary (divisors are then
@@ -37,6 +37,18 @@
 #                 genguard.awk; nothing may run where the program does
 #                 not run it (each program is stopped after 10 s: a hang
 #                 is a failure)
+#   -M            values of every class and width rotated around loops
+#                 under register pressure, from genmoves.awk (0.30.1,
+#                 RT-CG-5, RT-CG-6: the moves of an edge through spill
+#                 slots shared by an integer, a float and a vector);
+#                 with -V, the 8-, 16- and 32-byte vectors among them;
+#                 each built with --verify-regalloc
+#   -F            (0.30.1, RT-CG-7) -M with a large frame: main first
+#                 defines 2048 to 3071 f32 values live to its end
+#                 (genmoves.awk's pad), so the moves' spill slots lie past
+#                 16 KB, where an AArch64 f32 slot's offset needs more than
+#                 one ldr or str can encode; the values rotated are
+#                 i64, i32 and f32 (with -V: the vectors, padded)
 #   -j JOBS       programs tested at once (default: the number of CPUs,
 #                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
 
@@ -70,10 +82,14 @@ while [ $# -gt 0 ]; do
         -R) RANGES=1; shift ;;
         -A) ARCHMODE=1; shift ;;
         -G) GUARDS=1; shift ;;
+        -M) MOVES=1; shift ;;
+        -F) MOVES=1; PAD=1; shift ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
+VERIFY_RA=""
+[ "${MOVES:-0}" = 1 ] && VERIFY_RA=--verify-regalloc
 if [ -z "$TARGET" ]; then
     case "$(uname -s)-$(uname -m)" in
         Darwin-arm64) TARGET=aarch64-macos ;;
@@ -119,7 +135,15 @@ cc_run() {
 test_seed() {
     seed=$1
     program="$WORK/p$seed.vl"
-    if [ "${VECTOR:-0}" = 1 ]; then
+    if [ "${MOVES:-0}" = 1 ]; then
+        pad=0
+        types=""
+        if [ "${PAD:-0}" = 1 ]; then
+            pad=$((2048 + seed * 37 % 1024))
+            types="i64 i32 f32 f32"
+        fi
+        awk -v seed="$seed" -v vectors="${VECTOR:-0}" -v pad="$pad" -v types="$types" -f "$ROOT/tests/fuzz/genmoves.awk" >"$program"
+    elif [ "${VECTOR:-0}" = 1 ]; then
         awk -v seed="$seed" -f "$ROOT/tests/fuzz/genvec.awk" >"$program"
     elif [ "${ARCHMODE:-0}" = 1 ]; then
         awk -v seed="$seed" -f "$ROOT/tests/fuzz/genarch.awk" "$ROOT/compiler/arch/portable.def" "$ROOT/compiler/arch/${TARGET%%-*}.def" >"$program"
@@ -150,7 +174,11 @@ test_seed() {
             # (0.26.3, decision 6: the programs' arithmetic wraps, at
             # every level, with the overflow checks off; -O0 would check
             # it. tests/run's ovf_ cases test the checks.)
-            "$COMPILER" --target "$TARGET" "-$level" --overflow-checks=off --deny-warnings --verify-ir "$program" -o "$exe.o" >"$exe.log" 2>&1 \
+            # (0.30.1) -M: the allocation checked too, its moves simulated
+            # (--verify-regalloc), so a wrong order is an error even where
+            # the program's output does not show it
+            # shellcheck disable=SC2086
+            "$COMPILER" --target "$TARGET" "-$level" --overflow-checks=off --deny-warnings --verify-ir $VERIFY_RA "$program" -o "$exe.o" >"$exe.log" 2>&1 \
                 || { why="-$level failed to compile it: $(head -3 "$exe.log")"; break; }
             # shellcheck disable=SC2086
             cc_run $ARCH -o "$exe" "$exe.o" >>"$exe.log" 2>&1 || { why="-$level: cc failed"; break; }

@@ -69,7 +69,7 @@ trait Searcher {
     fn each_match<F: FnMut(usize)>(&self, text: &[u8], found: F);
 
     fn count(&self, text: &[u8]) -> i64 {
-        let mut n = 0;
+        let mut n: i64 = 0;
         self.each_match(text, |_| { n += 1; });   // `let mut n`: the closure changes it in place
         n
     }

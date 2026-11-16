@@ -19,7 +19,7 @@ use crate::front::effects::{
     EFF_SYNC, EFF_THREAD, EFF_TLS, EFF_UNKNOWN, Effects, fn_effects,
 };
 use crate::front::effects::builtin::{
-    C_ALLOC, C_GLOBAL, C_IO, C_NONE, C_READS, c_class, c_symbol, known_c_effects,
+    C_ALLOC, C_GLOBAL, C_IO, C_NONE, C_PURE, C_READS, c_class, c_symbol, known_c_effects,
 };
 use crate::front::types::{TY_BOOL, TY_U64, TY_U8, is_float, is_integer};
 use crate::gen0::gen::fn_is_global;
@@ -117,10 +117,16 @@ pub fn call_attrs(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> i64 {
 
 // What the front end's effects (0.16, front/effects) say of function f (an
 // FNS index), as attribute bits: ¬raw diverge WILLRETURN, ¬raw panic
-// NOPANIC, and a C function without alloc, io or global whose parameters
-// are all numbers READNONE (and so READONLY). A C function the inference
-// left unknown and that declares nothing has builtin.vl's table
-// (libm: READNONE). 0: nothing known.
+// NOPANIC, and READNONE (and so READONLY) for a C function of the table
+// that reads and writes no memory (C_PURE: libm, abs), by the symbol it
+// links to. A C function the inference left unknown and that declares
+// nothing has builtin.vl's table. 0: nothing known. (0.30.1, RT-5: what
+// a C function does to memory comes from the table, never from its
+// parameter types: a number can be a pointer in C's ABI, and memset and
+// strlen declared with usize parameters were READNONE, so -O1 deleted
+// the one and folded the other. Effects say nothing of the memory a
+// function reaches through its arguments, so a declaration's
+// `#[effects()]` gives no READNONE either.)
 pub fn front_attrs(f: i64, pcx: &Ctx<Comp>) -> i64 {
     let mut e = fn_effects(f, pcx);
     // (0.25) A C function of the table (that declares nothing): libm is
@@ -131,7 +137,9 @@ pub fn front_attrs(f: i64, pcx: &Ctx<Comp>) -> i64 {
         && pcx.fns[f as usize].effect_decl == 0 {
         e = known_c_effects(pcx.fns[f as usize].name, pcx);
     }
-    let mut attrs = effects_attrs(e, pcx.fns[f as usize].is_extern && numeric_params(f, pcx));
+    let pure = pcx.fns[f as usize].is_extern && pcx.fns[f as usize].effect_decl == 0
+        && c_class(c_symbol(f, pcx), pcx) == C_PURE;
+    let mut attrs = effects_attrs(e, pure);
     if table {
         attrs = c_lib_bounded(attrs);
     }
@@ -156,7 +164,8 @@ pub fn front_attrs(f: i64, pcx: &Ctx<Comp>) -> i64 {
 fn c_header_writes(f: i64, pcx: &Ctx<Comp>) -> i64 {
     let sym = c_symbol(f, pcx);
     let class = c_class(sym, pcx);
-    if class == C_READS || class == C_ALLOC && sym != find_sym(b"posix_memalign", pcx) {
+    if class == C_READS || class == C_PURE
+        || class == C_ALLOC && sym != find_sym(b"posix_memalign", pcx) {
         return HW_KNOWN;
     }
     if class != C_NONE && class != C_ALLOC && class != C_IO && class != C_GLOBAL
@@ -187,7 +196,7 @@ pub fn c_allocates(f: i64, pcx: &Ctx<Comp>) -> bool {
 }
 
 // The attribute bits effects e give (READNONE too when `readnone_ok`: a C
-// function whose parameters are all numbers).
+// function of the table's class C_PURE, front_attrs).
 fn effects_attrs(e: Effects, readnone_ok: bool) -> i64 {
     if (e.bits & EFF_UNKNOWN) != 0 {
         return 0;
@@ -209,31 +218,11 @@ fn effects_attrs(e: Effects, readnone_ok: bool) -> i64 {
     attrs
 }
 
-// Whether every parameter of function f is a number (an integer, a float,
-// a bool: no pointer, slice or function).
-fn numeric_params(f: i64, pcx: &Ctx<Comp>) -> bool {
-    if pcx.fns[f as usize].variadic {
-        return false;
-    }
-    for i in 0..pcx.fns[f as usize].param_count {
-        let t = (pcx.tlists[(pcx.fns[f as usize].params + i) as usize]);
-        if !is_integer(t) && !is_float(t) && t != TY_BOOL {
-            return false;
-        }
-    }
-    true
-}
-
 // What C library function `sym` called by the lowering (CALLC v) does:
-// builtin.vl's table, READNONE when every argument is a float.
+// builtin.vl's table, READNONE when its class is C_PURE (0.30.1: not by
+// its arguments' types, front_attrs).
 fn c_lib_attrs(cx: &mut FnCtx<Comp>, v: i64, sym: i64, pcx: &Ctx<Comp>) -> i64 {
-    let mut floats = true;
-    for i in 0..(cx.insts[v as usize]).nargs {
-        if !is_float((cx.argty[((cx.insts[v as usize]).args + i) as usize])) {
-            floats = false;
-        }
-    }
-    let attrs = effects_attrs(known_c_effects(sym, pcx), floats);
+    let attrs = effects_attrs(known_c_effects(sym, pcx), c_class(sym, pcx) == C_PURE);
     if (attrs & ATTR_WILLRETURN) == 0 { 0 } else { c_lib_bounded(attrs) }
 }
 
@@ -1043,9 +1032,11 @@ pub fn propagate_constants(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) -> bool {
 const HEAP_TO_STACK_MAX: i64 = 1024;
 const CALLOC_TO_STACK_MAX: i64 = 256;
 
-// The C function called by v (a symbol), or 0.
+// The C function called by v (a symbol), or 0. (0.30.1) An extern's FNS
+// name is the symbol it links to: an extern named malloc that links to
+// the program's allocator is not malloc here.
 fn c_callee_name(cx: &mut FnCtx<Comp>, v: i64, pcx: &Ctx<Comp>) -> i64 {
-    if (cx.insts[v as usize]).op == Call
+    if (cx.insts[v as usize]).op == Call && pcx.fns[(cx.insts[v as usize]).imm as usize].is_extern
         && (pcx.fn_ir[(cx.insts[v as usize]).imm as usize]) == 0 {
         return pcx.fns[(cx.insts[v as usize]).imm as usize].name;
     }

@@ -266,6 +266,27 @@ tables), `--trace` (0.17: a failure prints its line and callers),
 (the IR after the optimizer, after instruction selection) print to
 stdout, or to `-o FILE`. `volec guide TOPIC` for the language.
 
+## The variables volec sets for itself
+
+volec marks the volec processes it starts (a tool's check or build,
+try's and test's, a lazy std's build made again) in their environment;
+a program volec runs (`run`, `test`, `probe`, `try`) gets none of them:
+
+| variable | means |
+|---|---|
+| `VOLEC_NESTED=1` | started by another volec: no `ok:` line, no colour |
+| `VOLEC_EDIT_TAG=PID` | the first volec's pid: the copies its edits check |
+
+Set by hand they act the same: `VOLEC_NESTED=1` drops the `ok:` line;
+two shells with one `VOLEC_EDIT_TAG` share edit copies (a bad idea).
+(0.30.1) A nested volec never says `warning thread.main-stack`, so it
+cannot reach output its parent reads. A lazy std's build made again and
+`check --changed`'s checks are not nested: under a fallback the
+warning may then be said twice, or once a checked program. Known issue
+(as in 0.30.1's base): a fallback in a child alone is not reported, and
+if that child then overflows the command fails without saying why:
+`try` exits 1, `test` and `probe` report a build that failed.
+
 ## Seeing what the optimizer did
 
 `volec build --help` lists these (0.30); each prints on stderr.

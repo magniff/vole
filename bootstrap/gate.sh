@@ -56,15 +56,27 @@
 #                    fuzz-sem runs every mode of the fuzzer) and exit;
 #                    ROWS (0.30, comma-separated) only those rows: modes,
 #                    at-once, lock, stale-lock, no-docker, lost-slot,
-#                    waiting, hung, fuzz-sem (`--self-test list` names
+#                    waiting, hung, nested, fuzz-sem (`--self-test list` names
 #                    them). First it removes what failed self-tests left
 #                    (bootstrap/selftest-prune.sh: their directories in
 #                    $TMPDIR, a day old, and nothing else)
 #
+# (0.30.1) A step that passes must also have counted what it exists to
+# count: bootstrap/gate-floors.sh reads its log, and one whose count is
+# missing or below its floor (0.30.0's count less a margin, or the
+# programs asked of a fuzz row) fails. tests/gate_floors.sh shows each
+# floor catching a zero and a low count.
+#
 # Steps: chain; suite-O0, suite-O1, suite-O2; fuzz-plain, fuzz-loops,
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
 # fuzz-div, fuzz-range, fuzz-arch (0.19: intrinsics), fuzz-guard (0.25:
-# guarded accesses, never run where the program does not), fuzz-seed
+# guarded accesses, never run where the program does not), fuzz-moves
+# and fuzz-moves-vec (0.30.1: values of every class and width rotated
+# around loops, the edges' moves through shared spill slots, built with
+# --verify-regalloc; at least 20 programs in every mode, and again for
+# x86_64-macos under Rosetta: fuzz-moves-x86, fuzz-moves-vec-x86;
+# RT-CG-7: fuzz-moves-frame and fuzz-moves-frame-x86, the same in a frame
+# whose spill slots lie past 16 KB), fuzz-seed
 # (against the Rust seed), fuzz-sem (0.25: value semantics, drops and
 # leaks against tools/semfuzz/semfuzz.py's model; not in 0.28, back in
 # 0.29 with its programs in the one language); abi-plain,
@@ -79,6 +91,14 @@
 # voltty-fuzz (tests/voltty/run.sh -s 60: the terminal's core against
 # alacritty_terminal, 60 s of the differential fuzzer, 0.23; skipped
 # without cargo);
+# e18-loans (tests/e18_loans.sh, 0.30.1: E1.8's two lists, the walk's
+# borrow sites and the places IR's borrows, compared over every tests/run
+# program and example, after its self-test: the planted faults seen, each
+# changing a listing and a verdict; --quick too);
+# main-stack (tests/main_stack.sh, 0.30.1: the compiler's own 1 GiB
+# thread, and its refusals planted with a shim: said once, as a
+# diagnostic, and a -j 4 build on fewer threads; macOS, else a SKIP;
+# --quick too);
 # unsafe-audit (tests/unsafe_audit.sh, 0.25.3: the unsafe sites of
 # compiler/src and std without // UNSAFE: and // SAFETY:, `volec query
 # unsafe`; 0.29: none of them, and no unsafe block of compiler/src with
@@ -296,10 +316,14 @@ case "$MODE" in
 esac
 [ -z "$FUZZ_N" ] || { FZ=$FUZZ_N; XFZ=$FUZZ_N; AFZ=$FUZZ_N; SFZ=$FUZZ_N; }
 [ -z "$ABI_N" ] || { AB=$ABI_N; XAB=$ABI_N; AAB=$ABI_N; }
+# (0.30.1) the moves rows: at least 20 programs, whatever the mode (RT-CG-6
+# planted back fails first at -M -V's seed 13); gate-floors.sh asks the same
+MFZ=$FZ
+[ "$MFZ" -ge 20 ] || MFZ=20
 
-FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-seed fuzz-sem"
+FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-moves fuzz-moves-vec fuzz-moves-x86 fuzz-moves-vec-x86 fuzz-moves-frame fuzz-moves-frame-x86 fuzz-seed fuzz-sem"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit borrowck-twin stdtools std-check std-tests cachediff"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost e18-loans main-stack unsafe-audit borrowck-twin stdtools std-check std-tests cachediff"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
 # rebuild compilers rather than test one
 RELEASE_STEPS="chain-diverse chain-fresh"
@@ -312,11 +336,11 @@ INSIDE_SMOKE_STEPS="smoke-runner smoke-lsp smoke-examples smoke-cases smoke-walk
 # (steps only --only names: valgrind runs in the linux-aarch64 container)
 OTHER_STEPS="valgrind $INSIDE_SMOKE_STEPS"
 # (the self-test's steps, only for it)
-[ -z "${VOLE_GATE_SELFTEST:-}" ] || OTHER_STEPS="$OTHER_STEPS selftest-sleep selftest-leak selftest-slow selftest-hog selftest-wait selftest-hang"
+[ -z "${VOLE_GATE_SELFTEST:-}" ] || OTHER_STEPS="$OTHER_STEPS selftest-sleep selftest-leak selftest-slow selftest-hog selftest-wait selftest-hang selftest-nest"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
     quick)
-        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost unsafe-audit borrowck-twin stdtools std-tests cachediff"
+        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost e18-loans main-stack unsafe-audit borrowck-twin stdtools std-tests cachediff"
         [ $LINUX -eq 1 ] && STEPS="$SMOKE_STEPS $STEPS" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
@@ -390,6 +414,7 @@ is_heavy() { # <step>
 # tests/incremental.sh, tests/compiler_memcheck.sh, tests/valgrind.sh).
 is_runner() { # <step>
     case "$1" in
+        selftest-nest) return 1 ;;
         suite-*|stress-grow|fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental|compiler-memcheck|examples-checkalloc|std-tests|valgrind|smoke-*|selftest-*) return 0 ;;
     esac
     return 1
@@ -407,10 +432,10 @@ held_slots() { # <step>
     hs=0
     if [ $INSIDE -eq 0 ]; then
         case "$1" in
-            suite-*|stress-grow) hs=2 ;;
+            suite-*|stress-grow|e18-loans) hs=2 ;;
             cachediff|std-check) hs=4 ;;
-            chain-diverse|chain-fresh) hs=$JOBS ;;
-            layout|debug|unsafe-audit|borrowck-twin|stdtools|voltty-fuzz|compile-cost) hs=1 ;;
+            chain-diverse|chain-fresh|selftest-nest) hs=$JOBS ;;
+            layout|debug|unsafe-audit|borrowck-twin|stdtools|voltty-fuzz|compile-cost|main-stack) hs=1 ;;
         esac
     fi
     hs_max=$JOBS
@@ -453,7 +478,7 @@ fi
 # with a lock and run directories of their own.
 # (0.30) --self-test ROWS: the rows by these names (ST_ALL), each a few
 # checks; `list` prints them.
-ST_ALL="modes at-once lock stale-lock no-docker lost-slot waiting hung fuzz-sem"
+ST_ALL="modes at-once lock stale-lock no-docker lost-slot waiting hung nested fuzz-sem"
 self_test() {
     if [ "$ST_ROWS" = list ]; then
         printf '%s\n' $ST_ALL
@@ -611,6 +636,19 @@ self_test() {
         st_row "a hung job's step is stopped" pass
     else
         st_row "a hung job's step is stopped" "FAIL (exit $rc): $(grep -E 'selftest|stalled' "$st/hang.out" | tr '\n' ' ')"
+    fi
+    fi
+    # (0.30.1) A step that is no runner and holds every slot, whose own
+    # job takes a slot: it takes one of the step's, and the step passes
+    # (it waited for the gate's, all held by the step, and was stopped
+    # as stalled: chain-fresh's suite of the last release).
+    if st_on nested; then
+    VOLE_GATE_STALL=4 g -j 1 --only selftest-nest >"$st/nest.out" 2>&1
+    rc=$?
+    if [ $rc -eq 0 ] && grep -q 'selftest-nest .*pass' "$st/nest.out"; then
+        st_row "a step's own job runs" pass
+    else
+        st_row "a step's own job runs" "FAIL (exit $rc): $(grep -E 'selftest|stalled' "$st/nest.out" | tr '\n' ' ')"
     fi
     fi
     # (0.30) fuzz-sem runs the fuzzer once in each of its modes: the
@@ -884,6 +922,25 @@ run_step() {
         fuzz-range) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -R ;;
         fuzz-arch) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -A ;;
         fuzz-guard) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -G ;;
+        # (0.30.1, RT-CG-5, RT-CG-6) the moves of loop edges through spill
+        # slots shared by integers, floats, structs and vectors
+        fuzz-moves) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$MFZ" -k "$k" -M ;;
+        fuzz-moves-vec) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$MFZ" -k "$k" -M -V ;;
+        # (0.30.1, RT-CG-7) and in a frame past 16 KB (-F), where an
+        # AArch64 f32 slot's offset needs more than one ldr or str encodes
+        fuzz-moves-frame) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$MFZ" -k "$k" -F ;;
+        # (0.30.1) the same for x86-64, where 0.30.0 failed more of them,
+        # run by Rosetta; a host without it is a SKIP the log names
+        fuzz-moves-x86|fuzz-moves-vec-x86|fuzz-moves-frame-x86)
+            if [ "$(uname -s)" != Darwin ] || ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+                echo "skip: no x86_64-macos here (Rosetta: softwareupdate --install-rosetta)"
+                return 0
+            fi
+            v=""
+            [ "$1" = fuzz-moves-vec-x86 ] && v=-V
+            [ "$1" = fuzz-moves-frame-x86 ] && v=-F
+            # shellcheck disable=SC2086
+            sh "$ROOT/tests/fuzz/run.sh" -c "$C" -t x86_64-macos -n "$MFZ" -k "$k" -M $v ;;
         # (0.25) value semantics: seeded (the same programs every run of
         # a mode), failing ones shrunk and kept with their expected output;
         # 0.25.2: as many again with --assign-calls (owned
@@ -909,7 +966,8 @@ run_step() {
         abi-plain) sh "$ROOT/tests/abi/run.sh" -c "$C" -n "$AB" -k "$k" ;;
         abi-import) sh "$ROOT/tests/abi/run.sh" -c "$C" -n "$AB" -k "$k" -i ;;
         abi-header) sh "$ROOT/tests/abi/run.sh" -c "$C" -n "$AB" -k "$k" -H ;;
-        objcheck) sh "$ROOT/tests/objcheck.sh" -c "$C" ;;
+        objcheck) rm -f "$RUN/$1.results"
+            VOLE_OBJCHECK_RESULTS="$RUN/$1.results" sh "$ROOT/tests/objcheck.sh" -c "$C" ;;
         # (0.19: x86-64's intrinsics are encoded and checked against cc on
         # any host; no x86 CPU needed, so --no-x86 keeps it)
         objcheck-x86-arch) sh "$ROOT/tests/objcheck.sh" -c "$C" -t x86_64-macos arch_ ;;
@@ -926,6 +984,11 @@ run_step() {
         threads) sh "$ROOT/tests/threads_writes.sh" -c "$C" && sh "$ROOT/tests/threads.sh" -c "$C" ;;
         incremental) sh "$ROOT/tests/incremental.sh" -c "$C" ;;
         # (0.25.3) the unsafe sites without justification, against the baseline
+        # (0.30.1: the self-test, then the sweep with VOLE_CACHE=off, its
+        # own; two jobs, its slots)
+        e18-loans) sh "$ROOT/tests/e18_loans.sh" -c "$C" --self-test \
+            && sh "$ROOT/tests/e18_loans.sh" -c "$C" -j 2 ;;
+        main-stack) sh "$ROOT/tests/main_stack.sh" -c "$C" ;;
         unsafe-audit) sh "$ROOT/tests/unsafe_audit.sh" -c "$C" ;;
         # (0.30) std inside the tools, in a copy of compiler/std (also a
         # suite of tests/run.sh)
@@ -985,7 +1048,9 @@ run_step() {
                     printf "std-tests: %d passed at -O0 and -O2 under --check-alloc (gate 1: 1000); -O0 %d passed, %d xfail, %d failed; -O2 %d passed, %d xfail, %d failed\n", n, a[1], a[2], a[3], b[1], b[2], b[3]
                 }'
             return $rc ;;
-        voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -k "$k" ;;
+        # (0.30.1: and at least 200 scripts, its floor, however loaded the
+        # machine is)
+        voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -n 200 -k "$k" ;;
         stress-grow)
             # (0.14) The compiler with VOLE_STRESS_GROW=1 (base::grow):
             # every growth of its tables moves them and poisons the old
@@ -1074,6 +1139,14 @@ run_step() {
             read -r _ <&3
             echo "selftest: took the slot, and wait for another"
             read -r _ <&3 ;;
+        # (0.30.1) a step that is no runner and holds the one slot starts a
+        # runner's job: it takes its slot from the pool the step's slot
+        # makes (it waited for the gate's, which the step held)
+        selftest-nest)
+            exec 3<>"$VOLE_JOBSERVER"
+            read -r _ <&3
+            echo "selftest: a slot for the step's own job"
+            echo >&3 ;;
         selftest-slow)
             e=$(( $(date +%s) + 7 ))
             while [ "$(date +%s)" -lt $e ]; do awk 'BEGIN { while (i < 2e6) i++ }'; done
@@ -1154,10 +1227,41 @@ start() { # <step>
                 echo $held >"$RUN/$1.held.new" && mv "$RUN/$1.held.new" "$RUN/$1.held"
                 [ -z "${VOLE_GATE_STUB:-}" ] || echo "+ $1 held" >>"$RUN/stub.events"
             done
+            # (0.30.1) What a step that is no runner starts takes its slots
+            # from the ones the step holds, a pool of its own, never from
+            # the gate's: those are all taken when the step holds all of
+            # them, so a runner it starts (chain-fresh's suite of the last
+            # release, when the bytes differ) waited for a slot that its
+            # own step held, and the gate stopped it as stalled.
+            if ! is_runner "$1"; then
+                rm -f "$RUN/$1.jobs"
+                mkfifo "$RUN/$1.jobs"
+                exec 8<>"$RUN/$1.jobs"
+                i=0
+                while [ $i -lt "$held" ]; do
+                    echo >&8
+                    i=$((i + 1))
+                done
+                VOLE_JOBSERVER="$RUN/$1.jobs"
+                export VOLE_JOBSERVER
+            fi
         fi
         s=$(now)
         run_step "$1" </dev/null >"$RUN/$1.log" 2>&1
         rc=$?
+        # (0.30.1) a row that passed has counted what it exists to count:
+        # its floor (bootstrap/gate-floors.sh), or it fails. Not in the
+        # self-test's gates: their compiler is /bin/sh and their tools
+        # fakes, which count nothing (a stubbed gate's neither)
+        if [ $rc -eq 0 ] && [ -z "${VOLE_GATE_STUB:-}" ] && [ -z "${VOLE_GATE_SELFTEST:-}" ]; then
+            case "$1" in
+                selftest-*) ;;
+                *) sh "$ROOT/bootstrap/gate-floors.sh" "$1" "$RUN/$1.log" "$FZ" "$AB" "$SFZ" "$HOST" \
+                    >>"$RUN/$1.log" 2>&1
+                   # (77: the row skipped what it counts, saying why: a SKIP)
+                   case $? in 0) ;; 77) rc=77 ;; *) rc=1 ;; esac ;;
+            esac
+        fi
         echo "$rc $(( $(now) - s ))" >"$RUN/$1.status"
     ) &
     echo $! >"$RUN/$1.pid"
@@ -1503,8 +1607,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*|smoke-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff)
-            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff|e18-loans|main-stack)
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff|e18-loans|main-stack):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         # (no rows: it failed before the container's steps, e.g. docker)

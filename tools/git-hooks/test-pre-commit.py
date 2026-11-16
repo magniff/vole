@@ -138,6 +138,41 @@ try:
     rc, out = commit(WORDS, "words")
     case("pre-commit: the word in a string or a comment is no site", rc == 0, out)
 
+    # A source with a byte that is not UTF-8: the hook reads it without a
+    # traceback. From 0.30.1 such a source does not lex (lex.utf8, as
+    # rustc), even in a comment, so it is refused as that; a case about
+    # such bytes lives under tests/, which the fmt row leaves alone.
+    def commit_bytes(data, name):
+        with open(os.path.join(repo, "main.vl"), "wb") as fh:
+            fh.write(data)
+        run(["git", "add", "main.vl"], repo)
+        r = run(["git", "-c", "core.hooksPath=tools/git-hooks", "commit", "-q", "-m", name], repo)
+        out = r.stdout + r.stderr
+        if r.returncode != 0:
+            run(["git", "reset", "-q", "--hard", "HEAD"], repo)
+        return r.returncode, out
+    raw = b"// a byte that is not UTF-8: \xc3x\n"
+    rc, out = commit_bytes(raw + BORROWED.encode(), "not utf-8, unjustified")
+    case("pre-commit: a byte that is not UTF-8, an unjustified block refused",
+         rc != 0 and "main.vl does not lex" in out and "Traceback" not in out,
+         out)
+    rc, out = commit_bytes(raw + JUSTIFIED.encode(), "not utf-8")
+    case("pre-commit: a byte that is not UTF-8 is read, and refused as not lexing",
+         rc != 0 and "main.vl does not lex" in out and "not formatted" not in out
+         and "Traceback" not in out, out)
+    if rc == 0:
+        run(["git", "reset", "-q", "--hard", "HEAD~1"], repo)
+    # the unsafe script alone reads such bytes (the heuristic, as no volec
+    # reads the file), without a traceback
+    with open(os.path.join(repo, "main.vl"), "wb") as fh:
+        fh.write(raw + BORROWED.encode())
+    run(["git", "add", "main.vl"], repo)
+    r = run([sys.executable, "-I", "tools/unsafe-diff-check.py", "--cached"], repo)
+    case("unsafe-diff-check: a byte that is not UTF-8 is read by the heuristic",
+         "1 file by the text heuristic" in r.stdout and "Traceback" not in r.stdout + r.stderr,
+         r.stdout + r.stderr)
+    run(["git", "reset", "-q", "--hard", "HEAD"], repo)
+
     # staged, then changed again in the work tree: the heuristic for it
     write(os.path.join(repo, "main.vl"), BORROWED)
     run(["git", "add", "main.vl"], repo)

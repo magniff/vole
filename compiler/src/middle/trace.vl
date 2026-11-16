@@ -45,8 +45,17 @@ pub fn trace_runtime_source(out: i64) {
     buf_str(out, c"    #[link_name = \"signal\"]\n");
     buf_str(out, c"    fn signal_default(sig: i32, handler: u64) -> u64;\n");
     buf_str(out, c"    fn raise(sig: i32) -> i32;\n");
+    buf_str(out, c"    fn malloc(size: u64) -> *mut u8;\n");
+    buf_str(out, c"    fn sigaltstack(ss: *const u8, old: *mut u8) -> i32;\n");
+    buf_str(out, c"    fn sigaction(sig: i32, act: *const u8, old: *mut u8) -> i32;\n");
+    buf_str(out, c"    fn free(p: *mut u8);\n");
+    buf_str(out,
+        c"    fn pthread_key_create(key: *mut u64, done: extern \"C\" fn(*mut u8)) -> i32;\n");
+    buf_str(out, c"    fn pthread_setspecific(key: u64, value: *const u8) -> i32;\n");
     buf_str(out, c"}\n");
     buf_str(out, c"pub static mut DEPTH: i64 = 0;\n");
+    buf_str(out, c"static mut ALT_KEY: u64 = 0;\n");
+    buf_str(out, c"static mut KEYED: bool = false;\n");
     buf_str(out, c"pub static mut FRAMES: [*const u8; 4096] = [0 as *const u8; 4096];\n");
     buf_str(out, c"fn put(s: *const u8) {\n");
     buf_str(out, c"    unsafe {\n");
@@ -113,11 +122,68 @@ pub fn trace_runtime_source(out: i64) {
     buf_str(out, c"            put(c\" (SIGTERM)\");\n");
     buf_str(out, c"        } else if sig == 11 {\n");
     buf_str(out, c"            put(c\" (SIGSEGV: an invalid memory access)\");\n");
+    buf_str(out, if crate::base::target::get_elf() { c"        } else if sig == 7 {\n" }
+        else { c"        } else if sig == 10 {\n" });
+    buf_str(out, c"            put(c\" (SIGBUS: an invalid memory access)\");\n");
     buf_str(out, c"        }\n");
     buf_str(out, c"        put(c\"\\n\");\n");
     buf_str(out, c"        __vole_trace_dump();\n");
     buf_str(out, c"        signal_default(sig, 0);\n");
     buf_str(out, c"        raise(sig);\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"}\n");
+    // (0.30.1, RT-14) SIGSEGV's and SIGBUS's handler runs on a stack of its
+    // own: a stack overflow (safe code's SIGSEGV; SIGBUS on a spawned
+    // thread's guard page on macOS) leaves none on the stack that
+    // overflowed, and it printed nothing. sigaltstack's stack_t and
+    // sigaction's struct as the C library has them: macOS's (ss_size at 8;
+    // sa_flags, a u32 at 12, SA_ONSTACK 1), glibc's (ss_size at 16;
+    // sa_flags at 136, SA_ONSTACK 0x08000000). SIGBUS is 10 on macOS, 7 on
+    // Linux. Each thread has its own alternate stack: main's from start,
+    // a spawned one's from thread_begin, which std::thread's first frame
+    // calls under --trace (trace_after_lowering), freed when the thread
+    // ends (ALT_KEY's destructor, release: the stack disabled first,
+    // ss_flags SS_DISABLE, 4 at 16 on macOS, 2 at 8 on glibc). A thread
+    // C's pthread_create makes has none (its overflow prints nothing).
+    let elf = crate::base::target::get_elf();
+    buf_str(out, c"fn altstack() -> *mut u8 {\n");
+    buf_str(out, c"    unsafe {\n");
+    buf_str(out, c"        let alt = malloc(65536);\n");
+    buf_str(out, c"        if alt != 0 as *mut u8 {\n");
+    buf_str(out, c"            let mut ss: [u64; 3] = [0; 3];\n");
+    buf_str(out, c"            ss[0] = alt as u64;\n");
+    buf_str(out,
+        if elf { c"            ss[2] = 65536;\n" } else { c"            ss[1] = 65536;\n" });
+    buf_str(out, c"            sigaltstack(&ss[0] as *const u64 as *const u8, 0 as *mut u8);\n");
+    buf_str(out, c"        }\n");
+    buf_str(out, c"        alt\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"extern \"C\" fn release(alt: *mut u8) {\n");
+    buf_str(out, c"    unsafe {\n");
+    buf_str(out, c"        let mut ss: [u64; 3] = [0; 3];\n");
+    buf_str(out, if elf { c"        ss[1] = 2;\n" } else { c"        ss[2] = 4;\n" });
+    buf_str(out, c"        sigaltstack(&ss[0] as *const u64 as *const u8, 0 as *mut u8);\n");
+    buf_str(out, c"        free(alt);\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"fn on_own_stack(sig: i32) {\n");
+    buf_str(out, c"    unsafe {\n");
+    buf_str(out, c"        let mut sa: [u64; 20] = [0; 20];\n");
+    buf_str(out,
+        c"        if sigaction(sig, 0 as *const u8, &mut sa[0] as *mut u64 as *mut u8) == 0 {\n");
+    buf_str(out, if elf { c"            sa[17] = sa[17] | 134217728;\n" }
+        else { c"            sa[1] = sa[1] | 4294967296;\n" });
+    buf_str(out, c"            sigaction(sig, &sa[0] as *const u64 as *const u8, 0 as *mut u8);\n");
+    buf_str(out, c"        }\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"}\n");
+    buf_str(out, c"pub fn thread_begin() {\n");
+    buf_str(out, c"    unsafe {\n");
+    buf_str(out, c"        let alt = altstack();\n");
+    buf_str(out, c"        if alt != 0 as *mut u8 && KEYED {\n");
+    buf_str(out, c"            pthread_setspecific(ALT_KEY, alt as *const u8);\n");
+    buf_str(out, c"        }\n");
     buf_str(out, c"    }\n");
     buf_str(out, c"}\n");
     buf_str(out, c"pub fn start() {\n");
@@ -126,7 +192,15 @@ pub fn trace_runtime_source(out: i64) {
     buf_str(out, c"        signal(14, stopped);\n");
     buf_str(out, c"        signal(15, stopped);\n");
     buf_str(out, c"        signal(11, stopped);\n");
+    buf_str(out,
+        if elf { c"        signal(7, stopped);\n" } else { c"        signal(10, stopped);\n" });
     buf_str(out, c"    }\n");
+    buf_str(out, c"    altstack();\n");
+    buf_str(out, c"    unsafe {\n");
+    buf_str(out, c"        KEYED = pthread_key_create(&raw mut ALT_KEY, release) == 0;\n");
+    buf_str(out, c"    }\n");
+    buf_str(out, c"    on_own_stack(11);\n");
+    buf_str(out, if elf { c"    on_own_stack(7);\n" } else { c"    on_own_stack(10);\n" });
     buf_str(out, c"}\n");
 }
 
@@ -414,6 +488,12 @@ pub fn trace_after_lowering(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
         let at_ix = intern_c(c"std::panic_note", pcx) as usize; pcx.sym_fn[at_ix]
     }) - 1;
     let panic = ({ let at_ix = intern_c(c"std::panic", pcx) as usize; pcx.sym_fn[at_ix] }) - 1;
+    let thread_begin = ({
+        let at_ix = intern_c(c"__trace::thread_begin", pcx) as usize; pcx.sym_fn[at_ix]
+    }) - 1;
+    let thread_start = ({
+        let at_ix = intern_c(c"std::thread::thread_start", pcx) as usize; pcx.sym_fn[at_ix]
+    }) - 1;
     // (0.28.0) std has it in std::panic, called by what every panic
     // ends in (PanicBuf::emit), which is no one function to name
     let anywhere = note < 0;
@@ -449,6 +529,14 @@ pub fn trace_after_lowering(cx: &mut FnCtx<Comp>, pcx: &mut Ctx<Comp>) {
             let entry = fn_entry(cx, fi);
             let body_start_v = body_start(cx, entry);
             call_before(cx, entry, body_start_v, start, pcx);
+        }
+        // (0.30.1) a spawned thread's first frame gives the thread its
+        // alternate signal stack (the runtime's thread_begin)
+        if f == thread_start && thread_begin >= 0 {
+            ir_enter(cx, fi, pcx);
+            let entry = fn_entry(cx, fi);
+            let body_start_v = body_start(cx, entry);
+            call_before(cx, entry, body_start_v, thread_begin, pcx);
         }
     }
 }

@@ -41,6 +41,10 @@
 #   embed_block (0.26.0) an embedded block's bytes, kept by fmt as they
 #               are, the vole around it formatted
 #   embed_with  (0.26.2) a block's `with` header kept on its one line
+#   unreadable_at (0.30.1) a file fmt leaves as it is, not lexed, is named
+#               with the line of the lexer's error: a byte that is not
+#               UTF-8 on line 3 (lex.utf8, before any token: it was line
+#               1), an unterminated string on line 4
 #   same-output the compiler built from the copy's compiler/src: the same
 #               object as the one built from the tree's, and `same-output`
 #               against it: identical
@@ -86,7 +90,7 @@ WORK=$(cd "$WORK" && pwd -P)
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 # The checks, then the ones selected.
-for c in tree embed_block embed_with roundtrip compiles same-output; do
+for c in tree embed_block embed_with unreadable_at roundtrip compiles same-output; do
     echo "check $c"
 done | jobs_select "$FILTERS" >"$WORK/sel"
 if [ ! -s "$WORK/sel" ]; then
@@ -144,6 +148,18 @@ if sel embed_with; then
     printf 'embed wgsl K with A,  b::B {\n  fn f() {}\n}\nembed wgsl F with A from "x.wgsl";\n' >"$WORK/embed/want"
     check embed_with "$(cmp -s "$WORK/embed/with.vl" "$WORK/embed/want" && echo 1)" \
         "$(cat "$WORK/embed/out"; diff "$WORK/embed/want" "$WORK/embed/with.vl")"
+fi
+
+# unreadable_at (0.30.1): the line of the error, not of the last token
+if sel unreadable_at; then
+    mkdir -p "$WORK/unread"
+    printf 'fn main() {\n    // ok\n    let s = "a\303x";\n}\n' >"$WORK/unread/utf8.vl"
+    printf 'fn main() {\n    let a = 1;\n\n    let s = "open;\n}\n' >"$WORK/unread/open.vl"
+    "$COMPILER" fmt --check "$WORK/unread/utf8.vl" >"$WORK/unread/o1" 2>&1
+    "$COMPILER" fmt --check "$WORK/unread/open.vl" >"$WORK/unread/o2" 2>&1
+    check unreadable_at "$(grep -q 'utf8.vl:3: the source is not UTF-8' "$WORK/unread/o1" \
+        && grep -q 'open.vl:4: ' "$WORK/unread/o2" && echo 1)" \
+        "$(cat "$WORK/unread/o1" "$WORK/unread/o2")"
 fi
 
 # roundtrip (the copy: for compiles and same-output too)

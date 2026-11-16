@@ -223,8 +223,169 @@ over the control flow graph: the contents of every register and spill
 slot, through the moves (planned by the same functions the emitter uses),
 definitions, stores and clobbers, meeting at joins (a location whose
 predecessors disagree holds nothing), until nothing changes; every use
-must find its value where the allocation says it is. `--print-regalloc`
-shows the blocks' positions and every value's intervals and locations.
+must find its value where the allocation says it is. The moves it
+simulates are those of the gaps between instructions and of the blocks'
+starts and ends (the edges'), in pm_plan's order. It does not simulate
+the moves the emitter makes around them (0.30.1, as
+the second review of RT-CG-6 noted): a call's arguments into the ABI's
+registers and stack slots and its results out (pieces), the entry's
+parameters from the ABI's places to their locations (a parameter is
+taken to be where the allocation has it), and the return value into its
+register. Those are checked only by the class checks of `m_check_reg`
+and by the tests. (0.30.1, RT-CG-7: the code of every plan `pm_resolve` emits,
+the location moves of a call's arguments and of the entry's parameters
+among them, is followed instruction by instruction; see "The moves'
+scratch registers" below.) `--print-regalloc` shows the blocks' positions and
+every value's intervals and locations.
+
+**Registers and their classes** (0.30.1, RT-CG-5). A spill slot is
+shared by values of either class, so an edge's moves can form a cycle
+through two slots that holds an integer and an f64: `x2 -> slot(x)`,
+`n2 -> slot(n)` with x2 in n's slot and n2 in x's. The cycle is broken
+by saving one slot's current value in the cycle register; that value is
+the one the moves reading the slot take, so the register's class and the
+save's type are theirs, not those of the move writing the slot. 0.30.1's
+release branch took the writer's: an integer went
+through d31 and was stored as `str x63`, which the assembler encoded as
+`str xzr`, a 0, and an f64 through x17 was stored as `str d-15`, encoded
+as `str s0`; x86-64 stored `movq %xmm15, m` as a 4-byte movd. The
+checker above did not see it: it follows locations, and the moves were
+right as locations. Three nets now make such a mistake an internal error
+instead of code: every load, store and move of a register goes through
+`m_load`, `m_store` and `m_mov`, which require the register's number to
+be of the class of the type it is spelled by (`m_check_reg`: 0-31
+general, 32-63 float and vector; x86-64 0-15 and 32-47); the AArch64
+assembler refuses a register number its class has not (x/w 0-30, the
+others 0-31, `x31` is not a name) and an operand that is not a register
+where an instruction reads one; the x86-64 assembler refuses a register
+of the wrong class in an instruction that takes one class
+(`tests/arch/enc.sh`).
+
+**Slots as cells** (0.30.1, RT-CG-6). A spill slot is 8 bytes; a 16-
+or 32-byte vector takes 2 or 4 of them, aligned, and the slots beside
+it may hold other values at other times. A location is therefore a
+range of cells: a register is one, slot k with a value of size s is the
+cells k .. k + ceil(s / 8) - 1 (`loc_cells`), and two locations are the
+same place when their cells meet (`locs_overlap`). 0.30.0 compared slot
+numbers, so a move writing slot k+1 was not ordered after the move
+reading a vector from slot k (0.30.1's branch before the fix, on the
+review's programs): `ldr d30, [sp]; str d30, [sp, #24]; ldr q17, [sp,
+#16]` on AArch64 at -O1, `movups %xmm2, 144(%rsp)` then
+`movsd %xmm2, 152(%rsp)` on x86-64, and the vector read had half of an
+f64 in it. The order of an edge's moves is one function, `pm_plan`: it
+gives the steps (destination, source, type), the emitter emits them and
+the checker simulates them, cell by cell, so the two cannot disagree. A
+move is ready when no pending move reads a cell it writes; when none is,
+the moves form a cycle, and the source of one move on it is saved in
+the cycle register, by the type of the moves that read it (when two
+moves read one location as values of different types or sizes, that is
+an internal error, never code). When the cycle register holds a value
+already, the save goes to cells after the spill slots. With values of
+several widths any number of saves may be pending at once, so the cells
+are counted before the frame is laid out: `reserve_save_cells` plans
+every edge and gap of a function with a vector on the stack (saves in
+cells without an end) and keeps as many as they used, and the emitter's
+plans are the same plans. Without a vector on the stack every location
+is one unit, the stalled moves are simple cycles, and the cycle register
+is enough. A move edge never fails a compile; `plan_break`'s choice of
+what to save only keeps the saves few (`tests/fuzz/pm_model.py` models
+it all, line for line, over random edges).
+The checker requires that each move's destination hold its value after
+the steps, so a plan that overwrites a value before it is moved is an
+internal error under `--verify-regalloc` (tested by planting slot
+equality back: it reports `the moves' order overwrites a value before
+it is moved` on the reviews' programs). Random programs for these moves,
+with every class and width rotated through shared slots around a loop
+under pressure: `tests/fuzz/run.sh -M` (scalars and a struct) and `-M
+-V` (vectors), the gate's rows `fuzz-moves` and `fuzz-moves-vec`, and
+`tests/affected.map` runs both for a change under compiler/src/back.
+
+**The moves' scratch registers** (0.30.1, RT-CG-7). The steps of a plan
+hold values in registers no value is allocated to: the cycle registers
+(AArch64 x17 and v31, x86-64 r10 and xmm15) from a save until its last
+reader, and the moves' temporaries (x16 and v30, r11 and xmm14) from the
+load of a move between slots to its store. An instruction of a step may
+use no other scratch register that one of these is. 0.30.0's AArch64
+emitter computed an address it could not encode into x17, the integer
+cycle register: an f32 slot's offset is encodable below 16 KB, while
+`layout_frame` lets spill slots reach 32760 bytes, so in a frame past
+16 KB an f32 move between slots wrote its address over an integer saved
+in x17 (`ldr x17, [sp, #16928]`, `movz x17, #17024`, `add x17, sp,
+x17`, `ldr s30, [x17]`, ..., `str x17, [sp, #17000]`: the address
+stored). The scratch registers of both emitters, and why none is held:
+- AArch64 x17 (`ma_address`, `ma_lea` for an offset over 4095,
+  `ma_load_fimm`, `ma_copy`): taken only through `ma_scratch`, which is
+  an internal error while `cx.scratch_held` says x17 holds a value (the
+  steps of every plan, and a stack argument's piece between its load
+  and store). No step asks for it: every spill access goes through
+  `m_spill_load`/`m_spill_store`, whose type (`spill_access_type`) makes
+  its offset encodable. Spill offsets are below 32760 (`layout_frame`,
+  an error past it) and multiples of 8 (16 for a 16-byte value): `x`
+  (integers spill as u64) and `d` (f64, 8-byte vectors) reach 32760 at
+  8 bytes a unit, `q` 65520 at 16, and `s` only 16380 at 4, so an f32
+  slot from 16 KB on is read and written as its 8 bytes, with `ldr d` /
+  `str d` (the slot is 8 bytes; the s register is the d register's low
+  half). No value spills as `b` or `h`.
+- AArch64 x16 and x86-64 r11, the integer temporaries: a destination
+  only of a call's moves (the callee of an indirect call), whose
+  destinations are all registers, so no move between slots, the only
+  step that uses the temporary, is in such a plan (`move_loc` makes it
+  an internal error). v30 and xmm14 are no move's destination.
+- x86-64: a step's instructions are `mov`s with a 32-bit displacement
+  from rsp, below 32760; no scratch. `mx_load_fimm` (r10) and `mx_copy`
+  (r11) are never called by a step. x86-64 has no scratch for an offset
+  beyond 32 bits at all: a frame past 2 GB (a large array on the stack)
+  was written `subq $3000001744, %rsp`, `leaq 3000000032(%rsp)`, and the
+  assembler kept the low 32 bits (rsp moved up). It now refuses a
+  displacement or a 64-bit operation's immediate outside signed 32 bits,
+  and an immediate its field cannot hold, as cc refuses them
+  (`tests/arch/enc.sh`); AArch64's assembler likewise a pair's offset
+  outside -64 to 63 units and a movz or movk part over 16 bits, which it
+  masked too (the emitter makes neither; AArch64's frames past 2 GB are
+  right, through movz/movk and a register).
+- The instructions of a step are those of `move_loc`: `m_mov`,
+  `m_spill_load`, `m_spill_store` and the machine layer's moves, loads
+  and stores under them; the other scratch uses (ops.vl, atomic.vl,
+  arch.vl, vector.vl: temporaries inside one instruction) are not
+  reachable from it, and the check below refuses any instruction that is
+  not of the moves' forms, so a new path that puts one among the steps
+  is an error under `--verify-regalloc`, not code.
+
+`--verify-regalloc` now also follows the code of every plan as it is
+emitted (`regalloc/movecode.vl`, from `pm_resolve`: the edges' and the
+gaps' moves, and the location moves of a call's arguments and of the
+entry's parameters): every register and frame byte starts with a token,
+each instruction moves tokens (an address must be one the code computed
+from sp), and then every destination must hold its source's tokens, no
+register but the destinations, the cycle registers and the temporaries
+may have been written, and no frame byte but a destination's and the
+save cells'. The peepholes that use the instruction before the plan
+(m_load's forwarding of a store, m_mov's skip of a move back, a pair
+of accesses) are seeded with what they know. `VOLE_PLANT_RT_CG_7`
+(tests only, under `--verify-regalloc`) plants a fault in the steps, one
+per rule: `x17` RT-CG-7 itself, `temp` a move through an allocated
+register, `insn` a nop after each step, `frame` a store to the save
+area; `tests/refactor/movecode0301.t` shows each reported.
+`tests/fuzz/run.sh -F` (`-M` in a frame past 16 KB: main first defines
+2048 to 3071 f32 values live to its end) and the gate's rows
+`fuzz-moves-frame` and `fuzz-moves-frame-x86` make these frames; the
+cases are `rt_cg_007_*`.
+
+**The assemblers' registers** (0.30.1). On AArch64 register number 31
+is sp in some fields and xzr in others; the assembler keeps them apart:
+an operand where the field means xzr refuses `sp`, one where it means sp
+refuses `xzr`, and a memory base is x0-x30 or sp (`add x0, xzr, #1`,
+`orr sp, x0, x1`, `ldr x0, [xzr]` are errors, as in cc). `ldr`/`str`
+of `h` and `b` registers are encoded by their size, not as q. A symbol
+is never a register: an operand is a symbol where the instruction takes
+one (`b`, `bl`, `b.cond`, `adr`, `adrp`, `cbz`, `tbz` and a relocation),
+so a C function named `d5` or `w7` links. On x86-64 the table's
+instructions (`compiler/arch/insn_x86.def`) carry each operand's
+class (`r:` the classes in order, `x` vector, `g` general, `i` an
+immediate), and the assembler refuses a register of the other class there, in an atomic
+(`xadd`, `cmpxchg`: a general register into memory) and in an indirect
+`call`/`jmp`. The moves `ma_move` and `mx_move` and the jump table's
+registers go through `m_check_reg` as the loads and stores do.
 
 | | AArch64 | x86-64 |
 |---|---|---|
@@ -1644,7 +1805,9 @@ did not do before.
 (new information: the IR loses `willreturn` on any cycle, while the
 front end knows a counted `for` ends), no raw `panic` is `nopanic`, and
 a C function whose effects have no `alloc`, `io` or `global` and whose
-parameters are all numbers is `readnone`. A C function the program
+parameters are all numbers is `readnone` (0.30.1: no longer; only the
+table's C_PURE class is, see "0.30.1: the panics and the memory the
+effects missed"). A C function the program
 declares nothing about has the builtin table's effects
 (`front/effects/builtin.vl`, `known_c_effects`): libm none (so
 `readnone`, as 0.6's `PURE_LIBM` list had it, now the whole of libm),
@@ -3506,3 +3669,97 @@ optimizer:
   `param_written` looks only at the instructions made since.
 - A function with no loop runs the ranges and the dead code only
   (`optimize_loops`); the dead functions are found with one walk.
+
+## 0.30.1: the panics and the memory the effects missed
+
+The optimizer takes `nopanic` and `willreturn` from the front end's
+effects (`ipo::front_attrs`, "0.16: calls the effects make pure"): a
+`readnone willreturn nopanic` call whose result is unused is deleted,
+two equal ones are one, and LICM may run one where the program would
+not. Each attribute is a promise about every run, so each source of a
+panic the lowering emits must be a `panic` (or a raw panic) in the
+effects. 0.30.0 broke that promise in four places (the red team's RT-3,
+RT-4, RT-5, RT-19 and RT-20; the cases are tests/run/rt_00[345]_*,
+rt_019_*, rt_020_*).
+
+**Division** (RULE E1.7, `infer::arith_panic`). The lowering checks an
+integer `/`, `%`, `/=` and `%=` at every level
+(`lower_division_checks`, gen0's `gen_division_checks`): the divisor is
+not 0 and, signed, not -1 while the dividend is MIN. The check is left
+out only for a divisor that is a literal or a constant. The effect is
+`panic` unless the front end proves the check never fires:
+
+- the divisor is a constant whose value, as written and wrapped to the
+  type, is not 0 and, signed, not -1 (`int_value`: a literal, a negated
+  literal, `i64::MIN`, a computed `const`, an integer cast of one);
+  this is the lowering's own test, and a negated literal or a cast,
+  which the lowering checks at run time, is a constant all the same;
+- or it is an immutable integer local and the facts at the division say
+  it is not 0 and, signed, either not -1 or not -1 while the dividend,
+  an immutable local too, is MIN.
+
+The facts (`push_facts`, `pcx.loops` entries LOOP_NONZERO and
+LOOP_NO_MIN_NEG1) come from an `if`: its condition holds in the first
+branch and fails in the second, through `&&` (holds), `||` (fails) and
+a bool `!`; and after `if c { .. }` whose branch never completes
+(`return`, `break`, `continue`, a `!` value: `never_completes`) the rest
+of the block has c failed. A comparison gives a fact when one side is
+such a local and the other a constant, read at the local's type
+(`side_fact`: `d != 0`, `d == k` with k not 0, `d > k` with k >= 0,
+`d >= 1`, `d < k` with k <= 0, ...; an unsigned constant of 2^63 or
+more is not compared as a negative number), or the local is unsigned
+and greater than anything (`x < d`); `!(x == MIN && d == -1)` is the
+MIN fact. Why each is sound: the local is immutable, so what the
+condition said of it is still true wherever the branch runs (a closure
+is walked as its own function and sees no fact; a mutable local, a
+field, a `/=`'s place get none); facts are popped when the branch, or
+the block, ends. std's `checked_div`, `checked_rem`, `wrapping_div`
+(`if rhs == -1 { .. } else { self / rhs }`: still `panic`, for 0, as
+Rust's) and `Xoshiro256pp::below_u64` (`if lo < n { .. % n }`) are
+proven by exactly these rules; what is not proven keeps the `panic`
+(tests/run/err_effect_div_unproven.vl: 21 forms, each refused by
+`#[no_panic]`).
+
+**Overflow** (E1.7). `+ - * << >>`, their assignments and `-x` (but of a
+literal) panic only where the overflow checks are on (`checks_here`:
+-O0's default, `--overflow-checks=on`, and -O1 under `--trace`, which
+keeps the level's checks; never in std::num::wrapping). The effects say
+so with the raw panic only (EFF_RAW_PANIC, which `effects_attrs` reads),
+set when `pcx.overflow_checks` holds for the build: the attribute is
+true for the code this build makes. The visible `panic`, which
+`#[no_panic]` and `#[effects]` are checked against, does not depend on
+the level (effects-allocation.md: effects never depend on `-O`), so it
+does not count overflow (a proposal: a visible `overflow` effect, or
+`#[no_panic]` counting it, would refuse most arithmetic in std's 1200
+declarations; it needs the owner's word).
+
+**std's panic** (E1.6) adds the raw panic too: an allocator's edge
+(E_ALLOC) passes only the raw bits, and a panic called in an allocator
+method (an arena lent to a scope) reached its callers as nothing.
+
+**Counted loops** (E2.1). `for i in 0..N` proves `a[i]` in bounds for an
+array of length at least N; N is read as the type reads it, and one of
+2^63 or more (negative as an i64) or `0..=i64::MAX` (whose end does not
+fit) proves nothing (RT-19: u64::MAX was -1, "at most" every length). A
+counted `while`'s variable loses its proof to any write: an assignment,
+a `&mut` (an `&mut self` receiver too), a raw borrow (`&raw const i`
+may be written through a cast), a capture, and (RT-20) a `ref mut`
+binding of it in a `match`, `if let`, `while let` or `let` pattern
+(`walk_scrutinee`: the scrutinee is walked as a written place).
+
+**C functions' memory** (RT-5). A C function was `readnone` when its
+effects had no memory bit and its parameters were all numbers; a number
+can be a pointer in C's ABI, and memset and strlen declared with usize
+parameters were deleted and folded. Effects never describe the memory a
+function reaches through its arguments (`#[pure]` may write through its
+pointers), so `readnone` now comes only from the table's class C_PURE
+(libm, `abs`, `labs`, `llabs`: a result of the argument values alone),
+by the symbol the function links to, for a declaration and for the
+lowering's own `callc` alike; a `#[effects()]` declaration gives none.
+
+Tests: effect_div_proofs.vl (every proven form, #[no_panic], run at
+-O0 and -O2), err_effect_div_unproven.vl, opt_effects_div_min_kept.vl
+(MIN / -1 through `/=` kept at -O2), opt_effects_overflow_checked.vl
+(-O2 --overflow-checks=on keeps `+`, `<<` and `-x` calls),
+err_effect_range_bound_limits.vl, err_effect_counted_while_ref_mut.vl,
+err_effect_panic_call_text.vl, and the red team's cases.

@@ -21,11 +21,13 @@ use crate::back::mc_x86_64::ops::{
     mx_branch_bool, mx_cmp, mx_cmp_branch, mx_conv, mx_div, mx_float_op, mx_int_imm_ok, mx_int_op,
     mx_int_op_imm, mx_unary,
 };
-use crate::base::buf_len;
+use crate::base::{buf_len, exit_now};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::target::get_x86;
-use crate::front::types::{TY_U64, align_to, in_fregs, is_float, is_vector, type_size};
+use crate::front::types::{
+    TY_F32, TY_F64, TY_U64, align_to, in_fregs, is_float, is_vector, type_size,
+};
 use crate::gen0::target::{emit_jump, ins};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{Cond, Op};
@@ -160,13 +162,72 @@ pub fn spill_offset(cx: &mut FnCtx<Comp>, loc: i64) -> i64 {
     cx.spill_base + 8 * (0 - loc - 1)
 }
 
+// (0.30.1, RT-CG-7) The type the spill slot at sp + offset is read and
+// written with: spill_type's, except that on AArch64 an f32 slot from 16
+// KB on is accessed as its 8 bytes (an f64's ldr and str: its d register,
+// whose low half is the s register; the slot is 8 bytes). So no spill
+// access needs a scratch register for its address: layout_frame keeps
+// every spill slot (and the moves' save cells after them) below 32760, at
+// a multiple of 8 (16 for a 16-byte value, whose slots are aligned), and
+// AArch64's unsigned scaled offset reaches 4095 units: x (integers, which
+// spill as u64), d (f64, f32 here, 8-byte vectors) at 8 bytes up to 32760,
+// q (16-byte vectors) at 16 up to 65520, s (f32) at 4 only below 16384.
+// No value spills as b or h (a byte or a half: integers are u64). x17, the
+// scratch, is the integer cycle register of the parallel moves, whose
+// steps access spill slots only (ma_scratch refuses it there).
+pub fn spill_access_type(ty: i64, offset: i64, pcx: &Ctx<Comp>) -> i64 {
+    let st = spill_type(ty, pcx);
+    if st == TY_F32 && !get_x86() && offset >= 16384 && pcx.plant_rt_cg_7 != 1
+        && pcx.plant_rt_cg_7 != 5 { TY_F64 }
+    else { st }
+}
+
+// (0.30.1, RT-CG-7) Spill slot `loc` (a location below 0) loaded into
+// register r, and register r stored into it: every access of a spill slot
+// comes here (spill_access_type).
+pub fn m_spill_load(cx: &mut FnCtx<Comp>, ty: i64, r: i64, loc: i64, pcx: &Ctx<Comp>) {
+    let offset = spill_offset(cx, loc);
+    m_load(cx, spill_access_type(ty, offset, pcx), r, reg_sp(), offset, pcx);
+}
+
+pub fn m_spill_store(cx: &mut FnCtx<Comp>, ty: i64, r: i64, loc: i64, pcx: &Ctx<Comp>) {
+    let offset = spill_offset(cx, loc);
+    m_store(cx, spill_access_type(ty, offset, pcx), r, reg_sp(), offset, pcx);
+}
+
 pub fn block_label(cx: &mut FnCtx<Comp>, b: i64) -> i64 {
     cx.label_base + (cx.blocks[b as usize]).order
 }
 
 // ---- Dispatch to the machine layer ----
 
+// (0.30.1, RT-CG-5) Register r as the data operand of a load, store or
+// move of a value of type ty. Every load, store and move of a register
+// comes through m_load, m_store and m_mov, and the machine layer spells a
+// register by the type it is given (`ldr dN`, `str xN`, `fmov`, `mov`)
+// while its number says its class: 0-31 the general registers, 32-63 the
+// float and vector ones (x86-64: 0-15 and 32-47); AArch64's integers 0-30. So the two must agree:
+// a float register given an integer type was written `str x63`, which
+// the assembler took as xzr and stored 0. A register of the other class,
+// or a number the target has no register for, is an internal error.
+pub fn m_check_reg(r: i64, ty: i64, what: &str, pcx: &Ctx<Comp>) {
+    let float = in_fregs(ty, pcx);
+    // (0.30.1, F4) AArch64's register 31 is sp or xzr, never a value's:
+    // an integer is in x0-x30
+    let count: i64 = if get_x86() { 16 } else if float { 32 } else { 31 };
+    let first: i64 = if float { 32 } else { 0 };
+    if r < first || r >= first + count {
+        let class = if float { "a float or vector" } else { "an integer" };
+        eprint("{}", format_args(
+            "error: internal error: the {what} of {class} value names the register {r}, not one of its class ({first} to {})\n",
+            first + count - 1));
+        exit_now(1);
+    }
+}
+
 pub fn m_mov(cx: &mut FnCtx<Comp>, dst: i64, src: i64, ty: i64, pcx: &Ctx<Comp>) {
+    m_check_reg(dst, ty, "move", pcx);
+    m_check_reg(src, ty, "move", pcx);
     if dst == src { return; }
     if buf_len(cx.code) == cx.last_mov_end && dst == cx.last_mov_src
         && src == cx.last_mov_dst {
@@ -188,6 +249,7 @@ pub fn m_load_fimm(cx: &mut FnCtx<Comp>, dst: i64, bits: i64, ty: i64, pcx: &Ctx
 }
 
 pub fn m_load(cx: &mut FnCtx<Comp>, ty: i64, dst: i64, base: i64, offset: i64, pcx: &Ctx<Comp>) {
+    m_check_reg(dst, ty, "load", pcx);
     if cx.mem_index < 0 && base == reg_sp()
         && buf_len(cx.code) == cx.last_store_end
         && offset == cx.last_store_offset && ty == cx.last_store_type && type_size(ty, pcx) == 8
@@ -204,6 +266,7 @@ pub fn m_load(cx: &mut FnCtx<Comp>, ty: i64, dst: i64, base: i64, offset: i64, p
 }
 
 pub fn m_store(cx: &mut FnCtx<Comp>, ty: i64, src: i64, base: i64, offset: i64, pcx: &Ctx<Comp>) {
+    m_check_reg(src, ty, "store", pcx);
     st_spill(cx, false, base, offset);
     if get_x86() { mx_store(cx, ty, src, base, offset, pcx); }
     else { ma_store(cx, ty, src, base, offset, pcx); }
@@ -213,6 +276,23 @@ pub fn m_store(cx: &mut FnCtx<Comp>, ty: i64, src: i64, base: i64, offset: i64, 
         cx.last_store_type = ty;
         cx.last_store_end = buf_len(cx.code);
     }
+}
+
+// (0.30.1, RT-CG-2) Forgets what the peepholes remember of the code just
+// emitted: m_mov's last move, m_load's last stack store, emit_select's
+// last select, AArch64's pair_with_last. Each is a position in CODE, and
+// the code of the function before, cleared, may have reached the same
+// position the new one's does. Called at the start of every function
+// either generator emits (gen_ir_function; gen0's gen_body and
+// gen_atomic_function) and of the runtime's helpers (emit_runtime).
+// Before, -O0 only cleared the buffer: on x86-64 a load of a pushed
+// temporary became a move from the register an earlier function stored.
+pub fn forget_emitted(cx: &mut FnCtx<Comp>) {
+    cx.last_mov_end = -1;
+    cx.last_store_end = -1;
+    cx.pair_end = -1;
+    cx.last_select = 0;
+    cx.last_select_end = -1;
 }
 
 pub fn m_lea(cx: &mut FnCtx<Comp>, dst: i64, base: i64, offset: i64) {

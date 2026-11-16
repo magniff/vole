@@ -153,7 +153,13 @@ defined:
 - `volec --check-unsafe -O1 prog.vl -o prog` checks raw-pointer
   accesses against the heap blocks at run time (`malloc`/`free`):
   out-of-bounds and use-after-free stop the program with `unsafe access
-  ...` and exit 101. Programs run tens of times slower.
+  ...` and exit 101. Programs run tens of times slower. (0.30.1) Every
+  block of std's `Gpa` is checked too, C's `memcpy`, `memmove` and
+  `memset` (std's copies call them) check their bytes first, and on
+  macOS C's own frees are seen (`malloc_logger`, the program's own
+  logger still called). Its allocator costs more than 0.30.0's check:
+  about +10% on strdup and free, +21% on Box churn, +25% on Vec clones,
+  +90% on `push_str`.
 - `volec --check-alloc` (0.16) puts every block of Gpa on pages of
   its own: a use after free through raw pointers faults and is reported
   with where the block was allocated and freed;

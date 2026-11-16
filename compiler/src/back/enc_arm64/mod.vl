@@ -10,7 +10,7 @@ mod simd;
 mod atomic;
 
 use crate::back::enc_arm64::atomic::a64_atomic;
-use crate::back::enc_arm64::operands::parse_operand;
+use crate::back::enc_arm64::operands::{parse_operand, parse_symbol_operand};
 use crate::back::enc_arm64::simd::a64_table_instruction;
 use crate::back::objfile::{
     Asm, FX_A64_ADR, FX_A64_B14, FX_A64_B19, FX_A64_B26, FX_A64_GOTPAGE, FX_A64_GOTPAGEOFF,
@@ -266,8 +266,34 @@ fn sf(k: i64, asm: &mut Asm<Comp>) -> i64 {
     if asm.a64[k as usize].cls == C_X { 1 << 31 } else { 0 }
 }
 
+// The register of operand k. (0.30.1, RT-CG-5) Every instruction reads
+// its register operands here: one that is not a register (`d-15`, read as
+// the symbol d minus 15) was register 0, `str d-15` written `str s0`.
+//
+// (0.30.1, F4) Register 31 of a field is xzr (wzr) in most instructions
+// and sp in a few (add and sub's immediate and extended forms, a base):
+// r reads a field that means xzr and refuses sp, r_sp one that means sp
+// and refuses xzr. Taken for each other, `str sp, [x0]` was `str xzr`.
 fn r(k: i64, asm: &mut Asm<Comp>) -> i64 {
+    let kind = asm.a64[k as usize].kind;
+    if kind != K_REG && kind != K_LIST {
+        asm_error("expected a register", asm);
+    }
+    if asm.a64[k as usize].sp {
+        asm_error("sp where the instruction takes xzr", asm);
+    }
     asm.a64[k as usize].reg
+}
+
+fn r_sp(k: i64, asm: &mut Asm<Comp>) -> i64 {
+    let op = asm.a64[k as usize];
+    if op.kind != K_REG || (op.cls != C_X && op.cls != C_W) {
+        asm_error("expected a general register", asm);
+    }
+    if op.reg == 31 && !op.sp {
+        asm_error("xzr where the instruction takes sp", asm);
+    }
+    op.reg
 }
 
 fn need(n: i64, asm: &mut Asm<Comp>) {
@@ -342,9 +368,19 @@ fn cond_of(k: i64, asm: &mut Asm<Comp>) -> i64 {
 
 // ---- Instructions ----
 
-// add/sub/adds/subs: op 0 add, 1 sub; s: set flags. rd may be 31 (cmp).
-fn addsub(op: i64, s: i64, rd: i64, rn_k: i64, m_k: i64, asm: &mut Asm<Comp>) {
+// The Rd field of add and sub's immediate and extended forms: sp or a
+// register without flags, xzr or a register with them (rd_k -1: xzr).
+fn rd_sp_field(rd_k: i64, s: i64, asm: &mut Asm<Comp>) -> i64 {
+    if rd_k < 0 { 31 } else if s == 0 { r_sp(rd_k, asm) } else { r(rd_k, asm) }
+}
+
+// add/sub/adds/subs: op 0 add, 1 sub; s: set flags. rd_k: the operand
+// of the destination, or -1 for xzr (cmp, cmn). (0.30.1) The immediate
+// and extended forms' Rn is sp-or-register, and so is their Rd when no
+// flags are set; the shifted form's are xzr-or-register.
+fn addsub(op: i64, s: i64, rd_k: i64, rn_k: i64, m_k: i64, asm: &mut Asm<Comp>) {
     let x = sf(rn_k, asm);
+    let rd_any = rd_k >= 0 && asm.a64[rd_k as usize].sp;
     if is_imm(m_k, asm) {
         let mut imm = asm.a64[m_k as usize].imm;
         let mut o = op;
@@ -364,8 +400,8 @@ fn addsub(op: i64, s: i64, rd: i64, rn_k: i64, m_k: i64, asm: &mut Asm<Comp>) {
         if imm > 4095 {
             asm_error("immediate out of range", asm);
         }
-        word(x | o << 30 | s << 29 | 0x11000000 | sh << 22 | imm << 10 | r(rn_k, asm) << 5
-            | rd, asm);
+        word(x | o << 30 | s << 29 | 0x11000000 | sh << 22 | imm << 10 | r_sp(rn_k, asm) << 5
+            | rd_sp_field(rd_k, s, asm), asm);
         return;
     }
     if asm.a64[m_k as usize].kind == K_SYM {
@@ -373,17 +409,18 @@ fn addsub(op: i64, s: i64, rd: i64, rn_k: i64, m_k: i64, asm: &mut Asm<Comp>) {
             asm_error("expected @PAGEOFF", asm);
         }
         fixup(FX_A64_PAGEOFF, here(asm), asm.a64[m_k as usize].sym, 0, 0, false, asm);
-        word(x | op << 30 | s << 29 | 0x11000000 | r(rn_k, asm) << 5 | rd, asm);
+        word(x | op << 30 | s << 29 | 0x11000000 | r_sp(rn_k, asm) << 5 | rd_sp_field(rd_k, s, asm),
+            asm);
         return;
     }
     // Registers: the extended form when sp is involved (as LLVM does).
-    let rd_sp = asm.a64[0].kind == K_REG && asm.a64[0].sp && rd == 31
-        && s == 0;
+    let rd_sp = rd_any && s == 0;
     if asm.a64[rn_k as usize].sp || rd_sp {
         word(x | op << 30 | s << 29 | 0x0b200000 | r(m_k, asm) << 16 | 3 << 13
-            | r(rn_k, asm) << 5 | rd, asm);
+            | r_sp(rn_k, asm) << 5 | rd_sp_field(rd_k, s, asm), asm);
         return;
     }
+    let rd: i64 = if rd_k < 0 { 31 } else { r(rd_k, asm) };
     let mut shift: i64 = 0;
     let mut amount: i64 = 0;
     if m_k + 1 < asm.op_count && asm.a64[(m_k + 1) as usize].kind == K_SHIFT {
@@ -520,6 +557,11 @@ fn pair(load: bool, asm: &mut Asm<Comp>) {
     } else if m.pre {
         mode = 3;
     }
+    // (0.30.1) a multiple of the size, -64 to 63 of them, else an error
+    // (0.30.0 kept the low 7 bits: `ldp x0, x1, [sp, #1024]` was `[sp]`)
+    if off % scale != 0 || off / scale < -64 || off / scale > 63 {
+        asm_error("offset out of range", asm);
+    }
     let imm7 = (off / scale) & 0x7f;
     word(base | mode << 23 | l | imm7 << 15 | r(1, asm) << 10 | m.reg << 5 | r(0, asm), asm);
 }
@@ -556,7 +598,21 @@ fn a64_simd(code: i64, asm: &mut Asm<Comp>) {
     let o0 = asm.a64[0];
     let o1 = asm.a64[1];
     if code == A_LDR || code == A_STR {
-        load_store(if code == A_LDR { 0x3cc00000 } else { 0x3c800000 }, 4, asm);
+        // (0.30.1, F5) q, h and b by their own sizes: h and b were
+        // encoded as q (16 bytes for 2 or 1)
+        let load = code == A_LDR;
+        if o0.kind != K_REG {
+            asm_error("expected a register", asm);
+        }
+        if o0.cls == C_Q {
+            load_store(if load { 0x3cc00000 } else { 0x3c800000 }, 4, asm);
+        } else if o0.cls == C_H {
+            load_store(if load { 0x7c400000 } else { 0x7c000000 }, 1, asm);
+        } else if o0.cls == C_B {
+            load_store(if load { 0x3c400000 } else { 0x3c000000 }, 0, asm);
+        } else {
+            asm_error("a load or store of a vector register names q, d, s, h or b", asm);
+        }
         return;
     }
     let q = o0.shift << 30;
@@ -641,12 +697,37 @@ fn a64_simd(code: i64, asm: &mut Asm<Comp>) {
     }
 }
 
+// (0.30.1, F6) Which operand of mnemonic `name` is a label or a symbol
+// by the instruction's form, or -1: the target of b, bl, b.cond (0), of
+// cbz, cbnz (1), tbz and tbnz (2), and adr's and adrp's address (1).
+fn symbol_operand(name: &[u8]) -> i64 {
+    if name.len() == 0
+        || (name[0] != b'b' && name[0] != b'c' && name[0] != b'a' && name[0] != b't') {
+        return -1;
+    }
+    if name == b"b" || name == b"bl" || (name.len() > 2 && name[0] == b'b' && name[1] == b'.') {
+        return 0;
+    }
+    if name == b"cbz" || name == b"cbnz" || name == b"adr" || name == b"adrp" {
+        return 1;
+    }
+    if name == b"tbz" || name == b"tbnz" {
+        return 2;
+    }
+    -1
+}
+
 pub fn a64_instruction(a: i64, b: i64, asm: &mut Asm<Comp>) {
     let mut room = [0u8; 32];
     let name_len = mnemonic_copy(a, b, &mut room, asm);
     let name = &room[..name_len];
+    let sym = symbol_operand(name);
     for k in 0..asm.op_count {
-        parse_operand(k, asm);
+        if k == sym {
+            parse_symbol_operand(k, asm);
+        } else {
+            parse_operand(k, asm);
+        }
     }
     if asm.op_count > 0 && (is_simd(0, asm) || (asm.op_count > 1 && is_simd(1, asm))) {
         let code = mnemonic(name, asm);
@@ -696,9 +777,9 @@ pub fn a64_instruction(a: i64, b: i64, asm: &mut Asm<Comp>) {
         need(if asm.op_count == 4 { 4 } else { 3 }, asm);
         let op: i64 = if code == A_SUB || code == A_SUBS { 1 } else { 0 };
         let s: i64 = if code == A_ADDS || code == A_SUBS { 1 } else { 0 };
-        addsub(op, s, r(0, asm), 1, 2, asm);
+        addsub(op, s, 0, 1, 2, asm);
     } else if code == A_CMP || code == A_CMN {
-        addsub(if code == A_CMP { 1 } else { 0 }, 1, 31, 0, 1, asm);
+        addsub(if code == A_CMP { 1 } else { 0 }, 1, -1, 0, 1, asm);
     } else if code == A_AND || code == A_ORR || code == A_EOR || code == A_ANDS {
         let opc: i64 = if code == A_AND { 0 } else if code == A_ORR { 1 }
             else if code == A_EOR { 2 } else { 3 };
@@ -710,12 +791,21 @@ pub fn a64_instruction(a: i64, b: i64, asm: &mut Asm<Comp>) {
         if is_imm(1, asm) {
             mov_imm(0, asm.a64[1].imm, asm);
         } else if asm.a64[0].sp || asm.a64[1].sp {
-            word(sf(0, asm) | 0x11000000 | r(1, asm) << 5 | r(0, asm), asm);
+            // add rd, rn, #0: both fields sp-or-register
+            word(sf(0, asm) | 0x11000000 | r_sp(1, asm) << 5 | r_sp(0, asm), asm);
         } else {
             word(sf(0, asm) | 0x2a000000 | r(1, asm) << 16 | 31 << 5 | r(0, asm), asm);
         }
     } else if code == A_MOVZ || code == A_MOVK {
         let hw: i64 = if asm.op_count == 3 { asm.a64[2].amount / 16 } else { 0 };
+        // (0.30.1) 16 bits, at a shift of 0, 16, 32 or 48 (w: 0 or 16),
+        // else an error (0.30.0 kept the low 16 bits: `movz x0, #70000`
+        // was 4464)
+        let part = asm.a64[1].imm;
+        if part < 0 || part > 0xffff || (asm.op_count == 3 && asm.a64[2].amount % 16 != 0)
+            || hw < 0 || hw > (if sf(0, asm) != 0 { 3 } else { 1 }) {
+            asm_error("immediate out of range", asm);
+        }
         let base: i64 = if code == A_MOVZ { 0x52800000 } else { 0x72800000 };
         word(sf(0, asm) | base | hw << 21 | (asm.a64[1].imm & 0xffff) << 5
             | r(0, asm), asm);

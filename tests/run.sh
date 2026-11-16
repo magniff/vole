@@ -183,6 +183,9 @@
 #                        skipped, counted apart
 #   // REQUIRES: metal    (0.22) the case runs only on aarch64-macos (std::gpu
 #                        on Metal); elsewhere it is skipped, counted apart
+#   // REQUIRES: macos    (0.30.1) the case runs only on macOS (what it
+#                        tests is macOS's: a signal's number, an exit
+#                        code); elsewhere it is skipped, counted apart
 #   // NO-EXTRA-FLAGS: why (0.16) the case is built without
 #                        $VOLE_TEST_FLAGS (its output differs by design
 #                        with them)
@@ -213,6 +216,15 @@
 set -u
 LC_ALL=C
 export LC_ALL
+# (0.30.1) The files this run's caller gives it are this run's: taken
+# here and out of the environment, so that no tests/run.sh started below
+# (the runner suite's own runs, on a compiler that fails on purpose)
+# writes its records into this one's (the gate's suite rows judge every
+# case by its one record) or its XFAIL triage. The same for the note of
+# lazy std's reruns, below.
+RESULTS_FILE=${VOLE_TEST_RESULTS:-}
+XFAIL_WHY_FILE=${VOLE_TEST_XFAIL_WHY:-}
+unset VOLE_TEST_RESULTS VOLE_TEST_XFAIL_WHY
 # (0.18.1) Without the code cache (back::codecache), unless the caller
 # says (gate.sh's suite-O2 row): its programs are small, and a cache per
 # program and compiler would fill target/volec-cache.
@@ -454,7 +466,11 @@ TALLY="$WORK/tally"
 # (0.28.0) A build whose lazy read of std failed and whose whole read passed
 # (a rerun: three or four times the work) says so on stderr and is listed
 # here (front/modules/stdlazy.vl: rerun_note); the summary counts them.
-RERUNS="${VOLE_STD_RERUN_NOTE:-$WORK/reruns}"
+# (0.30.1) This run's own file, always: a file named by the environment
+# is an outer tests/run.sh's (no one else sets it), whose summary would
+# count this run's reruns. Only `1` (the note on stderr, no file) is kept.
+RERUNS="$WORK/reruns"
+[ "${VOLE_STD_RERUN_NOTE:-}" = 1 ] && RERUNS=1
 export VOLE_STD_RERUN_NOTE="$RERUNS"
 # (0.25.2) The skipped checks that say why (a `skip NAME: why` line of a
 # runner below, like the window tests' without a display giving frames):
@@ -1156,13 +1172,19 @@ cpu_count() {
 run_case() {
     file=$1
     dir=$2
+    # (0.30.1: what a skip needed, for its record: requires:WORD)
     if grep -qw clang "$dir/requires" && [ $CC_IS_CLANG -eq 0 ]; then
         echo skip >"$dir/status"
+        echo requires:clang >"$dir/skipwhy"
         return
     fi
     if grep -qw metal "$dir/requires" && [ "$TARGET" != aarch64-macos ]; then
         echo skip >"$dir/status"
+        echo requires:metal >"$dir/skipwhy"
         return
+    fi
+    if grep -qw macos "$dir/requires"; then
+        case "$TARGET" in *-macos) ;; *) echo skip >"$dir/status"; echo requires:macos >"$dir/skipwhy"; return ;; esac
     fi
     if check_case "$file" "$dir"; then
         if [ -s "$dir/xfail" ]; then echo xpass; else echo pass; fi
@@ -1449,12 +1471,22 @@ if [ "$BLESS" = 1 ]; then
 fi
 
 count=0
+: >"$WORK/casetally"
+: >"$WORK/records"
+: >"$WORK/caseskips"
+: >"$WORK/casenames"
 while read -r name file; do
     dir="$WORK/$name"
     category=${name%%_*}
     [ -s "$dir/errors" ] && category=error
     status=fail
     [ -f "$dir/status" ] && read -r status <"$dir/status"
+    # (0.30.1) the cases' own outcomes, apart from the suites' (the
+    # `cases:` line, which the gate's floors read)
+    case "$status" in pass|xfail|skip) echo "$status" ;; *) echo fail ;; esac >>"$WORK/casetally"
+    echo "$name" >>"$WORK/casenames"
+    # (each skipped case by name, with what it requires, for the floors)
+    [ "$status" = skip ] && echo "skip case $name: REQUIRES$(cat "$dir/requires" 2>/dev/null)" >>"$WORK/caseskips"
     if [ "$status" = xpass ]; then
         echo "$category fail" >>"$TALLY"
         echo "XPASS $name: passes but is marked XFAIL ($(cat "$dir/xfail")); remove the directive" >>"$FAILURES"
@@ -1466,21 +1498,27 @@ while read -r name file; do
         echo "$category $status" >>"$TALLY"
         # (0.27.2) VOLE_TEST_XFAIL_WHY=FILE: each XFAIL case's failure,
         # its name, the first line of why and its first error, for a triage
-        if [ "$status" = xfail ] && [ -n "${VOLE_TEST_XFAIL_WHY:-}" ]; then
+        if [ "$status" = xfail ] && [ -n "$XFAIL_WHY_FILE" ]; then
             printf '%s\t%s\t%s\n' "$name" "$(head -1 "$dir/why" 2>/dev/null | tr '\t' ' ')" \
-                "$(grep -m1 'error' "$dir/why" 2>/dev/null | tr '\t' ' ')" >>"$VOLE_TEST_XFAIL_WHY"
+                "$(grep -m1 'error' "$dir/why" 2>/dev/null | tr '\t' ' ')" >>"$XFAIL_WHY_FILE"
         fi
     fi
     # (0.27.2.1) VOLE_TEST_RESULTS=FILE: each case's name, its status
     # (pass, xfail, fail, xpass, skip) and how many borrowck errors its
     # compilation had at std's positions (`<std>:L:C`), one line each: the
     # gate's std-tests and std-check rows read the suite rows' builds of
-    # std's cases from it instead of building them again
-    if [ -n "${VOLE_TEST_RESULTS:-}" ]; then
-        bck=0
-        [ -f "$dir/compile.out" ] && bck=$(grep -c '^<std>:[0-9]*:[0-9]*: error\[borrowck' "$dir/compile.out")
-        echo "$name $status $bck" >>"$VOLE_TEST_RESULTS"
-    fi
+    # std's cases from it instead of building them again. (0.30.1) Each
+    # record also has why a skipped case was skipped (`requires:WORD`, the
+    # REQUIRES that does not hold; `-` for the others) and whether cc is
+    # clang (`cc:clang`, `cc:other`): the gate's floors judge the suite
+    # rows from these records, every case by name, and from nothing else.
+    bck=0
+    [ -f "$dir/compile.out" ] && bck=$(grep -c '^<std>:[0-9]*:[0-9]*: error\[borrowck' "$dir/compile.out")
+    why=-
+    [ "$status" = skip ] && [ -s "$dir/skipwhy" ] && why=$(cat "$dir/skipwhy")
+    record="$name $status $bck $why cc:$([ $CC_IS_CLANG -eq 1 ] && echo clang || echo other)"
+    echo "$record" >>"$WORK/records"
+    [ -z "$RESULTS_FILE" ] || echo "$record" >>"$RESULTS_FILE"
     count=$((count + 1))
 done <"$CASES"
 
@@ -2071,6 +2109,14 @@ awk '
             printf "  (%d skipped, not passed: the SKIP lines above say why)\n", total["skip"]
     }
 ' "$TALLY"
+# (0.30.1) Whether `// REQUIRES: clang` held, for the floors.
+[ $CC_IS_CLANG -eq 1 ] && echo "cc: clang" || echo "cc: not clang"
+# (0.30.1) The cases alone (the table's rows count the suites' checks too),
+# and the names run, as a digest (`names CRC-LENGTH`: cksum of the sorted
+# names, each on its line; the floors compare it with tests/run.sh -l's).
+[ -f "$WORK/casetally" ] && awk -v names="$(sort "$WORK/casenames" 2>/dev/null | cksum | tr ' ' -)" '{ n[$1]++ } END {
+    printf "cases: %d passed, %d xfail, %d failed, %d skipped of %d, names %s\n", n["pass"], n["xfail"], n["fail"], n["skip"], NR, names }' "$WORK/casetally"
+[ -f "$WORK/caseskips" ] && cat "$WORK/caseskips"
 # (0.25.5) The failing cases alone, in the form zsh leaves as it is
 # (`=NAME` is its path expansion; '=NAME' quoted works too).
 if [ -s "$WORK/failed-cases" ]; then

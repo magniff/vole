@@ -87,7 +87,7 @@ trap 'rm -rf "$WORK"' EXIT INT TERM
 map_code() {
     case "$1" in
         E0499) echo mut_twice ;;
-        E0501|E0502) echo conflict ;;  # (E0501: a closure's unique capture, D19.2)
+        E0500|E0501|E0502) echo conflict ;;  # (E0500, E0501: a closure's unique capture, D19.2)
         E0503) echo use_borrowed ;;
         E0506) echo assign_borrowed ;;
         E0505) echo move_borrowed ;;
@@ -95,6 +95,7 @@ map_code() {
         E0515) echo return_local ;;
         E0621|E0623|E0521|lifetime|captured) echo outlives ;;  # (0.27.2: E0521, D20.3; "captured variable cannot escape", D19.10)
         E0106) echo elision ;;
+        E0310) echo param_outlives ;;  # (0.30.1, D4.5: the front's check of a type parameter's 'static)
         E0392) echo unused_param ;;
         E0382) echo use_moved ;;
         E0381) echo assign_moved_part ;;
@@ -110,6 +111,7 @@ map_code() {
         E0596) echo borrow_immutable ;;
         E0510) echo guard_write ;;
         E0796|static_mut) echo static_mut_ref ;;
+        E0793) echo packed_ref ;;  # (0.30.1, D2.10)
         *) echo "?$1" ;;
     esac
 }
@@ -188,6 +190,11 @@ for case_ in "$@"; do
         # (E0308 where an `impl Trait` result's values differ, D21.2)
         if [ "$want" = opaque.mismatch ] && [ "$first" = E0308 ]; then
             gotcode=opaque.mismatch
+        fi
+        # (0.30.1, D4.7: E0308, "one type is more general than the
+        # other", where a function needing a 'static parameter is a value)
+        if [ "$want" = fn_value_static ] && [ "$first" = E0308 ]; then
+            gotcode=fn_value_static
         fi
     fi
     msg=$(awk '/^error/ && !/^error: aborting/ { print; exit }' "$WORK/out" | cut -c1-120)
