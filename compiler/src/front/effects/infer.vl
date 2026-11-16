@@ -225,7 +225,13 @@ pub fn through(e: Effects, kind: i64, add: i64, pcx: &mut Ctx<Comp>) -> Effects 
         }
         allocs = allocs | add;
     }
-    Effects { bits: e.bits & !EFF_UNSAFE, allocs: allocs }
+    // (0.30.2: a callee's raw write is the caller's EFF_RAW_CALLEE, C3.4)
+    let mut bits = e.bits & !EFF_UNSAFE;
+    if (bits & crate::front::effects::EFF_RAW_WRITE) != 0 {
+        bits = (bits & !crate::front::effects::EFF_RAW_WRITE)
+            | crate::front::effects::EFF_RAW_CALLEE;
+    }
+    Effects { bits: bits, allocs: allocs }
 }
 
 // Whether e has the effect (bit, alloc): an EFF_* bit, or with bit 0 the
@@ -1754,6 +1760,82 @@ pub fn holds_mut(t: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
             let vi = pcx.variants[enum_variant(en, v, pcx) as usize];
             for j in 0..vi.field_count {
                 if holds_mut((pcx.tlists[(vi.fields + j) as usize]), depth + 1, pcx) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    true
+}
+
+// RULE: C3.4 (0.30.2) Whether a value of type t may hold a raw pointer,
+// `*const T` or `*mut T` (a NonNull, a Vec's buffer), at any depth, through
+// references too (what a `&H` points to may hold one): a fat raw pointer,
+// an opaque type or a type not known, yes. A fn pointer holds none (what it
+// calls is its own callee). Yes beyond a depth of 16.
+pub fn holds_raw(t: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if t <= 0 || depth > 16 || crate::front::opaque::is_opaque(t, pcx) {
+        return true;
+    }
+    let u = undistinct(t, pcx);
+    if u <= 0 {
+        return true;
+    }
+    let k = pcx.types[u as usize].kind;
+    if k == TyKind::Prim || k == TyKind::Fn {
+        return false;
+    }
+    if k == TyKind::Ptr {
+        if pcx.types[u as usize].b == 0 {
+            return true;
+        }
+        return holds_raw(pcx.types[u as usize].a, depth + 1, pcx);
+    }
+    if k == TyKind::Slice {
+        if is_raw_view(u, pcx) {
+            return true;
+        }
+        return holds_raw(pcx.types[u as usize].a, depth + 1, pcx);
+    }
+    if k == TyKind::Array || k == TyKind::Vector {
+        return holds_raw(pcx.types[u as usize].a, depth + 1, pcx);
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[u as usize].count {
+            if holds_raw(type_elem(u, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == TyKind::Struct {
+        let st = pcx.types[u as usize].a;
+        for i in 0..pcx.structs[st as usize].field_count {
+            if holds_raw((struct_field(st, i, pcx)).ty, depth + 1, pcx) {
+                return true;
+            }
+        }
+        for i in 0..pcx.structs[st as usize].targ_count {
+            if holds_raw((pcx.tlists[(pcx.structs[st as usize].targs + i) as usize]), depth + 1,
+                pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == TyKind::Enum {
+        let en = pcx.types[u as usize].a;
+        for i in 0..(pcx.enums[en as usize]).targ_count {
+            if holds_raw((pcx.tlists[((pcx.enums[en as usize]).targs + i) as usize]), depth + 1,
+                pcx) {
+                return true;
+            }
+        }
+        for v in 0..(pcx.enums[en as usize]).variant_count {
+            let vi = pcx.variants[enum_variant(en, v, pcx) as usize];
+            for j in 0..vi.field_count {
+                if holds_raw((pcx.tlists[(vi.fields + j) as usize]), depth + 1, pcx) {
                     return true;
                 }
             }
@@ -3544,7 +3626,7 @@ fn signature_of(m: i64, pcx: &mut Ctx<Comp>) {
         d.allocs = if d.allocs < 0 { i.allocs } else { d.allocs & i.allocs };
     }
     let hidden = EFF_RAW_PANIC | EFF_RAW_DIVERGE | EFF_RAW_GLOBAL | EFF_INTERIOR | EFF_UNSAFE
-        | EFF_ADDR | crate::front::effects::EFF_RAW_WRITE;
+        | EFF_ADDR | crate::front::effects::EFF_RAW_WRITE | crate::front::effects::EFF_RAW_CALLEE;
     let debt = if std { i.bits & (EFF_TLS | EFF_THREAD | EFF_SYNC) } else { 0 };
     if track {
         // (a list allows a cell's write, set_bound: that is no write of
@@ -3557,7 +3639,8 @@ fn signature_of(m: i64, pcx: &mut Ctx<Comp>) {
         // signature, or E3.3c's callers lost them: spawn_in's thread)
         fixed.bits |= debt;
         // (0.30.2: and a raw write's, as a cell's, RT-38g)
-        let writes = EFF_INTERIOR | crate::front::effects::EFF_RAW_WRITE;
+        let writes = EFF_INTERIOR | crate::front::effects::EFF_RAW_WRITE
+            | crate::front::effects::EFF_RAW_CALLEE;
         fixed.bits = (fixed.bits & !writes) | ((i.bits | pf.bits) & writes);
         (pcx.fx_fixed[m as usize]) = fixed;
         (pcx.fx_dyn[m as usize]) = pd;

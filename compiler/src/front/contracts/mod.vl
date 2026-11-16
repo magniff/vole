@@ -118,12 +118,37 @@ pub fn check_contracts(pcx: &mut Ctx<Comp>) {
         if kind != CHK_REQUIRES && kind != CHK_ENSURES && kind != CHK_INVARIANT {
             continue;
         }
+        let raw_in = i >= pcx.check_call_fns.len() as i64
+            || raw_inputs(pcx.check_call_fns[i as usize], pcx);
         if pcx.fn_effects_count != 0
-            && (impure(child(call, 0, pcx), check, pcx)
-                || impure_whole(child(call, 0, pcx), check, pcx)) {
+            && (impure(child(call, 0, pcx), check, raw_in, pcx)
+                || impure_whole(child(call, 0, pcx), check, raw_in, pcx)) {
             seen.push(check);
         }
     }
+}
+
+// RULE: C3.4 (0.30.2) Whether a raw pointer may reach a callee of a clause
+// in function g from what the clause reads: a parameter's or the result's
+// type may hold one (effects/infer.vl holds_raw; g not known: yes). A
+// callee's raw write (EFF_RAW_CALLEE) is refused then, a raw write the
+// clause's own code makes always (EFF_RAW_WRITE). Else a callee's raw write
+// reaches only what the clause made or what a `&mut` the clause lent
+// covers, which the views keep to what the clause made (std's `take`,
+// `swap`, `sort` on a local; Rust's aliasing rules: a pointer made of a
+// `&T` is never written through outside an UnsafeCell, EFF_INTERIOR).
+fn raw_inputs(g: i64, pcx: &Ctx<Comp>) -> bool {
+    if g < 0 || g >= pcx.fns.len() as i64 {
+        return true;
+    }
+    for i in 0..pcx.fns[g as usize].param_count {
+        if crate::front::effects::infer::holds_raw(crate::front::types::fn_param(g, i, pcx), 0,
+            pcx) {
+            return true;
+        }
+    }
+    let r = pcx.fns[g as usize].ret;
+    r > 0 && crate::front::effects::infer::holds_raw(r, 0, pcx)
 }
 
 // (0.27.1) contract.old (ensures_values, with C5's rule in the rust
@@ -224,7 +249,7 @@ fn ensures_values(n: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
 
 // Whether the condition at n (of check `check`) does io, allocates or
 // touches a static; reported once.
-fn impure(n: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
+fn impure(n: i64, check: i64, raw_in: bool, pcx: &mut Ctx<Comp>) -> bool {
     if n <= 0 {
         return false;
     }
@@ -246,26 +271,32 @@ fn impure(n: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
         if (e.bits & EFF_UNKNOWN) != 0 {
             return false;
         }
-        let bad = impure_bit(e);
+        // (0.30.2: the callee's own raw write is a callee's, C3.4)
+        let mut e = e;
+        if (e.bits & crate::front::effects::EFF_RAW_WRITE) != 0 {
+            e.bits = (e.bits & !crate::front::effects::EFF_RAW_WRITE)
+                | crate::front::effects::EFF_RAW_CALLEE;
+        }
+        let bad = impure_bit(e, raw_in);
         if bad != 0 && f != pcx.check_fn {
             effect_error(n, check, f, bad, pcx);
             return true;
         }
     }
     for k in 0..3 {
-        if impure(subtree(n, k, pcx), check, pcx) {
+        if impure(subtree(n, k, pcx), check, raw_in, pcx) {
             return true;
         }
     }
     for i in 0..pcx.nodes[n as usize].count {
-        if impure(child(n, i, pcx), check, pcx) {
+        if impure(child(n, i, pcx), check, raw_in, pcx) {
             return true;
         }
     }
     // (0.25) A call through a fn value: what the functions it may
     // call do.
     if kind == NodeKind::Call && pcx.nodes[n as usize].x <= 0 {
-        let bad = impure_bit(expr_effects(n, pcx));
+        let bad = impure_bit(expr_effects(n, pcx), raw_in);
         if bad != 0 && (bad != -4 || error_count(pcx) == 0) {
             effect_error(n, check, -3, bad, pcx);
             return true;
@@ -277,8 +308,8 @@ fn impure(n: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
 // (0.25) Whether condition n does io, allocates or touches a static by any
 // other way than impure finds (all that the effect inference sees of it);
 // reported at the condition.
-fn impure_whole(n: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
-    let bad = impure_bit(expr_effects(n, pcx));
+fn impure_whole(n: i64, check: i64, raw_in: bool, pcx: &mut Ctx<Comp>) -> bool {
+    let bad = impure_bit(expr_effects(n, pcx), raw_in);
     if bad == 0 || bad == -4 {
         return false;
     }
@@ -288,7 +319,7 @@ fn impure_whole(n: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
 
 // (0.25) What makes effects e impure in a condition: -4 unknown
 // (conservatively), -2 alloc, EFF_IO, EFF_GLOBAL, or 0.
-fn impure_bit(e: Effects) -> i64 {
+fn impure_bit(e: Effects, raw_in: bool) -> i64 {
     if (e.bits & EFF_UNKNOWN) != 0 {
         return -4;
     }
@@ -307,9 +338,13 @@ fn impure_bit(e: Effects) -> i64 {
         return crate::front::effects::EFF_INTERIOR;
     }
     // RULE: C3.4 (0.30.2, RT-38g: a write through a raw pointer, which the
-    // views cannot keep from writing what the clause did not make)
-    if (e.bits & crate::front::effects::EFF_RAW_WRITE) != 0 { crate::front::effects::EFF_RAW_WRITE }
-    else { 0 }
+    // views cannot keep from writing what the clause did not make: the
+    // clause's own, or a callee's that a raw pointer may reach, raw_inputs)
+    let callee = (e.bits & crate::front::effects::EFF_RAW_CALLEE) != 0;
+    if (e.bits & crate::front::effects::EFF_RAW_WRITE) != 0
+        || callee && raw_in {
+        crate::front::effects::EFF_RAW_WRITE
+    } else { 0 }
 }
 
 // contract.effect at node n, a call of f (-1: a static read; -3: a call

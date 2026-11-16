@@ -64,7 +64,8 @@ Vole adds two things to a signature, both checked.
   `requires` stops at its own line with the message, exit 101 (`guide
   contracts`). A clause writes nothing it did not make: it reads the
   parameters and `result` as through `&`, whatever their types are
-  written as, and writes through no raw pointer or cell (0.30.2).
+  written as, and writes through no cell, nor a raw pointer that may
+  point to what it did not make (0.30.2).
 
 ```vole
 fn half(x: i64) -> i64
