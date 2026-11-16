@@ -130,7 +130,7 @@ A correctness release, its branches merged as each is reviewed clean.
   `type.ambiguous` (rustc E0221); 0.30.1 took the first bound's.
 - `<S as Tr>::f(args)` calls Tr's function with its arguments as
   written, with no autoref (rustc's); `<S as B>::m` where B declares no
-  `m` is `name.unknown` (E0576), and one where S has no impl of B is
+  `m` is `trait.no_item` (E0576), and one where S has no impl of B is
   `trait.unmet` (E0277).
 
 ### What's new in 0.30.1
