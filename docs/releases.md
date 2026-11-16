@@ -509,10 +509,13 @@ that keeps few values live is unlikely to make such moves.
   `--version`, `explain` or `guide`), so that it is there before a deep
   expression overflows that stack. A volec a command starts (try's,
   test's, probe's checks and builds: `VOLEC_NESTED`) never says it, so
-  the warning cannot reach output a parent reads (try's answer); when
-  only such a child falls back it is not reported, and a child that
-  then overflows still fails visibly, as a crashed child (a lazy std's
-  build made again says it only when the first run did not). A program volec runs (`run`,
+  the warning cannot reach output a parent reads (try's answer). A
+  lazy std's build made again and `check --changed`'s checks are not
+  nested: under a fallback the warning may be said twice, or once a
+  checked program. Known issue, as in 0.30.1's base (RT-45): when only
+  such a child falls back it is not reported, and if it then overflows
+  the command fails without saying why (`try` exits 1, `test` and
+  `probe` report a build that failed). A program volec runs (`run`,
   `test`, `test --input`, `probe`, `try`, `reduce --until`'s command)
   no longer gets the variables volec sets for itself (`VOLEC_NESTED`,
   `VOLEC_EDIT_TAG`; `volec guide tools`): it

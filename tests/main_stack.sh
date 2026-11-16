@@ -63,22 +63,24 @@ fn main() {
     let x: u64 = "s";
 }
 VL
-# (each: the shim's mode, the exit status wanted, the command line)
-while read -r mode want args; do
+# (each: the shim's mode, the exit status wanted, the warnings wanted,
+# the command line; a build with errors is made again with std whole,
+# not nested, and says it a second time: stdlazy::rerun_eager)
+while read -r mode want nw args; do
     # shellcheck disable=SC2086
     SHIM_MODE=$mode DYLD_INSERT_LIBRARIES="$T/shim.dylib" VOLE_CACHE=off "$C" $args \
         > "$T/o" 2> "$T/e"
     s=$?
     n=$(cat "$T/o" "$T/e" | grep -c "$W")
-    if [ $s -ne "$want" ] || [ "$n" -ne 1 ]; then
-        echo "main-stack: FAIL: SHIM_MODE=$mode volec $args: exit $s ($want wanted), the warning $n times (1 wanted):"
+    if [ $s -ne "$want" ] || [ "$n" -ne "$nw" ]; then
+        echo "main-stack: FAIL: SHIM_MODE=$mode volec $args: exit $s ($want wanted), the warning $n times ($nw wanted):"
         cat "$T/o" "$T/e"; bad=1
     fi
 done <<LINES
-nosize 0 check $T/ok.vl
-nobig 0 check $T/ok.vl
-nobig 1 $T/bad.vl -o $T/bad
-nosize 0 -O2 -j 4 $T/ok.vl -o $T/ok4
+nosize 0 1 check $T/ok.vl
+nobig 0 1 check $T/ok.vl
+nobig 1 2 $T/bad.vl -o $T/bad
+nosize 0 1 -O2 -j 4 $T/ok.vl -o $T/ok4
 LINES
 if [ ! -x "$T/ok4" ] || [ "$("$T/ok4")" != 3 ]; then
     echo "main-stack: FAIL: the -j 4 build on no worker's stack did not run"; bad=1
@@ -161,7 +163,7 @@ nobig 1 probe t.vl:5 f()
 nosize 1 test t.vl
 nosize 1 try 1+2
 nosize 1 probe t.vl:5 f()
-nosize 1 bad.vl -o bad
+nosize 2 bad.vl -o bad
 childnobig 0 try 1+2
 childnobig 0 --json try 1+2
 childnobig 0 test t.vl
