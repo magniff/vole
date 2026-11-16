@@ -374,12 +374,36 @@ Where the code differs from §3:
   Neither occurs in the suite or in our own code: coherence leaves one
   impl per reference, and the front's own search meets the depth limit
   first (it then says the trait is not implemented).
-- **Not yet through `select`:** the front's method dispatch in an
-  instance (`convert::dispatch`, `has_generic_trait_fn`): `t.up()`
-  through `T: Sub` with `trait Sub: Sup<i32>`, for a type with impls of
-  Sup<i32> and Sup<i64>, is refused as ambiguous (rustc takes the bound's
-  impl); the projections' impls (`direct_impl`, `proj_walk`, M4) and the
-  impl-level checks of `impl_regions` (M5).
+- **Not yet through `select`** (each decides an impl for a type and a
+  trait, or a name, by its own rule; each is a form of the bug until it
+  asks `select`):
+  - the places' projections, `proj_walk`, `direct_impl`, `proj_again`,
+    `proj_bound` (`places/regions.vl`), and `param_proj` through the
+    front's `found_impl`: `T::Out` under `T: Tr<i64>` is read from the
+    first impl for the type that defines a type named `Out`, of any trait
+    and any trait arguments. With `Tr<i32>`'s `Out = &'static str` beside
+    `Tr<i64>`'s `Out = &'a str`, a short borrow is returned as
+    `'static`, accepted in v0.30.1 and here (rustc E0597): M4;
+  - the front's associated types and constants (`assoc::find_assoc`,
+    `assoc_value_with`, `assoc_const_value`, `declared_for`): M4;
+  - the front's calls of a generic trait's functions in an instance
+    (`convert::dispatch`, `has_generic_trait_fn`, `one_generic_trait_fn`,
+    `covers_member`, `place_takes`, `template_trait_call`): `T::mk()`
+    under `T: Tr<i64>` for a type with Tr<i32> and Tr<i64> is refused as
+    ambiguous (rustc takes the bound's); RT-52, a method on `&W` through
+    impls for `&'a W<'b>`, is not found. Not in §8's milestones: it
+    belongs with M3 (the env's `Param` candidates name the bound's impl);
+  - `impl_regions::super_impls` and `check_super_predicates`: M5;
+  - `auto_traits::vouched`, `alloc_rules::struct_implements`,
+    `kinds::has_drop_impl`, `checkalloc::of_allocator_type`,
+    `borrowck::diag::overloaded_call`, `effects::check::effects_declared`:
+    traits without arguments, one impl per type by coherence; M6 routes
+    them;
+  - coherence (`check_overlap`, `could_hold`, `entails`) decides whether
+    two impls can meet, not which one does: it stays its own.
+- **The depth limit** (`MAX_ASSOC_DEPTH`, 32) is the front's: a chain of
+  40 nested impls is refused as "not implemented" (RT-53; rustc's limit is
+  128). `select` says SEL_LIMIT there; the front's message does not yet.
 
 M1's cases: `tests/run/rt_c301_015_*` (review 5's m01, m03, m04, m13),
 `tests/run/rust_o_m1_*` (the A4 forms m05, m10, m11; trait arguments
