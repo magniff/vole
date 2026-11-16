@@ -1,0 +1,84 @@
+// XFAIL: RT-83: a frame larger than the guard page is entered without probing: safe code in one thread writes into another thread's live stack (0.30.2)
+// Thread t1 (2 MiB stack) holds a 480 KB local array, `canary`, and waits.
+// Thread t2 (128 KiB stack) calls jump(false): jump's frame holds a
+// 240 KB array (in the branch not taken), so its sp moves past t2's
+// stack and its 16 KiB guard page, which is never touched, into t1's
+// stack, mapped just below. fill(), called from there, writes its own
+// locals (and total's frame, its saved registers) into t1's canary. No
+// unsafe anywhere. vole: exit 0 and `t1: canary sum before 46620000,
+// after 16612955601` (-O0; 10515761786 at -O2): t1's stack corrupted.
+// rustc probes every page of a large frame (`sub sp; str xzr, [sp]`
+// loop), so the guard page is hit first: `thread '<unnamed>' has
+// overflowed its stack`, SIGABRT. The fix (a probe loop for a frame
+// over the page size, aarch64 and x86-64) makes t2 die on its guard
+// page: SIGBUS on macOS, exit 138, as trace_thread_stack_overflow.vl's
+// thread does, before t1 prints anything.
+// REQUIRES: macos
+// EXIT: 138
+use std::thread;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+static STAGE: AtomicI64 = AtomicI64::new(0);
+
+#[inline(never)]
+fn total(a: &[i64]) -> i64 {
+    let mut t = 0;
+    for x in a {
+        t += *x;
+    }
+    t
+}
+
+// Writes 1 into a local array of 64 elements: its own frame, in safe code.
+#[inline(never)]
+fn fill() -> i64 {
+    let mut a = [0i64; 64];
+    for i in 0..64 {
+        a[i] = 1;
+    }
+    total(&a)
+}
+
+// A frame larger than the guard page: the branch that uses it is not taken.
+#[inline(never)]
+fn jump(big: bool) -> i64 {
+    if big {
+        let b = [3i64; 30000];
+        return total(&b);
+    }
+    fill()
+}
+
+#[inline(never)]
+fn wait() {
+    STAGE.store(1, Ordering::SeqCst);
+    while STAGE.load(Ordering::SeqCst) < 2 {
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[inline(never)]
+fn hold() -> i64 {
+    let canary = [777i64; 60000];
+    let before = total(&canary);
+    wait();
+    let after = total(&canary);
+    println("t1: canary sum before {before}, after {after}");
+    0
+}
+
+fn main(gpa: Gpa) {
+    let h1 = thread::Builder::new().stack_size(2097152).spawn_in(move || hold(), gpa).unwrap();
+    while STAGE.load(Ordering::SeqCst) < 1 {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let h2 = thread::Builder::new()
+        .stack_size(131072)
+        .spawn_in(move || jump(STAGE.load(Ordering::SeqCst) > 5), gpa)
+        .unwrap();
+    let r2 = h2.join().unwrap();
+    println("t2: {r2}");
+    STAGE.store(2, Ordering::SeqCst);
+    h1.join().unwrap();
+}
