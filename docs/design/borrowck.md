@@ -2671,6 +2671,18 @@ decided by where `'a` and `'v` are:
    universals of `F`'s substitution), and D19.5's call rule includes
    them in the callee's order.
 
+(0.30.2, RT-44) The closures a body made while the bodies are built
+(the `drop` instance of a generic Drop impl, made where a value of its
+type is dropped, places/shim.vl drop_fn, with what it calls: a generic
+function, a trait's default method, a generic trait's impl method, a
+const's initializer) get D19.1-D19.6 as every closure does, and their
+bodies are built before the bodies that make them, innermost first:
+`places/mod.vl: place_late_closures`, after every body run_places
+builds. Before, they had no `X_C` (a closure's signature indexed
+`CSLOTS` past its type's slots: a compiler panic) and no D19.2 (a
+capture its body moved stayed a borrow: a double drop). Cases
+`rt_044_*`.
+
 *Soundness.* No position of `slots(Env(C))` is contravariant (a `fn`
 type has no slot, R6); `X_C`'s have `fn` variance. Every later value
 of type `C` is reached from the aggregate's destination by `sub` with

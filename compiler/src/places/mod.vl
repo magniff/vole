@@ -176,29 +176,36 @@ pub fn run_places(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
     crate::places::impl_regions::check_impl_regions(pcx);
     // (0.27.2: every closure's kind and env type, before the bodies:
     // D19.2-D19.4, front/closures/kinds.vl)
-    let failed = crate::front::closures::kinds::infer_kinds(pbody, pcx);
+    // (0.30.2: the closures made while it builds bodies are after `done`,
+    // place_late_closures')
+    let mut done = pcx.closures.len() as i64;
+    let failed = crate::front::closures::kinds::infer_kinds(0, pbody, pcx);
     // RULE: D19.6 (0.30.1) a closure that does not meet its bound
     // (closure.kind, rustc E0525) is the error: the bodies that would be
     // borrow-checked with a kind it does not have are not
     // (kind_failed_bodies); the others are
-    let skip = kind_failed_bodies(&failed, pcx);
-    let skipped = |g: i64| g >= 0 && g < skip.len() as i64 && skip[g as usize];
+    let mut skip = kind_failed_bodies(&failed, pcx);
     // (FN_COUNT grows: a `Drop::drop` instance a drop needs is made here,
     // shim.vl: drop_fn, and built in turn; 0.26.2: a std `drop` that
     // nothing called, checked only now, is built before the functions
-    // after the one that needs it, shim.vl late_drop)
+    // after the one that needs it, shim.vl late_drop; 0.30.2: the
+    // closures such an instance makes, place_late_closures)
     // RULE: D19.10 (a closure body is solved before the body that makes it:
     // its requirements are that body's constraints; nested ones innermost
     // first, by their order of creation reversed)
     let mut first = Vec::<i64, Comp>::new_in(Comp {});
-    let mut id = pcx.closures.len() as i64 - 1;
+    let early = done;
+    // (those infer_kinds' own building made)
+    place_late_closures(&mut done, &mut skip, &mut first, out, &mut bck, pbody, pcx);
+    let mut id = early - 1;
     while id >= 0 {
         let g = pcx.closures[id as usize].f;
         if (pcx.closures[id as usize].xc_at > 0 || pcx.closures[id as usize].kind != 0)
-            && !skipped(g) {
+            && !skipped(&skip, g) && !first.contains(&g) {
             pcx.next_fn = g + 1;
             place_body(g, out, &mut bck, pbody, pcx);
             first.push(g);
+            place_late_closures(&mut done, &mut skip, &mut first, out, &mut bck, pbody, pcx);
         }
         id -= 1;
     }
@@ -210,11 +217,12 @@ pub fn run_places(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
             late += 1;
         } else {
             pcx.next_fn = f + 1;
-            if !first.contains(&f) && !skipped(f) {
+            if !first.contains(&f) && !skipped(&skip, f) {
                 place_body(f, out, &mut bck, pbody, pcx);
             }
             f += 1;
         }
+        place_late_closures(&mut done, &mut skip, &mut first, out, &mut bck, pbody, pcx);
     }
     // RULE: D4.4 (e) (0.27.6: the concrete instances' errors held, every
     // opaque instance solved)
@@ -319,6 +327,61 @@ fn kind_failed_bodies(failed: &Vec<i64, Comp>, pcx: &Ctx<Comp>) -> Vec<bool, Com
         }
     }
     skip
+}
+
+// Whether function g's body is left out (SKIP, kind_failed_bodies).
+fn skipped(skip: &Vec<bool, Comp>, g: i64) -> bool {
+    g >= 0 && g < skip.len() as i64 && skip[g as usize]
+}
+
+// RULE: D19.1, D19.10 (0.30.2, RT-44) The closures made since closure
+// `done` while bodies were built: a body that drops a value whose type
+// has a generic Drop impl makes that impl's `drop` instance and checks it
+// then (shim.vl drop_fn, check_late), with what it calls (a generic
+// function, a trait's default method, a generic trait's impl method, a
+// const's initializer), so their closures are made after run_places'
+// infer_kinds. Each gets what infer_kinds gives every closure before any
+// body: its X_C slots (closure_sig indexes CSLOTS, made from its type's
+// slot count, at the env's count plus an X_C position), its kind, its
+// by-value captures, its env parameter's type; its body is then built
+// before the body that makes it (D19.10), innermost first, and a closure
+// that does not meet its bound leaves its bodies out (D19.6), as at the
+// start. Before, such a closure had none of it: `thread::scope(|s| ..)`
+// in a generic Drop impl indexed CSLOTS past a type without the X_C
+// slots (a compiler panic), and a capture its body moved stayed a borrow
+// (the value dropped twice). run_places calls it after every body.
+fn place_late_closures(done: &mut i64, skip: &mut Vec<bool, Comp>, first: &mut Vec<i64, Comp>,
+    out: i64, bck: &mut crate::places::borrowck::Bck<Comp>, pbody: &mut Body<Comp>,
+    pcx: &mut Ctx<Comp>) {
+    while *done < pcx.closures.len() as i64 {
+        let from = *done;
+        let to = pcx.closures.len() as i64;
+        *done = to;
+        let failed = crate::front::closures::kinds::infer_kinds(from, pbody, pcx);
+        let more = kind_failed_bodies(&failed, pcx);
+        for g in 0..more.len() {
+            if g >= skip.len() {
+                skip.push(false);
+            }
+            if more[g] {
+                skip[g] = true;
+            }
+        }
+        // (the run's place: what check_late counts as built already)
+        let next = pcx.next_fn;
+        let mut id = to - 1;
+        while id >= from {
+            let g = pcx.closures[id as usize].f;
+            if (pcx.closures[id as usize].xc_at > 0 || pcx.closures[id as usize].kind != 0)
+                && !skipped(skip, g) && !first.contains(&g) {
+                pcx.next_fn = g + 1;
+                place_body(g, out, bck, pbody, pcx);
+                first.push(g);
+            }
+            id -= 1;
+        }
+        pcx.next_fn = next;
+    }
 }
 
 // RULE: Z7.2 (0.27.4) Whether f's body, std's and not an instance, is
