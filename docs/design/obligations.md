@@ -475,4 +475,9 @@ levels down, impls told apart only by a region or `&'a T` beside
 shadowed parameter, through a `where`, declared after its bound, a
 default, a parameter as the argument, a supertrait's arguments, a
 generic supertrait's) and `rust_o_m1_impl_*self*` (an impl's bound
-naming `Self`, s01, s05, s06); the guards', `tests/refactor/oblig0302.t`.
+naming `Self`, s01, s05, s06), `rust_o_m1_param_impl_*` (an impl's
+parameter beside a struct of its name, f34), `rust_o_m1_param_checked_*`
+(a Drop impl, a method and a `where` whose Self type's declaration bounds
+one parameter by another: each now checked as a template, where 0.30.1
+warned `generic.unchecked`; the Ωs get their home before the Self type
+is read, `set_home_self`); the guards', `tests/refactor/oblig0302.t`.
