@@ -118,8 +118,25 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   Bound> Tr<U> for W` is no impl of `Tr<B>` when B is no Bound, refused
   at the bound that needs it, rustc E0277). A reference two impls prove
   where an instance needs it is error `trait.ambiguous` (rustc E0283),
-  and a chain of impls deeper than the limit `trait.overflow` (E0275):
-  neither is a yes.
+  and a chain of impls deeper than the limit `trait.overflow` (E0275),
+  which the front reports too where a bound's search met the limit:
+  neither is a yes, and the limit is no "not implemented".
+- **A generic function's own bounds prove only what they say** (the
+  Param candidate of the same selection, RT-96). Inside a generic body,
+  `T: Tr<U>` (U a parameter) proved `T: Tr<i32>`, a supertrait `trait
+  Sub: Tr<i64>` proved Tr<i32>, a bound `T: Tr` of `trait Tr<U = i64>`
+  proved Tr with any arguments, and a bound's argument `P` naming the
+  function's parameter was read as a `struct P` of the module of the same
+  name: each accepted where rustc says E0277, and with an impl that needs
+  `'a: 'static` for Tr<i32>, a short borrow returned as `'static` (the
+  region checker's requiring every candidate impl's predicates had
+  refused those, at the price of RT-C301-15). A parameter's bounds and
+  `where` clauses are now read whole where they are written, the
+  defaults filled in and each supertrait's arguments substituted, and a
+  reference is proved by one of them exactly; one whose arguments do not
+  resolve proves nothing. An impl's bound naming `Self` (`impl<U:
+  Conv<Self>> Tr<U> for W`) is read with Self the impl's type, wherever
+  it is asked from.
 
 ### What's new in 0.30.1
 
