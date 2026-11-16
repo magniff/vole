@@ -56,7 +56,7 @@
 #                    fuzz-sem runs every mode of the fuzzer) and exit;
 #                    ROWS (0.30, comma-separated) only those rows: modes,
 #                    at-once, lock, stale-lock, no-docker, lost-slot,
-#                    waiting, hung, fuzz-sem (`--self-test list` names
+#                    waiting, hung, nested, fuzz-sem (`--self-test list` names
 #                    them). First it removes what failed self-tests left
 #                    (bootstrap/selftest-prune.sh: their directories in
 #                    $TMPDIR, a day old, and nothing else)
@@ -336,7 +336,7 @@ INSIDE_SMOKE_STEPS="smoke-runner smoke-lsp smoke-examples smoke-cases smoke-walk
 # (steps only --only names: valgrind runs in the linux-aarch64 container)
 OTHER_STEPS="valgrind $INSIDE_SMOKE_STEPS"
 # (the self-test's steps, only for it)
-[ -z "${VOLE_GATE_SELFTEST:-}" ] || OTHER_STEPS="$OTHER_STEPS selftest-sleep selftest-leak selftest-slow selftest-hog selftest-wait selftest-hang"
+[ -z "${VOLE_GATE_SELFTEST:-}" ] || OTHER_STEPS="$OTHER_STEPS selftest-sleep selftest-leak selftest-slow selftest-hog selftest-wait selftest-hang selftest-nest"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
     quick)
@@ -414,6 +414,7 @@ is_heavy() { # <step>
 # tests/incremental.sh, tests/compiler_memcheck.sh, tests/valgrind.sh).
 is_runner() { # <step>
     case "$1" in
+        selftest-nest) return 1 ;;
         suite-*|stress-grow|fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental|compiler-memcheck|examples-checkalloc|std-tests|valgrind|smoke-*|selftest-*) return 0 ;;
     esac
     return 1
@@ -433,7 +434,7 @@ held_slots() { # <step>
         case "$1" in
             suite-*|stress-grow|e18-loans) hs=2 ;;
             cachediff|std-check) hs=4 ;;
-            chain-diverse|chain-fresh) hs=$JOBS ;;
+            chain-diverse|chain-fresh|selftest-nest) hs=$JOBS ;;
             layout|debug|unsafe-audit|borrowck-twin|stdtools|voltty-fuzz|compile-cost|main-stack) hs=1 ;;
         esac
     fi
@@ -477,7 +478,7 @@ fi
 # with a lock and run directories of their own.
 # (0.30) --self-test ROWS: the rows by these names (ST_ALL), each a few
 # checks; `list` prints them.
-ST_ALL="modes at-once lock stale-lock no-docker lost-slot waiting hung fuzz-sem"
+ST_ALL="modes at-once lock stale-lock no-docker lost-slot waiting hung nested fuzz-sem"
 self_test() {
     if [ "$ST_ROWS" = list ]; then
         printf '%s\n' $ST_ALL
@@ -635,6 +636,19 @@ self_test() {
         st_row "a hung job's step is stopped" pass
     else
         st_row "a hung job's step is stopped" "FAIL (exit $rc): $(grep -E 'selftest|stalled' "$st/hang.out" | tr '\n' ' ')"
+    fi
+    fi
+    # (0.30.1) A step that is no runner and holds every slot, whose own
+    # job takes a slot: it takes one of the step's, and the step passes
+    # (it waited for the gate's, all held by the step, and was stopped
+    # as stalled: chain-fresh's suite of the last release).
+    if st_on nested; then
+    VOLE_GATE_STALL=4 g -j 1 --only selftest-nest >"$st/nest.out" 2>&1
+    rc=$?
+    if [ $rc -eq 0 ] && grep -q 'selftest-nest .*pass' "$st/nest.out"; then
+        st_row "a step's own job runs" pass
+    else
+        st_row "a step's own job runs" "FAIL (exit $rc): $(grep -E 'selftest|stalled' "$st/nest.out" | tr '\n' ' ')"
     fi
     fi
     # (0.30) fuzz-sem runs the fuzzer once in each of its modes: the
@@ -1125,6 +1139,14 @@ run_step() {
             read -r _ <&3
             echo "selftest: took the slot, and wait for another"
             read -r _ <&3 ;;
+        # (0.30.1) a step that is no runner and holds the one slot starts a
+        # runner's job: it takes its slot from the pool the step's slot
+        # makes (it waited for the gate's, which the step held)
+        selftest-nest)
+            exec 3<>"$VOLE_JOBSERVER"
+            read -r _ <&3
+            echo "selftest: a slot for the step's own job"
+            echo >&3 ;;
         selftest-slow)
             e=$(( $(date +%s) + 7 ))
             while [ "$(date +%s)" -lt $e ]; do awk 'BEGIN { while (i < 2e6) i++ }'; done
@@ -1205,6 +1227,24 @@ start() { # <step>
                 echo $held >"$RUN/$1.held.new" && mv "$RUN/$1.held.new" "$RUN/$1.held"
                 [ -z "${VOLE_GATE_STUB:-}" ] || echo "+ $1 held" >>"$RUN/stub.events"
             done
+            # (0.30.1) What a step that is no runner starts takes its slots
+            # from the ones the step holds, a pool of its own, never from
+            # the gate's: those are all taken when the step holds all of
+            # them, so a runner it starts (chain-fresh's suite of the last
+            # release, when the bytes differ) waited for a slot that its
+            # own step held, and the gate stopped it as stalled.
+            if ! is_runner "$1"; then
+                rm -f "$RUN/$1.jobs"
+                mkfifo "$RUN/$1.jobs"
+                exec 8<>"$RUN/$1.jobs"
+                i=0
+                while [ $i -lt "$held" ]; do
+                    echo >&8
+                    i=$((i + 1))
+                done
+                VOLE_JOBSERVER="$RUN/$1.jobs"
+                export VOLE_JOBSERVER
+            fi
         fi
         s=$(now)
         run_step "$1" </dev/null >"$RUN/$1.log" 2>&1

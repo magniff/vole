@@ -545,6 +545,14 @@ names its kind (`closure.kind`, `borrowck.move_out`, `type error`).
   `check_unsafe_add_isize`, `ovf_o0_ptr_add_count`).
 - `--trace`'s stacks for its handler, freed with their threads:
   `trace_thread_altstack_freed`.
+- What the gate found in its own runs. A tests/run.sh that another
+  starts (the runner suite's, on a compiler that fails on purpose) no
+  longer writes its records into its caller's: they had failed the
+  suite rows, a case with two records (`runner_caller_files_not_inherited`).
+  A gate step that is no runner gives what it starts the slots it holds,
+  a pool of its own: chain-fresh holds every slot, and the suite it runs
+  when a release's bytes differ waited for one of the gate's, stopped
+  as stalled (`gate.sh --self-test nested`).
 
 #### Known issues
 
