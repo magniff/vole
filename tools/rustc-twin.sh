@@ -157,6 +157,9 @@ def overflow_checks(src):
 VOLE_ONLY_ERROR = re.compile(r"error\[effect[\w.]*\]|' is #\[(effects\([^)]*\)|pure|no_alloc|no_io|no_panic)\], but ")
 
 
+OPT1_ONLY = []  # (cases whose rustc -O1 build alone differs)
+
+
 def run(prog):
     name, src, want, wexit, stdin, args, merged = prog
     m = re.search(r"^\s*// RUSTC-DIFFERS:\s*(.*)$", src, re.M)
@@ -177,40 +180,59 @@ def run(prog):
     if any(VOLE_ONLY_ERROR.search(e) for e in re.findall(r"^\s*// ERROR:\s*(.*)$", src, re.M)):
         return name, "outside", "vole-only error: an effect declaration's"
     exe = os.path.join(d, "main")
-    # (Rust's overflow checks where vole's are: a case built at -O0)
-    bad = rustc_build(RUSTC, os.path.join(d, "main.rs"), exe, rust_edition(src),
-                      overflow=overflow_checks(src), alloc_api=ALLOC)
+
+    def at_level(opt):
+        """(error, diff): rustc's first error line, or what its build at
+        opt-level OPT prints differently from the case ("" when it agrees)."""
+        w = want
+        # (Rust's overflow checks where vole's are: a case built at -O0)
+        bad = rustc_build(RUSTC, os.path.join(d, "main.rs"), exe, rust_edition(src),
+                          overflow=overflow_checks(src), alloc_api=ALLOC, opt=opt)
+        if bad:
+            return bad, ""
+        try:
+            p = subprocess.run([exe] + args, input=stdin.encode(), cwd=d, timeout=60,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merged else subprocess.PIPE)
+        except subprocess.TimeoutExpired:
+            return "", "no exit after 60 s"
+        got = p.stdout.decode("utf-8", errors="replace")
+        if merged:  # (the guide's out block: each line's trailing blanks aside)
+            # (0.28.0: a panic's frame, rustc's alone: its `thread 'main'
+            # panicked at FILE:L:C:` line, the blank line before it and the
+            # backtrace note; the message, which the vole program prints too,
+            # stays)
+            kept = []
+            for l in got.split("\n"):
+                l = l.rstrip()
+                if re.match(r"thread '[^']*'( \(\d+\))? panicked at .*:$", l):
+                    while kept and not kept[-1]:
+                        kept.pop()
+                    continue
+                if not l.startswith("note: run with `RUST_BACKTRACE=1`"):
+                    kept.append(l)
+            got = "\n".join(kept)
+            w = "\n".join(l.rstrip() for l in w.split("\n"))
+        diff = stdout_differs(w, got)
+        if not diff and p.returncode != wexit:
+            diff = f"exit {p.returncode}, expected {wexit}"
+        return "", diff
+
+    bad, diff = at_level(1)
     if bad:
         # (a borrowck divergence the case names, tools/borrowck-twin.sh's)
         mk = re.search(r"^\s*// RUSTC: rejects\s+(\S+)\s*(.*)$", src, re.M)
         if mk:
             return name, "named", f"rustc rejects, named {mk.group(1)}: {mk.group(2)[:80]}"
         return name, "outside", "rustc rejects: " + bad
-    try:
-        p = subprocess.run([exe] + args, input=stdin.encode(), cwd=d, timeout=60,
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merged else subprocess.PIPE)
-    except subprocess.TimeoutExpired:
-        return name, ("named" if named else "differ"), "no exit after 60 s"
-    got = p.stdout.decode("utf-8", errors="replace")
-    if merged:  # (the guide's out block: each line's trailing blanks aside)
-        # (0.28.0: a panic's frame, rustc's alone: its `thread 'main'
-        # panicked at FILE:L:C:` line, the blank line before it and the
-        # backtrace note; the message, which the vole program prints too,
-        # stays)
-        kept = []
-        for l in got.split("\n"):
-            l = l.rstrip()
-            if re.match(r"thread '[^']*'( \(\d+\))? panicked at .*:$", l):
-                while kept and not kept[-1]:
-                    kept.pop()
-                continue
-            if not l.startswith("note: run with `RUST_BACKTRACE=1`"):
-                kept.append(l)
-        got = "\n".join(kept)
-        want = "\n".join(l.rstrip() for l in want.split("\n"))
-    diff = stdout_differs(want, got)
-    if not diff and p.returncode != wexit:
-        diff = f"exit {p.returncode}, expected {wexit}"
+    # (rustc's optimizer is not the reference: when the opt-level 1 build
+    # differs and the opt-level 0 build agrees, rustc's optimizer is what
+    # is wrong (rustc 1.98 at opt-level 1 computes a chain of u8
+    # wrapping_sub wrongly; the re-review of g302scan), and the case agrees)
+    if diff:
+        bad0, diff0 = at_level(0)
+        if not bad0 and not diff0:
+            OPT1_ONLY.append(name)
+            diff = ""
     if diff:
         if not named and key != name:
             diff += f" (its divergences.tsv key: {key})"
@@ -248,5 +270,7 @@ print(f"rustc-twin{' (allocator_api, RUSTC_BOOTSTRAP=1)' if ALLOC else ''}: {len
       f"{counts['named']} named, {counts['stale']} stale, {counts['outside']} outside")
 for r, n in sorted(reasons.items(), key=lambda x: -x[1])[:12]:
     print(f"  outside {n}: {r}")
+for n in sorted(OPT1_ONLY):
+    print(f"  rustc -O1 alone differs (its -O0 build agrees: rustc's optimizer): {n}")
 sys.exit(1 if counts["differ"] or counts["stale"] else 0)
 PY
