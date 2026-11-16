@@ -11,6 +11,7 @@
 // terms, and the one the trait arguments pick is the one (RT-C301-15,
 // review 5's m01-m13).
 
+use crate::base::sym_text;
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::child;
@@ -22,13 +23,26 @@ use crate::front::generics::{env_enter, env_leave};
 use crate::front::traits::{generic_bounds, impl_applies, impls_after, impls_start, satisfies};
 use crate::front::types::{TyKind, type_elem};
 
-// What select gives besides an impl's index (>= 0): no impl proves the
-// reference (it may still hold without one: an Ω's bound, a builtin, the
-// front's own rules); two or more do (Ambiguous, never a yes); a depth
-// limit cut the search short before one was found (never a no it proved).
+// What select gives besides an impl's index (>= 0): nothing proves the
+// reference (it may still hold by a builtin or the front's own rules);
+// an Ω's own predicate does (SEL_PARAM); two or more impls do (Ambiguous,
+// never a yes); a depth limit cut the search short before one was found
+// (never a no it proved).
 pub const SEL_NONE: i64 = -1;
 pub const SEL_AMBIG: i64 = -3;
 pub const SEL_LIMIT: i64 = -4;
+
+// An Ω's own predicate proves the reference (the Param candidate, rustc's
+// ParamCandidate): no impl is chosen; the bound is the template's premise.
+pub const SEL_PARAM: i64 = -2;
+// A predicate's arguments that do not resolve (param_preds): never a yes.
+pub const PRED_UNREAD: i64 = -2;
+// Where an Ω's bounds are read (Ctx.omega_rows, 8 words a row): a
+// template's parameters (generics, the TLISTS of their Ωs, how many, Self,
+// a trait's parameters, theirs, how many), or an associated type's Ω (its
+// parent Ω, how many of its bounds are its declaration's).
+const HOME_TEMPLATE: i64 = 0;
+const HOME_ASSOC: i64 = 1;
 
 // The impl that proves `t: tr<targs>` (targs a TLISTS index of tr's
 // arguments; -1: any arguments, a bound written without them), or SEL_*.
@@ -46,10 +60,40 @@ pub fn select(tr: i64, t: i64, targs: i64, pcx: &mut Ctx<Comp>) -> i64 {
         pcx.sel_impls = pcx.traits_impls.len() as i64;
     }
     let n: i64 = if targs >= 0 { trait_param_count(tr, pcx) } else { -1 };
+    // (0.30.2, review of M1: an impl's `Self` is t, whatever the asker's
+    // is: `impl<U: Conv<Self>> Tr<U> for W` reads its bound as `U: Conv<W>`;
+    // so the answer is the reference's alone, and the record's key is it)
+    let saved_self = pcx.self_type;
+    pcx.self_type = t;
+    let r = select_for(tr, t, targs, n, pcx);
+    pcx.self_type = saved_self;
+    r
+}
+
+// select with Self t: the Param candidate for an Ω, else the record or a
+// choice among the impls.
+fn select_for(tr: i64, t: i64, targs: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    // RULE: O-M1 (0.30.2, review of M1) An Ω's own predicates first, rustc's
+    // ParamCandidate, which wins over every impl: one of them is the whole
+    // reference (param_candidate); else the impls that cover it (a
+    // blanket's). One of tr's whose arguments do not resolve is never a
+    // yes: the instance is unsure (D22.2), its concrete instances are
+    // checked whole.
+    if crate::front::opaque::is_omega(t, pcx) {
+        let p = param_candidate(tr, t, targs, n, pcx);
+        if p > 0 {
+            return SEL_PARAM;
+        }
+        let r = choose(tr, t, targs, n, pcx);
+        if r == SEL_NONE && p < 0 {
+            pcx.opaque_unsure = true;
+        }
+        return r;
+    }
     let key = sel_key(tr, t, targs, n, pcx);
     let row = sel_find(key, tr, t, targs, n, pcx);
     if row >= 0 {
-        return pcx.sel_rows[(row + 4 + (if n > 0 { n } else { 0 })) as usize];
+        return pcx.sel_rows[(row + 3 + (if n > 0 { n } else { 0 })) as usize];
     }
     let top = pcx.assoc_depth == 0 && pcx.impls_known;
     let cuts = pcx.depth_cuts;
@@ -60,11 +104,322 @@ pub fn select(tr: i64, t: i64, targs: i64, pcx: &mut Ctx<Comp>) -> i64 {
     r
 }
 
-// Whether select's answer r says the reference holds through an impl
+// RULE: O-M1 (0.30.2, review of M1) The Param candidate for `t: tr<targs>`
+// (n arguments; n <= 0: any), t an Ω: one of its predicates (param_preds)
+// is tr with exactly those arguments. 1: one is; 0: none is; -1: none is,
+// and one of tr's has arguments that do not resolve.
+fn param_candidate(tr: i64, t: i64, targs: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if pcx.nodes[pcx.types[t as usize].b as usize].h <= 0 {
+        return 0;
+    }
+    let row = param_preds(t, pcx);
+    let count = pcx.param_rows[(row + 2) as usize];
+    let mut r: i64 = 0;
+    for e in 0..count {
+        let at = row + 3 + 2 * e;
+        if pcx.param_rows[at as usize] != tr {
+            continue;
+        }
+        let args = pcx.param_rows[(at + 1) as usize];
+        if n <= 0 || args >= 0 && same_list(args, targs, n, pcx) {
+            return 1;
+        }
+        if args == PRED_UNREAD {
+            r = -1;
+        }
+    }
+    r
+}
+
+// RULE: O-M1 (0.30.2, review of M1) What Ω t's bounds say, each read whole,
+// as the places read a bound: its trait and its arguments, the written ones
+// resolved where the bound is written (home_args: a template's parameters
+// are its Ωs, never a type of the module of the same name), the others the
+// trait's defaults with Self t (`T: Tr` of `trait Tr<U = i64>` is `T:
+// Tr<i64>`); and each supertrait's of those, its arguments substituted
+// (elaborate: `T: Sub<i64>` of `trait Sub<Q>: Tr<Q>` gives `T: Tr<i64>`,
+// not Tr with any arguments). A row of param_rows: the bound list and the
+// home it was read with (a `where` gives an Ω more bounds, a new list), the
+// count, the (trait, arguments) pairs; arguments -1: the trait has none;
+// PRED_UNREAD: they do not resolve.
+fn param_preds(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let h = pcx.nodes[pcx.types[t as usize].b as usize].h;
+    let home = pcx.omega_homes.get(t);
+    let have = pcx.param_map.get(t) - 1;
+    if have >= 0 && pcx.param_rows[have as usize] == h
+        && pcx.param_rows[(have + 1) as usize] == home {
+        return have;
+    }
+    // (none while it is read: a bound's arguments that ask of t again)
+    let busy = pcx.param_rows.len() as i64;
+    pcx.param_rows.push(h);
+    pcx.param_rows.push(home);
+    pcx.param_rows.push(0);
+    pcx.param_map.put(t, busy + 1);
+    let mut preds = Vec::<i64, Comp>::new_in(Comp {});
+    for i in 0..(if h > 0 { pcx.nodes[h as usize].count } else { 0 }) {
+        let b = child(h, i, pcx);
+        let bt = crate::front::traits::bound_trait(b, pcx);
+        if bt < 0 {
+            continue;
+        }
+        let mut args: i64 = -1;
+        if trait_param_count(bt, pcx) > 0 {
+            let g = pcx.nodes[b as usize].g;
+            let mut w: i64 = -1;
+            if g > 0 {
+                let m = crate::front::modules::module_of(b, pcx);
+                w = home_args(t, i, g, m, pcx);
+            }
+            args = if g > 0 && w < 0 { -1 }
+                else { complete_args(bt, w, if g > 0 { pcx.nodes[g as usize].count } else { 0 }, t,
+                    pcx) };
+            if args < 0 {
+                args = PRED_UNREAD;
+            }
+        }
+        elaborate(bt, args, t, 0, &mut preds, pcx);
+    }
+    let row = pcx.param_rows.len() as i64;
+    pcx.param_rows.push(h);
+    pcx.param_rows.push(home);
+    pcx.param_rows.push(preds.len() as i64 / 2);
+    for p in preds {
+        pcx.param_rows.push(p);
+    }
+    pcx.param_map.put(t, row + 1);
+    row
+}
+
+// Pushes Ω t's predicate (tr, args) to preds, once, and its supertraits',
+// each read in tr's module with tr's parameters bound to args and Self t
+// (`trait Sub<Q>: Tr<Q>`; none written, the defaults). A chain deeper than
+// the depth limit is read no further: what it would give is no predicate,
+// never a yes.
+fn elaborate(tr: i64, args: i64, t: i64, depth: i64, preds: &mut Vec<i64, Comp>,
+    pcx: &mut Ctx<Comp>) {
+    let n = trait_param_count(tr, pcx);
+    let mut e: i64 = 0;
+    while e < preds.len() as i64 {
+        let had = preds[(e + 1) as usize];
+        if preds[e as usize] == tr
+            && (had == args || n > 0 && had >= 0 && args >= 0 && same_list(had, args, n, pcx)) {
+            return;
+        }
+        e += 2;
+    }
+    preds.push(tr);
+    preds.push(args);
+    let supers = crate::front::traits::trait_supers(tr, pcx);
+    if supers <= 0 || depth >= crate::front::assoc::MAX_ASSOC_DEPTH {
+        return;
+    }
+    for k in 0..pcx.nodes[supers as usize].count {
+        let sb = child(supers, k, pcx);
+        let tr2 = crate::front::traits::bound_trait(sb, pcx);
+        if tr2 < 0 {
+            continue;
+        }
+        let mut args2: i64 = -1;
+        if trait_param_count(tr2, pcx) > 0 {
+            let g = pcx.nodes[sb as usize].g;
+            let mut w: i64 = -1;
+            if g > 0 {
+                let m = crate::front::modules::module_of(sb, pcx);
+                w = resolve_args_in(g, m, pcx.traits[tr as usize].params, args, n, 0, -1, 0, t,
+                    pcx);
+            }
+            args2 = if g > 0 && w < 0 { -1 }
+                else { complete_args(tr2, w, if g > 0 { pcx.nodes[g as usize].count } else { 0 }, t,
+                    pcx) };
+            if args2 < 0 {
+                args2 = PRED_UNREAD;
+            }
+        }
+        elaborate(tr2, args2, t, depth + 1, preds, pcx);
+    }
+}
+
+// Type nodes g, the arguments of Ω t's i-th bound, resolved quietly in
+// module m in the scope of t's home: a template's Ω's, its parameters
+// bound to the instance's Ωs and its Self (and, for an impl function's
+// bounds held against its trait's, the trait's parameters); an associated
+// type's Ω's own bounds (its declaration's), Self the parent Ω and nothing
+// else; a `where` bound added to one, its parent's home. -1 when one does
+// not resolve, or t has no home.
+fn home_args(t: i64, i: i64, g: i64, m: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut o = t;
+    let mut own = true;
+    loop {
+        let row = pcx.omega_homes.get(o) - 1;
+        if row < 0 {
+            return -1;
+        }
+        let at = |k: i64, pcx: &Ctx<Comp>| -> i64 { pcx.omega_rows[(row + k) as usize] };
+        if at(0, pcx) == HOME_ASSOC {
+            if own && i < at(2, pcx) {
+                return resolve_args_in(g, m, 0, -1, 0, 0, -1, 0, at(1, pcx), pcx);
+            }
+            o = at(1, pcx);
+            own = false;
+            continue;
+        }
+        return resolve_args_in(g, m, at(1, pcx), at(2, pcx), at(3, pcx), at(5, pcx), at(6, pcx),
+            at(7, pcx), at(4, pcx), pcx);
+    }
+}
+
+// RULE: O-M1 (0.30.2, review of M1) Ω t's home (param_preds): the
+// parameters gp bound to TLISTS[binds..] (n of them) and Self self_ty;
+// with a trait's parameters tparams bound to TLISTS[ttargs..] (tn). The
+// first given is kept.
+pub fn set_home(t: i64, gp: i64, binds: i64, n: i64, self_ty: i64, tparams: i64, ttargs: i64,
+    tn: i64, pcx: &mut Ctx<Comp>) {
+    if t <= 0 || !crate::front::opaque::is_omega(t, pcx) || pcx.omega_homes.get(t) != 0 {
+        return;
+    }
+    let row = pcx.omega_rows.len() as i64;
+    pcx.omega_rows.push(HOME_TEMPLATE);
+    pcx.omega_rows.push(gp);
+    pcx.omega_rows.push(binds);
+    pcx.omega_rows.push(n);
+    pcx.omega_rows.push(self_ty);
+    pcx.omega_rows.push(tparams);
+    pcx.omega_rows.push(ttargs);
+    pcx.omega_rows.push(tn);
+    pcx.omega_homes.put(t, row + 1);
+}
+
+// The home of associated type Ω t (`T::Item`): its first `own` bounds are
+// its declaration's, read with Self parent; a `where` adds the others,
+// read in parent's home.
+pub fn set_assoc_home(t: i64, parent: i64, own: i64, pcx: &mut Ctx<Comp>) {
+    if t <= 0 || pcx.omega_homes.get(t) != 0 {
+        return;
+    }
+    let row = pcx.omega_rows.len() as i64;
+    pcx.omega_rows.push(HOME_ASSOC);
+    pcx.omega_rows.push(parent);
+    pcx.omega_rows.push(own);
+    for _ in 0..5 {
+        pcx.omega_rows.push(0);
+    }
+    pcx.omega_homes.put(t, row + 1);
+}
+
+// The arguments of trait tr for subject s, the first w given at TLISTS
+// given (w 0: none written): each other its parameter's default, read in
+// tr's module with Self s and the parameters before it bound (`trait Tr<A,
+// B = A>`): a TLISTS index of all of them, -1 when one has no default or
+// does not resolve, or tr has no parameters.
+pub fn complete_args(tr: i64, given: i64, w: i64, s: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let n = trait_param_count(tr, pcx);
+    if n == 0 {
+        return -1;
+    }
+    if w >= n && given >= 0 {
+        return given;
+    }
+    let tp = pcx.traits[tr as usize].params;
+    let mut got: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for k in 0..w {
+        got.push(pcx.tlists[(given + k) as usize]);
+    }
+    for j in w..n {
+        let d = pcx.nodes[child(tp, j, pcx) as usize].b;
+        if d <= 0 {
+            return -1;
+        }
+        if pcx.nodes[d as usize].kind == crate::front::ast::NodeKind::TyName
+            && pcx.nodes[d as usize].list == 0 && pcx.nodes[d as usize].g == 0
+            && crate::base::sym_text(pcx.nodes[d as usize].a, pcx) == b"Self" {
+            got.push(s);
+            continue;
+        }
+        let before = pcx.tlists.len() as i64;
+        for k in 0..j {
+            pcx.tlists.push(got[k as usize]);
+        }
+        let saved = env_enter(tp, before, j, pcx);
+        let saved_mod = pcx.cur_mod;
+        let saved_self = pcx.self_type;
+        pcx.cur_mod = pcx.traits[tr as usize].module;
+        pcx.self_type = s;
+        let mark = crate::base::diag::errors_mark(pcx);
+        let ok = attempt(Try::Type, d, pcx) && pcx.try_result > 0
+            && !has_error_type(pcx.try_result, pcx);
+        let t = pcx.try_result;
+        crate::base::diag::errors_forget(mark, pcx);
+        pcx.self_type = saved_self;
+        pcx.cur_mod = saved_mod;
+        env_leave(saved, pcx);
+        if !ok {
+            return -1;
+        }
+        got.push(t);
+    }
+    let r = pcx.tlists.len() as i64;
+    for t in got {
+        pcx.tlists.push(t);
+    }
+    r
+}
+
+// Whether select's answer r says the reference holds: through an impl
 // (one, or more than one: the front's verdict; the places refuse
-// Ambiguous, prove_bound).
-pub fn through_impl(r: i64) -> bool {
-    r >= 0 || r == SEL_AMBIG
+// Ambiguous, prove_bound), or an Ω's own predicate.
+pub fn holds(r: i64) -> bool {
+    r >= 0 || r == SEL_AMBIG || r == SEL_PARAM
+}
+
+// RULE: O-M1 error trait.overflow (overflow) or trait.ambiguous at pos: no
+// one impl proves `s: tr` where an instance's bound needs it.
+pub fn obligation_error(overflow: bool, front: bool, tr: i64, s: i64, pos: i64, pcx: &mut Ctx<Comp>) {
+    let saved = pcx.err_kind;
+    if overflow {
+        pcx.err_kind = c"trait.overflow";
+    } else {
+        pcx.err_kind = c"trait.ambiguous";
+    }
+    crate::base::diag::err_begin(pos, pcx);
+    crate::base::diag::err_fmt(format_args("'"), pcx);
+    crate::front::types::err_type(s, pcx);
+    crate::base::diag::err_fmt(format_args(": {}'",
+        str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap()), pcx);
+    if overflow {
+        crate::base::diag::err_fmt(
+            format_args(
+                " is not proved: the impls that would prove it need it again, deeper than {} steps", crate::front::assoc::MAX_ASSOC_DEPTH), pcx);
+        crate::base::diag::err_help(
+            c"an impl's bounds must not need the impl itself for a larger type (rustc E0275)", pcx);
+    } else {
+        crate::base::diag::err_fmt(
+            format_args(" is proved by more than one impl, and which one is meant is not known"),
+            pcx);
+        crate::base::diag::err_help(
+            c"make the impls' headers or trait arguments tell the types apart (rustc E0283)", pcx);
+    }
+    // (the front's ends the check of what met it, as its "not
+    // implemented" does: one error, not one per instance it would make)
+    crate::base::diag::err_end_soft(pcx);
+    pcx.err_kind = saved;
+    if front {
+        crate::base::diag::err_jump(pcx);
+    }
+}
+
+// (0.30.2, test-only) VOLE_PLANT_OBLIG's fault (Ctx.plant_oblig): `depth`
+// 1, `overlap` 2, unset 0; any other value stops the compiler.
+pub fn plant_from_env() -> i64 {
+    match std::env::var_in("VOLE_PLANT_OBLIG", Comp {}) {
+        Ok(v) => {
+            let w = v.as_bytes();
+            if w == b"depth" { 1 } else if w == b"overlap" { 2 } else {
+                crate::base::die(c"VOLE_PLANT_OBLIG is depth or overlap");
+            }
+        }
+        Err(_) => 0,
+    }
 }
 
 // The impls of tr that may prove `t: tr<targs>`: each whose header and
@@ -227,11 +582,10 @@ fn args_concrete(targs: i64, n: i64, pcx: &Ctx<Comp>) -> bool {
     true
 }
 
-// The key of a trait reference in sel_map (never 0). Self is in it: an
-// impl's bound may name `Self`, resolved by the context's.
+// The key of a trait reference in sel_map (never 0). (select reads an
+// impl's `Self` as t: the asker's is not in it.)
 fn sel_key(tr: i64, t: i64, targs: i64, n: i64, pcx: &Ctx<Comp>) -> i64 {
     let mut h: u64 = (tr as u64).wrapping_mul(1000003u64) ^ (t as u64);
-    h = h.wrapping_mul(1000003u64) ^ (pcx.self_type as u64);
     h = h.wrapping_mul(1000003u64) ^ ((n + 1) as u64);
     for k in 0..n {
         h = h.wrapping_mul(1000003u64) ^ (pcx.tlists[(targs + k) as usize] as u64);
@@ -247,19 +601,18 @@ fn sel_find(key: i64, tr: i64, t: i64, targs: i64, n: i64, pcx: &Ctx<Comp>) -> i
         if same_row(row, tr, t, targs, n, pcx) {
             return row;
         }
-        row = pcx.sel_rows[(row + 5 + (if n > 0 { n } else { 0 })) as usize] - 1;
+        row = pcx.sel_rows[(row + 4 + (if n > 0 { n } else { 0 })) as usize] - 1;
     }
     -1
 }
 
 fn same_row(row: i64, tr: i64, t: i64, targs: i64, n: i64, pcx: &Ctx<Comp>) -> bool {
     if pcx.sel_rows[row as usize] != tr || pcx.sel_rows[(row + 1) as usize] != t
-        || pcx.sel_rows[(row + 2) as usize] != pcx.self_type
-        || pcx.sel_rows[(row + 3) as usize] != n {
+        || pcx.sel_rows[(row + 2) as usize] != n {
         return false;
     }
     for k in 0..n {
-        if pcx.sel_rows[(row + 4 + k) as usize] != pcx.tlists[(targs + k) as usize] {
+        if pcx.sel_rows[(row + 3 + k) as usize] != pcx.tlists[(targs + k) as usize] {
             return false;
         }
     }
@@ -270,7 +623,6 @@ fn sel_store(key: i64, tr: i64, t: i64, targs: i64, n: i64, r: i64, pcx: &mut Ct
     let row = pcx.sel_rows.len() as i64;
     pcx.sel_rows.push(tr);
     pcx.sel_rows.push(t);
-    pcx.sel_rows.push(pcx.self_type);
     pcx.sel_rows.push(n);
     for k in 0..n {
         pcx.sel_rows.push(pcx.tlists[(targs + k) as usize]);
@@ -289,11 +641,24 @@ fn sel_store(key: i64, tr: i64, t: i64, targs: i64, n: i64, r: i64, pcx: &mut Ct
 // or of an impl it chose.
 pub fn resolve_args_quietly(g: i64, m: i64, params: i64, binds: i64, n: i64, self_ty: i64,
     pcx: &mut Ctx<Comp>) -> i64 {
+    resolve_args_in(g, m, params, binds, n, 0, -1, 0, self_ty, pcx)
+}
+
+// resolve_args_quietly with a trait's parameters tparams (a Generics) in
+// scope too, bound to TLISTS[ttargs..] (tn of them).
+fn resolve_args_in(g: i64, m: i64, params: i64, binds: i64, n: i64, tparams: i64, ttargs: i64,
+    tn: i64, self_ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if g <= 0 {
         return -1;
     }
     let count: i64 = if params > 0 && binds >= 0 { n } else { 0 };
     let saved = env_enter(params, binds, count, pcx);
+    if tparams > 0 && ttargs >= 0 {
+        for k in 0..tn {
+            pcx.tp_names.push(pcx.nodes[child(tparams, k, pcx) as usize].a);
+            pcx.tp_types.push(pcx.tlists[(ttargs + k) as usize]);
+        }
+    }
     let saved_mod = pcx.cur_mod;
     let saved_self = pcx.self_type;
     pcx.cur_mod = m;
@@ -346,52 +711,22 @@ pub fn bindings(i: i64, t: i64, targs: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // The trait arguments of bound node b, of trait tr, whose subject is s,
 // for the places: those it writes resolved (resolve_args_quietly: module
 // m, the parameters params bound to TLISTS[binds..], the first n; `Self`
-// self_ty), or, when it writes none, tr's defaults with `Self` s (`T:
-// PartialEq` is `T: PartialEq<T>`, F12.1); -1 when tr has no parameters,
-// or one does not resolve or has no default, or (the front reads a bound
+// self_ty), the rest tr's defaults with `Self` s (`T: PartialEq` is `T:
+// PartialEq<T>`, F12.1; complete_args); -1 when tr has no parameters, or
+// one does not resolve or has no default, or (the front reads a bound
 // without arguments as any, implements) no impl proves the defaults.
 pub fn bound_ref_args(b: i64, tr: i64, s: i64, m: i64, params: i64, binds: i64, n: i64,
     self_ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if tr < 0 || trait_param_count(tr, pcx) == 0 {
         return -1;
     }
-    if pcx.nodes[b as usize].g > 0 {
-        return resolve_args_quietly(pcx.nodes[b as usize].g, m, params, binds, n, self_ty, pcx);
+    let g = pcx.nodes[b as usize].g;
+    if g > 0 {
+        let w = resolve_args_quietly(g, m, params, binds, n, self_ty, pcx);
+        return if w < 0 { -1 } else { complete_args(tr, w, pcx.nodes[g as usize].count, s, pcx) };
     }
-    let tp = pcx.traits[tr as usize].params;
-    let mut got: Vec<i64, Comp> = Vec::new_in(Comp {});
-    for j in 0..pcx.nodes[tp as usize].count {
-        let d = pcx.nodes[child(tp, j, pcx) as usize].b;
-        if d <= 0 {
-            return -1;
-        }
-        if pcx.nodes[d as usize].kind == crate::front::ast::NodeKind::TyName
-            && pcx.nodes[d as usize].list == 0 && pcx.nodes[d as usize].g == 0
-            && crate::base::sym_text(pcx.nodes[d as usize].a, pcx) == b"Self" {
-            got.push(s);
-            continue;
-        }
-        let saved_mod = pcx.cur_mod;
-        let saved_self = pcx.self_type;
-        pcx.cur_mod = pcx.traits[tr as usize].module;
-        pcx.self_type = s;
-        let mark = crate::base::diag::errors_mark(pcx);
-        let ok = attempt(Try::Type, d, pcx) && pcx.try_result > 0
-            && !has_error_type(pcx.try_result, pcx);
-        let t = pcx.try_result;
-        crate::base::diag::errors_forget(mark, pcx);
-        pcx.self_type = saved_self;
-        pcx.cur_mod = saved_mod;
-        if !ok {
-            return -1;
-        }
-        got.push(t);
-    }
-    let r = pcx.tlists.len() as i64;
-    for t in got {
-        pcx.tlists.push(t);
-    }
-    if select(tr, s, r, pcx) == SEL_NONE {
+    let r = complete_args(tr, -1, 0, s, pcx);
+    if r < 0 || select(tr, s, r, pcx) == SEL_NONE {
         return -1;
     }
     r
