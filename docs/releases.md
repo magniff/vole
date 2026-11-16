@@ -136,10 +136,12 @@ A correctness release, its branches merged as each is reviewed clean.
   and `&mut [T]` parameters keep their facts: the compiler's source
   built at -O2 by 0.30.1 and by 0.30.2 gives the same assembly, byte
   for byte. `--no-noalias` was the workaround.
-- **Refused where rustc accepts, fixed with it (RT-C301-9):**
+- **Refused where rustc accepts, fixed with it (RT-C301-9, RT-87):**
   `<T as B>::m` as a value in a generic function, `<S as Conv<i64>>::c`
-  of a generic trait with two impls for S, and `<T as B>::Out` beside
-  `<T as A>::Out` in a generic body (one opaque type for both before).
+  of a generic trait with two impls for S, `T::mk()` under `T: Tr<i64>`
+  for a type with impls of `Tr<i32>` and `Tr<i64>`, and `<T as B>::Out`
+  beside `<T as A>::Out` in a generic body (one opaque type for both
+  before).
 
 #### What the checkers now refuse
 
