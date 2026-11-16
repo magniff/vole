@@ -105,6 +105,14 @@ function is known by the symbol it links to and never by its vole name:
 -O2 removed the calls of a program's own allocator declared as
 `malloc`. `--trace` reports a stack overflow, and a warm -O2 build has
 the bytes of a cold one when a function's number of calls changes.
+Built and tested on aarch64-macos only; no Linux row ran. The release
+gate, on 2026-11-16: 46 of 47 rows passed on its run (the suites 6990
+cases at each level, none failed); chain-fresh failed on what the gate
+found in itself ("The safety nets", the last item; the branch lacked
+0.30.0's line in bootstrap/chain-hashes) and passed alone on the fixed
+tree, 53 releases rebuilt from the seed with the recorded bytes. The
+bench row alone, the machine near idle (a load of 3 to 6): 1.003
+against cc -O2 at -O2 (0.30.0: 1.002), iterchain 1.016 times iterloop.
 
 **0.30.0 can compile a program at -O1 or -O2 to code that prints wrong
 values, with no error: use 0.30.1.** Three silent miscompiles of its
