@@ -124,16 +124,26 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   associated type or `self` of `impl Bump for &mut i64` had none after
   the body, so `ensures { *p = 9; true }` wrote the caller's value (with
   a `debug ensures`, the output changed with `--debug-contracts`).
+  A view is made only when a name of the clause resolves to the
+  parameter: `ensures { let s = 3; s > 0 }`, a closure's parameter or a
+  match binding named as a by-value parameter the body took read
+  nothing of it.
 - **A clause writes through no raw pointer** (RT-38g, `contract.effect`).
   `unsafe { *p = 5 }`, `(*p).f = 5`, a raw slice's element, `&mut *p`,
-  `p.write(5)`, a C function given a pointer, or a call of a function
-  that does one: refused as a cell's `set` is. A read through a raw
-  pointer is allowed; a write through one the clause made itself is
-  refused too, as the effects cannot tell what a pointer points to: so
-  are std's `Option::take`, `mem::replace` and `mem::swap`, which write
-  through raw pointers, on the clause's own values too. A C function
-  given only `*const` pointers to what holds no other (`memcmp`) does
-  not count. `query effects F --why raw_write` shows the chain.
+  `p.write(5)` or a C function given a `*mut` in the clause itself are
+  refused, as a cell's `set` is, even on a pointer the clause made: the
+  effects cannot tell what a pointer points to. A function the clause
+  calls that writes through a raw pointer (`poke(p)`, std's `take`,
+  `swap`, `sort`) is refused when a raw pointer may reach it from what
+  the clause reads: a parameter's or the result's type holds one (`*mut
+  T`, a NonNull, a Vec's buffer, a type parameter). Else its write
+  reaches only what the clause made, since the views keep the clause
+  from lending `&mut` of anything else: `o.iter().all(..)` on an
+  `Option<i64>`, `a.sort_unstable()` or `mem::swap` on a local array are
+  accepted. (Rust's rules make the rest: a pointer made of a `&T` is not
+  written through outside an UnsafeCell, and one made of an integer has
+  no provenance to write with.) A read through a raw pointer is allowed.
+  `query effects F --why raw_write` shows the chain.
 
 #### Bugs fixed
 
@@ -147,6 +157,13 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   none; one whose body moved a capture kept it borrowed and dropped the
   value twice. They now get both, and their bodies are built before the
   bodies that make them.
+- **A closure whose result holds another closure** (RT-91):
+  `w.iter().flat_map(|y| v.iter().map(move |x| x * y))`, a closure
+  returning an Option, a tuple or a struct holding a `map` or `filter`
+  closure, made the compiler panic (places/regions.vl, index out of
+  bounds). A closure type's region slots include its signature's, which
+  were made in the closures' order, the outer before the inner one it
+  holds; they are now made after those of every closure the type holds.
 
 ### What's new in 0.30.1
 
