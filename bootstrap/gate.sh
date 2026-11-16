@@ -105,7 +105,8 @@
 # nothing unsafe inside, each one named; --quick too);
 # redteam-cases (tests/redteam_cases.sh, 0.30.2: every red-team finding,
 # a `## RT-...` heading of the notes beside the main checkout, has its
-# case in tests/, open or fixed, after a canary it must catch; --quick
+# case in tests/, open or fixed, after a canary it must catch; then
+# tests/redteam/run.sh, the red team's shell cases; --quick
 # too; a SKIP where there are no notes);
 # borrowck-twin (tools/borrowck-twin.sh, 0.27.1: every rust_b_ case's
 # verdict against rustc's, accept or reject, and its code; a divergence
@@ -995,7 +996,7 @@ run_step() {
         main-stack) sh "$ROOT/tests/main_stack.sh" -c "$C" ;;
         unsafe-audit) sh "$ROOT/tests/unsafe_audit.sh" -c "$C" ;;
         # (0.30.2) every red-team finding has its case in the tree
-        redteam-cases) sh "$ROOT/tests/redteam_cases.sh" ;;
+        redteam-cases) sh "$ROOT/tests/redteam_cases.sh" && sh "$ROOT/tests/redteam/run.sh" -c "$C" ;;
         # (0.30) std inside the tools, in a copy of compiler/std (also a
         # suite of tests/run.sh)
         stdtools) sh "$ROOT/tests/stdtools.sh" -c "$C" ;;

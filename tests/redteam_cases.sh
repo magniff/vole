@@ -16,7 +16,8 @@
 # is a file or directory under tests/ whose name begins with the tag's
 # prefix (RT-46: rt_046, RT-TL-1: rt_tl_001, RT-C301-8: rt_c301_008), or
 # a file under tests/ that names the tag (its XFAIL line, or the header of
-# a fixed case). Exit 0 when every finding has one, 1 when one has not,
+# a fixed case). A heading of a round's own number (`## R302B-4:`), not
+# yet an RT number, has no case by definition. Exit 0 when every finding has one, 1 when one has not,
 # 77 when there are no notes (the row skips, saying so).
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DIR=""
@@ -46,6 +47,13 @@ audit() {
             grep -qE "^${pre}([_a-z.]|$)" "$names" && continue
             grep -rqE "(^|[^A-Z0-9-])$tag([^0-9a-z]|$)" "$2" 2>/dev/null && continue
             echo "no case: $tag (${f#$1/})"
+            missing=$((missing + 1))
+        done
+        # a finding not yet given its RT number (a round's own R302B-N): it
+        # has no case yet, by definition
+        for tag in $(grep -oE '^## R[0-9][0-9A-Z]*-[0-9]+[a-z]?:' "$f" | sed 's/^## //; s/:$//' | sort -u); do
+            total=$((total + 1))
+            echo "no case: $tag, not yet given its RT number (${f#$1/})"
             missing=$((missing + 1))
         done
     done
