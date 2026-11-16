@@ -1,0 +1,792 @@
+// The trait of a path's item (0.30.2, RT-C301-8, RT-C301-9): which trait's
+// function or constant a path `X::name` or `<X as Tr>::name` names,
+// decided from what the path says, and that item found in that trait's
+// impl for X's type (X a type parameter of a generic body, an Ω: the
+// bound's virtual one). A path checked as a value or a constant
+// (paths::synth_path) and one called (paths::synth_path_call) ask
+// path_trait first, and for a concrete type without an inherent item
+// concrete_trait; only when both give no trait is an item found by its
+// name on the type. So a qualified path's trait, a type parameter's bound
+// and a trait default's own trait are never dropped for a lookup by name,
+// and two traits that supply the name are an error (rustc E0034), not a
+// choice. RULE: F8.3, F8.4, F9.3
+
+use crate::base::sym_text;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{
+    err_begin, err_end, err_end_soft, err_help, err_jump, err_str, err_sym, err_try_fmt,
+};
+use crate::front::ast::{FN_DEFAULT_COPY, NODE_ASSOC_CONST, NodeKind, child};
+use crate::front::convert::{bound_args, impl_covers, impl_fn, impl_targs, same_list};
+use crate::front::opaque::{assoc_in_trait, is_omega};
+use crate::front::traits::{
+    bound_trait, impl_of_fn, impls_after, impls_start, trait_fn, trait_supers,
+};
+use crate::front::types::err_type;
+
+// What a path names its item through (path_trait, concrete_trait): trait
+// tr, -1 for none (the item is an inherent one, or there is none); the
+// trait's arguments the path writes, a TLISTS index (-1: none written),
+// and their number; the impl the path names already, or -1 when it is
+// the impl of tr for the path's type (trait_impl finds it).
+#[derive(Clone, Copy)]
+pub struct PathTrait {
+    pub tr: i64,
+    pub args: i64,
+    pub nargs: i64,
+    pub imp: i64,
+}
+
+pub fn no_trait() -> PathTrait {
+    PathTrait { tr: -1, args: -1, nargs: 0, imp: -1 }
+}
+
+// RULE: F8.4, F8.3 (0.30.2) The trait path n (`X::name`, X's type t)
+// names `name` through, from what the path says:
+// - `<X as Tr>::name`: Tr with the arguments written (`<S as Conv<i64>>`),
+//   whatever X is; Tr itself declares name (rustc E0576 otherwise);
+// - X a type parameter (t its Ω in the generic body, or the type it
+//   stands for in an instance): the one of its bounds, or of their
+//   supertraits, that declares name, with that bound's arguments; two are
+//   rustc's E0034;
+// - `Self` in a trait's default function copied into an impl: that
+//   trait, the impl's own (or a supertrait), as rustc reads Self there.
+// Else no trait: concrete_trait decides, after the type's inherent items.
+pub fn path_trait(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTrait {
+    let qn = crate::front::parser::rust::lifetimes_of(crate::front::parser::rust::qpath_key(n),
+        pcx);
+    if qn != 0 {
+        let tr = bound_trait(qn, pcx);
+        if tr < 0 {
+            err_begin(pcx.nodes[n as usize].start, pcx);
+            err_str(c"the name after 'as' in a qualified path is not a trait", pcx);
+            err_end(pcx);
+        }
+        if !declares(tr, name, pcx) {
+            not_in_trait_error(n, tr, name, pcx);
+        }
+        let g = pcx.nodes[qn as usize].g;
+        if g == 0 {
+            return PathTrait { tr: tr, args: -1, nargs: 0, imp: -1 };
+        }
+        let nargs = pcx.nodes[g as usize].count;
+        if nargs > crate::front::convert::trait_param_count(tr, pcx) {
+            err_begin(pcx.nodes[qn as usize].start, pcx);
+            err_str(c"trait '", pcx);
+            err_sym(pcx.traits[tr as usize].name, pcx);
+            err_str(c"' takes ", pcx);
+            crate::base::diag::err_int(crate::front::convert::trait_param_count(tr, pcx), pcx);
+            err_str(c" type arguments, got ", pcx);
+            crate::base::diag::err_int(nargs, pcx);
+            err_end(pcx);
+        }
+        return PathTrait { tr: tr, args: bound_args(qn, pcx), nargs: nargs, imp: -1 };
+    }
+    // `Tr::f(args)` whose Self the checker took from an argument or from
+    // the expected type (F8.2, paths::self_from_args, trait_assoc_self:
+    // the type in n.y): `<y as Tr>::f`
+    if pcx.nodes[n as usize].y > 0 {
+        let k = crate::front::check::calls::paths::trait_path_key(n, pcx);
+        if k > 0 {
+            // (Tr's own, or the one supertrait's that declares it)
+            let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
+            declaring_all(k - 1, name, 0, &mut seen, pcx);
+            if seen.len() > 1 {
+                ambiguous_error(n, t, name, seen[0], seen[1], pcx);
+            }
+            if seen.len() == 1 {
+                return PathTrait { tr: seen[0], args: -1, nargs: 0, imp: -1 };
+            }
+        }
+    }
+    let p = param_node(n, t, pcx);
+    if p > 0 {
+        return bound_choice(n, t, p, name, pcx);
+    }
+    if pcx.nodes[n as usize].count == 0 && pcx.nodes[n as usize].a == pcx.self_type_sym {
+        let i = default_copy_impl(pcx);
+        if i >= 0 {
+            return default_choice(n, t, i, name, pcx);
+        }
+    }
+    no_trait()
+}
+
+// Whether trait tr itself declares a function or a constant `name`.
+fn declares(tr: i64, name: i64, pcx: &Ctx<Comp>) -> bool {
+    if trait_fn(tr, name, pcx) != 0 {
+        return true;
+    }
+    let d = assoc_in_trait(tr, name, pcx);
+    d != 0 && (pcx.nodes[d as usize].p & NODE_ASSOC_CONST) != 0
+}
+
+// The traits, tr and its supertraits (F2.2), that declare `name`, pushed
+// onto out once each. Supertraits deeper than 8 are an error.
+fn declaring_all(tr: i64, name: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+    if tr < 0 {
+        return;
+    }
+    if declares(tr, name, pcx) && !out.contains(&tr) {
+        out.push(tr);
+    }
+    let supers = trait_supers(tr, pcx);
+    let count: i64 = if supers > 0 { pcx.nodes[supers as usize].count } else { 0 };
+    if count > 0 && depth >= 8 {
+        supertrait_depth_error(tr, pcx);
+    }
+    for i in 0..count {
+        declaring_all(bound_trait(child(supers, i, pcx), pcx), name, depth + 1, out, pcx);
+    }
+}
+
+// error trait.depth: trait tr's supertraits nest deeper than the
+// checker follows (8): a limit, never read as "none declares it".
+pub fn supertrait_depth_error(tr: i64, pcx: &mut Ctx<Comp>) -> ! {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"trait.depth";
+    err_begin(pcx.nodes[pcx.traits[tr as usize].node as usize].start, pcx);
+    err_str(c"the supertraits of trait '", pcx);
+    err_sym(pcx.traits[tr as usize].name, pcx);
+    err_str(c"' nest deeper than 8", pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved_kind;
+    err_jump(pcx)
+}
+
+// The type parameter node path n's X names, its bounds in .h: t's when t
+// is an Ω (the generic body), else the parameter X stands for in this
+// instance; 0 when X is no type parameter or has no bounds.
+fn param_node(n: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if pcx.nodes[n as usize].count != 0 {
+        return 0;
+    }
+    if is_omega(t, pcx) {
+        let p = pcx.types[t as usize].b;
+        return if pcx.nodes[p as usize].h != 0 { p } else { 0 };
+    }
+    let name = pcx.nodes[n as usize].a;
+    if name == pcx.self_type_sym || crate::front::generics::env_lookup(name, pcx) == 0 {
+        return 0;
+    }
+    let mut p = crate::front::generics::env_param_node(name, pcx);
+    if p <= 0 {
+        p = crate::front::traits::bounded_param(name, pcx);
+    }
+    if p > 0 && pcx.nodes[p as usize].h != 0 { p } else { 0 }
+}
+
+// path_trait for X a type parameter p: the trait of its bounds, or of
+// their supertraits, that declares `name`, with the bound's arguments
+// when it names that trait itself; none when none declares it (the
+// bounds' check reports it: require_in_bounds); two, or one trait with
+// two bounds' different arguments: error method.ambiguous (rustc E0034).
+fn bound_choice(n: i64, t: i64, p: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTrait {
+    let bounds = pcx.nodes[p as usize].h;
+    let mut found = no_trait();
+    let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..pcx.nodes[bounds as usize].count {
+        let b = child(bounds, i, pcx);
+        let bt = bound_trait(b, pcx);
+        if bt < 0 {
+            continue;
+        }
+        seen.clear();
+        declaring_all(bt, name, 0, &mut seen, pcx);
+        for k in 0..seen.len() as i64 {
+            let tr = seen[k as usize];
+            let g: i64 = if tr == bt { pcx.nodes[b as usize].g } else { 0 };
+            let here = if g != 0 {
+                PathTrait { tr: tr, args: bound_args(b, pcx), nargs: pcx.nodes[g as usize].count,
+                    imp: -1 }
+            } else { PathTrait { tr: tr, args: -1, nargs: 0, imp: -1 } };
+            if found.tr < 0 {
+                found = here;
+            } else if found.tr != here.tr || found.nargs != here.nargs
+                || found.args >= 0 && !same_list(found.args, here.args, found.nargs, pcx) {
+                ambiguous_error(n, t, name, found.tr, here.tr, pcx);
+            }
+        }
+    }
+    found
+}
+
+// The impl the function being checked was copied into as its trait's
+// default (FN_DEFAULT_COPY; an instance's: its template's), or -1.
+fn default_copy_impl(pcx: &Ctx<Comp>) -> i64 {
+    let f = pcx.cur_fn;
+    if f < 0 {
+        return -1;
+    }
+    let g = if pcx.fns[f as usize].tmpl != 0 { pcx.fns[f as usize].tmpl - 1 } else { f };
+    if (pcx.nodes[pcx.fns[g as usize].node as usize].p & FN_DEFAULT_COPY) == 0 {
+        return -1;
+    }
+    impl_of_fn(g, pcx)
+}
+
+// path_trait for `Self::name` in a default of impl i's trait: the trait
+// (the item of impl i) or the supertrait that declares name; none when
+// none does; two: method.ambiguous.
+fn default_choice(n: i64, t: i64, i: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTrait {
+    let own = pcx.traits_impls[i as usize].tr;
+    let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
+    declaring_all(own, name, 0, &mut seen, pcx);
+    if seen.len() == 0 {
+        return no_trait();
+    }
+    if seen.len() > 1 {
+        ambiguous_error(n, t, name, seen[0], seen[1], pcx);
+    }
+    let tr = seen[0];
+    PathTrait { tr: tr, args: -1, nargs: 0, imp: if tr == own { i } else { -1 } }
+}
+
+// RULE: F8.3, F9.2, F9.3 (0.30.2) For path n `X::name` that path_trait
+// gave no trait, X's type t having no inherent item `name` (the caller
+// looked first): the trait whose impl for t has a function or a constant
+// `name`, with that impl when it is the only one (several: a generic
+// trait's, `Conv<i32>` and `Conv<i64>`, chosen by a call's arguments,
+// convert::generic_trait_call, else an error); of two traits the one in
+// scope (F9.2), else error method.ambiguous (rustc E0034). No trait
+// when no impl for t has it.
+pub fn concrete_trait(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTrait {
+    if t <= 0 || crate::front::check::has_error_type(t, pcx)
+        || crate::front::opaque::is_opaque(t, pcx) {
+        return no_trait();
+    }
+    let mut imps: Vec<i64, Comp> = Vec::new_in(Comp {});
+    // (the impls that may have a function `name`)
+    let mut c = crate::front::convert::impl_naming(name, pcx);
+    while c >= 0 {
+        let i = pcx.name_cells[c as usize];
+        c = crate::front::convert::impl_naming_after(c, pcx);
+        if impl_fn(i, name, pcx) >= 0 && !imps.contains(&i) && impl_covers(i, t, pcx) {
+            imps.push(i);
+        }
+    }
+    // (and a constant `name`)
+    for i in 0..pcx.traits_impls.len() as i64 {
+        if impl_const_decl(i, name, pcx) != 0 && !imps.contains(&i) && impl_covers(i, t, pcx) {
+            imps.push(i);
+        }
+    }
+    let mut trs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for k in 0..imps.len() as i64 {
+        let tr = pcx.traits_impls[imps[k as usize] as usize].tr;
+        if !trs.contains(&tr) {
+            trs.push(tr);
+        }
+    }
+    if trs.len() == 0 {
+        return no_trait();
+    }
+    let mut tr = trs[0];
+    if trs.len() > 1 {
+        let mut hits: i64 = 0;
+        for k in 0..trs.len() as i64 {
+            if crate::front::check::calls::trait_in_scope(trs[k as usize], pcx) {
+                tr = trs[k as usize];
+                hits += 1;
+            }
+        }
+        if hits != 1 {
+            ambiguous_error(n, t, name, trs[0], trs[1], pcx);
+        }
+    }
+    let mut imp: i64 = -1;
+    let mut count: i64 = 0;
+    for k in 0..imps.len() as i64 {
+        if pcx.traits_impls[imps[k as usize] as usize].tr == tr {
+            imp = imps[k as usize];
+            count += 1;
+        }
+    }
+    PathTrait { tr: tr, args: -1, nargs: 0, imp: if count == 1 { imp } else { -1 } }
+}
+
+// The constant `name` impl i gives (its own, else its trait's default):
+// an AssocType node with a value, or 0. RULE: F3.2
+pub fn impl_const_decl(i: i64, name: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut d: i64 = 0;
+    let h = pcx.nodes[pcx.traits_impls[i as usize].node as usize].c;
+    for k in 0..(if h > 0 { pcx.nodes[h as usize].count } else { 0 }) {
+        if pcx.nodes[child(h, k, pcx) as usize].a == name
+            && pcx.nodes[child(h, k, pcx) as usize].kind == NodeKind::AssocType {
+            d = child(h, k, pcx);
+            break;
+        }
+    }
+    if d == 0 {
+        d = assoc_in_trait(pcx.traits_impls[i as usize].tr, name, pcx);
+    }
+    if d == 0 || (pcx.nodes[d as usize].p & NODE_ASSOC_CONST) == 0 || pcx.nodes[d as usize].c == 0 {
+        return 0;
+    }
+    d
+}
+
+// The impl of pt's trait for type t: pt.imp when the path named it
+// already; else the one impl of pt.tr that covers t and whose trait
+// arguments begin with those the path writes; -1 when none does, -2
+// when several do (a generic trait's arguments not written).
+pub fn trait_impl(t: i64, pt: PathTrait, pcx: &mut Ctx<Comp>) -> i64 {
+    if pt.imp >= 0 {
+        return pt.imp;
+    }
+    let mut found: i64 = -1;
+    let mut count: i64 = 0;
+    let mut i = impls_start(pt.tr, pcx);
+    while i >= 0 {
+        let at = i;
+        i = impls_after(at, pcx);
+        if !impl_covers(at, t, pcx) || !args_agree(at, t, pt, pcx) {
+            continue;
+        }
+        count += 1;
+        if found < 0 {
+            found = at;
+        }
+    }
+    if count > 1 { -2 } else { found }
+}
+
+// Whether impl i (covering t) is of pt's trait with the arguments the
+// path writes, pt.args: its own; a pattern impl's parameter that only
+// the trait's arguments fix (`impl<T, U: From<T>> Into<U> for T`) bound
+// from the path's, and its arguments read back with it.
+fn args_agree(i: i64, t: i64, pt: PathTrait, pcx: &mut Ctx<Comp>) -> bool {
+    if pt.args < 0 || pt.nargs == 0 {
+        return true;
+    }
+    let mut have = impl_targs(i, t, pcx);
+    if have < 0 {
+        let header = pcx.nodes[pcx.nodes[pcx.traits_impls[i as usize].node as usize].a as usize].g;
+        if header == 0 || pcx.nodes[header as usize].count != pt.nargs {
+            return false;
+        }
+        let b = crate::front::convert::complete_impl_bindings(i, t, pt.args, pcx);
+        if b < 0 {
+            return false;
+        }
+        have = crate::front::convert::impl_targs_with(i, b, pcx);
+    }
+    have >= 0 && same_list(have, pt.args, pt.nargs, pcx)
+}
+
+// RULE: F8.4 (0.30.2) The function `name` of pt's trait for path n's type
+// t: for an Ω, the virtual function of its bound (opaque::virtual_fn_of);
+// else the trait's impl's own, or its default copied into the impl. -1
+// when the trait's item `name` is no function; -2 when several impls of
+// a generic trait are t's (trait_impl). An error when t has no impl.
+pub fn trait_fn_of(n: i64, t: i64, pt: PathTrait, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if trait_fn(pt.tr, name, pcx) == 0 {
+        return -1;
+    }
+    if is_omega(t, pcx) {
+        let b = crate::front::opaque::omega_bound_for(t, pt.tr, pcx);
+        if b < 0 {
+            unmet_error(n, t, pt.tr, pcx);
+        }
+        return crate::front::opaque::virtual_fn_of(t, pt.tr, b, name, pcx);
+    }
+    let i = trait_impl(t, pt, pcx);
+    if i == -2 {
+        return -2;
+    }
+    // (a generic trait's impl that is none of TRAITS_IMPLS, an intrinsic
+    // conversion, `<i64 as From<i32>>::from(7)`: the call's arguments
+    // choose, convert::generic_trait_call)
+    if i < 0 && crate::front::convert::trait_param_count(pt.tr, pcx) > 0 {
+        return -2;
+    }
+    if i < 0 {
+        unmet_error(n, t, pt.tr, pcx);
+    }
+    let f = impl_fn(i, name, pcx);
+    if f < 0 {
+        // (its signature failed, reported; or a default never copied)
+        unmet_error(n, t, pt.tr, pcx);
+    }
+    f
+}
+
+// RULE: F8.4, F3.2 (0.30.2) The constant `name` of pt's trait for path n's
+// type t, n made its value (an Ω's: opaque::omega_const_of; else the
+// impl's, or the trait's default: assoc::impl_const_value): its type;
+// -1 when the trait's item `name` is no constant.
+pub fn trait_const_of(n: i64, t: i64, pt: PathTrait, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let d = assoc_in_trait(pt.tr, name, pcx);
+    if d == 0 || (pcx.nodes[d as usize].p & NODE_ASSOC_CONST) == 0 {
+        return -1;
+    }
+    if is_omega(t, pcx) {
+        if crate::front::opaque::omega_bound_for(t, pt.tr, pcx) < 0 {
+            unmet_error(n, t, pt.tr, pcx);
+        }
+        return crate::front::opaque::omega_const_of(n, t, pt.tr, name, pcx);
+    }
+    let i = trait_impl(t, pt, pcx);
+    if i == -2 {
+        several_impls_error(n, t, pt.tr, name, pcx);
+    }
+    if i < 0 {
+        unmet_error(n, t, pt.tr, pcx);
+    }
+    let r = crate::front::assoc::impl_const_value(n, t, i, name, pcx);
+    if r < 0 {
+        // (the impl leaves it out and the trait has no default: reported
+        // at the impl)
+        unmet_error(n, t, pt.tr, pcx);
+    }
+    r
+}
+
+// error method.ambiguous: `name` is an item of traits a and b for path
+// n's X (rustc E0034), with the qualified path of each.
+fn ambiguous_error(n: i64, t: i64, name: i64, a: i64, b: i64, pcx: &mut Ctx<Comp>) -> ! {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"method.ambiguous";
+    err_begin(pcx.nodes[n as usize].start, pcx);
+    err_str(c"multiple applicable items: '", pcx);
+    err_sym(name, pcx);
+    err_str(c"' is an item of more than one trait for '", pcx);
+    // (a type parameter by its name, in the generic body and in an
+    // instance alike: the bounds are what is ambiguous)
+    if pcx.nodes[n as usize].count == 0
+        && crate::front::generics::env_lookup(pcx.nodes[n as usize].a, pcx) != 0 {
+        err_sym(pcx.nodes[n as usize].a, pcx);
+    } else {
+        err_type(t, pcx);
+    }
+    err_str(c"'", pcx);
+    err_help(c"name the trait in a qualified path to say which", pcx);
+    let x = sym_text(pcx.nodes[n as usize].a, pcx);
+    for tr in [a, b] {
+        err_try_fmt(format_args("<{} as {}>::{}", str::from_utf8(x).unwrap(),
+            str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap(),
+            str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+    }
+    err_end_soft(pcx);
+    pcx.err_kind = saved_kind;
+    err_jump(pcx)
+}
+
+// error trait.unmet: path n's type t has no impl of trait tr (rustc
+// E0277).
+fn unmet_error(n: i64, t: i64, tr: i64, pcx: &mut Ctx<Comp>) -> ! {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"trait.unmet";
+    err_begin(pcx.nodes[n as usize].start, pcx);
+    err_str(c"'", pcx);
+    err_type(t, pcx);
+    err_str(c"' has no impl of '", pcx);
+    err_sym(pcx.traits[tr as usize].name, pcx);
+    err_str(c"' that gives '", pcx);
+    err_sym(pcx.nodes[n as usize].b, pcx);
+    err_str(c"'", pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved_kind;
+    err_jump(pcx)
+}
+
+// error type.infer: path n's type t has several impls of generic trait
+// tr, and the path says not which (rustc E0283, E0790).
+fn several_impls_error(n: i64, t: i64, tr: i64, name: i64, pcx: &mut Ctx<Comp>) -> ! {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"type.infer";
+    err_begin(pcx.nodes[n as usize].start, pcx);
+    err_str(c"'", pcx);
+    err_type(t, pcx);
+    err_str(c"' has more than one impl of '", pcx);
+    err_sym(pcx.traits[tr as usize].name, pcx);
+    err_str(c"' that gives '", pcx);
+    err_sym(name, pcx);
+    err_str(c"': which one is not said", pcx);
+    err_help(c"write the trait's arguments in a qualified path: `<S as Tr<A>>::name`", pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved_kind;
+    err_jump(pcx)
+}
+
+// error name.unknown: trait tr, named in path n `<X as Tr>::name`,
+// declares no function or constant `name` (rustc E0576).
+fn not_in_trait_error(n: i64, tr: i64, name: i64, pcx: &mut Ctx<Comp>) -> ! {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"name.unknown";
+    err_begin(pcx.nodes[n as usize].start, pcx);
+    err_str(c"no function or constant '", pcx);
+    err_sym(name, pcx);
+    err_str(c"' in trait '", pcx);
+    err_sym(pcx.traits[tr as usize].name, pcx);
+    err_str(c"'", pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved_kind;
+    err_jump(pcx)
+}
+
+// The error for path n used as a value when trait_fn_of answered -2:
+// several impls of pt's trait are t's (several_impls_error), or none is
+// (unmet_error).
+pub fn several_impls(n: i64, t: i64, pt: PathTrait, name: i64, pcx: &mut Ctx<Comp>) -> ! {
+    if trait_impl(t, pt, pcx) == -2 {
+        several_impls_error(n, t, pt.tr, name, pcx);
+    }
+    unmet_error(n, t, pt.tr, pcx)
+}
+
+// RULE: F9.1 (0.30.2) The inherent function `name` of type t (of an impl
+// without a trait: t's own, its template's, a pattern impl's), or -1.
+// An Ω's virtual functions are its bounds' (path_trait), never inherent.
+pub fn inherent_fn(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let f = crate::front::check::calls::method_of(t, name, pcx);
+    if f >= 0 && impl_of_fn(f, pcx) < 0 && !is_virtual(f, pcx) {
+        return f;
+    }
+    let mut i = crate::front::check::collect::gm_start(crate::front::generics::TPL_PATTERN, name,
+        pcx);
+    while i >= 0 {
+        let at = i;
+        i = crate::front::check::collect::gm_after(at, pcx);
+        let g = pcx.gmethods[at as usize].f;
+        if pcx.gmethods[at as usize].ty == crate::front::generics::TPL_PATTERN
+            && pcx.gmethods[at as usize].name == name && impl_of_fn(g, pcx) < 0
+            && crate::front::traits::fn_pattern_bindings(g, t, pcx) >= 0 {
+            return g;
+        }
+    }
+    -1
+}
+
+// Whether function f is an Ω's virtual function (opaque::virtual_fn_of).
+fn is_virtual(f: i64, pcx: &Ctx<Comp>) -> bool {
+    f < pcx.virtual_trait.len() as i64 && pcx.virtual_trait[f as usize] != 0
+}
+
+// (0.30.2) Call n through path callee, of pt's trait (a generic trait
+// whose impl the path does not fix: its arguments left out with several
+// impls t's, or an intrinsic conversion that is no impl), as
+// convert::generic_trait_call chose it by the call's arguments (r its
+// type, -1: it chose none): an error when it chose none, or a function
+// of another trait's impl, or of an impl with other arguments than the
+// path writes.
+pub fn check_dispatched(n: i64, callee: i64, t: i64, pt: PathTrait, name: i64, r: i64,
+    pcx: &mut Ctx<Comp>) {
+    if r < 0 {
+        several_impls(callee, t, pt, name, pcx);
+    }
+    let x = pcx.nodes[n as usize].x;
+    if pcx.nodes[n as usize].kind == NodeKind::Call && x > 0 {
+        let i = impl_of_fn(x - 1, pcx);
+        let i0: i64 = if i >= 0 { i }
+            else if pcx.fns[(x - 1) as usize].tmpl != 0 {
+                impl_of_fn(pcx.fns[(x - 1) as usize].tmpl - 1, pcx)
+            } else { -1 };
+        if i0 >= 0 && pcx.traits_impls[i0 as usize].tr != pt.tr {
+            ambiguous_error(callee, t, name, pt.tr, pcx.traits_impls[i0 as usize].tr, pcx);
+        }
+        if i0 >= 0 && !args_agree(i0, t, pt, pcx) {
+            unmet_error(callee, t, pt.tr, pcx);
+        }
+    }
+}
+
+// RULE: F8.4, F9.3 (0.30.2) The function `name` of generic template tpl
+// that path n (`W::name(args)`, W written without its arguments) calls:
+// with `<W as Tr>`, Tr's; else an inherent one; else the one trait's
+// whose impl for tpl has it, two being E0034 (F9.2: the one in scope);
+// -1 when tpl has none (convert::template_trait_call looks for a
+// generic trait's).
+pub fn template_fn(n: i64, tpl: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let qn = crate::front::parser::rust::lifetimes_of(crate::front::parser::rust::qpath_key(n),
+        pcx);
+    let want: i64 = if qn != 0 { bound_trait(qn, pcx) } else { -1 };
+    let mut found: i64 = -1;
+    let mut trs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut fs: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut i = crate::front::check::collect::gm_start(tpl, name, pcx);
+    while i >= 0 {
+        let at = i;
+        i = crate::front::check::collect::gm_after(at, pcx);
+        if pcx.gmethods[at as usize].ty != tpl || pcx.gmethods[at as usize].name != name {
+            continue;
+        }
+        let f = pcx.gmethods[at as usize].f;
+        let im = impl_of_fn(f, pcx);
+        if im < 0 {
+            if want < 0 {
+                return f;
+            }
+            continue;
+        }
+        let tr = pcx.traits_impls[im as usize].tr;
+        if want >= 0 && tr != want {
+            continue;
+        }
+        if !trs.contains(&tr) {
+            trs.push(tr);
+            fs.push(f);
+        }
+        if found < 0 {
+            found = f;
+        }
+    }
+    if trs.len() > 1 {
+        let mut hits: i64 = 0;
+        for k in 0..trs.len() as i64 {
+            if crate::front::check::calls::trait_in_scope(trs[k as usize], pcx) {
+                found = fs[k as usize];
+                hits += 1;
+            }
+        }
+        if hits != 1 {
+            ambiguous_template_error(n, tpl, name, trs[0], trs[1], pcx);
+        }
+    }
+    if found < 0 && want >= 0 && pcx.nodes[qn as usize].g == 0 {
+        // (a trait's default copied into a generic impl: impl_fn of the
+        // impl of want for tpl)
+        let mut k = impls_start(want, pcx);
+        while k >= 0 {
+            let at = k;
+            k = impls_after(at, pcx);
+            if pcx.traits_impls[at as usize].tpl == tpl {
+                let f = impl_fn(at, name, pcx);
+                if f >= 0 {
+                    return f;
+                }
+            }
+        }
+    }
+    found
+}
+
+// error method.ambiguous for template tpl's `name` of traits a and b.
+fn ambiguous_template_error(n: i64, tpl: i64, name: i64, a: i64, b: i64, pcx: &mut Ctx<Comp>) -> ! {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"method.ambiguous";
+    err_begin(pcx.nodes[n as usize].start, pcx);
+    err_str(c"multiple applicable items: '", pcx);
+    err_sym(name, pcx);
+    err_str(c"' is an item of more than one trait for '", pcx);
+    err_sym(crate::front::generics::template_name(tpl, pcx), pcx);
+    err_str(c"'", pcx);
+    err_help(c"name the trait in a qualified path to say which", pcx);
+    let x = sym_text(pcx.nodes[n as usize].a, pcx);
+    for tr in [a, b] {
+        err_try_fmt(format_args("<{} as {}>::{}", str::from_utf8(x).unwrap(),
+            str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap(),
+            str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+    }
+    err_end_soft(pcx);
+    pcx.err_kind = saved_kind;
+    err_jump(pcx)
+}
+
+// RULE: F11.3, F9.3 (0.30.2) `P::name`, an associated type through the
+// bounds of type parameter P (bounds, a Generics holder; at pos): the
+// one trait of its bounds, or of their supertraits, that declares a type
+// `name`; -1 when none does; two are an error (rustc E0221), never the
+// first bound's by its name.
+pub fn bound_assoc_trait(p_name: i64, bounds: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
+        type_declaring_all(bound_trait(child(bounds, i, pcx), pcx), name, 0, &mut seen, pcx);
+    }
+    if seen.len() > 1 {
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"type.ambiguous";
+        err_begin(pos, pcx);
+        err_str(c"ambiguous associated type '", pcx);
+        err_sym(name, pcx);
+        err_str(c"' in the bounds of '", pcx);
+        err_sym(p_name, pcx);
+        err_str(c"': traits '", pcx);
+        err_sym(pcx.traits[seen[0] as usize].name, pcx);
+        err_str(c"' and '", pcx);
+        err_sym(pcx.traits[seen[1] as usize].name, pcx);
+        err_str(c"' both declare it", pcx);
+        err_help(c"name the trait in a qualified path to say which", pcx);
+        for k in 0..2 {
+            err_try_fmt(format_args("<{} as {}>::{}",
+                str::from_utf8(sym_text(p_name, pcx)).unwrap(),
+                str::from_utf8(sym_text(pcx.traits[seen[k as usize] as usize].name, pcx)).unwrap(),
+                str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+        }
+        err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
+        err_jump(pcx);
+    }
+    if seen.len() == 1 { seen[0] } else { -1 }
+}
+
+// The traits, tr and its supertraits (F2.2), that declare an associated
+// type `name`, pushed onto out once each; deeper than 8 is an error.
+fn type_declaring_all(tr: i64, name: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+    if tr < 0 {
+        return;
+    }
+    let d = assoc_in_trait(tr, name, pcx);
+    if d != 0 && (pcx.nodes[d as usize].p & NODE_ASSOC_CONST) == 0 && !out.contains(&tr) {
+        out.push(tr);
+    }
+    let supers = trait_supers(tr, pcx);
+    let count: i64 = if supers > 0 { pcx.nodes[supers as usize].count } else { 0 };
+    if count > 0 && depth >= 8 {
+        supertrait_depth_error(tr, pcx);
+    }
+    for i in 0..count {
+        type_declaring_all(bound_trait(child(supers, i, pcx), pcx), name, depth + 1, out, pcx);
+    }
+}
+
+// (0.30.2) The trait, tr or one of its supertraits, that declares the
+// associated type `name` (`Self::Out` read in tr's declaration is `<Self
+// as Tr>::Out`, rustc's reading); -1 when none does; two: E0221 at pos.
+pub fn trait_type_declaring(tr: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
+    type_declaring_all(tr, name, 0, &mut seen, pcx);
+    if seen.len() > 1 {
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"type.ambiguous";
+        err_begin(pos, pcx);
+        err_str(c"ambiguous associated type '", pcx);
+        err_sym(name, pcx);
+        err_str(c"': traits '", pcx);
+        err_sym(pcx.traits[seen[0] as usize].name, pcx);
+        err_str(c"' and '", pcx);
+        err_sym(pcx.traits[seen[1] as usize].name, pcx);
+        err_str(c"' both declare it", pcx);
+        err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
+        err_jump(pcx);
+    }
+    if seen.len() == 1 { seen[0] } else { -1 }
+}
+
+// The trait whose declaration function f is an Ω's virtual function of
+// (opaque::virtual_fn_of), or an instance of one: its index, else -1.
+pub fn virtual_trait_of(f: i64, pcx: &Ctx<Comp>) -> i64 {
+    if f < 0 {
+        return -1;
+    }
+    if f < pcx.virtual_trait.len() as i64 && pcx.virtual_trait[f as usize] != 0 {
+        return pcx.virtual_trait[f as usize] - 1;
+    }
+    let g = pcx.fns[f as usize].tmpl - 1;
+    if g >= 0 && g < pcx.virtual_trait.len() as i64 && pcx.virtual_trait[g as usize] != 0 {
+        return pcx.virtual_trait[g as usize] - 1;
+    }
+    -1
+}
+
+// (0.30.2) How many traits of bounds (a Generics holder), or of their
+// supertraits, declare an associated type `name`.
+pub fn bound_assoc_count(bounds: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
+        type_declaring_all(bound_trait(child(bounds, i, pcx), pcx), name, 0, &mut seen, pcx);
+    }
+    seen.len() as i64
+}

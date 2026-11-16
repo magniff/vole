@@ -16,7 +16,7 @@ use crate::front::ast::NodeKind::{Ident, Path, VariantLit};
 use crate::front::check::{Res, has_error_type, lookup_local, name_error};
 use crate::front::check::arch::{check_intrinsic_call, check_raw_form};
 use crate::front::check::args::{arity_help, normalize_args};
-use crate::front::check::calls::{method_of, offer_template_methods, path_member_error};
+use crate::front::check::calls::{offer_template_methods, path_member_error};
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::collect::{
     find_generic_method, gm_after, gm_start, template_of_type_node, template_variant_named,
@@ -544,14 +544,25 @@ pub fn synth_path(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             return t;
         }
     }
-    let mut f = method_of(t, member, pcx);
+    // RULE: F8.4, F8.3, F9.3 (0.30.2, RT-C301-8: the function or constant
+    // is of the trait the path names, qualified::path_trait, `<S as B>::m`
+    // B's, `<S as A>::K` A's, `T::K` its bound's, D22.1 an Ω's; else an
+    // inherent one; else of the one trait whose impl for t has it,
+    // qualified::concrete_trait, two being E0034; never a trait's item
+    // found by its name alone, as 0.30.1's method_of and
+    // assoc_const_value did)
+    let mut pt = crate::front::check::calls::qualified::path_trait(n, t, member, pcx);
+    let mut f: i64 = -1;
+    if pt.tr < 0 {
+        f = crate::front::check::calls::qualified::inherent_fn(t, member, pcx);
+    }
     // (0.15: `i64::MAX`, `u8::MIN`, a literal)
-    if f < 0 && is_integer(t)
+    if pt.tr < 0 && f < 0 && is_integer(t)
         && (sym_is_c(member, c"MAX", pcx) || sym_is_c(member, c"MIN", pcx)) {
         return int_limit(n, t, sym_is_c(member, c"MAX", pcx), pcx);
     }
     // (0.25.2.1: `f64::EPSILON`, `f32::NAN`, a literal)
-    if f < 0 && (t == TY_F32 || t == TY_F64) {
+    if pt.tr < 0 && f < 0 && (t == TY_F32 || t == TY_F64) {
         let r = float_const(n, t, member, false, pcx);
         if r >= 0 {
             return r;
@@ -560,21 +571,24 @@ pub fn synth_path(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             float_const_error(pcx.nodes[n as usize].start, t, member, false, pcx);
         }
     }
-    // RULE: F3.2 (0.27.2: `t::N`, an associated constant)
-    if f < 0 {
-        let mut r = crate::front::assoc::inherent_const_value(n, t, member, pcx);
-        if r < 0 {
-            r = crate::front::assoc::assoc_const_value(n, t, member, pcx);
-        }
+    // RULE: F3.1 (0.27.2: `t::N`, an inherent constant)
+    if pt.tr < 0 && f < 0 {
+        let r = crate::front::assoc::inherent_const_value(n, t, member, pcx);
         if r >= 0 {
             return r;
         }
+        pt = crate::front::check::calls::qualified::concrete_trait(n, t, member, pcx);
     }
-    // RULE: D22.1 (0.27.3: `Ω::NAME`, a bound's associated constant, FL11)
-    if f < 0 && crate::front::opaque::is_omega(t, pcx) {
-        let r = crate::front::opaque::omega_const(n, t, member, pcx);
+    // RULE: F3.2, D22.1 (0.27.2: `t::N`, a trait's associated constant;
+    // 0.27.3: `Ω::NAME`, a bound's, FL11)
+    if pt.tr >= 0 {
+        let r = crate::front::check::calls::qualified::trait_const_of(n, t, pt, member, pcx);
         if r >= 0 {
             return r;
+        }
+        f = crate::front::check::calls::qualified::trait_fn_of(n, t, pt, member, pcx);
+        if f == -2 {
+            crate::front::check::calls::qualified::several_impls(n, t, pt, member, pcx);
         }
     }
     if f < 0 {
@@ -641,7 +655,7 @@ fn bind_impl_params(f: i64, t: i64, pcx: &mut Ctx<Comp>) {
 // (0.27.2) The trait a path callee names (`Tr::f`, `a::b::Tr::f`), its
 // index + 1, or 0: neither a local nor a primitive, an item that is a
 // trait. RULE: F8.2
-fn trait_path_key(callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
+pub fn trait_path_key(callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let segments = pcx.nodes[callee as usize].count;
     let mut key: i64 = -1;
     if segments == 0 {
@@ -808,29 +822,6 @@ fn self_in_param(ty: i64, t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
     0
 }
 
-// RULE: Z9.1c (0.27.6) The trait of a bound of type parameter `name` (of
-// the instance being checked) that declares `member` with a `self`
-// receiver, or -1.
-fn bound_method_trait(name: i64, member: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let p = bounded_param(name, pcx);
-    if p == 0 {
-        return -1;
-    }
-    let bounds = pcx.nodes[p as usize].h;
-    for i in 0..pcx.nodes[bounds as usize].count {
-        let tr = crate::front::traits::bound_trait(child(bounds, i, pcx), pcx);
-        if tr < 0 {
-            continue;
-        }
-        let f = crate::front::traits::trait_fn(tr, member, pcx);
-        if f != 0 && pcx.nodes[f as usize].count > 0
-            && pcx.nodes[child(f, 0, pcx) as usize].a == pcx.self_sym {
-            return tr;
-        }
-    }
-    -1
-}
-
 // `T::m(args)`: a variant with fields, or a call of an associated function
 // (or of a method, with the receiver passed explicitly).
 fn synth_path_call(n: i64, callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
@@ -845,23 +836,18 @@ fn synth_path_call(n: i64, callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // receiver explicit, is `x.m(args)`, probed as a method call is;
     // 0.27.2 M3: by its path too, `std::clone::Clone::clone(x)`, as
     // the derives write it, F17.1)
-    // RULE: F8.4 (0.30.1: `<S as Tr>::f`, the trait's function for S, as
-    // rustc's: with a receiver `Tr::f(x)`'s, through Tr only; without
-    // one, S's impl of Tr below)
+    // RULE: F8.4 (0.30.2: `<S as Tr>::f(args)`, Tr's function for S, is
+    // the item qualified::path_trait and trait_fn_of find below, called
+    // with its arguments as written, as rustc's; 0.30.1 made one with a
+    // receiver the method call `Tr::f(x)` is, and dropped the trait's
+    // arguments: `<S as Conv<i64>>::c(&s)` was ambiguous)
     let qn = crate::front::parser::rust::lifetimes_of(crate::front::parser::rust::qpath_key(callee),
         pcx);
-    let qtr: i64 = if qn != 0 { crate::front::traits::bound_trait(qn, pcx) } else { -1 };
-    if pcx.nodes[callee as usize].y == 0 && pcx.nodes[n as usize].count > 0 {
-        let mut tr = if qtr >= 0 { qtr + 1 } else { trait_path_key(callee, pcx) };
-        // RULE: Z9.1c (0.27.6: `A::m(x, args)` of a bounded parameter A
-        // whose bound declares the method m, with a receiver: `Tr::m(x,
-        // args)`, the bound's method of the type A stands for, as rustc
-        // resolves it on the generic body; `A::clone(&a)` with A = &Gpa
-        // is `<&Gpa as Clone>::clone`)
-        if tr == 0 && pcx.nodes[callee as usize].count == 0 {
-            tr = bound_method_trait(pcx.nodes[callee as usize].a, pcx.nodes[callee as usize].b,
-                pcx) + 1;
-        }
+    // (0.27.6, Z9.1c: `A::m(x)` of a bounded parameter A was the method
+    // call `Tr::m(x)` of the first bound declaring m; 0.30.2: the item of
+    // the one bound that declares it, qualified::path_trait, below)
+    if qn == 0 && pcx.nodes[callee as usize].y == 0 && pcx.nodes[n as usize].count > 0 {
+        let mut tr = trait_path_key(callee, pcx);
         // RULE: F8.2 (0.27.6: a function of the trait without a receiver,
         // its Self from an argument, `Hash::hash_slice(self, state)`:
         // `<T as Hash>::hash_slice`, path_target reads y)
@@ -870,10 +856,7 @@ fn synth_path_call(n: i64, callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
             else { 0 };
         let receiver = f != 0 && pcx.nodes[f as usize].count > 0
             && pcx.nodes[child(f, 0, pcx) as usize].a == pcx.self_sym;
-        if qtr >= 0 && !receiver {
-            tr = 0;
-        }
-        let s: i64 = if f != 0 && !receiver && qtr < 0 { self_from_args(f, n, pcx) } else { 0 };
+        let s: i64 = if f != 0 && !receiver { self_from_args(f, n, pcx) } else { 0 };
         if s > 0 {
             pcx.nodes[callee as usize].y = s;
             tr = 0;
@@ -943,7 +926,10 @@ fn synth_path_call(n: i64, callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
         if tpl < 0 && template_variant_named(-tpl - 1, member, pcx) {
             t = infer_enum(tpl, 0, member, n, pcx.nodes[callee as usize].start, pcx);
         } else {
-            let mut f = find_generic_method(tpl, member, pcx);
+            // RULE: F8.4, F9.3 (0.30.2: `<W as Tr>::f(..)` Tr's, and of two
+            // traits' functions neither by its name alone: qualified)
+            let mut f = crate::front::check::calls::qualified::template_fn(callee, tpl, member,
+                pcx);
             if f < 0 {
                 // RULE: F5.1 (`HashMap::new_in(a)` of `impl<K, V, A>
                 // HashMap<K, V, A, FixedState>`: a pattern impl on tpl)
@@ -1043,33 +1029,33 @@ fn synth_path_call(n: i64, callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
             return t;
         }
     }
-    let mut f = method_of(t, member, pcx);
-    if qtr >= 0 {
-        let g: i64 = if f >= 0 {
-            crate::front::check::calls::trait_method_choice(n, t,
-                crate::front::check::calls::method_template(t, pcx), member, f, qtr, pcx)
-        } else { -1 };
-        let gi: i64 = if g >= 0 { crate::front::traits::impl_of_fn(g, pcx) } else { -1 };
-        f = if gi >= 0 && pcx.traits_impls[gi as usize].tr == qtr { g }
-            else { crate::front::check::calls::pattern_method_via(t, member, qtr, pcx) };
+    // RULE: F8.4, F8.3, F9.3 (0.30.2, RT-C301-8: the function is of the
+    // trait the path names, qualified::path_trait, `<S as B>::m` B's, `T::m`
+    // its bound's, D22.1a an Ω's virtual one; else an inherent one, F5.1 a
+    // pattern impl's too; else of the one trait whose impl for t has it,
+    // qualified::concrete_trait, two being E0034; never a trait's function
+    // found by its name alone, as 0.30.1's method_of did)
+    let mut pt = crate::front::check::calls::qualified::path_trait(callee, t, member, pcx);
+    let mut f: i64 = -1;
+    if pt.tr < 0 {
+        f = crate::front::check::calls::qualified::inherent_fn(t, member, pcx);
+        if f < 0 {
+            pt = crate::front::check::calls::qualified::concrete_trait(callee, t, member, pcx);
+        }
     }
-    // RULE: F5.1 (0.29.0: `HashMap::<K, V, Gpa, FixedState>::new_in(a)`,
-    // a pattern impl's function by its type written whole, as
-    // `HashMap::new_in(a)` finds it by the template)
-    if f < 0 {
-        f = crate::front::check::calls::pattern_method_of(t, member, pcx);
-    }
-    // RULE: D22.1a (0.27.3: `Ω::f(args)`, a bound's associated function,
-    // `T::default()`: its virtual function, FL11)
-    if f < 0 && crate::front::opaque::is_omega(t, pcx) {
-        f = crate::front::opaque::virtual_fn(t, member, pcx);
-    }
-    if f < 0 {
-        // (0.15: `T::from(x)`, a function of a generic trait's impl)
-        let r = generic_trait_call(n, t, member, pcx);
-        if r >= 0 {
+    if pt.tr >= 0 {
+        f = crate::front::check::calls::qualified::trait_fn_of(callee, t, pt, member, pcx);
+        if f == -2 {
+            // (0.15: `T::from(x)`, impls of a generic trait the path names
+            // without its arguments: the call's arguments choose, of that
+            // trait's only)
+            let r = generic_trait_call(n, t, member, pcx);
+            crate::front::check::calls::qualified::check_dispatched(n, callee, t, pt, member, r,
+                pcx);
             return r;
         }
+    }
+    if f < 0 {
         path_member_error(callee, t, member, pcx);
     }
     crate::front::check::sealed::check_method_private(n, f, pcx);
