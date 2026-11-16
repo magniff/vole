@@ -2181,14 +2181,17 @@ gone too). Three codes keep the family's name: `conv.set` (`x: set T`),
 gives it these rules (docs/design/collections-text-io.md §2.3, L3):
 
 - `&str` (and `&mut str`) in a type is `str`, as `&[T]` is `[T]`.
-- A string literal is a `str` where one goes, when its bytes are UTF-8
-  (one with `\x80`..`\xff` escapes that break it stays `[u8]`: the error
-  is `str::from_utf8(..)?`); elsewhere it is a `[u8]`, as before. A
+- A string literal is a `str` where one goes, its bytes UTF-8 always
+  (0.30.1: a `\x` escape in a str or a char is ASCII, `\x00` to `\x7F`,
+  as Rust's: `out of range hex escape`; `\x80` and above are a byte
+  string's, `b"..."`, or a byte's, `b'.'`, which take no `\u{...}`);
+  elsewhere it is a `[u8]`, as before. A
   literal receiver has `str`'s methods: `"a,b".split(',')`.
 - A `str` goes where a `[u8]` does, for free; `b as str` of bytes is an
   error outside std (`str::from_utf8(b)?` checks them).
-- `s[i]` is byte i (a `u8`), `s[a..b]` a `str` (byte offsets; not
-  checked at char boundaries in 0.20).
+- `s[i]` is byte i (a `u8`), `s[a..b]` a `str` (byte offsets, checked
+  to fall at char boundaries, std's Index: in a program from 0.28.0, in
+  std too from 0.30.1).
 - `&s` of a String (or a PathBuf) goes where a `str` (a Path) or `[u8]`
   does, and `&v` of a Vec or a Buf where its slice does: Rust's deref
   coercions, as `s.as_str()`, `s.as_bytes()`, `v.as_slice()`. A String

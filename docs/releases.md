@@ -317,6 +317,14 @@ that keeps few values live is unlikely to make such moves.
   and prints `stopped by signal 11` (10, SIGBUS, for a spawned thread on
   macOS) and the frames where it printed nothing. A thread made by C's
   `pthread_create` has no such stack: its overflow prints nothing.
+- **`std::thread::Builder`**, Rust's, with `stack_size`:
+  `thread::Builder::new().stack_size(1 << 30).spawn_in(f, gpa)` starts
+  the thread on a stack of that size (rounded up to a multiple of 64 KiB,
+  128 KiB at least) and gives an `io::Result`: when no thread is made
+  (the size refused, its memory not had) an Err, the closure dropped and
+  not run. `name` is left out (nothing reads it back). std's own threads
+  (`spawn_in`, `Scope::spawn`) now look at pthread's answer to their
+  stack size too. 0.30.2's compiler starts its own thread with it.
 
 #### Bugs fixed
 
@@ -352,6 +360,52 @@ that keeps few values live is unlikely to make such moves.
   now add modulo 2^64 (`wrapping_add`). Found by reading the source: a
   compiler built at -O0, whose arithmetic is checked, would panic there
   on an offset near 2^63, where one built at -O2 wraps.
+- A long chain of operators (RT-28): `1 + 1 + ... + 1` of 8000 terms,
+  or 10000 nested `-`, overflowed the compiler's stack, and `check` and
+  every build died by SIGSEGV with no message. The front end's passes
+  recurse over an expression, about 1.2 KB a level, and the process's
+  main thread has 8 MB. The compilation now runs on a thread of its own
+  with a 1 GiB stack, reserved and used only as deep as it goes: a chain
+  of 60000 terms builds at -O0 and -O2. When the system makes no such
+  thread, it says so and compiles where it did. A far deeper one (some 800 000
+  levels) still overflows it with no error. Such a function is also one
+  whose body the borrow checker's liveness holds in memory quadratic in
+  its statements (a chain of 60000 terms takes 8.5 GB; a flat body of
+  30000 statements took 3.3 GB on 0.30.0 too).
+- A read through an alias of an alias (RT-32): `let r = &d; let rr =
+  &r; zap(*rr); x / d` was accepted under `#[no_panic]` and panicked
+  (0.30.0 too), as were `&**rr`, `let r2 = *rr`, `let &r2 = rr` and a
+  counted loop whose counter `(**rr).zap()` zeroed. A read through a
+  reference whose value may be an address is now a use of what the
+  alias reaches, for the effect walk and for the places IR's check of
+  it alike (E1.8, "What a read through an alias is").
+- A source that is not UTF-8 (RT-24): a byte that begins no character,
+  in a string literal or a comment, was accepted, a `&str` held it, and
+  an error that quoted it panicked the compiler. It is now `lex.utf8`,
+  an error at the byte, as rustc refuses such a file. Its other forms:
+  a `\x80`..`\xFF` escape in a str literal, a text block or an
+  f-string made a `&str` that was not UTF-8, and `'\xFF'` was a char.
+  The one escape decoder refuses them now, as rustc (`out of range hex
+  escape`): a str's and a char's `\x` is ASCII; such bytes are a byte
+  string's (`b"\xFF"`) or a byte's, and a byte string takes no
+  `\u{...}` (**a program that used a str literal's `\xFF` as bytes
+  writes `b"..."`**; std's tables did). `volec fmt` names such a file
+  with the byte's line.
+- std's own `s[a..b]` of a str (RT-21) was its bytes' slice, unchecked:
+  `"é".split_at(1)` gave two strs that are not UTF-8, and
+  `String::remove` decoded half a character. std's str ranges go
+  through Index as a program's: they panic off a char boundary, as
+  Rust's.
+- E1.8 and the borrow checker's hidden bindings: a format argument (`{}`
+  and `{i}`) became a borrow of its place, which the effect walk did not
+  see, so a counted loop that printed its counter, or a guarded divisor
+  printed before its division, lost its proof (a false `diverge` or
+  `panic`): 14 borrows in the tests and examples. The places IR now says
+  where each borrow's reference goes, from the built body: one only read
+  through gives the place's value and needs no site of the walk's (E1.8,
+  "Where the reference goes, from the IR"). `tests/e18_loans.sh` counts
+  every borrow, reports a crash or a panic of the check with its file,
+  and has a `--self-test` that plants a fault in each of its rules.
 - Functions the compiler makes from a program's code (RT-34, unsound,
   in 0.30.0): an `ensures`'s `f$body` (which holds f's body), a
   `#[multiversion]` version and a derive's impl were lowered under
@@ -442,6 +496,36 @@ that keeps few values live is unlikely to make such moves.
 
 #### Known issues
 
+- The compiler's own thread (RT-28) reserves 1 GiB of address space for
+  its stack. It is not memory used: pages are touched only as deep as
+  the passes recurse. But a limit on address space counts it: on Linux
+  (not tried on this release's macOS runs, where `ulimit -v` cannot be
+  set) `ulimit -v` under about 1.2 GiB, or overcommit turned off
+  (`vm.overcommit_memory=2`) with little memory, may make no such
+  thread, and the compiler then compiles on the first thread's 8 MB,
+  saying so once on stderr, `warning thread.main-stack: ...` (a JSON
+  line under `--json`), the moment a command starts to read a program
+  (a build, check, query, fmt, fix, test, try, the LSP; not
+  `--version`, `explain` or `guide`), so that it is there before a deep
+  expression overflows that stack. A volec a command starts (try's,
+  test's, probe's checks and builds: `VOLEC_NESTED`) never says it, so
+  the warning cannot reach output a parent reads (try's answer). A
+  lazy std's build made again and `check --changed`'s checks are not
+  nested: under a fallback the warning may be said twice, or once a
+  checked program. Known issue, as in 0.30.1's base (RT-45): when only
+  such a child falls back it is not reported, and if it then overflows
+  the command fails without saying why (`try` exits 1, `test` and
+  `probe` report a build that failed). A program volec runs (`run`,
+  `test`, `test --input`, `probe`, `try`, `reduce --until`'s command)
+  no longer gets the variables volec sets for itself (`VOLEC_NESTED`,
+  `VOLEC_EDIT_TAG`; `volec guide tools`): it
+  is exec'd with volec's environment less those, by execve of its
+  path. A worker or the assembler's thread that
+  cannot be made leaves the build on fewer threads (the main thread's
+  at the least), where 0.30.0 stopped it (`try -j1`)
+  (tests/main_stack.sh plants each). A stack
+  overflow, at some 800 000 levels, now ends the compiler by SIGBUS,
+  exit status 138 (the thread's guard page), not by SIGSEGV, 139.
 - A struct assigned field by field before it is initialized (`let mut
   p: P; p.a = 1;`) is accepted; rustc refuses it (E0381). A census
   XFAIL, `rust_b_err_mv_assign_part_uninit`.

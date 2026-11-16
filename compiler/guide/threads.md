@@ -82,7 +82,9 @@ fn main(gpa: Gpa) {
 499500 1000 2
 ```
 
-`thread::yield_now()`, `thread::sleep(d)`, `thread::available_parallelism()`
+A thread's stack is 8 MiB; `thread::Builder::new().stack_size(n)
+.spawn_in(f, gpa)` gives one of n bytes (rounded up to 64 KiB), and an
+`io::Result` of the handle: Err when no thread is made. `thread::yield_now()`, `thread::sleep(d)`, `thread::available_parallelism()`
 (a `usize`). Printing is safe from any thread: once threads run, each
 print holds a lock, so output never interleaves.
 
