@@ -1959,6 +1959,45 @@ outside the holes named below.
   the result outlive the argument (case `rust_b_err_fn_item_bound_result`).
   Stricter than rustc for a fn item whose result is `'static` (the erased
   type says every argument region outlives every result region).
+  *(0.30.2, RT-282, RT-297..301, RT-304, RT-308..311) One rule where a
+  callable meets an Fn bound or a `fn` type.* A call through such a
+  callable in a signature's body relates the regions of its parts as
+  `indirect_call` reads the erased type (every argument region outlives
+  every result region; one in an invariant position equals every other
+  one's), and the signature says so: `regions::callable_ties` (in
+  `sig_compute`) reads every `Fn*` bound of a type parameter whose
+  substitution is a `fn` type, a `fn` item or an opaque `impl Fn` (and
+  the bound's of a closure that has its own bound regions, checked
+  against another bound before: `closure_group_ties`), every `fn` type
+  written in a parameter's type at any depth (behind `&`, in an array, a
+  tuple, a struct's or an enum's type argument), and every `where`
+  predicate on another subject, in the signature's universals. Each
+  relation is `Sig.vties`: assumed in the body (`assign_regions`) and
+  required at each call (`constraints::call`), except where the value
+  given for that parameter is a fn item whose own signature keeps the two
+  positions apart (`fn st(x: &i64) -> &'static i64` for `F: Fn(T) -> U`:
+  `fn_values::relates`), as rustc reads the item's own type. A relation
+  whose first region is the call's own (an elided lifetime of the
+  bound's input, `F: FnMut(&T) -> K`) is no universal's: it is a strict
+  record (`Sig.strict`), checked where the value is given
+  (`fn_values::check_callables`, from `build.vl lower_call`): a fn item
+  whose signature relates them, a `fn` value, or a parameter forwarded
+  from a body that has no such record is `borrowck.fn_value_bound`
+  (rustc E0308). A struct or an enum whose field is a `fn` type
+  (`struct H<A, B> { f: fn(A) -> B }`) has the same relations as its
+  declaration's requirements (`regions::fn_field_reqs`, through
+  `adt_reqs`), its parameters' regions standing for every slot of what
+  they are given. Before, a fn item's call in the instance related
+  nothing at the caller: `v.first().map(idr2)`, `ap(&v[0], idr2)`,
+  `v.iter().scan(0, sc)`, a `fn` value kept in a field or a Vec and
+  passed on each kept no borrow of v, a use after free from safe code.
+  The `'static` a parameter's slot needs by the signature's bounds (the
+  impl select chose for `T: Keep`, a supertrait's `'static`) is read
+  from the signature too (`check_fn_value`, RT-308). Stricter than
+  rustc: a `fn` value (not an item) relates every argument to its
+  result, as before; HRTB bounds (`for<'a>`) are not parsed (RT-207).
+  *Cases:* the tags, `rust_b_fn_value_r6_ok`, `rust_b_err_fn_value_r6_drop`,
+  `rust_b_err_fn_value_r6_given`.
 - R7 Constant index projections `P[k]` vs `P[k']` with `k ≠ k'` were
   disjoint (D1.5), so `&mut a[0]` and `&mut a[1]` could coexist on an
   array and through a `&mut [T]`, and so could `a[i]` and `a[j]` by

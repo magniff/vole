@@ -188,6 +188,37 @@ A correctness release, its branches merged as each is reviewed clean.
   for `k(&y)`, E0596/E0594 for the rest). Reads through `*&y` still
   build.
 
+- **A callable meeting an Fn bound kept no borrow of its argument
+  (RT-282, RT-297, RT-297b, RT-297c, RT-299, RT-304, RT-308, RT-309,
+  RT-310, RT-311), every -O, in v0.30.1 and before.** A fn item whose result
+  borrows its argument, `fn idr2<'a>(x: &'a i64) -> &'a i64`, given to
+  `v.first().map(idr2)`, `and_then`, `sort_by_key`, Iterator's `scan`,
+  `find_map`, `map_while`, `fold`, a program's `F: Fn(T) -> U` or `f:
+  fn(I::Item) -> U` parameter, or kept in a struct's field or a Vec and
+  passed on, gave a result that kept no borrow of v: `drop(v)` while it
+  lived was accepted, a use after free from safe code; a generic fn used
+  as a value whose bound's impl needs `'static` (`kb::<&i64>` with only
+  `impl Keep for &'static i64`) the same. In the instance such a value is
+  its erased `fn` type, and a call through it related its arguments to
+  its result only inside the instance, where those are the instance's
+  own substitutions. Now the signature says it: every place a callable
+  meets an Fn bound or a `fn` type (a type parameter's `Fn*` bound, a
+  `fn` type at any depth of a parameter's type, a struct's or an enum's
+  `fn` field, a `where` predicate) relates the regions its call relates,
+  assumed in the body and required at each call, read through the item's
+  own signature where a fn item is given (`fn st(x: &i64) -> &'static
+  i64` keeps no borrow, as rustc reads it), and a value whose result may
+  borrow what the bound's elided input lends for the call alone is
+  refused where it is given, `borrowck.fn_value_bound` (rustc E0308;
+  `v.iter().scan(0, bad)` with a `bad` that returns its state). One rule
+  for closures, fn items, fn pointers, method paths, generic fns with
+  their arguments and opaque `impl Fn` values (borrowck.md R6). With it,
+  a fn item or a `fn` value given to Iterator's adapters (`map`,
+  `filter_map`, `flat_map`) builds (RT-298: `&mut F` of a `fn` type meets
+  an Fn bound as F does), an opaque `impl Fn(&i64) -> &i64` value given
+  to a bound infers its result (RT-301), and `binary_search_by` and
+  `binary_search_by_key` take Rust's `F: FnMut(&'a T) -> ..` (RT-300: a
+  key that is the element's reference was refused).
 - **The results of partition_in and unzip_in kept no borrow of their
   items (RT-211, RT-261, RT-267, RT-268, RT-237b, RT-283), every -O,
   since 0.28.0.** `let (a, b): (Vec<&i64, Gpa>, ..) =
