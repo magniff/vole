@@ -14,7 +14,7 @@ use crate::base::diag::{
     err_help, err_help_fmt, err_help_sym, err_pos, err_str, err_sym, err_try, err_try_fmt,
 };
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{FN_UNSAFE, NodeKind};
+use crate::front::ast::{FN_UNSAFE, NodeKind, child};
 use crate::front::ast::NodeKind::{CStr, Path, Str};
 use crate::front::check::{Res, lookup_local, name_error};
 use crate::front::check::synth_mode::synth_expr;
@@ -238,24 +238,31 @@ fn name_const(n: i64, c: i64, pcx: &mut Ctx<Comp>) -> i64 {
     pcx.consts[c as usize].ty
 }
 
-// RULE: F34.4 (0.30.2, RT-302) The one check of a constant's value e (a
-// copy made at a use: inline_const, assoc.vl assoc_const_value and
-// inherent_const_value) against its type ty. A constant's value is a body
-// of its own, as rustc's: no `return`, `?`, `break` or `continue` in it
-// leaves it (E0572, E0268), so its evaluation, which vole makes where the
-// constant is used, never leaves the using function half way through (a
-// `[C; N]` part built, places/build.vl repeat_each). The using function's
-// loops are out of reach (loop_base) and a `return` or `?` not inside a
-// closure of the value is refused (const_value, body.vl check_return,
-// check_try, leave_closure_error).
-pub fn check_const_value(e: i64, ty: i64, pcx: &mut Ctx<Comp>) {
+// RULE: F34.4 (0.30.2, RT-302) The one check of a constant's value e
+// against its type ty, wherever it is checked: a copy made at a use
+// (inline_const, inline_array_const, assoc.vl assoc_const_value and
+// inherent_const_value), a constant expression (consteval.vl
+// check_const_expr), an array length, a repeat count, a discriminant
+// (synth_const_value: ty 0). A constant's value is a body of its own:
+// what would leave it is refused once, where the value is written
+// (const_body_exits, check_const_bodies), so here the using function's
+// loops are out of reach (loop_base), and a `return` or `?` of the value
+// (not of a closure in it, const_value) is read as no function's
+// (body.vl check_return, check_try, leave_closure_error say nothing
+// more).
+pub fn check_const_value(e: i64, ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let saved_base = pcx.loop_base;
     let saved_value = pcx.const_value;
     pcx.loop_base = pcx.loop_stack.len() as i64;
     pcx.const_value = pcx.closure_stack.len() as i64 + 1;
-    crate::front::check::check_mode::check_expr(e, ty, pcx);
+    let r = if ty == 0 { crate::front::check::synth_mode::synth_expr(e, pcx) }
+        else {
+            crate::front::check::check_mode::check_expr(e, ty, pcx);
+            ty
+        };
     pcx.loop_base = saved_base;
     pcx.const_value = saved_value;
+    r
 }
 
 // (0.30.2, RT-302) Whether the expression being checked is a constant's
@@ -265,18 +272,151 @@ pub fn in_const_value(pcx: &Ctx<Comp>) -> bool {
     pcx.const_value > 0 && pcx.const_value == pcx.closure_stack.len() as i64 + 1
 }
 
-// RULE: F34.4 (0.30.2, RT-302) `return`, `?`, `break` or `continue` node n
-// (keyword) in a constant's value, outside any closure of it: refused, as
-// rustc's E0572 and E0268 (a constant's value is a body of its own).
-pub fn const_exit_error(n: i64, keyword: *const u8, at: i64, pcx: &mut Ctx<Comp>) {
+// RULE: F34.4 (0.30.2) A use of a constant's value met an exit that would
+// leave it: const_body_exits refused it where the value is written, before
+// any function was checked, so the use says nothing more and gives the
+// exit no target (no loop, no result of the using function). With no
+// error recorded the walk missed a body: an internal error, never a
+// program accepted with an exit the walk did not see.
+pub fn const_exit_seen(pcx: &mut Ctx<Comp>) {
+    if crate::base::diag::error_count(pcx) == 0 {
+        crate::base::die(c"internal: an exit from a constant's value that const_body_exits did not refuse (front-rust.md F34.4)");
+    }
+}
+
+// RULE: F34.4 (0.30.2, RT-302) error const.exit: `return`, `?`, `break` or
+// `continue` (keyword) at position at leaves a constant's value
+// (const_body_exits), as rustc's E0572 and E0268. One error per position:
+// a body walked again (an expansion's copy) says nothing new.
+fn const_exit_error(keyword: *const u8, at: i64, pcx: &mut Ctx<Comp>) {
+    if crate::base::diag::error_recorded_at(at, pcx) {
+        return;
+    }
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"const.exit";
     crate::base::diag::err_begin(at, pcx);
     crate::base::diag::err_str(c"'", pcx);
     crate::base::diag::err_str(keyword, pcx);
-    crate::base::diag::err_str(c"' cannot leave a constant's value: it is evaluated where the constant is used, and is a body of its own (rustc E0572, E0268)", pcx);
+    crate::base::diag::err_str(
+        c"' cannot leave a constant's value: the value is a body of its own (rustc E0572, E0268)", pcx);
     crate::base::diag::err_help(
         c"compute the value without leaving it, or make the constant a function and call it", pcx);
-    crate::base::diag::err_end(pcx);
-    let _ = n;
+    // (the walk goes on: every exit of every body is reported)
+    crate::base::diag::err_end_soft(pcx);
+    pcx.err_kind = saved;
+}
+
+// RULE: F34.4 (0.30.2, RT-302, RT-279) A constant's value is a body of its
+// own, as rustc's: no `return`, `?`, `break` or `continue` in it leaves
+// it (E0572, E0268). Checked once where each body is (check_const_bodies:
+// every constant and static, an associated one, a trait's default, a
+// local one, used or not; eval_array_len and eval_discriminant: an array
+// length, a repeat count, a discriminant), by its tree as written, which
+// every use's copy is made of (clone_node, whose fields this walks), so
+// no use can bring an exit along: a constant is made at each use, and
+// its evaluation never leaves the using function half way through (a
+// `[C; N]` part built, places/build.vl repeat_each). A closure in it is a
+// body of its own (the checker's closure rules); an array length or a
+// repeat count in it is one too (no loop of the value is in reach).
+pub fn const_body_exits(e: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mut loops: Vec<i64, Comp> = Vec::new_in(Comp {});
+    exits_in(e, &mut loops, pcx)
+}
+
+// (whether e has an exit that would leave it, reported or reported
+// before)
+fn exits_in(n: i64, loops: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> bool {
+    if n == 0 {
+        return false;
+    }
+    let kind = pcx.nodes[n as usize].kind;
+    if kind == NodeKind::Closure || kind == NodeKind::Fn {
+        return false;
+    }
+    let mut found = false;
+    if kind == NodeKind::Return {
+        const_exit_error(c"return", pcx.nodes[n as usize].start, pcx);
+        found = true;
+    } else if kind == NodeKind::Try {
+        const_exit_error(c"?", pcx.nodes[n as usize].end - 1, pcx);
+        found = true;
+    } else if kind == NodeKind::Break || kind == NodeKind::Continue {
+        let label = pcx.nodes[n as usize].a;
+        let mut inside = false;
+        for i in 0..loops.len() {
+            if label == 0 || pcx.nodes[loops[i] as usize].a == label {
+                inside = true;
+            }
+        }
+        if !inside {
+            const_exit_error(if kind == NodeKind::Break { c"break" } else { c"continue" },
+                pcx.nodes[n as usize].start, pcx);
+            found = true;
+        }
+    }
+    // (the field a loop's `break` and `continue` reach, as the checker
+    // has it, body.vl check_loop, check_while, check_for: a `loop`'s body
+    // b, a `while`'s body c (its condition b is outside), a `for`'s body d
+    // (its pattern b and its iterator c are outside))
+    let body = if kind == NodeKind::Loop { pcx.nodes[n as usize].b }
+        else if kind == NodeKind::While { pcx.nodes[n as usize].c }
+        else if kind == NodeKind::For { pcx.nodes[n as usize].d }
+        else { 0 };
+    if body != 0 {
+        loops.push(n);
+        found = exits_in(body, loops, pcx) || found;
+        loops.pop();
+    }
+    // (the fields clone_node copies, generics/instantiate.vl)
+    if crate::front::generics::instantiate::node_field_a(kind) {
+        found = exits_in(other(pcx.nodes[n as usize].a, body), loops, pcx) || found;
+    }
+    if crate::front::generics::instantiate::node_field_b(kind) {
+        if kind == NodeKind::Repeat || kind == NodeKind::TyArray {
+            // (a repeat count, an array length: a body of its own)
+            found = const_body_exits(pcx.nodes[n as usize].b, pcx) || found;
+        } else {
+            found = exits_in(other(pcx.nodes[n as usize].b, body), loops, pcx) || found;
+        }
+    }
+    if crate::front::generics::instantiate::node_field_c(kind) {
+        found = exits_in(other(pcx.nodes[n as usize].c, body), loops, pcx) || found;
+    }
+    if kind == NodeKind::For || kind == NodeKind::Param {
+        found = exits_in(other(pcx.nodes[n as usize].d, body), loops, pcx) || found;
+    }
+    found = exits_in(other(pcx.nodes[n as usize].g, body), loops, pcx) || found;
+    found = exits_in(other(pcx.nodes[n as usize].h, body), loops, pcx) || found;
+    for i in 0..pcx.nodes[n as usize].count {
+        found = exits_in(other(child(n, i, pcx), body), loops, pcx) || found;
+    }
+    found
+}
+
+// (a node of a loop's but its body, walked with the loop in reach; 0: not
+// walked again)
+fn other(e: i64, body: i64) -> i64 {
+    if e == body { 0 } else { e }
+}
+
+// RULE: F34.4 (0.30.2, RT-302, RT-279) Every constant's and static's value,
+// checked once where it is (const_body_exits): the program's items, an
+// impl's or a trait's associated constants, the constants inside a body;
+// before any function is checked, used or not.
+pub fn check_const_bodies(pcx: &mut Ctx<Comp>) {
+    let count = pcx.nodes.len() as i64;
+    for n in 1..count {
+        let k = pcx.nodes[n as usize].kind;
+        // (an associated constant: an AssocType flagged NODE_ASSOC_CONST,
+        // parser/items parse_assoc_const; a trait's default, an impl's, an
+        // inherent one's)
+        let assoc = k == NodeKind::AssocType
+            && (pcx.nodes[n as usize].p & crate::front::ast::NODE_ASSOC_CONST) != 0;
+        if (k == NodeKind::Const || k == NodeKind::Static || assoc)
+            && pcx.nodes[n as usize].c != 0 {
+            const_body_exits(pcx.nodes[n as usize].c, pcx);
+        }
+    }
 }
 
 // RULE: F34.2 Ident n names constant c, made at each use (a rust-edition

@@ -776,21 +776,45 @@ not this one. *Anchor:*
 promoted_const`. *Cases:* `rt_214_const_array_each_use`,
 `rt_214_const_array_index_refused`, `rt_214_const_array_borrow_promoted`.
 
-**F34.4 (a constant's value is a body of its own).** (0.30.2, RT-302)
-vole makes a constant at each use, its value checked there
-(`check_const_value`, the one check of a constant's value: names.vl
-inline_const, inline_array_const, assoc.vl assoc_const_value and
-inherent_const_value). A
-`return` or `?` in it outside a closure of its own, and a `break` or
-`continue` to a loop outside it, are refused (rustc E0572, E0268), as
-rustc's constant is a body of its own: v0.30.1 returned from whatever
-function read the constant, half way through a `[C; N]`. The using
-function's loops are out of reach (`loop_base`), and `const_value` (the
-closure depth it was entered at) tells a `return` in the value from one
-in a closure of it. *Anchor:* `front/check/names.vl: check_const_value,
-in_const_value, const_exit_error`. *Cases:*
-`rt_302_const_value_control_flow_escapes`,
-`rt_302_const_value_exits_more`, `rt_148_repeat_const_exit_*`.
+**F34.4 (a constant's value is a body of its own).** (0.30.2, RT-302,
+RT-279c, RT-407) A `return`, `?`, `break` or `continue` that would leave
+a constant's value is refused, error `const.exit` (rustc E0572, E0268):
+the value of a `const` or `static` item, of an associated constant (an
+impl's, an inherent one, a trait's default), of a local constant, an
+array length or a repeat count, an enum discriminant. It is checked once,
+where the value is written, used or not (`check_const_bodies`, before
+any function is checked, and consteval's own entry points,
+`check_const_expr`, `eval_array_len`, `eval_discriminant`): by the
+value's tree as written (`const_body_exits`, which walks the fields
+`clone_node` copies), so no use, which is a copy of that tree, can bring
+an exit along, and a constant made at each use never leaves the using
+function half way through (a `[C; N]` part built, F35.2). A closure in
+the value is a body of its own (the checker's closure rules); an array
+length or a repeat count in it is one too, out of reach of the value's
+loops; a loop of the value's own may be left by its `break`. a5eefbcae
+refused an exit only where a constant was used, so an unused constant's
+and a value consteval folded past the exit (`true || return`) were
+accepted. Every check of a constant's value goes through
+`check_const_value` (the copies at a use: inline_const,
+inline_array_const, assoc_const_value, inherent_const_value; consteval's
+bodies): the using function's loops are out of reach (`loop_base`), and
+a `return` or `?` of the value, refused already, says nothing more there
+(`const_value`). A function's check is a body of its own wherever it is
+asked from (`check_function`, called inside a value by check_nested for
+a hidden type): it starts with no constant's value, no constant
+expression, every local of its own in reach and no caller's argument
+around it (`const_value`, `const_context`, `env_floor`, `rust_arg`;
+a5eefbcae reset only `loop_base`, and refused mk's own `return` when
+mk's hidden type was asked inside a constant's value). A use of a value
+whose exit is refused gives the exit no target (`find_loop` 0, no loop
+of the using function takes its `break`), and with no error recorded it
+is an internal error (`const_exit_seen`); the walk reaches a loop as the
+checker does (a `loop`'s, a `while`'s and a `for`'s body; a `while`'s
+condition and a `for`'s iterator are outside it, rustc E0590, E0268). *Anchor:*
+`front/check/names.vl: const_body_exits, check_const_bodies,
+check_const_value, const_exit_error`, `front/check/body.vl:
+check_function`. *Cases:* `rt_302_*`, `rt_279c*`, `rt_407*`,
+`rt_148_repeat_const_exit_*`.
 
 ### F35 Array repeat
 
@@ -827,12 +851,15 @@ it is made: the first value repeated, which makes the temporary a value
 for the borrow checker, then element i written with a value of its own
 (an assignment that drops nothing, the first's bits being element 0's).
 While the loop runs a guard scope (`EN_GUARD`, `emit_guard`) holds the
-temporary: an exit through it (a `return`, `break`, `continue` or `?`
-reaching it) moves the temporary out and drops elements 0 to i - 1,
-exactly the values made; the normal end emits nothing. No such exit can
-come from a constant's value (F34.4), so the guard is the second of two
-walls: 10d65043a filled the destination itself and an exit dropped the
-first's copies (a triple drop, a double free). A panic ends the
+temporary: no exit can reach it, as F34.4 refuses every exit from a
+constant's value where the value is, and one that did would be an
+internal error, never a drop of what may or may not have been made.
+10d65043a filled the destination itself and an exit dropped the first's
+copies (a triple drop, a double free). Without an exit the temporary
+and the destination built in place give the same output (an assignment
+evaluates its value into a temporary first, and the destination is not
+seen meanwhile: `rt_148_repeat_const_dest_seen`), so the construction is
+pinned by the places IR (`rt_148_repeat_const_into_temp`). A panic ends the
 program, no unwinding. Any length: no limit (0.30.2's first form expanded the AST and refused
 more than 4096). A constant whose value calls a function calls it once
 per element, as vole's constants do at each use (rustc computes the

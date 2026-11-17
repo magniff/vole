@@ -121,10 +121,12 @@ A correctness release, its branches merged as each is reviewed clean.
   one place, so `[T::ZERO; N]` in a generic body is a constant's repeat
   too. `[x; 0]` now drops x as soon as it is made (it leaked), `[C;
   0]` makes nothing, `[x; 1]` moves x. A constant's value is a body of
-  its own (RT-302): a `return`, `?`, `break` or `continue` in it, which
-  left the function that read the constant, is refused (rustc E0572,
-  E0268), and `[C; N]` builds into a temporary whose guard drops
-  exactly the elements made on any exit.
+  its own (RT-302, RT-279c, RT-407): a `return`, `?`, `break` or
+  `continue` that would leave it, which left the function that read the
+  constant, is refused where the value is written, used or not, in a
+  constant, a static, an associated constant, an array length or a
+  discriminant (`const.exit`, rustc E0572, E0268); `[C; N]` builds into a
+  temporary moved into its destination once made.
 
 #### Miscompiles fixed
 
