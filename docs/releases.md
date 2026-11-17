@@ -195,7 +195,12 @@ A correctness release, its branches merged as each is reviewed clean.
   B)`, `Pair<B>`, `Option<B>`), refused in its own body since 0.30.1
   (RT-225), now builds, and its result keeps the borrow at the caller
   (RT-225b, a use after free on 0.30.0); so does a default method with
-  such a `where Self:` predicate.
+  such a `where Self:` predicate, and a program's fn that returns what
+  partition_in or unzip_in made (RT-237). A `where` predicate on a
+  compound type met by an impl with lifetime bounds (`where V<T>:
+  Sup`, `where X<'a>: Sup` with `impl<'a: 'static> Sup for X<'a>`) is
+  now assumed in the body and proven at the call, as rustc does
+  (RT-C301-11's compound form; 0.30.1 refused the body).
 
 ### What's new in 0.30.1
 
