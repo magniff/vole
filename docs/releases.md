@@ -140,6 +140,35 @@ A correctness release, its branches merged as each is reviewed clean.
   built at -O2 by 0.30.1 and by 0.30.2 gives the same assembly, byte
   for byte. `--no-noalias` was the workaround.
 
+- **A scan vectorized as a reduction (RT-61), at -O2, in safe code.** A
+  value carried from one iteration of a loop to the next and also read
+  inside it, `acc = acc ^ b[i]; a[i] = acc`, was kept in vector lanes as
+  a reduction: each lane held its part of the running value, so the
+  store wrote b[i] (or the lanes' partial sums) for the prefix, at every
+  integer width (u8 to i64) and with every operation the vectorizer
+  takes (+ - * & | ^, wrapping or not, min, max); a running maximum
+  stored, the running value compared, stored to another array or
+  summed again (`s1 += b[i]; s2 += s1`, with no store at all) were
+  wrong the same way. The value returned after the loop was right.
+  The vectorizer checked that the phi was read by its update alone, never
+  who read the update. What a reduction is is now decided in one place,
+  `middle::vectorize::reduction::reduction_set`: its running value (the
+  phi and every value computed from it in the loop) is read inside the
+  loop only by its own steps, a minimum's comparison or the overflow
+  check of its step, and after the loop as its last value; any other
+  reader (a store, a comparison, a call, an address, a conversion,
+  another carried value, a branch) makes it a scan, which stays scalar.
+  The run-time unroller, whose rule that was, asks the same function;
+  that rule judged each value at its first visit, in block order, so a
+  step `acc = acc + u` whose u was made from acc in an earlier block
+  visited later was split into partial sums (RT-89, in 0.30.1 at -O2;
+  `--no-unroll-runtime` was the workaround). The set is now grown whole
+  before any of it is judged.
+  Floats were never vectorized as reductions; the outer-loop vectorizer
+  and SLP compute each lane exactly and were right. Seen on 0.28.0 (the
+  first release that builds the case) to 0.30.1; `--no-vectorize` was
+  the workaround.
+
 ### What's new in 0.30.1
 
 The safety nets' release: checks that passed without looking, found

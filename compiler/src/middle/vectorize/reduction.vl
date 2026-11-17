@@ -1,0 +1,180 @@
+// What a reduction is (0.30.2, RT-61): a value carried from one iteration
+// of a loop to the next whose partial values nothing sees. The vectorizer
+// keeps one in lanes, each lane a part of it, and the run-time unroller on
+// several accumulators, one per copy, combined after the loop; both decide
+// with reduction_set. A running value read otherwise inside the loop
+// (stored, compared, passed, an address, carried on into another value)
+// makes a scan, not a reduction: each lane or copy would show its part
+// instead of the whole.
+
+use crate::base::comp::Comp;
+use crate::front::types::is_integer;
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{Cond, Op, Term, ir_arg, ir_operand, ir_operand_count, ir_val};
+use crate::middle::ir::Op::{Add, And, Mul, Or, Phi, Sub, Xor};
+use crate::middle::loops::{loop_block, loop_contains, loop_header, loop_size};
+
+// Whether v is one of the set's values.
+pub fn in_set(set: &[i64], v: i64) -> bool {
+    for i in 0..set.len() as i64 {
+        if set[i as usize] == v {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether an operand of instruction w is one of the set's values.
+pub fn uses_set(cx: &mut FnCtx<Comp>, w: i64, set: &[i64]) -> bool {
+    for i in 0..ir_operand_count(cx, w) {
+        let x = ir_operand(cx, w, i);
+        if x != 0 && in_set(set, ir_val(cx, x)) {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether header phi r of loop l, next value nx (its argument from the
+// latch), is a reduction: the values of l that hold its running value (r,
+// then every value computed from one of them) into `set`, and the overflow
+// checks that read one into `checks` (none of the set: the caller decides
+// on each). Its values are combined only by one associative and
+// commutative operation (+ and -, ^, |, &, * of r's integer type), each
+// time with a value outside the set, and through phis (not the header's)
+// and selects (on a condition outside the set) of them; or it is a minimum
+// or maximum, nx `k ? x : r` (or `k ? r : x`) with k an ordered integer
+// comparison of x and r. Any other read of one of its values inside l
+// refuses it: an instruction's operand (a store, a comparison, a call, an
+// address, a conversion, another header phi), a branch's condition; and so
+// does a read after the loop of any but nx (outs: the exit's values).
+// The set is grown whole first, then each member is judged against all of
+// it, so the order the loop's blocks are visited in decides nothing
+// (RT-89). Returns the operation (as i64; Add for + and -), -1 for a
+// minimum or maximum, or 0.
+pub fn reduction_set(cx: &mut FnCtx<Comp>, l: i64, r: i64, nx: i64, outs: &[i64],
+    set: &mut Vec<i64, Comp>, checks: &mut Vec<i64, Comp>) -> i64 {
+    set.clear();
+    checks.clear();
+    let ty = (cx.insts[r as usize]).ty;
+    if !is_integer(ty) || r == cx.v_iv || nx == r || nx == 0 || (cx.insts[nx as usize]).block == 0
+        || !loop_contains(cx, l, (cx.insts[nx as usize]).block) {
+        return 0;
+    }
+    let h = loop_header(cx, l);
+    set.push(r);
+    let mut family: i64 = 0;
+    let mut minmax = false;
+    let mut k: i64 = 0;
+    if (cx.insts[nx as usize]).op == Op::Sel {
+        let kc = ir_val(cx, (cx.insts[nx as usize]).a);
+        let ka = ir_val(cx, (cx.insts[kc as usize]).a);
+        let kb = ir_val(cx, (cx.insts[kc as usize]).b);
+        if (cx.insts[kc as usize]).op == Op::Cmp && is_integer((cx.insts[kc as usize]).imm2)
+            && (cx.insts[kc as usize]).cond != Cond::Eq
+            && (cx.insts[kc as usize]).cond != Cond::Ne && (ka == r) != (kb == r) {
+            let z = if ka == r { kb } else { ka };
+            let sb = ir_val(cx, (cx.insts[nx as usize]).b);
+            let sc = ir_val(cx, (cx.insts[nx as usize]).c);
+            if (sb == r && sc == z) || (sb == z && sc == r) {
+                minmax = true;
+                k = kc;
+                set.push(kc);
+                set.push(nx);
+            }
+        }
+    }
+    let mut ok = true;
+    // (0.30.2, RT-89) First the whole set: every instruction of the loop
+    // that reads one of its values joins it (an overflow check goes to
+    // `checks`), until it grows no more; no reader is judged while the set
+    // still grows, since an operand may join it after its reader was seen
+    // (an earlier block visited after the latch). The header's phi r is
+    // its start and is not read again.
+    let mut grew = !minmax;
+    while grew {
+        grew = false;
+        for i in 0..loop_size(cx, l) {
+            let mut w = { let at_ix = loop_block(cx, l, i) as usize; cx.blocks[at_ix].first };
+            while w != 0 {
+                if w != r && !in_set(set.as_slice(), w) && !in_set(checks.as_slice(), w)
+                    && uses_set(cx, w, set.as_slice()) {
+                    if (cx.insts[w as usize]).op == Op::Ovf {
+                        // An overflow check: the caller's to judge.
+                        checks.push(w);
+                    } else {
+                        set.push(w);
+                        grew = true;
+                    }
+                }
+                w = (cx.insts[w as usize]).next;
+            }
+        }
+    }
+    // Then every member against the whole set: each is a step of the
+    // reduction, or the reduction is refused.
+    let mut m: i64 = 1;
+    while !minmax && ok && m < set.len() as i64 {
+        let w = set[m as usize];
+        let op = (cx.insts[w as usize]).op;
+        if op == Phi {
+            // (another header's phi is another carried value)
+            ok = (cx.insts[w as usize]).block != h;
+            for a in 0..(cx.insts[w as usize]).nargs {
+                let ir_arg_v = ir_arg(cx, w, a);
+                let x = ir_val(cx, ir_arg_v);
+                ok = ok && in_set(set.as_slice(), x);
+            }
+        } else if op == Op::Sel {
+            let c = ir_val(cx, (cx.insts[w as usize]).a);
+            let x = ir_val(cx, (cx.insts[w as usize]).b);
+            let y = ir_val(cx, (cx.insts[w as usize]).c);
+            ok = !in_set(set.as_slice(), c) && in_set(set.as_slice(), x)
+                && in_set(set.as_slice(), y);
+        } else if (op == Add || op == Sub || op == Xor || op == Or || op == And || op == Mul)
+            && (cx.insts[w as usize]).ty == ty {
+            // One operand of the set, the other from outside it (a + a,
+            // or a + f(a), is no step of one associative operation).
+            let f = if op == Sub { Add as i64 } else { op as i64 };
+            let x = ir_val(cx, (cx.insts[w as usize]).a);
+            let y = ir_val(cx, (cx.insts[w as usize]).b);
+            ok = in_set(set.as_slice(), x) != in_set(set.as_slice(), y)
+                && (op != Sub || in_set(set.as_slice(), x)) && (family == 0 || family == f);
+            family = f;
+        } else {
+            // A store, a comparison, a call, a conversion, an address, a
+            // load: it sees a partial value.
+            ok = false;
+        }
+        m += 1;
+    }
+    // Nothing else uses the set inside the loop (a minimum's compare and
+    // select only each other and r), nor a branch, nor anything after the
+    // loop but nx.
+    for i in 0..loop_size(cx, l) {
+        let b = loop_block(cx, l, i);
+        if (cx.blocks[b as usize]).term != Term::Jump && (cx.blocks[b as usize]).cond != 0 {
+            let c = ir_val(cx, (cx.blocks[b as usize]).cond);
+            if in_set(set.as_slice(), c) {
+                ok = false;
+            }
+        }
+        if minmax {
+            let mut w = (cx.blocks[b as usize]).first;
+            while w != 0 && ok {
+                if w != r && w != k && w != nx && uses_set(cx, w, set.as_slice()) {
+                    ok = false;
+                }
+                w = (cx.insts[w as usize]).next;
+            }
+        }
+    }
+    ok = ok && in_set(set.as_slice(), nx) && (minmax || family != 0);
+    for i in 0..outs.len() as i64 {
+        let x = outs[i as usize];
+        if x != nx && in_set(set.as_slice(), x) {
+            ok = false;
+        }
+    }
+    if !ok { 0 } else if minmax { -1 } else { family }
+}
