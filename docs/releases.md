@@ -212,7 +212,9 @@ A correctness release, its branches merged as each is reviewed clean.
   of the signature, on a parameter, `Self`, a projection or any type, is
   read by one function (places/regions.vl `subject_ties`), through the
   impl `front::obligations::select` chose for its whole reference, the
-  one chooser (a projection's too: `warm_selections`, `proj_walk`); that
+  one chooser (a projection's too: `warm_selections`, `proj_walk`, so
+  `T::Out` under `T: Tr<i64>` is no longer read from `Tr<i32>`'s impl by
+  its name, RT-86, a short borrow returned as 'static); that
   impl's trait arguments are the bound's slot by slot, and its nested
   obligations are met the same way, recursively, as rustc's confirmation
   (`impl_bound_ties`, `arg_ties`). A lifetime of the impl its header does
