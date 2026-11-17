@@ -69,19 +69,38 @@ fn deep(c: i64) -> i64 {
 // one), at any depth; an opaque type or one not known, yes. A fn pointer
 // holds none (what it calls is its own callee).
 pub fn holds_ptr(t: i64, refs: bool, pcx: &mut Ctx<Comp>) -> bool {
-    let mut cyc = false;
-    holds_in(t, refs, &mut cyc, pcx)
+    let mut w = HoldsWalk { next: 1, stack: Vec::new_in(Comp {}) };
+    let mut lo: i64 = i64::MAX;
+    holds_in(t, refs, &mut w, &mut lo, pcx)
 }
 
-// holds_ptr's walk, each type's answer kept once known (RAW_HOLDS: bit 0
-// refs known, 1 refs yes, 2 raw known, 3 raw yes; 4 and 5 the walk is in
-// it, refs and raw), so that a type met again is not walked again: an
-// enum's type arguments are its variants' fields, and before, nested
-// Options cost 2^depth (re-review 2 of g302holes: 26 deep, 6 s). A type
-// met while the walk is in it answers no for now, and an answer that
-// depended on such a no is kept only when it is yes (cyc): no is the
-// least answer, and a cycle adds no pointer of its own.
-fn holds_in(t: i64, refs: bool, cyc: &mut bool, pcx: &mut Ctx<Comp>) -> bool {
+// holds_in's walk: the types it is in (Tarjan's stack, each marked
+// RAW_ON_STACK with its index), and the next index.
+struct HoldsWalk<A: Allocator> {
+    next: i64,
+    stack: Vec<i64, A>,
+}
+
+// raw_holds' bits: 1 refs known, 2 refs yes, 4 raw known, 8 raw yes; 16
+// the walk is in it, its index from bit 32 (a walk is never in another:
+// refs and raw are separate walks).
+const RAW_ON_STACK: i64 = 16;
+
+// holds_ptr's walk, each type's answer kept once known, so that a type met
+// again is not walked again: an enum's type arguments are its variants'
+// fields, and types share and refer back to each other (re-review 2 of
+// g302holes: 26 nested Options, 6 s; re-review 3: `struct Ni { r:
+// Option<&N0>, a: Ni+1, b: Ni+1 }`, 30 deep, over 60 s). The answer is
+// whether t reaches a type that is a pointer, a reachability: Tarjan's
+// walk, t's strongly connected component answered together when its
+// root is done (no, unless one of them is yes); a yes answers yes for
+// every type the walk is in, as each of them reaches it. lo is the
+// caller's lowlink, lowered to what t reaches on the stack. Each type is
+// walked once per walk, and an answer is never a guess: before, a type
+// met while the walk was in it answered no for now, and an answer that
+// depended on such a no was not kept, so a graph with back edges was
+// walked 2^depth times.
+fn holds_in(t: i64, refs: bool, w: &mut HoldsWalk<Comp>, lo: &mut i64, pcx: &mut Ctx<Comp>) -> bool {
     if t <= 0 || crate::front::opaque::is_opaque(t, pcx) {
         return true;
     }
@@ -89,30 +108,41 @@ fn holds_in(t: i64, refs: bool, cyc: &mut bool, pcx: &mut Ctx<Comp>) -> bool {
         pcx.raw_holds.resize(pcx.types.len().max(t as usize + 1), 0);
     }
     let known: i64 = if refs { 1 } else { 4 };
-    let inside: i64 = if refs { 16 } else { 32 };
     let m = pcx.raw_holds[t as usize];
     if (m & known) != 0 {
         return (m & (known * 2)) != 0;
     }
-    if (m & inside) != 0 {
-        *cyc = true;
+    if (m & RAW_ON_STACK) != 0 {
+        let ix = m >> 32;
+        if ix < *lo {
+            *lo = ix;
+        }
         return false;
     }
-    pcx.raw_holds[t as usize] = m | inside;
-    let mut below = false;
-    let r = holds_step(t, refs, &mut below, pcx);
-    let mut after = pcx.raw_holds[t as usize] & !inside;
-    if r || !below {
-        after = after | known | (if r { known * 2 } else { 0 });
-    }
-    pcx.raw_holds[t as usize] = after;
-    if below && !r {
-        *cyc = true;
+    let ix = w.next;
+    w.next += 1;
+    pcx.raw_holds[t as usize] = (m & 15) | RAW_ON_STACK | (ix << 32);
+    let at = w.stack.len();
+    w.stack.push(t);
+    let mut low = ix;
+    let r = holds_step(t, refs, w, &mut low, pcx);
+    if r || low == ix {
+        // (t's component, or with a yes every type above t on the stack:
+        // answered, off the stack; below t, the callers answer theirs)
+        while w.stack.len() > at {
+            let s = w.stack.pop().unwrap();
+            pcx.raw_holds[s as usize] = (pcx.raw_holds[s as usize] & 15) | known
+                | (if r { known * 2 } else { 0 });
+        }
+    } else if low < *lo {
+        *lo = low;
     }
     r
 }
 
-fn holds_step(t: i64, refs: bool, cyc: &mut bool, pcx: &mut Ctx<Comp>) -> bool {
+// t's own answer: yes when it is a pointer, else whether a type it
+// holds holds one (holds_in, lo its lowlink).
+fn holds_step(t: i64, refs: bool, w: &mut HoldsWalk<Comp>, lo: &mut i64, pcx: &mut Ctx<Comp>) -> bool {
     let u = undistinct(t, pcx);
     if u <= 0 {
         return true;
@@ -123,18 +153,18 @@ fn holds_step(t: i64, refs: bool, cyc: &mut bool, pcx: &mut Ctx<Comp>) -> bool {
     }
     if k == TyKind::Ptr {
         return refs || pcx.types[u as usize].b == 0
-            || holds_in(pcx.types[u as usize].a, refs, cyc, pcx);
+            || holds_in(pcx.types[u as usize].a, refs, w, lo, pcx);
     }
     if k == TyKind::Slice {
         return refs || is_raw_view(u, pcx)
-            || holds_in(pcx.types[u as usize].a, refs, cyc, pcx);
+            || holds_in(pcx.types[u as usize].a, refs, w, lo, pcx);
     }
     if k == TyKind::Array || k == TyKind::Vector || k == TyKind::Unsized {
-        return holds_in(pcx.types[u as usize].a, refs, cyc, pcx);
+        return holds_in(pcx.types[u as usize].a, refs, w, lo, pcx);
     }
     if k == TyKind::Tuple {
         for i in 0..pcx.types[u as usize].count {
-            if holds_in(type_elem(u, i, pcx), refs, cyc, pcx) {
+            if holds_in(type_elem(u, i, pcx), refs, w, lo, pcx) {
                 return true;
             }
         }
@@ -143,12 +173,12 @@ fn holds_step(t: i64, refs: bool, cyc: &mut bool, pcx: &mut Ctx<Comp>) -> bool {
     if k == TyKind::Struct {
         let st = pcx.types[u as usize].a;
         for i in 0..pcx.structs[st as usize].field_count {
-            if holds_in((struct_field(st, i, pcx)).ty, refs, cyc, pcx) {
+            if holds_in((struct_field(st, i, pcx)).ty, refs, w, lo, pcx) {
                 return true;
             }
         }
         for i in 0..pcx.structs[st as usize].targ_count {
-            if holds_in(pcx.tlists[(pcx.structs[st as usize].targs + i) as usize], refs, cyc, pcx) {
+            if holds_in(pcx.tlists[(pcx.structs[st as usize].targs + i) as usize], refs, w, lo, pcx) {
                 return true;
             }
         }
@@ -157,14 +187,14 @@ fn holds_step(t: i64, refs: bool, cyc: &mut bool, pcx: &mut Ctx<Comp>) -> bool {
     if k == TyKind::Enum {
         let en = pcx.types[u as usize].a;
         for i in 0..pcx.enums[en as usize].targ_count {
-            if holds_in(pcx.tlists[(pcx.enums[en as usize].targs + i) as usize], refs, cyc, pcx) {
+            if holds_in(pcx.tlists[(pcx.enums[en as usize].targs + i) as usize], refs, w, lo, pcx) {
                 return true;
             }
         }
         for v in 0..pcx.enums[en as usize].variant_count {
             let vi = pcx.variants[enum_variant(en, v, pcx) as usize];
             for j in 0..vi.field_count {
-                if holds_in(pcx.tlists[(vi.fields + j) as usize], refs, cyc, pcx) {
+                if holds_in(pcx.tlists[(vi.fields + j) as usize], refs, w, lo, pcx) {
                     return true;
                 }
             }
@@ -850,6 +880,38 @@ pub fn summary(w: i64, pcx: &mut Ctx<Comp>) {
     }
 }
 
+// RULE: C4 (0.30.2, re-review 3 of g302holes) The parameters a body-less
+// writer (EFF_RAW_ARGS) writes through: of a C function, those whose types
+// may be written through (infer.vl holds_mut, the rule extern_effects
+// gives the whole function: a `*const T` to what holds no `*mut` is read
+// only, F30.5) and C's `...`; of an intrinsic's store or an atomic, every
+// one. Before, every argument of C, so memcpy's source, and with it
+// ptr::copy_nonoverlapping's and ptr::copy's src, was written: a clause
+// that copied a parameter's pointee into its own local was refused.
+fn raw_args_mask(m: i64, pcx: &Ctx<Comp>) -> i64 {
+    // (C only, as infer.vl node_locals tells it: an intrinsic or an
+    // atomic declared without a body is not, nor a ⊤ one, is_top)
+    if m >= pcx.graph_fns || !pcx.fns[m as usize].is_extern || pcx.failed[m as usize] != 0
+        || pcx.fns[m as usize].node == 0
+        || crate::arch::intrinsic_of_fn(m, pcx) >= 0
+        || crate::middle::lower::atomic::atomic_intrinsic(m, pcx) >= 0 {
+        return PMASK;
+    }
+    let n = pcx.fns[m as usize].param_count;
+    let mut mask: i64 = 0;
+    for i in 0..n {
+        if crate::front::effects::infer::holds_mut(crate::front::types::fn_param(m, i, pcx), 0,
+            pcx) {
+            mask = mask | p0(i);
+        }
+    }
+    if pcx.fns[m as usize].variadic || n > LAST {
+        // (C's `...`, the arguments from n on; past bit LAST, every one)
+        mask = mask | (PMASK & !(p0(n) - 1));
+    }
+    mask
+}
+
 // One pass's summary of node m from its sites and its edges, its callees'
 // summaries as they are now; the first reason of an unknown write into
 // why (a site or a call, and its callee: -1 none, -2 its own set).
@@ -864,9 +926,9 @@ fn node_raw(m: i64, why: &mut (i64, i64), pcx: &mut Ctx<Comp>) -> (i64, i64, boo
     }
     if (own & EFF_RAW_ARGS) != 0 {
         // (a body-less writer: an intrinsic's store, an atomic, C given a
-        // pointer: through what it is given)
-        d0 = PMASK;
-        d1 = PMASK;
+        // pointer: through what it is given, raw_args_mask)
+        d0 = raw_args_mask(m, pcx);
+        d1 = d0;
     }
     let fnode = m < pcx.graph_fns && pcx.fns[m as usize].node > 0;
     let mut tab: Option<Tab<Comp>> = None;
