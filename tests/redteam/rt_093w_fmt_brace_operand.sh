@@ -6,7 +6,11 @@
 # shifts; after one that is a whole statement (`if t { .. } <S as
 # A>::g();`, `unsafe`, `while`, `for`, `loop`, an `if` whose head holds
 # a block, an `else`) it opens a qualified path. A comment between an
-# operand and the `<` changes nothing. The branch before the fix took
+# operand and the `<` changes nothing. (The third re-review) A head
+# holds a block-like operand whose `{` is not the body (`'w: while {
+# w } < b as i64 {`, `unsafe { u }`, `match m { .. }`, labeled or not,
+# and an `else if` head): the first cut took a label for a block and a
+# head's `match` body for the loop's. The branch before the fix took
 # every `}` for no operand: it printed `unsafe { a } <b as i64` and
 # indented every later line of the block one level deeper; v0.30.1's fmt
 # kept these as written. The program is formatted: fmt leaves it as it
@@ -79,6 +83,51 @@ fn main() {
     } else {
         f();
     } <S as A>::g();
+    let mut w: i64 = 0;
+    'w: while { w } < b as i64 {
+        w += 3;
+        if w > 100 {
+            break 'w;
+        }
+    }
+    let mut u: i64 = 0;
+    'u: while unsafe { u } < b as i64 {
+        u += 2;
+        if u > 100 {
+            break 'u;
+        }
+    }
+    let mut m: i64 = 0;
+    'm: while match m {
+        _ => m,
+    } < b as i64 {
+        m += 4;
+        if m > 100 {
+            break 'm;
+        }
+    }
+    let mut q: i64 = 0;
+    while match q {
+        _ => q,
+    } < b as i64 {
+        q += 5;
+    }
+    if match q {
+        _ => q,
+    } < b as i64 {
+        f();
+    } <S as A>::g();
+    'o: for _ in 0..1 {
+        break 'o;
+    } <S as A>::g();
+    if t {
+        f();
+    } else if match q {
+        _ => q,
+    } < b as i64 {
+        f();
+    } <S as A>::g();
+    println("{} {} {} {}", w, u, m, q);
     let n = { <S as A>::C } + <S as A>::C;
     println("{}", n);
 }
@@ -93,6 +142,6 @@ perl -e 'alarm 20; exec @ARGV' "$V" fmt flat.vl > fmt2.txt 2>&1 || { echo "fmt o
 if ! cmp -s orig.vl flat.vl; then echo "the unindented copy formats to other text:"; diff orig.vl flat.vl; exit 1; fi
 VOLE_CACHE=off perl -e 'alarm 20; exec @ARGV' "$V" main.vl -o prog > build.txt 2>&1 || { echo "the program does not build:"; cat build.txt; exit 1; }
 out=$(./prog | tr '\n' '|')
-want="false 20 true true false true false false false|6|"
+want="false 20 true true false true false false false|3 2 4 5|6|"
 if [ "$out" != "$want" ]; then echo "printed '$out', rustc prints '$want'"; exit 1; fi
 exit 0
