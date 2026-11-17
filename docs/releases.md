@@ -191,7 +191,7 @@ A correctness release, its branches merged as each is reviewed clean.
 
 - **The results of partition_in and unzip_in kept no borrow of their
   items (RT-211, RT-261, RT-267, RT-268, RT-237b, RT-283, RT-387,
-  RT-387f, RT-388, RT-404), every -O,
+  RT-387f, RT-388, RT-99, RT-404), every -O,
   since 0.28.0.** `let (a, b): (Vec<&i64, Gpa>, ..) =
   v.iter().partition_in(.., gpa); drop(v);` and then reading a was a
   use after free from safe code; `unzip_in` the same, and so a program's
@@ -220,7 +220,9 @@ A correctness release, its branches merged as each is reviewed clean.
   (`impl_bound_ties`, `arg_ties`). A lifetime of the impl its header does
   not name (`impl<'a, T: Copy> Extend<&'a T> for Vec<T>`) is bound to the
   bound's slot for the impl's own predicates and relates to nothing else
-  (0.30.2's first fix tied it to all, refusing `words.iter()
+  (so `impl<'a: 'static> From<W<'a>> for i64`, met through the Into
+  blanket, makes `go<T: Into<i64>>(W { r: &v })`'s borrow 'static:
+  refused, RT-99, accepted since v0.30.1; 0.30.2's first fix tied it to all, refusing `words.iter()
   .partition_in(..)` of `Vec<&'static str>` and a dropped `words`, which
   v0.30.1 and rustc build); one neither the header nor the trait
   arguments name (`'a` of std's `impl<'a, T: Copy + 'a, I: Iterator<Item
