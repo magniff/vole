@@ -15,13 +15,12 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{err_begin, err_end_soft, err_fmt, err_help};
 use crate::front::ast::{NODE_REF, NodeKind, child};
-use crate::front::check::Res;
 use crate::front::parser::rust::{lifetimes_of, outlives_of, where_key};
 use crate::places::front::{fn_node, fn_template};
 use crate::places::regions::{B_NAMED, B_STATIC, Sig, lifetime_binding, sig_new, sig_of, slot_count};
 
 // RULE: D4.7 (0.30.1) Function f used as a value at expression e: the
-// first parameter whose type needs `'static` is the error.
+// first parameter whose type needs `'static` (static_param) is the error.
 pub fn check_fn_value(f: i64, e: i64, pcx: &mut Ctx<Comp>) {
     if f < 0 {
         return;
@@ -30,43 +29,28 @@ pub fn check_fn_value(f: i64, e: i64, pcx: &mut Ctx<Comp>) {
     if node <= 0 || pcx.nodes[node as usize].kind != NodeKind::Fn {
         return;
     }
-    let mut statics = Vec::<i64, Comp>::new_in(Comp {});
-    static_lifetimes(node, &mut statics, pcx);
-    let self_node = pcx.nodes[node as usize].h;
-    for p in 0..pcx.nodes[node as usize].count {
-        let pn = child(node, p, pcx);
-        let param_ty = crate::front::types::fn_param(f, p, pcx);
-        if needs_static(pcx.nodes[pn as usize].b, f, node, self_node, &statics, param_ty, 0, pcx) {
-            report(f, pn, e, pcx);
-            return;
-        }
-    }
-    // (0.30.2, RT-308: a 'static its signature's bounds ask of a parameter's
-    // slot that its text does not say: the impl select chose for a bound,
-    // `kb::<&i64>` with `T: Keep` and only `impl Keep for &'static i64`, or
-    // a supertrait's, `trait St: 'static`; read afresh, the builder asks)
-    let mut sig = crate::places::regions::sig_new();
-    crate::places::regions::sig_fresh(f, &mut sig, pcx);
-    for p in 0..pcx.nodes[node as usize].count {
-        if p + 1 >= sig.param_at.len() as i64 {
-            break;
-        }
-        for j in sig.param_at[p as usize]..sig.param_at[(p + 1) as usize] {
-            if outlives_in(&sig, sig.params[j as usize], 0) {
-                report(f, child(node, p, pcx), e, pcx);
-                return;
-            }
-        }
+    let p = static_param(f, pcx);
+    if p >= 0 && p < pcx.nodes[node as usize].count {
+        report(f, child(node, p, pcx), e, pcx);
+        return;
     }
     // RULE: R6 (0.30.2) a function whose signature keeps strict records
-    // (regions::callable_ties) has its body checked on the promise that
-    // each caller is checked by them where it calls it by its name
-    // (check_callables, constraints::indirect_call): a call through it as
-    // a value is checked by no one
+    // of a parameter typed by a type parameter (regions::bound_param) has
+    // its body checked on the promise that each caller is checked by them
+    // where it calls it by its name (check_callables,
+    // constraints::indirect_call): a call through it as a value is checked
+    // by no one. A `fn(..)` parameter's records ask nothing of the body
+    // (it is checked as R6 reads that type), so such a function is a value
+    // as any other
     let mut strict = Vec::<i64, Comp>::new_in(Comp {});
     crate::places::regions::strict_records(f, &mut strict, pcx);
-    if strict.len() > 0 {
-        report_value_strict(f, e, pcx);
+    let mut r: usize = 0;
+    while r + 5 <= strict.len() {
+        if strict[r] >= 0 && crate::places::regions::bound_param(f, strict[r], pcx) {
+            report_value_strict(f, e, pcx);
+            return;
+        }
+        r += 5;
     }
 }
 
@@ -306,13 +290,15 @@ fn report(f: i64, pn: i64, e: i64, pcx: &mut Ctx<Comp>) {
 // would reach K). A fn item given there is checked by its own signature:
 // the relation holds when its bounds keep that parameter's slot from
 // outliving the other position (`fn sc<'a>(st: &mut i64, x: &'a i64) ->
-// Option<&'a i64>` for scan's `FnMut(&mut St, Self::Item) -> Option<B>`).
-// A parameter of the body given on (fwd: its index, -1 for another
-// argument) holds it when the body's own signature has the record, which
-// its callers checked. Anything else is read as R6 reads its erased type:
+// Option<&'a i64>` for scan's `FnMut(&mut St, Self::Item) -> Option<B>`);
+// so is one a local surely holds (items: build::held_callable, `let p =
+// st;`). A parameter of the body given on (fwd: its index, -1 for another
+// argument), not `mut` and typed by a type parameter, holds it when the
+// body's own signature has the record, which its callers checked. Anything else is read as R6 reads its erased type:
 // borrowck.fn_value_bound (rustc E0308: one type is more general than the
 // other).
-pub fn check_callables(f: i64, n: i64, fwd: &Vec<i64, Comp>, body_fn: i64, pcx: &mut Ctx<Comp>) {
+pub fn check_callables(f: i64, n: i64, fwd: &Vec<i64, Comp>, items: &Vec<i64, Comp>, body_fn: i64,
+    pcx: &mut Ctx<Comp>) {
     let mut strict = Vec::<i64, Comp>::new_in(Comp {});
     crate::places::regions::strict_records(f, &mut strict, pcx);
     let len = strict.len() as i64;
@@ -332,15 +318,21 @@ pub fn check_callables(f: i64, n: i64, fwd: &Vec<i64, Comp>, body_fn: i64, pcx: 
         }
         let arg = if p >= 0 && p < pcx.nodes[n as usize].count { child(n, p, pcx) } else { -1 };
         let mut ok = false;
-        if arg > 0 && pcx.nodes[arg as usize].kind == NodeKind::Ident
-            && pcx.nodes[arg as usize].res == Res::Fn {
-            ok = keeps_apart(pcx.nodes[arg as usize].y, &strict, at, pcx);
+        if p >= 0 && p < items.len() as i64 && items[p as usize] >= 0 {
+            // (an item a parameter of which must be 'static is refused where
+            // it is used as a value, borrowck.fn_value_static: not twice)
+            ok = static_param(items[p as usize], pcx) >= 0
+                || keeps_apart(items[p as usize], &strict, at, pcx);
         } else if p >= 0 && p < fwd.len() as i64 && fwd[p as usize] >= 0 && body_fn >= 0 {
             if !own_read {
                 crate::places::regions::strict_records(body_fn, &mut own, pcx);
                 own_read = true;
             }
-            ok = has_record(&own, fwd[p as usize], &strict, at);
+            // (only a parameter typed by a type parameter: a `fn(..)` one
+            // may hold any `fn` value, given through the body used as a
+            // value too, regions::bound_param)
+            ok = crate::places::regions::bound_param(body_fn, fwd[p as usize], pcx)
+                && has_record(&own, fwd[p as usize], &strict, at);
         }
         if !ok {
             report_bound(f, if arg > 0 { arg } else { n }, pcx);
@@ -461,4 +453,45 @@ pub fn relates(g: i64, vties: &Vec<i64, Comp>, k: i64, pcx: &mut Ctx<Comp>) -> b
     let a = sig_position(&gs, vties[(k + 3) as usize], vties[(k + 4) as usize]);
     let b = sig_position(&gs, vties[(k + 5) as usize], vties[(k + 6) as usize]);
     a < 0 || b < 0 || outlives_in(&gs, a, b)
+}
+
+// RULE: D4.7, R6 (0.30.2) The first parameter of f whose type needs
+// 'static (-1: none), the one rule for a function used as a value
+// (check_fn_value) and given where a bound reads it (check_callables). Its
+// written text: a `'static` in it, in an alias's definition (which the
+// signature's walk does not read), a lifetime bounded by it (0.30.1). And
+// what its bounds bring, as the signature reads them, each through the
+// impl select chose and that impl's nested obligations
+// (regions::impl_bound_ties, the one reading of a bound: `T: Keep` with
+// only `impl Keep for &'static i64`, `T: Into<&'static i64>` through the
+// blanket `impl<T, U: From<T>> Into<U> for T`, a supertrait's `'static`;
+// RT-308, RT-364, RT-421). Read afresh: the builder asks.
+pub fn static_param(f: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if f < 0 {
+        return -1;
+    }
+    let node = fn_node(fn_template(f, pcx), pcx);
+    if node <= 0 || pcx.nodes[node as usize].kind != NodeKind::Fn {
+        return -1;
+    }
+    let mut statics = Vec::<i64, Comp>::new_in(Comp {});
+    static_lifetimes(node, &mut statics, pcx);
+    let self_node = pcx.nodes[node as usize].h;
+    for p in 0..pcx.nodes[node as usize].count {
+        let pn = child(node, p, pcx);
+        let param_ty = crate::front::types::fn_param(f, p, pcx);
+        if needs_static(pcx.nodes[pn as usize].b, f, node, self_node, &statics, param_ty, 0, pcx) {
+            return p;
+        }
+    }
+    let mut sig = sig_new();
+    crate::places::regions::sig_fresh(f, &mut sig, pcx);
+    for p in 0..sig.param_at.len() as i64 - 1 {
+        for j in sig.param_at[p as usize]..sig.param_at[(p + 1) as usize] {
+            if outlives_in(&sig, sig.params[j as usize], 0) {
+                return p;
+            }
+        }
+    }
+    -1
 }
