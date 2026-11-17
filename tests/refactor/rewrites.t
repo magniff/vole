@@ -112,12 +112,12 @@ $ undo
 undid rewrote 1 site in 1 file	main.vl	+1 -1 lines
 ## A rewrite that breaks the program: nothing written.
 $ rewrite 'grow($v, $n)' 'grow($n, $v)'
-main.vl:10:10: error[type error] expected '&mut IntVec', got 'i32'  [edited: crate::main]
+main.vl:10:10: error[type error] expected '&mut IntVec', got '{integer}'  [edited: crate::main]
 main.vl:25:10: error[type error] expected '&mut IntVec', got 'i64'  [edited: crate::more]
 main.vl:26:10: error[type error] expected '&mut IntVec', got 'i64'  [edited: crate::more]
-main.vl:31:10: error[type error] expected '&mut IntVec', got 'i32' | note: in instantiation of 'grow_twice<i64>' at main.vl:20:5  [edited: crate::grow_twice]
-main.vl:32:10: error[type error] expected '&mut IntVec', got 'i32' | note: in instantiation of 'grow_twice<i64>' at main.vl:20:5  [edited: crate::grow_twice]
-error edit.breaks: 5 new errors; nothing written; the first: main.vl:10:10: expected '&mut IntVec', got 'i32'
+main.vl:31:10: error[type error] expected '&mut IntVec', got '{integer}' | note: in instantiation of 'grow_twice<i64>' at main.vl:20:5  [edited: crate::grow_twice]
+main.vl:32:10: error[type error] expected '&mut IntVec', got '{integer}' | note: in instantiation of 'grow_twice<i64>' at main.vl:20:5  [edited: crate::grow_twice]
+error edit.breaks: 5 new errors; nothing written; the first: main.vl:10:10: expected '&mut IntVec', got '{integer}'
 try: volec rewrite 'grow($v, $n)' 'grow($n, $v)' --no-check
 [exit 1]
 % git status --short

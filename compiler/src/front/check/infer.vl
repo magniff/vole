@@ -13,6 +13,8 @@
 // FN_QUERY_ONLY; its instance key holds a variable no later type equals.
 // MVS makes none (can_defer), and every hook is behind INFER_LIVE.
 
+use std::alloc::Allocator;
+
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{NodeKind, TY_OMEGA, TY_OPAQUE, child, new_node};
@@ -484,6 +486,51 @@ fn first_int(t: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
     0
 }
 
+// Whether type t is or holds a type variable still free that is not an
+// integer variable (unify: the sweep its solution needs).
+fn first_general(t: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if t <= 0 || depth > 16 {
+        return false;
+    }
+    if is_var(t, pcx) {
+        let s = solution(t, pcx);
+        return if s != 0 { first_general(s, depth + 1, pcx) } else { !is_int_var(t, pcx) };
+    }
+    let k = pcx.types[t as usize].kind;
+    if k == TyKind::Ptr || k == TyKind::Array || k == TyKind::Slice || k == TyKind::Unsized
+        || k == TyKind::Distinct || k == TyKind::Vector {
+        return first_general(pcx.types[t as usize].a, depth + 1, pcx);
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[t as usize].count {
+            if first_general(pcx.tlists[(pcx.types[t as usize].list + i) as usize], depth + 1,
+                pcx) {
+                return true;
+            }
+        }
+    }
+    if k == TyKind::Struct || k == TyKind::Enum {
+        let (at, n) = targs_of(t, pcx);
+        for i in 0..n {
+            if first_general(pcx.tlists[(at + i) as usize], depth + 1, pcx) {
+                return true;
+            }
+        }
+    }
+    if k == TyKind::Fn {
+        if first_general(pcx.types[t as usize].a, depth + 1, pcx) {
+            return true;
+        }
+        for i in 0..pcx.types[t as usize].count {
+            if first_general(pcx.tlists[(pcx.types[t as usize].list + i) as usize], depth + 1,
+                pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // Type t with free integer variable v read as integer type c (a trial: v
 // stays free).
 fn with_solution(t: i64, v: i64, c: i64, pcx: &mut Ctx<Comp>) -> i64 {
@@ -528,31 +575,91 @@ pub fn int_like(t: i64, pcx: &Ctx<Comp>) -> bool {
     int_type(t, pcx) || int_free(t, pcx)
 }
 
-// The smallest node index of the tree at n (from `low`).
-fn tree_min(n: i64, low: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
-    if n <= 0 || depth > 4096 {
-        return low;
+// (sweep, remap_patterns, remake_calls) The nodes the end of a function's
+// check retypes: those the parser made for it, [lo, pe) (from its item's
+// node to the first node of source after it), the nodes of its tree made
+// after them (by the checks of other functions before it: moved, desugared,
+// [extras]), and those made since its check began, [infer_nodes, len).
+// (0.30.2: not every node from its tree's first on, a range that held every
+// node made between a function's parse and its check: with integer
+// literals' variables nearly every function's check goes live, and that
+// range made the check quadratic.)
+struct Swept<A: Allocator> {
+    lo: i64,
+    pe: i64,
+    extras: Vec<i64, A>,
+}
+
+impl Swept<Comp> {
+    fn count(&self, pcx: &Ctx<Comp>) -> i64 {
+        (self.pe - self.lo) + self.extras.len() as i64 + (pcx.nodes.len() as i64 - pcx.infer_nodes)
     }
-    let mut m = if n < low { n } else { low };
+
+    fn at(&self, k: i64, pcx: &Ctx<Comp>) -> i64 {
+        if k < self.pe - self.lo {
+            return self.lo + k;
+        }
+        let e = k - (self.pe - self.lo);
+        if e < self.extras.len() as i64 {
+            return self.extras[e as usize];
+        }
+        pcx.infer_nodes + e - self.extras.len() as i64
+    }
+}
+
+fn swept(pcx: &Ctx<Comp>) -> Swept<Comp> {
+    let mut s = Swept { lo: 0, pe: 0, extras: Vec::new_in(Comp {}) };
+    if pcx.cur_fn < 0 {
+        return s;
+    }
+    let item = pcx.fns[pcx.cur_fn as usize].node;
+    if item <= 0 || item >= pcx.infer_nodes {
+        return s;
+    }
+    // (the parser makes an item's node first, then the nodes of its source
+    // in order: they end at the first node of source past the item's)
+    let is = pcx.nodes[item as usize].start;
+    let ie = pcx.nodes[item as usize].end;
+    let mut pe = item + 1;
+    while pe < pcx.infer_nodes && pcx.nodes[pe as usize].start <= ie
+        && pcx.nodes[pe as usize].start >= is {
+        pe += 1;
+    }
+    s.lo = item;
+    s.pe = pe;
+    let mut extras: Vec<i64, Comp> = Vec::new_in(Comp {});
+    tree_extras(item, item, pe, 0, &mut extras, pcx);
+    s.extras = extras;
+    s
+}
+
+// The nodes of the tree at n outside [lo, pe) made before the function's
+// check began, pushed to out (the walk of instantiate's node fields).
+fn tree_extras(n: i64, lo: i64, pe: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    if n <= 0 || depth > 4096 {
+        return;
+    }
+    if (n < lo || n >= pe) && n < pcx.infer_nodes {
+        out.push(n);
+    }
     let k = pcx.nodes[n as usize].kind;
     if k == NodeKind::Fn {
-        m = tree_min(pcx.nodes[n as usize].b, m, depth + 1, pcx);
-        m = tree_min(pcx.nodes[n as usize].c, m, depth + 1, pcx);
+        tree_extras(pcx.nodes[n as usize].b, lo, pe, depth + 1, out, pcx);
+        tree_extras(pcx.nodes[n as usize].c, lo, pe, depth + 1, out, pcx);
     } else {
         if crate::front::generics::instantiate::node_field_a(k) {
-            m = tree_min(pcx.nodes[n as usize].a, m, depth + 1, pcx);
+            tree_extras(pcx.nodes[n as usize].a, lo, pe, depth + 1, out, pcx);
         }
         if crate::front::generics::instantiate::node_field_b(k) {
-            m = tree_min(pcx.nodes[n as usize].b, m, depth + 1, pcx);
+            tree_extras(pcx.nodes[n as usize].b, lo, pe, depth + 1, out, pcx);
         }
         if crate::front::generics::instantiate::node_field_c(k) {
-            m = tree_min(pcx.nodes[n as usize].c, m, depth + 1, pcx);
+            tree_extras(pcx.nodes[n as usize].c, lo, pe, depth + 1, out, pcx);
         }
     }
     for i in 0..pcx.nodes[n as usize].count {
-        m = tree_min(child(n, i, pcx), m, depth + 1, pcx);
+        tree_extras(child(n, i, pcx), lo, pe, depth + 1, out, pcx);
     }
-    m
 }
 
 // Whether type t is or holds a variable (solved or not: `any`), or a free
@@ -693,10 +800,15 @@ fn subst(t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
 pub fn unify(a: i64, b: i64, pcx: &mut Ctx<Comp>) -> bool {
     let x = resolve(a, pcx);
     let y = resolve(b, pcx);
+    // (0.30.2: the retyping of the function so far is for a type
+    // variable's solution; an integer variable's alone waits for the
+    // function's end, as each reader of one resolves it: an integer
+    // literal's unify sweeping the function made its check quadratic)
+    let general = first_general(x, 0, pcx) || first_general(y, 0, pcx);
     unify_at(x, y, 0, pcx);
     settle_deps(pcx);
     let s = resolve(x, pcx) == resolve(y, pcx);
-    if s {
+    if s && general {
         sweep(pcx);
     }
     s
@@ -816,7 +928,9 @@ pub fn sweep(pcx: &mut Ctx<Comp>) {
             pcx.locals[l as usize].ty = r;
         }
     }
-    for n in pcx.infer_nodes..pcx.nodes.len() as i64 {
+    let s = swept(pcx);
+    for k in 0..s.count(pcx) {
+        let n = s.at(k, pcx);
         let t = pcx.nodes[n as usize].ty;
         // (0.30: a primitive holds no variable; most nodes are of one)
         if t > crate::front::types::TY_ISIZE && mentions(t, true, pcx) {
@@ -871,7 +985,9 @@ fn remap_variant(n: i64, r: i64, pcx: &mut Ctx<Comp>) {
 // enum names it again in the solution's, once the function's check is done
 // (the match's usefulness, checked before, read the ids it had).
 fn remap_patterns(pcx: &mut Ctx<Comp>) {
-    for n in pcx.infer_nodes..pcx.nodes.len() as i64 {
+    let s = swept(pcx);
+    for k in 0..s.count(pcx) {
+        let n = s.at(k, pcx);
         let r = pcx.nodes[n as usize].ty;
         if pcx.nodes[n as usize].kind == NodeKind::PatVariant && r > 0
             && pcx.types[r as usize].kind == TyKind::Enum
@@ -1130,7 +1246,9 @@ pub fn literal_fits(n: i64, negated: bool, t: i64, pcx: &mut Ctx<Comp>) {
 // Each Call node of the sweep's range whose callee is an instance made with
 // a variable now solved calls the instance of the solutions.
 fn remake_calls(pcx: &mut Ctx<Comp>) {
-    for n in pcx.infer_nodes..pcx.nodes.len() as i64 {
+    let s = swept(pcx);
+    for k in 0..s.count(pcx) {
+        let n = s.at(k, pcx);
         if pcx.nodes[n as usize].kind != NodeKind::Call || pcx.nodes[n as usize].x <= 0 {
             continue;
         }
@@ -1250,17 +1368,10 @@ pub fn hole(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     v
 }
 
-// The function being checked makes its first variable: the sweep's nodes
-// are its tree's and those made since.
+// The function being checked makes its first variable: its end sweeps
+// (swept: its tree's nodes and those made since).
 fn go_live(pcx: &mut Ctx<Comp>) {
-    if !pcx.infer_live {
-        pcx.infer_live = true;
-        let item = pcx.fns[pcx.cur_fn as usize].node;
-        let lo = tree_min(item, item, 0, pcx);
-        if lo < pcx.infer_nodes {
-            pcx.infer_nodes = lo;
-        }
-    }
+    pcx.infer_live = true;
 }
 
 // Whether type t is a variable still free.
