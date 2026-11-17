@@ -184,22 +184,24 @@ A correctness release, its branches merged as each is reviewed clean.
   parameter: `ensures { let s = 3; s > 0 }`, a closure's parameter or a
   match binding named as a by-value parameter the body took read
   nothing of it.
-- **A clause writes through no raw pointer** (RT-38g, `contract.effect`).
-  `unsafe { *p = 5 }`, `(*p).f = 5`, a raw slice's element, `&mut *p`,
-  `p.write(5)` or a C function given a `*mut` in the clause itself are
-  refused, as a cell's `set` is, even on a pointer the clause made: the
-  effects cannot tell what a pointer points to. A function the clause
-  calls that writes through a raw pointer (`poke(p)`, std's `take`,
-  `swap`, `sort`) is refused when a raw pointer may reach it from what
-  the clause reads: a parameter's or the result's type holds one (`*mut
-  T`, a NonNull, a Vec's buffer, a type parameter). Else its write
-  reaches only what the clause made, since the views keep the clause
-  from lending `&mut` of anything else: `o.iter().all(..)` on an
-  `Option<i64>`, `a.sort_unstable()` or `mem::swap` on a local array are
-  accepted. (Rust's rules make the rest: a pointer made of a `&T` is not
-  written through outside an UnsafeCell, and one made of an integer has
-  no provenance to write with.) A read through a raw pointer is allowed.
-  `query effects F --why raw_write` shows the chain.
+- **A clause writes nothing it did not make through a raw pointer**
+  (RT-38g, `contract.effect`), judged by where the pointer comes from.
+  A pointer made of a `&mut` of the clause's own local is a `&mut`
+  write, which the borrow checker and the views police: std's `take`,
+  `swap`, `sort`, `iter_mut`, `mem::replace` on a clause's locals, and
+  `o.iter().all(..)` on an `Option`, are accepted. A pointer from a
+  parameter (`poke(p)`, `a.as_ptr() as *mut i64`, a struct, a Vec, a
+  Box, a HashMap holding one) writes the caller's memory, and one of
+  unknown provenance (`addr as *mut i64` of an integer that is not a
+  constant, a static's or a thread-local's pointer, a union's field, a
+  C function's) unknown memory: both are refused, in the clause, its
+  `old(..)` and whatever it calls, a fn value, a trait method or a
+  closure. A read through a raw pointer is allowed. `query effects F
+  --why raw_write` shows the chain (`raw_src`: where a pointer of
+  unknown provenance is made).
+- **A clause touches no thread-local static** (RT-199) and **`old(e)`
+  is effect-checked** (RT-198): `ensures old(say()) == 1` with `say`
+  printing was accepted.
 
 #### Bugs fixed
 
@@ -219,7 +221,9 @@ A correctness release, its branches merged as each is reviewed clean.
   closure, made the compiler panic (places/regions.vl, index out of
   bounds). A closure type's region slots include its signature's, which
   were made in the closures' order, the outer before the inner one it
-  holds; they are now made after those of every closure the type holds.
+  holds; each closure's slots are now made on demand, after those of
+  every closure its signature and type hold (visited once, at any
+  depth: a closure in 15 nested one-tuples, RT-91c).
 
 ### What's new in 0.30.1
 

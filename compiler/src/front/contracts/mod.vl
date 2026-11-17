@@ -22,7 +22,9 @@ use crate::front::check::Res;
 use crate::front::contracts::checks::{CHK_ENSURES, CHK_INVARIANT, CHK_REQUIRES};
 use crate::front::contracts::diag::{CONTRACT_EFFECT, CONTRACT_OLD, end_with_code};
 use crate::front::contracts::expand::subtree;
-use crate::front::effects::{EFF_ALLOC_EXTERN, EFF_GLOBAL, EFF_IO, EFF_UNKNOWN, Effects, fn_effects};
+use crate::front::effects::{
+    EFF_ALLOC_EXTERN, EFF_GLOBAL, EFF_IO, EFF_TLS, EFF_UNKNOWN, Effects, fn_effects,
+};
 use crate::front::effects::infer::expr_effects;
 use crate::front::kinds::{is_owned_type, is_view_type};
 use crate::front::types::err_type;
@@ -98,7 +100,10 @@ pub fn test_kind(item: i64, pcx: &Ctx<Comp>) -> i64 {
 // effects. (0.18, with 0.17's values) An ensures reads no moved
 // parameter and keeps no view in an old(..) (contract.old). (The
 // conditions' types and names were checked with the functions expand.vl
-// made of them.)
+// made of them.) RULE: C3.4 (0.30.2, RT-198) A clause is its condition
+// and the `old(..)` it reads, which expand.vl made lets before the call:
+// both checked alike. (RT-38g) It writes through no pointer but what it
+// made, clause_raw.
 pub fn check_contracts(pcx: &mut Ctx<Comp>) {
     if pcx.check_calls.len() as i64 == 0 {
         return;
@@ -118,37 +123,82 @@ pub fn check_contracts(pcx: &mut Ctx<Comp>) {
         if kind != CHK_REQUIRES && kind != CHK_ENSURES && kind != CHK_INVARIANT {
             continue;
         }
-        let raw_in = i >= pcx.check_call_fns.len() as i64
-            || raw_inputs(pcx.check_call_fns[i as usize], pcx);
-        if pcx.fn_effects_count != 0
-            && (impure(child(call, 0, pcx), check, raw_in, pcx)
-                || impure_whole(child(call, 0, pcx), check, raw_in, pcx)) {
+        if pcx.fn_effects_count == 0 {
+            continue;
+        }
+        let cond = child(call, 0, pcx);
+        let mut parts: Vec<i64, Comp> = Vec::new_in(Comp {});
+        parts.push(cond);
+        olds_of(cond, &mut parts, pcx);
+        let mut bad = false;
+        for p in parts.iter().copied() {
+            if impure(p, check, pcx) || impure_whole(p, check, pcx) {
+                bad = true;
+                break;
+            }
+        }
+        let g = if i < pcx.check_call_fns.len() as i64 { pcx.check_call_fns[i as usize] }
+            else { -1 };
+        if bad || writes_raw(&parts, g, check, pcx) {
             seen.push(check);
         }
     }
 }
 
-// RULE: C3.4 (0.30.2) Whether a raw pointer may reach a callee of a clause
-// in function g from what the clause reads: a parameter's or the result's
-// type may hold one (effects/infer.vl holds_raw; g not known: yes). A
-// callee's raw write (EFF_RAW_CALLEE) is refused then, a raw write the
-// clause's own code makes always (EFF_RAW_WRITE). Else a callee's raw write
-// reaches only what the clause made or what a `&mut` the clause lent
-// covers, which the views keep to what the clause made (std's `take`,
-// `swap`, `sort` on a local; Rust's aliasing rules: a pointer made of a
-// `&T` is never written through outside an UnsafeCell, EFF_INTERIOR).
-fn raw_inputs(g: i64, pcx: &Ctx<Comp>) -> bool {
-    if g < 0 || g >= pcx.fns.len() as i64 {
-        return true;
+// RULE: C3.4 (0.30.2, RT-198) The `old(..)` lets condition n reads (a
+// local `?oldN` of expand.vl replace_olds, by resolution), their values
+// into out.
+fn olds_of(n: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    if n <= 0 {
+        return;
     }
-    for i in 0..pcx.fns[g as usize].param_count {
-        if crate::front::effects::infer::holds_raw(crate::front::types::fn_param(g, i, pcx), 0,
-            pcx) {
-            return true;
+    if pcx.nodes[n as usize].kind == NodeKind::Ident && pcx.nodes[n as usize].res == Res::Local {
+        let y = pcx.nodes[n as usize].y;
+        let name = sym_text(pcx.locals[y as usize].name, pcx);
+        let v = pcx.locals[y as usize].value;
+        if name.len() > 4 && name[0..4] == b"?old" && v > 0 && !out.contains(&v) {
+            out.push(v);
         }
+        return;
     }
-    let r = pcx.fns[g as usize].ret;
-    r > 0 && crate::front::effects::infer::holds_raw(r, 0, pcx)
+    let mut ks: Vec<i64, Comp> = Vec::new_in(Comp {});
+    crate::front::effects::provenance::kids(n, &mut ks, pcx);
+    for e in ks.iter().copied() {
+        olds_of(e, out, pcx);
+    }
+}
+
+// RULE: C3.4 (0.30.2, RT-38g) Whether the clause made of parts (in
+// function g) writes through a pointer it did not make: one of g's
+// parameters' (the caller's memory) or of unknown provenance, itself or
+// in what it calls (effects/provenance.vl clause_raw); reported once.
+fn writes_raw(parts: &Vec<i64, Comp>, g: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mut inside: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for p in parts.iter().copied() {
+        nodes_in(p, &mut inside, pcx);
+    }
+    inside.sort();
+    let (n, callee) = crate::front::effects::provenance::clause_raw(g, &inside, pcx);
+    if n <= 0 {
+        return false;
+    }
+    effect_error(n, check, if callee == -1 { -5 } else { callee },
+        crate::front::effects::EFF_RAW_WRITE, pcx);
+    true
+}
+
+// The nodes of the tree at n into out (those the effects walk goes into:
+// a `for`'s body, a lowered `?`, effects/provenance.vl kids).
+fn nodes_in(n: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    if n <= 0 {
+        return;
+    }
+    out.push(n);
+    let mut ks: Vec<i64, Comp> = Vec::new_in(Comp {});
+    crate::front::effects::provenance::kids(n, &mut ks, pcx);
+    for e in ks.iter().copied() {
+        nodes_in(e, out, pcx);
+    }
 }
 
 // (0.27.1) contract.old (ensures_values, with C5's rule in the rust
@@ -249,7 +299,7 @@ fn ensures_values(n: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
 
 // Whether the condition at n (of check `check`) does io, allocates or
 // touches a static; reported once.
-fn impure(n: i64, check: i64, raw_in: bool, pcx: &mut Ctx<Comp>) -> bool {
+fn impure(n: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
     if n <= 0 {
         return false;
     }
@@ -271,32 +321,26 @@ fn impure(n: i64, check: i64, raw_in: bool, pcx: &mut Ctx<Comp>) -> bool {
         if (e.bits & EFF_UNKNOWN) != 0 {
             return false;
         }
-        // (0.30.2: the callee's own raw write is a callee's, C3.4)
-        let mut e = e;
-        if (e.bits & crate::front::effects::EFF_RAW_WRITE) != 0 {
-            e.bits = (e.bits & !crate::front::effects::EFF_RAW_WRITE)
-                | crate::front::effects::EFF_RAW_CALLEE;
-        }
-        let bad = impure_bit(e, raw_in);
+        let bad = impure_bit(e);
         if bad != 0 && f != pcx.check_fn {
             effect_error(n, check, f, bad, pcx);
             return true;
         }
     }
     for k in 0..3 {
-        if impure(subtree(n, k, pcx), check, raw_in, pcx) {
+        if impure(subtree(n, k, pcx), check, pcx) {
             return true;
         }
     }
     for i in 0..pcx.nodes[n as usize].count {
-        if impure(child(n, i, pcx), check, raw_in, pcx) {
+        if impure(child(n, i, pcx), check, pcx) {
             return true;
         }
     }
     // (0.25) A call through a fn value: what the functions it may
     // call do.
     if kind == NodeKind::Call && pcx.nodes[n as usize].x <= 0 {
-        let bad = impure_bit(expr_effects(n, pcx), raw_in);
+        let bad = impure_bit(expr_effects(n, pcx));
         if bad != 0 && (bad != -4 || error_count(pcx) == 0) {
             effect_error(n, check, -3, bad, pcx);
             return true;
@@ -308,8 +352,8 @@ fn impure(n: i64, check: i64, raw_in: bool, pcx: &mut Ctx<Comp>) -> bool {
 // (0.25) Whether condition n does io, allocates or touches a static by any
 // other way than impure finds (all that the effect inference sees of it);
 // reported at the condition.
-fn impure_whole(n: i64, check: i64, raw_in: bool, pcx: &mut Ctx<Comp>) -> bool {
-    let bad = impure_bit(expr_effects(n, pcx), raw_in);
+fn impure_whole(n: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let bad = impure_bit(expr_effects(n, pcx));
     if bad == 0 || bad == -4 {
         return false;
     }
@@ -318,8 +362,10 @@ fn impure_whole(n: i64, check: i64, raw_in: bool, pcx: &mut Ctx<Comp>) -> bool {
 }
 
 // (0.25) What makes effects e impure in a condition: -4 unknown
-// (conservatively), -2 alloc, EFF_IO, EFF_GLOBAL, or 0.
-fn impure_bit(e: Effects, raw_in: bool) -> i64 {
+// (conservatively), -2 alloc, EFF_IO, EFF_GLOBAL, EFF_TLS (0.30.2,
+// RT-199: a thread-local's state, as a static's), EFF_INTERIOR, or 0. (A
+// write through a pointer: writes_raw, by where the pointer comes from.)
+fn impure_bit(e: Effects) -> i64 {
     if (e.bits & EFF_UNKNOWN) != 0 {
         return -4;
     }
@@ -337,14 +383,12 @@ fn impure_bit(e: Effects, raw_in: bool) -> i64 {
     if (e.bits & crate::front::effects::EFF_INTERIOR) != 0 {
         return crate::front::effects::EFF_INTERIOR;
     }
-    // RULE: C3.4 (0.30.2, RT-38g: a write through a raw pointer, which the
-    // views cannot keep from writing what the clause did not make: the
-    // clause's own, or a callee's that a raw pointer may reach, raw_inputs)
-    let callee = (e.bits & crate::front::effects::EFF_RAW_CALLEE) != 0;
-    if (e.bits & crate::front::effects::EFF_RAW_WRITE) != 0
-        || callee && raw_in {
-        crate::front::effects::EFF_RAW_WRITE
-    } else { 0 }
+    // RULE: C3.4 (0.30.2, RT-199: a thread-local read or written: its
+    // state changes what the program does as a static's)
+    if (e.bits & EFF_TLS) != 0 {
+        return EFF_TLS;
+    }
+    0
 }
 
 // contract.effect at node n, a call of f (-1: a static read; -3: a call
@@ -356,8 +400,8 @@ fn effect_error(n: i64, check: i64, f: i64, bit: i64, pcx: &mut Ctx<Comp>) {
         else if bit == crate::front::effects::EFF_INTERIOR {
             c"writes through a shared reference (a cell)"
         } else if bit == crate::front::effects::EFF_RAW_WRITE {
-            c"writes through a raw pointer"
-        } else { c"touches a static" };
+            c"writes through a raw pointer what it did not make"
+        } else if bit == EFF_TLS { c"touches a thread-local static" } else { c"touches a static" };
     let word = if (pcx.check_kind[check as usize]) == CHK_REQUIRES { c"requires" }
         else if (pcx.check_kind[check as usize]) == CHK_ENSURES { c"ensures" }
         else { c"invariant" };
@@ -390,7 +434,8 @@ fn effect_error(n: i64, check: i64, f: i64, bit: i64, pcx: &mut Ctx<Comp>) {
     if f >= 0 && bit != -4 {
         let effect = if bit == -2 { "alloc" } else if bit == EFF_IO { "io" }
             else if bit == crate::front::effects::EFF_INTERIOR { "interior" }
-            else if bit == crate::front::effects::EFF_RAW_WRITE { "raw_write" } else { "global" };
+            else if bit == crate::front::effects::EFF_RAW_WRITE { "raw_write" }
+            else if bit == EFF_TLS { "tls" } else { "global" };
         let t = buf_new();
         buf_fmt(t,
             format_args("query effects {} --why {effect}",

@@ -1,0 +1,998 @@
+// Pointer provenance (0.30.2, C3.4; docs/design/contracts-effects.md C4).
+//
+// A contract's clause writes nothing it did not make (RT-38f, RT-38g).
+// A write through a raw pointer is judged by where its pointer comes
+// from, not by the types around it. A class is a set: P0 bits, the
+// pointers a parameter's value is or holds (bit i: parameter i); P1 bits,
+// the pointers read from the memory those reach; UNK, a pointer of unknown
+// provenance (made of an integer that is not a constant, read from a
+// static, a thread-local or a union's field, C's: EFF_RAW_SRC, effects/
+// mod.vl). A pointer made of a borrow of the function's own local is in
+// no class: a write through it writes the function's own memory, or what
+// a reference covers, which the borrow checker polices (a clause's views
+// keep that to what the clause made). An expression's class is a pair:
+// its value's pointers (v) and the pointers read from what they reach (d).
+//
+// A graph node's summary (made when a clause asks: its callees' first, a
+// cycle's members to a fixpoint): D0, the parameters through whose own
+// pointers it may write; D1, those through pointers read from what they
+// reach; and whether it may write memory of unknown provenance
+// (EFF_RAW_WRITE). A function's write sites (infer.vl raw_write) and the
+// arguments its calls give where the callee's masks name them are classed
+// in the function (cls, with its locals' classes, table: flow-insensitive,
+// to a fixpoint): a P bit is the function's own mask's, UNK an unknown
+// write. A clause, classed in the function its check call is in, is
+// refused any bit: a P bit is the caller's memory (clause_raw).
+
+use std::alloc::Allocator;
+
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::{NODE_RAW, NodeKind, PAT_AMP, PAT_REF, child};
+use crate::front::check::Res;
+use crate::front::contracts::expand::subtree;
+use crate::front::effects::{EFF_RAW_ARGS, EFF_RAW_SRC, EFF_RAW_WRITE, EFF_UNKNOWN};
+use crate::front::effects::infer::{E_ALLOC, E_DROP};
+use crate::front::lexer::Tok;
+use crate::front::types::{TyKind, enum_variant, is_integer, is_raw_view, struct_field, type_elem};
+use crate::places::ir::undistinct;
+
+// A class's bits: P0 (parameter i's own pointers, bit min(i, 29)), P1 (the
+// same shifted by 30), UNK.
+const UNK: i64 = 1 << 60;
+const PMASK: i64 = (1 << 30) - 1;
+const LAST: i64 = 29;
+
+// The kinds of a table's records (a local's definitions).
+const REC_VALUE: i64 = 0;
+const REC_DEREF: i64 = 1;
+const REC_REF: i64 = 2;
+const REC_ELEM: i64 = 3;
+const REC_LEND: i64 = 4;
+const REC_STORE: i64 = 5;
+const REC_ESCAPE: i64 = 6;
+const REC_CALL: i64 = 7;
+
+fn p0(i: i64) -> i64 {
+    1 << (if i > LAST { LAST } else { i })
+}
+
+// The pointers read from memory class c's pointers reach.
+fn deep(c: i64) -> i64 {
+    ((c & PMASK) << 30) | (c & (PMASK << 30)) | (c & UNK)
+}
+
+// ---- Types ----
+
+// Whether a value of type t may hold a pointer: a raw one, or with refs a
+// reference too (a NonNull, a Vec's buffer; what a `&H` points to may hold
+// one), at any depth; an opaque type or one not known, yes. A fn pointer
+// holds none (what it calls is its own callee). Known answers are kept
+// (RAW_HOLDS: bit 0 refs known, 1 refs yes, 2 raw known, 3 raw yes).
+pub fn holds_ptr(t: i64, refs: bool, pcx: &mut Ctx<Comp>) -> bool {
+    if t <= 0 {
+        return true;
+    }
+    if pcx.raw_holds.len() < pcx.types.len() {
+        pcx.raw_holds.resize(pcx.types.len(), 0);
+    }
+    let known: i64 = if refs { 1 } else { 4 };
+    let m = pcx.raw_holds[t as usize];
+    if (m & known) != 0 {
+        return (m & (known * 2)) != 0;
+    }
+    let r = holds_in(t, refs, 0, pcx);
+    pcx.raw_holds[t as usize] = pcx.raw_holds[t as usize] | known | (if r { known * 2 } else { 0 });
+    r
+}
+
+fn holds_in(t: i64, refs: bool, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if t <= 0 || depth > 64 || crate::front::opaque::is_opaque(t, pcx) {
+        return true;
+    }
+    let u = undistinct(t, pcx);
+    if u <= 0 {
+        return true;
+    }
+    let k = pcx.types[u as usize].kind;
+    if k == TyKind::Prim || k == TyKind::Fn {
+        return false;
+    }
+    if k == TyKind::Ptr {
+        return refs || pcx.types[u as usize].b == 0
+            || holds_in(pcx.types[u as usize].a, refs, depth + 1, pcx);
+    }
+    if k == TyKind::Slice {
+        return refs || is_raw_view(u, pcx)
+            || holds_in(pcx.types[u as usize].a, refs, depth + 1, pcx);
+    }
+    if k == TyKind::Array || k == TyKind::Vector || k == TyKind::Unsized {
+        return holds_in(pcx.types[u as usize].a, refs, depth + 1, pcx);
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[u as usize].count {
+            if holds_in(type_elem(u, i, pcx), refs, depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == TyKind::Struct {
+        let st = pcx.types[u as usize].a;
+        for i in 0..pcx.structs[st as usize].field_count {
+            if holds_in((struct_field(st, i, pcx)).ty, refs, depth + 1, pcx) {
+                return true;
+            }
+        }
+        for i in 0..pcx.structs[st as usize].targ_count {
+            if holds_in(pcx.tlists[(pcx.structs[st as usize].targs + i) as usize], refs, depth + 1,
+                pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if k == TyKind::Enum {
+        let en = pcx.types[u as usize].a;
+        for i in 0..pcx.enums[en as usize].targ_count {
+            if holds_in(pcx.tlists[(pcx.enums[en as usize].targs + i) as usize], refs, depth + 1,
+                pcx) {
+                return true;
+            }
+        }
+        for v in 0..pcx.enums[en as usize].variant_count {
+            let vi = pcx.variants[enum_variant(en, v, pcx) as usize];
+            for j in 0..vi.field_count {
+                if holds_in(pcx.tlists[(vi.fields + j) as usize], refs, depth + 1, pcx) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    true
+}
+
+// RULE: C3.4 (0.30.2) Whether expression n is a constant (a literal, a
+// constant item, a builtin's value such as `align_of(T)`, an operation of
+// constants): an integer cast to a pointer from one makes a pointer with
+// no provenance (a null pointer, a dangling one, Rust's
+// without_provenance), which writes nothing; any other integer's pointer
+// may be any exposed allocation's (exposed provenance, Rust's `as`).
+pub fn is_const_int(n: i64, pcx: &Ctx<Comp>) -> bool {
+    if n <= 0 {
+        return false;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    if k == NodeKind::Int || k == NodeKind::Bool || k == NodeKind::Char {
+        return true;
+    }
+    if k == NodeKind::Ident {
+        return pcx.nodes[n as usize].res == Res::Const;
+    }
+    if k == NodeKind::Unary || k == NodeKind::Cast {
+        let o = if k == NodeKind::Cast { pcx.nodes[n as usize].a } else { pcx.nodes[n as usize].b };
+        return (k == NodeKind::Cast || pcx.nodes[n as usize].op != Tok::Star
+            && pcx.nodes[n as usize].op != Tok::Amp) && is_const_int(o, pcx);
+    }
+    if k == NodeKind::Binary {
+        return is_const_int(pcx.nodes[n as usize].b, pcx)
+            && is_const_int(pcx.nodes[n as usize].c, pcx);
+    }
+    if k == NodeKind::Call && pcx.nodes[n as usize].x <= 0 {
+        // (a builtin: `size_of(T)`, `align_of(T)`, its arguments types)
+        let callee = pcx.nodes[n as usize].a;
+        return callee > 0 && pcx.nodes[callee as usize].kind == NodeKind::Ident
+            && pcx.nodes[callee as usize].res == Res::None
+            && (0..pcx.nodes[n as usize].count).all(|i| {
+                let a = child(n, i, pcx);
+                pcx.nodes[a as usize].kind != NodeKind::Ident
+                    || pcx.nodes[a as usize].res != Res::Local
+                    && pcx.nodes[a as usize].res != Res::Static
+            });
+    }
+    false
+}
+
+// ---- A function's table ----
+
+// The function a table is of, its parameters' locals (param_at: local,
+// index pairs), whether it is a closure with an env (its captures are read
+// through parameter 0), and its locals' definitions (recs: kind, local,
+// node, call quadruples; RAW_TV, RAW_TD, RAW_TFN hold the classes).
+struct Tab<A: Allocator> {
+    f: i64,
+    gen: i64,
+    params: Vec<i64, A>,
+    env: bool,
+    recs: Vec<i64, A>,
+    store: i64,
+}
+
+fn tab_new(f: i64, pcx: &mut Ctx<Comp>) -> Tab<Comp> {
+    pcx.raw_gen = pcx.raw_gen + 1;
+    let mut t = Tab {
+        f: f,
+        gen: pcx.raw_gen,
+        params: Vec::new_in(Comp {}),
+        env: false,
+        recs: Vec::new_in(Comp {}),
+        store: 0,
+    };
+    let node = pcx.fns[f as usize].node;
+    let id = crate::places::regions::closure_of_fn(f, pcx);
+    let e0: i64 = if id >= 0 && pcx.closures[id as usize].capture_count > 0 { 1 } else { 0 };
+    t.env = e0 == 1;
+    // (a closure's parameters are its Closure node's, after its env)
+    let pnode = if id >= 0 { pcx.closures[id as usize].node } else { node };
+    if pnode > 0 {
+        for i in 0..pcx.nodes[pnode as usize].count {
+            let p = child(pnode, i, pcx);
+            if p > 0 && pcx.nodes[p as usize].kind == NodeKind::Param
+                && pcx.nodes[p as usize].x >= 0 {
+                t.params.push(pcx.nodes[p as usize].x);
+                t.params.push(i + e0);
+            }
+        }
+    }
+    if pcx.raw_tv.len() < pcx.locals.len() {
+        pcx.raw_tv.resize(pcx.locals.len(), 0);
+        pcx.raw_td.resize(pcx.locals.len(), 0);
+        pcx.raw_tfn.resize(pcx.locals.len(), -1);
+    }
+    if node > 0 {
+        scan(pcx.nodes[node as usize].c, &mut t, pcx);
+    }
+    settle(&mut t, pcx);
+    t
+}
+
+fn rec(t: &mut Tab<Comp>, kind: i64, y: i64, n: i64, call: i64) {
+    t.recs.push(kind);
+    t.recs.push(y);
+    t.recs.push(n);
+    t.recs.push(call);
+}
+
+// The local place e is in, without a deref (its own slot), or -1.
+fn own_root(e: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut n = e;
+    while n > 0 {
+        let k = pcx.nodes[n as usize].kind;
+        if k == NodeKind::Ident {
+            if pcx.nodes[n as usize].res != Res::Local {
+                return -1;
+            }
+            return pcx.nodes[n as usize].y;
+        }
+        if k != NodeKind::FieldAccess && k != NodeKind::TupleField && k != NodeKind::Index {
+            return -1;
+        }
+        if through_pointer(n, pcx) {
+            return -1;
+        }
+        n = pcx.nodes[n as usize].a;
+    }
+    -1
+}
+
+// Whether place n (a field, an element) is reached through a pointer: its
+// base is a raw pointer, a reference or a view (auto-deref).
+fn through_pointer(n: i64, pcx: &Ctx<Comp>) -> bool {
+    if (pcx.nodes[n as usize].p & NODE_RAW) != 0 {
+        return true;
+    }
+    let b = pcx.nodes[n as usize].a;
+    let bt = if b > 0 { undistinct(pcx.nodes[b as usize].ty, pcx) } else { 0 };
+    bt > 0 && (pcx.types[bt as usize].kind == TyKind::Ptr
+        || pcx.types[bt as usize].kind == TyKind::Slice)
+}
+
+// Each local a pattern binds, defined by src (REC_VALUE, or REC_DEREF for
+// `&x`, REC_REF for a binding by reference).
+fn bind(p: i64, src: i64, kind: i64, t: &mut Tab<Comp>, pcx: &Ctx<Comp>) {
+    if p <= 0 {
+        return;
+    }
+    if pcx.nodes[p as usize].kind == NodeKind::PatBind {
+        let y = pcx.nodes[p as usize].x;
+        if y >= 0 {
+            let k = if (pcx.nodes[p as usize].p & PAT_AMP) != 0 { REC_DEREF }
+                else if (pcx.nodes[p as usize].p & PAT_REF) != 0 { REC_REF } else { kind };
+            rec(t, k, y, src, 0);
+        }
+    }
+    for k in 0..3 {
+        let e = subtree(p, k, pcx);
+        if e > 0 {
+            bind(e, src, kind, t, pcx);
+        }
+    }
+    for i in 0..pcx.nodes[p as usize].count {
+        bind(child(p, i, pcx), src, kind, t, pcx);
+    }
+}
+
+// RULE: C3.4 (0.30.2) The subtrees of node n the effects walk goes into
+// (infer.vl walk_node): a, b, c by its kind (expand.vl subtree), a
+// `for`'s body (d), the node a checked `?` or f-string is lowered to (y),
+// its list; a closure's env (y: its body is its own function).
+pub fn kids(n: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    let k = pcx.nodes[n as usize].kind;
+    if k == NodeKind::Closure {
+        if pcx.nodes[n as usize].y > 0 {
+            out.push(pcx.nodes[n as usize].y);
+        }
+        return;
+    }
+    for j in 0..3 {
+        let e = subtree(n, j, pcx);
+        if e > 0 {
+            out.push(e);
+        }
+    }
+    if k == NodeKind::For && pcx.nodes[n as usize].d > 0 {
+        out.push(pcx.nodes[n as usize].d);
+    }
+    if (k == NodeKind::Try || k == NodeKind::Interp) && pcx.nodes[n as usize].y > 0 {
+        out.push(pcx.nodes[n as usize].y);
+    }
+    for i in 0..pcx.nodes[n as usize].count {
+        let c = child(n, i, pcx);
+        if c > 0 {
+            out.push(c);
+        }
+    }
+}
+
+// The definitions in the tree at n: a `let`'s, a `for`'s, a match arm's
+// bindings; an assignment of a local; a local lent to a call; a local's
+// borrow kept (escaping: what a store through a pointer or a call given
+// one may change); a closure's env (its body is its own function).
+fn scan(n: i64, t: &mut Tab<Comp>, pcx: &Ctx<Comp>) {
+    if n <= 0 {
+        return;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    if k == NodeKind::Let {
+        bind(pcx.nodes[n as usize].a, pcx.nodes[n as usize].c, REC_VALUE, t, pcx);
+    } else if k == NodeKind::For {
+        bind(pcx.nodes[n as usize].b, pcx.nodes[n as usize].c, REC_ELEM, t, pcx);
+    } else if k == NodeKind::Match {
+        for i in 0..pcx.nodes[n as usize].count {
+            let arm = child(n, i, pcx);
+            bind(pcx.nodes[arm as usize].a, pcx.nodes[n as usize].a, REC_REF, t, pcx);
+        }
+    } else if k == NodeKind::Assign {
+        let y = own_root(pcx.nodes[n as usize].b, pcx);
+        if y >= 0 {
+            rec(t, REC_VALUE, y, pcx.nodes[n as usize].c, 0);
+        } else {
+            rec(t, REC_STORE, -1, pcx.nodes[n as usize].c, 0);
+        }
+    } else if k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::VecOp {
+        rec(t, REC_CALL, -1, 0, n);
+        for i in 0..pcx.nodes[n as usize].count {
+            let a = child(n, i, pcx);
+            let v = if a > 0 && pcx.nodes[a as usize].kind == NodeKind::NamedArg {
+                pcx.nodes[a as usize].b
+            } else { a };
+            if v > 0 && pcx.nodes[v as usize].kind == NodeKind::Unary
+                && pcx.nodes[v as usize].op == Tok::Amp {
+                let y = own_root(pcx.nodes[v as usize].b, pcx);
+                if y >= 0 {
+                    rec(t, REC_LEND, y, v, n);
+                    scan(pcx.nodes[v as usize].b, t, pcx);
+                    continue;
+                }
+            }
+            scan(a, t, pcx);
+        }
+        if k != NodeKind::Call {
+            scan(pcx.nodes[n as usize].a, t, pcx);
+        } else if pcx.nodes[n as usize].x <= 0 {
+            scan(pcx.nodes[n as usize].a, t, pcx);
+        }
+        return;
+    } else if k == NodeKind::Unary && pcx.nodes[n as usize].op == Tok::Amp {
+        let y = own_root(pcx.nodes[n as usize].b, pcx);
+        if y >= 0 {
+            rec(t, REC_ESCAPE, y, n, 0);
+        }
+    }
+    let mut ks = Vec::<i64, Comp>::new_in(Comp {});
+    kids(n, &mut ks, pcx);
+    for e in ks.iter().copied() {
+        scan(e, t, pcx);
+    }
+}
+
+// Joins (v, d) into local y's class; whether it grew.
+fn grow(y: i64, v: i64, d: i64, t: &Tab<Comp>, pcx: &mut Ctx<Comp>) -> bool {
+    if pcx.raw_tfn[y as usize] != t.gen {
+        pcx.raw_tfn[y as usize] = t.gen;
+        pcx.raw_tv[y as usize] = v;
+        pcx.raw_td[y as usize] = d;
+        return true;
+    }
+    let ov = pcx.raw_tv[y as usize];
+    let od = pcx.raw_td[y as usize];
+    pcx.raw_tv[y as usize] = ov | v;
+    pcx.raw_td[y as usize] = od | d;
+    (ov | v) != ov || (od | d) != od
+}
+
+// What a call may store in what it is lent: what its arguments hold, and
+// a pointer of unknown provenance when its callee makes one.
+fn call_store(n: i64, t: &Tab<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut c: i64 = if call_src(n, pcx) { UNK } else { 0 };
+    for i in 0..pcx.nodes[n as usize].count {
+        let (v, d) = cls(child(n, i, pcx), t, pcx);
+        c = c | v | d;
+    }
+    if pcx.nodes[n as usize].kind != NodeKind::Call || pcx.nodes[n as usize].x <= 0 {
+        let (v, d) = cls(pcx.nodes[n as usize].a, t, pcx);
+        c = c | v | d;
+    }
+    c
+}
+
+// Whether call n's callee may make a pointer of unknown provenance (a call
+// through a fn value: its targets' are not known here, yes).
+fn call_src(n: i64, pcx: &Ctx<Comp>) -> bool {
+    if pcx.nodes[n as usize].kind != NodeKind::Call || pcx.nodes[n as usize].x <= 0 {
+        return true;
+    }
+    let f = pcx.nodes[n as usize].x - 1;
+    f >= pcx.node_fx.len() as i64
+        || (pcx.node_fx[f as usize].bits & (EFF_RAW_SRC | EFF_UNKNOWN)) != 0
+}
+
+// The locals' classes, to a fixpoint (each pass only grows them); a call
+// given a pointer it is not lent from a local (a parameter, a reference
+// held) may store what its arguments hold wherever that reaches, so in
+// every local whose borrow escapes, as an assignment through a pointer.
+fn settle(t: &mut Tab<Comp>, pcx: &mut Ctx<Comp>) {
+    for i in 0..t.params.len() / 2 {
+        let y = t.params[2 * i];
+        let c = p0(t.params[2 * i + 1]);
+        pcx.raw_tfn[y as usize] = t.gen;
+        pcx.raw_tv[y as usize] = c;
+        pcx.raw_td[y as usize] = deep(c);
+    }
+    // (a local a record defines starts with no class, which the passes
+    // only grow; one none defines is unknown, local_cls: were it unknown
+    // before its record was read, the passes could never take that back)
+    for r in 0..t.recs.len() / 4 {
+        let y = t.recs[4 * r + 1];
+        if y >= 0 && pcx.raw_tfn[y as usize] != t.gen {
+            pcx.raw_tfn[y as usize] = t.gen;
+            pcx.raw_tv[y as usize] = 0;
+            pcx.raw_td[y as usize] = 0;
+        }
+    }
+    let mut pass: i64 = 0;
+    loop {
+        let mut changed = false;
+        let mut store = t.store;
+        let n = t.recs.len() / 4;
+        for r in 0..n {
+            let kind = t.recs[4 * r];
+            let y = t.recs[4 * r + 1];
+            let e = t.recs[4 * r + 2];
+            let call = t.recs[4 * r + 3];
+            if kind == REC_STORE {
+                let (v, d) = cls(e, t, pcx);
+                store = store | v | d;
+                continue;
+            }
+            if kind == REC_CALL {
+                let mut foreign = false;
+                for i in 0..pcx.nodes[call as usize].count {
+                    let a = child(call, i, pcx);
+                    let lent = a > 0 && pcx.nodes[a as usize].kind == NodeKind::Unary
+                        && pcx.nodes[a as usize].op == Tok::Amp
+                        && own_root(pcx.nodes[a as usize].b, pcx) >= 0;
+                    if !lent && a > 0 && holds_ptr(pcx.nodes[a as usize].ty, true, pcx) {
+                        foreign = true;
+                    }
+                }
+                if foreign {
+                    store = store | call_store(call, t, pcx);
+                }
+                continue;
+            }
+            let mut v: i64 = 0;
+            let mut d: i64 = 0;
+            if kind == REC_VALUE {
+                let (a, b) = cls(e, t, pcx);
+                v = a;
+                d = b;
+            } else if kind == REC_DEREF {
+                let (_, b) = cls(e, t, pcx);
+                v = b;
+                d = deep(b);
+            } else if kind == REC_REF || kind == REC_ELEM {
+                let (a, b) = cls(e, t, pcx);
+                v = a | b | (if kind == REC_REF { addr(e, t, pcx) } else { 0 });
+                d = a | b | deep(a | b);
+            } else if kind == REC_LEND {
+                // (the call may store what its other arguments hold)
+                let c = call_store(call, t, pcx);
+                v = c;
+                d = c | deep(c);
+            } else if kind == REC_ESCAPE {
+                v = t.store;
+                d = t.store | deep(t.store);
+            }
+            if grow(y, v, d, t, pcx) {
+                changed = true;
+            }
+        }
+        if store != t.store {
+            t.store = store;
+            changed = true;
+        }
+        pass += 1;
+        if !changed {
+            break;
+        }
+        if pass > 200 {
+            // (no fixpoint in reach: every local unknown)
+            for r in 0..n {
+                let y = t.recs[4 * r + 1];
+                if y >= 0 {
+                    grow(y, UNK, UNK, t, pcx);
+                }
+            }
+            break;
+        }
+    }
+}
+
+// Local y's class in t: a parameter's own; a local the table defines; in
+// a closure's body a capture, read through its env (parameter 0); else
+// unknown (a binding no rule sees).
+fn local_cls(y: i64, t: &Tab<Comp>, pcx: &Ctx<Comp>) -> (i64, i64) {
+    if y >= 0 && (y as usize) < pcx.raw_tfn.len() && pcx.raw_tfn[y as usize] == t.gen {
+        return (pcx.raw_tv[y as usize], pcx.raw_td[y as usize]);
+    }
+    if t.env {
+        return (p0(0) << 30, p0(0) << 30);
+    }
+    (UNK, UNK)
+}
+
+// Where place e is: 0 a local's own slot (a by-value parameter's too),
+// else the class of the pointer it is reached through.
+fn addr(e: i64, t: &Tab<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    if e <= 0 {
+        return 0;
+    }
+    let k = pcx.nodes[e as usize].kind;
+    if k == NodeKind::Ident {
+        if pcx.nodes[e as usize].res == Res::Local {
+            let y = pcx.nodes[e as usize].y;
+            let own = (y as usize) < pcx.raw_tfn.len() && pcx.raw_tfn[y as usize] == t.gen;
+            return if own || !t.env { 0 } else { p0(0) << 30 };
+        }
+        return 0;
+    }
+    if k == NodeKind::Unary && pcx.nodes[e as usize].op == Tok::Star {
+        let (v, _) = cls(pcx.nodes[e as usize].b, t, pcx);
+        return v;
+    }
+    if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
+        if through_pointer(e, pcx) {
+            let (v, _) = cls(pcx.nodes[e as usize].a, t, pcx);
+            return v;
+        }
+        return addr(pcx.nodes[e as usize].a, t, pcx);
+    }
+    0
+}
+
+// RULE: C3.4 (0.30.2) The class of expression n's value in t (v) and of
+// the pointers read from what it reaches (d). A value whose type holds no
+// pointer has none.
+fn cls(n: i64, t: &Tab<Comp>, pcx: &mut Ctx<Comp>) -> (i64, i64) {
+    if n <= 0 {
+        return (0, 0);
+    }
+    let k = pcx.nodes[n as usize].kind;
+    let ty = pcx.nodes[n as usize].ty;
+    if k != NodeKind::Ident && ty > 0 && !holds_ptr(ty, true, pcx) {
+        return (0, 0);
+    }
+    if k == NodeKind::Ident {
+        let res = pcx.nodes[n as usize].res;
+        if res == Res::Local {
+            if ty > 0 && !holds_ptr(ty, true, pcx) {
+                return (0, 0);
+            }
+            return local_cls(pcx.nodes[n as usize].y, t, pcx);
+        }
+        if res == Res::Static {
+            return if holds_ptr(ty, false, pcx) { (UNK, UNK) } else { (0, 0) };
+        }
+        return (0, 0);
+    }
+    if k == NodeKind::Int || k == NodeKind::Float || k == NodeKind::Char || k == NodeKind::Bool
+        || k == NodeKind::Str || k == NodeKind::CStr || k == NodeKind::Unit
+        || k == NodeKind::Binary {
+        return (0, 0);
+    }
+    if k == NodeKind::Unary {
+        let o = pcx.nodes[n as usize].b;
+        if pcx.nodes[n as usize].op == Tok::Amp {
+            let a = addr(o, t, pcx);
+            let (v, d) = cls(o, t, pcx);
+            return (a, v | d);
+        }
+        if pcx.nodes[n as usize].op == Tok::Star {
+            let (_, d) = cls(o, t, pcx);
+            return (d, deep(d));
+        }
+        return (0, 0);
+    }
+    if k == NodeKind::Cast {
+        let o = pcx.nodes[n as usize].a;
+        let from = undistinct(pcx.nodes[o as usize].ty, pcx);
+        if from > 0 && is_integer(from) {
+            return if is_const_int(o, pcx) { (0, 0) } else { (UNK, UNK) };
+        }
+        return cls(o, t, pcx);
+    }
+    if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
+        if k == NodeKind::FieldAccess && crate::front::effects::infer::reads_union(n, pcx)
+            && holds_ptr(ty, false, pcx) {
+            // (a union's pointer field read: what another field wrote)
+            return (UNK, UNK);
+        }
+        let b = pcx.nodes[n as usize].a;
+        let (ev, ed) = if through_pointer(n, pcx) {
+            let (_, d) = cls(b, t, pcx);
+            (d, deep(d))
+        } else { cls(b, t, pcx) };
+        // (a slicing, `base[a..b]`, is a view of the place: its pointer
+        // is where the elements are, as a borrow's)
+        let ix = pcx.nodes[n as usize].b;
+        if k == NodeKind::Index && ix > 0 && pcx.nodes[ix as usize].kind == NodeKind::Range {
+            return (addr(n, t, pcx), ev | ed);
+        }
+        return (ev, ed);
+    }
+    if k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::VecOp {
+        // (a result may hold any pointer its arguments reach, and one of
+        // unknown provenance when its callee makes one)
+        let c = call_store(n, t, pcx);
+        return (c, c | deep(c));
+    }
+    if k == NodeKind::Closure {
+        return cls(pcx.nodes[n as usize].y, t, pcx);
+    }
+    let mut v: i64 = 0;
+    let mut d: i64 = 0;
+    let mut ks = Vec::<i64, Comp>::new_in(Comp {});
+    kids(n, &mut ks, pcx);
+    for e in ks.iter().copied() {
+        let (a, b) = cls(e, t, pcx);
+        v = v | a;
+        d = d | b;
+    }
+    (v, d)
+}
+
+// The pointer a write site writes through (infer.vl raw_write): `*p`'s p,
+// `p.f`'s and `p[i]`'s p; a raw view's Ident, itself.
+fn site_class(s: i64, t: &Tab<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let k = pcx.nodes[s as usize].kind;
+    if k == NodeKind::Unary {
+        let (v, _) = cls(pcx.nodes[s as usize].b, t, pcx);
+        return v;
+    }
+    if k == NodeKind::FieldAccess || k == NodeKind::Index || k == NodeKind::TupleField {
+        let (v, _) = cls(pcx.nodes[s as usize].a, t, pcx);
+        return v;
+    }
+    if k == NodeKind::Ident && pcx.nodes[s as usize].res == Res::Local {
+        let (v, _) = local_cls(pcx.nodes[s as usize].y, t, pcx);
+        return v;
+    }
+    UNK
+}
+
+// The class of what call n gives where masks d0, d1 name its parameters
+// (child i, parameter i): an argument's own pointers for D0, those read
+// from what it reaches for D1.
+fn args_class(n: i64, d0: i64, d1: i64, t: &Tab<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut c: i64 = 0;
+    for i in 0..pcx.nodes[n as usize].count {
+        let b = p0(i);
+        if (d0 & b) == 0 && (d1 & b) == 0 {
+            continue;
+        }
+        let mut a = child(n, i, pcx);
+        if a > 0 && pcx.nodes[a as usize].kind == NodeKind::NamedArg {
+            a = pcx.nodes[a as usize].b;
+        }
+        let (v, d) = cls(a, t, pcx);
+        if (d0 & b) != 0 {
+            c = c | v;
+        }
+        if (d1 & b) != 0 {
+            c = c | d;
+        }
+    }
+    c
+}
+
+// The value a drop edge drops (places::drop_edge_node), as its callee's
+// parameter 0.
+fn drop_class(n: i64, d0: i64, d1: i64, t: &Tab<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let (v, d) = if pcx.nodes[n as usize].kind == NodeKind::PatBind {
+        local_cls(pcx.nodes[n as usize].x, t, pcx)
+    } else { cls(n, t, pcx) };
+    (if (d0 & 1) != 0 { v } else { 0 }) | (if (d1 & 1) != 0 { d } else { 0 })
+}
+
+// ---- Summaries ----
+
+// The graph's nodes by component (RAW_MEMBERS from RAW_COMP_AT), once.
+fn members_index(pcx: &mut Ctx<Comp>) {
+    if pcx.raw_state.len() as i64 == pcx.graph_size + 1 {
+        return;
+    }
+    let size = pcx.graph_size;
+    pcx.raw_state.clear();
+    pcx.raw_state.resize((size + 1) as usize, 0);
+    pcx.raw_d0.clear();
+    pcx.raw_d0.resize((size + 1) as usize, 0);
+    pcx.raw_d1.clear();
+    pcx.raw_d1.resize((size + 1) as usize, 0);
+    pcx.raw_rw.clear();
+    pcx.raw_rw.resize((size + 1) as usize, false);
+}
+
+// The members of node w's component (Tarjan's, infer.vl components): the
+// nodes the component's edges reach that share its number.
+fn members(w: i64, pcx: &Ctx<Comp>) -> Vec<i64, Comp> {
+    let comp = pcx.component[w as usize];
+    let mut out = Vec::<i64, Comp>::new_in(Comp {});
+    out.push(w);
+    let mut i: usize = 0;
+    while i < out.len() {
+        let m = out[i];
+        for e in pcx.edge_start[m as usize]..pcx.edge_start[(m + 1) as usize] {
+            let x = pcx.edges[e as usize] >> 2;
+            if pcx.component[x as usize] == comp && !out.contains(&x) {
+                out.push(x);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+// RULE: C3.4 (0.30.2) Node w's summary (RAW_D0, RAW_D1, RAW_RW), with its
+// component's: the callees outside it first, then the members to a
+// fixpoint (each pass only grows them).
+pub fn summary(w: i64, pcx: &mut Ctx<Comp>) {
+    members_index(pcx);
+    if w < 0 || w >= pcx.graph_size || pcx.raw_state[w as usize] != 0 {
+        return;
+    }
+    let ms = members(w, pcx);
+    for m in ms.iter().copied() {
+        pcx.raw_state[m as usize] = 1;
+    }
+    for m in ms.iter().copied() {
+        for e in pcx.edge_start[m as usize]..pcx.edge_start[(m + 1) as usize] {
+            let x = pcx.edges[e as usize] >> 2;
+            if pcx.raw_state[x as usize] == 0 {
+                summary(x, pcx);
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for m in ms.iter().copied() {
+            let mut why: (i64, i64) = (0, -1);
+            let (d0, d1, rw) = node_raw(m, &mut why, pcx);
+            let od0 = pcx.raw_d0[m as usize];
+            let od1 = pcx.raw_d1[m as usize];
+            let orw = pcx.raw_rw[m as usize];
+            pcx.raw_d0[m as usize] = od0 | d0;
+            pcx.raw_d1[m as usize] = od1 | d1;
+            pcx.raw_rw[m as usize] = orw || rw;
+            if (od0 | d0) != od0 || (od1 | d1) != od1 || rw && !orw {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for m in ms.iter().copied() {
+        pcx.raw_state[m as usize] = 2;
+        // (visible to the queries: query effects, why)
+        if pcx.raw_rw[m as usize] {
+            pcx.node_fx[m as usize].bits = pcx.node_fx[m as usize].bits | EFF_RAW_WRITE;
+        }
+        if (pcx.raw_d0[m as usize] | pcx.raw_d1[m as usize]) != 0 {
+            pcx.node_fx[m as usize].bits = pcx.node_fx[m as usize].bits | EFF_RAW_ARGS;
+        }
+    }
+}
+
+// One pass's summary of node m from its sites and its edges, its callees'
+// summaries as they are now; the first reason of an unknown write into
+// why (a site or a call, and its callee: -1 none, -2 its own set).
+fn node_raw(m: i64, why: &mut (i64, i64), pcx: &mut Ctx<Comp>) -> (i64, i64, bool) {
+    let mut d0: i64 = 0;
+    let mut d1: i64 = 0;
+    let at = if m < pcx.graph_fns { pcx.fns[m as usize].node } else { 0 };
+    let own = local_own(m, pcx);
+    let mut rw = (pcx.node_fx[m as usize].bits & EFF_UNKNOWN) != 0 || (own & EFF_RAW_WRITE) != 0;
+    if rw {
+        *why = (at, -2);
+    }
+    if (own & EFF_RAW_ARGS) != 0 {
+        // (a body-less writer: an intrinsic's store, an atomic, C given a
+        // pointer: through what it is given)
+        d0 = PMASK;
+        d1 = PMASK;
+    }
+    let fnode = m < pcx.graph_fns && pcx.fns[m as usize].node > 0;
+    let mut tab: Option<Tab<Comp>> = None;
+    if fnode {
+        let s0 = pcx.raw_site_start[m as usize];
+        let s1 = pcx.raw_site_start[(m + 1) as usize];
+        for s in s0..s1 {
+            if tab.is_none() {
+                tab = Some(tab_new(m, pcx));
+            }
+            let c = site_class(pcx.raw_sites[s as usize], tab.as_ref().unwrap(), pcx);
+            if !rw && (c & UNK) != 0 {
+                rw = true;
+                *why = (pcx.raw_sites[s as usize], -1);
+            }
+            d0 = d0 | (c & PMASK);
+            d1 = d1 | ((c >> 30) & PMASK);
+        }
+    }
+    for e in pcx.edge_start[m as usize]..pcx.edge_start[(m + 1) as usize] {
+        let x = pcx.edges[e as usize] >> 2;
+        let kind = pcx.edges[e as usize] & 3;
+        if kind == E_ALLOC {
+            continue;
+        }
+        let n = if (e as usize) < pcx.edge_node.len() { pcx.edge_node[e as usize] } else { 0 };
+        if pcx.raw_rw[x as usize] && !rw {
+            rw = true;
+            *why = (if n > 0 { n } else { at }, x);
+        }
+        let xd0 = pcx.raw_d0[x as usize];
+        let xd1 = pcx.raw_d1[x as usize];
+        if (xd0 | xd1) == 0 {
+            continue;
+        }
+        let call = n > 0 && kind != E_DROP && pcx.nodes[n as usize].kind == NodeKind::Call;
+        let dropped = n > 0 && kind == E_DROP;
+        if !fnode || !call && !dropped {
+            // (a virtual node's targets, a shim's, a callee named as a
+            // value: what it is given passes through, any parameter)
+            d0 = PMASK;
+            d1 = PMASK;
+            continue;
+        }
+        if tab.is_none() {
+            tab = Some(tab_new(m, pcx));
+        }
+        let c = if call { args_class(n, xd0, xd1, tab.as_ref().unwrap(), pcx) }
+            else { drop_class(n, xd0, xd1, tab.as_ref().unwrap(), pcx) };
+        if !rw && (c & UNK) != 0 {
+            rw = true;
+            *why = (n, x);
+        }
+        d0 = d0 | (c & PMASK);
+        d1 = d1 | ((c >> 30) & PMASK);
+    }
+    (d0, d1, rw)
+}
+
+fn local_own(m: i64, pcx: &Ctx<Comp>) -> i64 {
+    if m < pcx.graph_fns {
+        return pcx.local_fx[m as usize].bits;
+    }
+    if m == pcx.c_unknown {
+        return EFF_RAW_WRITE;
+    }
+    0
+}
+
+// ---- A clause ----
+
+// RULE: C3.4 (0.30.2, RT-38f, RT-38g) Whether a clause, the nodes in (a
+// sorted list: its condition's and its old(..)'s) of function g, may write
+// what it did not make: a write site of its own or a call whose callee
+// writes memory of unknown provenance, or through what it is given where
+// the clause gives a pointer of g's parameters (the caller's memory) or
+// one of unknown provenance. The site or call (0: none), and its callee
+// (-1: none).
+pub fn clause_raw(g: i64, inside: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> (i64, i64) {
+    if g < 0 || g >= pcx.graph_fns || pcx.edge_start.len() as i64 <= g + 1 {
+        return (0, -1);
+    }
+    members_index(pcx);
+    let e0 = pcx.edge_start[g as usize];
+    let e1 = pcx.edge_start[(g + 1) as usize];
+    for e in e0..e1 {
+        let n = if (e as usize) < pcx.edge_node.len() { pcx.edge_node[e as usize] } else { 0 };
+        if n > 0 && inside.binary_search(&n).is_ok() {
+            summary(pcx.edges[e as usize] >> 2, pcx);
+        }
+    }
+    let t = tab_new(g, pcx);
+    let s0 = pcx.raw_site_start[g as usize];
+    let s1 = pcx.raw_site_start[(g + 1) as usize];
+    for s in s0..s1 {
+        let n = pcx.raw_sites[s as usize];
+        if inside.binary_search(&n).is_ok() && site_class(n, &t, pcx) != 0 {
+            return (n, -1);
+        }
+    }
+    for e in e0..e1 {
+        let n = if (e as usize) < pcx.edge_node.len() { pcx.edge_node[e as usize] } else { 0 };
+        if n <= 0 || !inside.binary_search(&n).is_ok() {
+            continue;
+        }
+        let x = pcx.edges[e as usize] >> 2;
+        let kind = pcx.edges[e as usize] & 3;
+        if kind == E_ALLOC {
+            continue;
+        }
+        let callee = if x < pcx.graph_fns { x } else { -3 };
+        if pcx.raw_rw[x as usize] {
+            return (n, callee);
+        }
+        let xd0 = pcx.raw_d0[x as usize];
+        let xd1 = pcx.raw_d1[x as usize];
+        if (xd0 | xd1) == 0 {
+            continue;
+        }
+        let c = if kind == E_DROP { drop_class(n, xd0, xd1, &t, pcx) }
+            else if pcx.nodes[n as usize].kind == NodeKind::Call {
+                args_class(n, xd0, xd1, &t, pcx)
+            } else { UNK };
+        if c != 0 {
+            return (n, callee);
+        }
+    }
+    (0, -1)
+}
+
+// RULE: C3.4 (0.30.2) For `query effects --why raw_write`: where node f
+// may write memory of unknown provenance, its summary made, as the
+// summary found it: its own site (callee -1), its own set (-2: ⊤, a body
+// not known, C), or the call (its callee) that brings it; (0, -1):
+// nowhere.
+pub fn why_raw(f: i64, pcx: &mut Ctx<Comp>) -> (i64, i64) {
+    if f < 0 || f >= pcx.graph_size {
+        return (0, -1);
+    }
+    summary(f, pcx);
+    let mut why: (i64, i64) = (0, -1);
+    let (_, _, rw) = node_raw(f, &mut why, pcx);
+    if rw { why } else { (0, -1) }
+}
+
+// Every function's summary (the queries: `query effects --has raw_write`).
+pub fn summarize_all(pcx: &mut Ctx<Comp>) {
+    if pcx.edge_start.len() as i64 <= pcx.graph_size {
+        return;
+    }
+    for f in 0..pcx.graph_fns {
+        summary(f, pcx);
+    }
+}

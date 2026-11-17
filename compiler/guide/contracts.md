@@ -79,12 +79,14 @@ copy"), and a by-value binding of a part that is not `Copy`
 (`match o { Some(w) => .. }`, `let (a, _) = t;`) is `contract.move`:
 match on `&o`, or bind `ref w`. What a clause makes itself (a `let mut
 n`) it may change (`o.take()`, `a.sort_unstable()`, `mem::swap` on its
-own locals), but never through a cell or a raw pointer of its own code:
-`c.set(1)`, `unsafe { *p = 1 }`, `p.write(1)` or `&mut *p` are
-`contract.effect`, and so is a call of a function that writes through a
-raw pointer when a parameter's or the result's type holds one (a `*mut
-T`, a NonNull, a Vec): it may write through what the clause reads. A
-read through a raw pointer is allowed. So a contract never changes what the program does:
+own locals), but never through a cell: `c.set(1)` is `contract.effect`.
+A write through a raw pointer is judged by where the pointer comes
+from: one made of a `&mut` of the clause's own local is a `&mut` write
+(so std's `swap` and `sort` are fine); one from a parameter (`unsafe {
+*p = 1 }`, `p.write(1)`, a Vec's or a struct's pointer) or of unknown
+provenance (an integer's, a static's, C's) is `contract.effect`, in the
+clause, its `old(..)` and every function it calls. A read through a raw
+pointer is allowed. So a contract never changes what the program does:
 `--debug-contracts` on or off prints the same for a program that
 passes its contracts.
 
