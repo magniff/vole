@@ -221,7 +221,10 @@ A correctness release, its branches merged as each is reviewed clean.
   bound whose supertrait declares Out, and `Self::Output` written in a
   trait whose supertrait declares it (std's IndexMut beside a Mul impl),
   are that trait's (RT-426: "ambiguous" before). A `where` subject may be
-  a qualified path, `<Bx<T> as H>::Item: Copy`.
+  a qualified path, `<Bx<T> as H>::Item: Copy`. An impl's supertrait or
+  associated-type bound proved through more than eight blanket impls is
+  proved or refused, and past 127 refused with the overflow error
+  (RT-436: accepted before, unmet or not).
 - **std's HashMap and HashSet impls state `S: BuildHasher`**, the bound
   their types declare: the impls without it (their Drop, Debug,
   IntoIterator, DefaultIn and the plain methods) were never checked by

@@ -485,7 +485,11 @@ Where the code differs from §3:
   its text names, then that trait's supertraits: `T::Out` under `T: Sub`
   of `trait Sub: Tr` is Tr's, and `Self::Output` written in `trait Get:
   Index<usize>` is Index's (`enclosing_trait`, `super_projection`,
-  RT-426), never another trait's of the type by the name.
+  RT-426), never another trait's of the type by the name. Coherence's
+  generic proof (`coherence::entails`, an impl's supertraits and its
+  associated types' declared bounds) stops at the impl search's limit
+  with a cut reported as `trait.overflow` (E0275), never a yes (RT-436;
+  it said yes past 8).
   Earlier text of this item:
   `convert::bound_ref` reads one written without arguments with the
   trait's defaults, and `bound_holds` is the one test of a trait bound
