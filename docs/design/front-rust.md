@@ -2425,22 +2425,26 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
 - **FL6 (integer inference variables, F18.5; 0.30.2).** F18.5's
   variables are rustc's `{integer}`: unified through the whole function
   and given the `i32` fallback at its end, F18.3's context rule before.
-  Two uses still take the fallback where they are, where rustc keeps
-  the variable: (1) a method that several integer types have that is not
-  F18.5's trait method, of one trait two or more integer types implement
-  with Self alone varying (that one may be generic, `x.hash(&mut h)`,
-  its instance made again for the type taken, E0277 when that type has
-  no impl; not: a method of a generic trait, `x.into()`, one
-  whose other parameters or result name `Self` or `i32`, one called
-  through a reference, `(&x).hash(..)`): vole takes `i32`'s, the
-  variable `i32` from there (one integer type alone having it: that
-  type; an integer type's own method is E0689, as rustc's); (2) a hole of a `format_args` value
-  (`format_args("{n}")`: its closure holds the write, made when the
-  value is checked; a direct call's hole, `println`, `format_in`,
-  `write`, waits). An `i32` taken there and passed where an `i64` goes
-  is widened (F29.3's widening, vole's), and `type.widen_i32` refuses it
-  when it was computed, so neither gives another value: each is a
-  refusal where rustc accepts. No float-literal variables (an
+  A method called on such a value (directly, through shared references,
+  `Tr::m(x)`, with a turbofish) whose trait several integer types
+  implement with Self alone varying is called with Self the variable,
+  its callee the impl of the type taken (E0277 when that type has none;
+  two traits' methods of the name are E0034); `T::from(x)` and
+  `x.into()` are the cast, their From impl checked with the type taken;
+  a format hole, of a direct call or of a `format_args` value, leaves the
+  variable as it is. One use still takes the fallback where it is, where
+  rustc keeps the variable: a method that several integer types have
+  whose signature differs between them otherwise (a generic one whose
+  other parameters name `Self`, a `&mut self` one): vole takes `i32`'s,
+  the variable `i32` from there (one integer type alone having it: that
+  type; an integer type's own method is E0689, as rustc's). An `i32`
+  taken there and passed where an `i64` goes is widened (F29.3's
+  widening, vole's), and `type.widen_i32` refuses it when it was
+  computed, so neither gives another value: each is a refusal where
+  rustc accepts. A `{:c}` hole (vole's: a byte as a character) is a use
+  that types the variable `u8`, as a `u8` parameter does. Outside a
+  function's body (a const's or static's value, an array length) an
+  unsuffixed literal is `i32` at once. No float-literal variables (an
   unsuffixed float literal is `f64`; `&0.0` and a context take theirs,
   F18.3). No `i128`/`u128` (16, F29.3): a literal that fits no 64-bit
   type is the lexer's error.

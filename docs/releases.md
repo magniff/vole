@@ -182,6 +182,14 @@ A correctness release, its branches merged as each is reviewed clean.
   `e.show()` then `take(e)` of `take(x: i64)` called i32's `show` in
   0.30.1 (another output, no error); i64's now, as rustc. When the type
   taken has no impl of the trait, rustc's E0277.
+- A literal's value in a `format_args` hole or an `assert!` message was
+  typed i32 there (`format_args("{}", a + a)` then `let b: i64 = a`
+  overflowed: -294967296, RT-410), and a turbofish method of a trait
+  implemented for i32 and i64 called i32's (RT-411): both now wait for
+  the type the variable takes. Accepted as rustc accepts them:
+  `i64::from(a + 1)`, `take(a.into())`, `x.cmp(&best)` and `x.clone()`
+  of an `x: &{integer}`, `Add2::add2(a, b)` with `b: i64`, `.sum()` of
+  mapped or iterated literals into an i64 (RT-412, RT-415, RT-417).
 - A lazy build (0.27.4) makes every integer type's builtin impls: the
   integer variables' decisions read them all, and one it lacked typed a
   literal another way than `volec check` did (`x.hash(&mut h)` hashed an
@@ -233,11 +241,14 @@ A correctness release, its branches merged as each is reviewed clean.
   E0600), and one variable met by two integer types that do not widen to
   one another (E0308): each was typed `i32` before, and passed or failed
   elsewhere.
-- Still the fallback where they are (FL6): a method of a generic trait
-  called on such a value (`x.into()`), one whose parameters name `Self`
-  in another place than its self, and a `format_args` value's hole; an
-  `i32` computed there is refused where it is widened
-  (`type.widen_i32`), never widened to another value.
+- Still the fallback where it is (FL6): a method several integer types
+  have whose signature differs between them but for Self (a generic one
+  whose other parameters name `Self`, a `&mut self` one); an `i32`
+  computed there is refused where it is widened (`type.widen_i32`),
+  never widened to another value.
+- A method of two traits that integer types implement, called on such a
+  value (`a.m()` with `impl A for i32` and `impl B for i64`), is rustc's
+  E0034 (0.30.1 called i32's).
 
 ### What's new in 0.30.1
 

@@ -705,21 +705,57 @@ pub fn synth_method(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // the type's the variable takes, int_var_method; another is the one
     // integer type's that has it, else i32's, the variable taking the
     // fallback here, FL6)
-    let int_recv = crate::front::check::infer::int_free(receiver_ty, pcx);
+    // (0.30.2: through shared references too, the probe's autoderef steps:
+    // `x.cmp(&best)` of an `x: &{integer}` is `{integer}`'s, `(*x).cmp`)
+    let mut int_base = receiver_ty;
+    let mut derefs: i64 = 0;
+    while pcx.infer_live && derefs < 8 && int_base > 0 && is_ref(int_base, pcx)
+        && pcx.types[int_base as usize].b == REF_SHARED {
+        int_base = crate::front::check::infer::follow(pcx.types[int_base as usize].a, pcx);
+        derefs += 1;
+    }
+    let int_recv = crate::front::check::infer::int_free(int_base, pcx);
     if int_recv {
+        let (traits, tr) = int_method_traits(name, via, pcx);
         if inherent_int_method(name, pcx) {
             literal_method_error(receiver, name,
                 pcx.nodes[receiver as usize].kind == NodeKind::Ident, pcx);
-        } else if via < 0 && pcx.nodes[n as usize].g == 0 {
-            let r = int_var_method(n, receiver, receiver_ty, name, pcx);
+        } else if traits > 1 {
+            // RULE: F9.2 (0.30.2: two traits' methods for integer types:
+            // the probe of `{integer}` finds both, rustc's E0034)
+            let saved_kind = pcx.err_kind;
+            pcx.err_kind = c"method.ambiguous";
+            err_begin(pcx.nodes[n as usize].start, pcx);
+            err_str(c"multiple applicable items: '", pcx);
+            err_sym(name, pcx);
+            err_str(c"' is a method of more than one trait for '{integer}' (rustc E0034)", pcx);
+            err_help(
+                c"call it through its trait to say which, or give the integer its type (`7i64`)",
+                pcx);
+            err_end_soft(pcx);
+            pcx.err_kind = saved_kind;
+        } else if traits == 1 {
+            let mut recv = receiver;
+            let mut rt = receiver_ty;
+            for _ in 0..derefs {
+                rt = crate::front::check::infer::follow(pcx.types[rt as usize].a, pcx);
+                recv = synthetic_unary(Tok::Star, recv, rt, pcx);
+            }
+            let r = int_var_method(n, recv, int_base, name, tr, derefs > 0, pcx);
             if r != 0 {
                 return r;
             }
         }
-        let one = crate::front::check::infer::int_method_type(name, pcx);
-        crate::front::check::infer::unify(receiver_ty, one, pcx);
-        receiver_ty = one;
-        pcx.nodes[receiver as usize].ty = one;
+        // (through a reference, a method taking self by value is the
+        // reference's own impl's at the probe's first step, `r.max(&5)` of
+        // `impl Ord for &A`, its A the variable: probed below as it is)
+        if derefs == 0 {
+            let one = crate::front::check::infer::int_method_type(name,
+                if traits == 1 { tr } else { -1 }, pcx);
+            crate::front::check::infer::unify(int_base, one, pcx);
+            receiver_ty = crate::front::check::infer::resolve(receiver_ty, pcx);
+            pcx.nodes[receiver as usize].ty = receiver_ty;
+        }
     }
     if hint != 0 {
         pcx.hint_node = n;
@@ -1384,11 +1420,18 @@ pub fn synth_method(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // of the type the variable takes at the function's end (infer.vl
 // int_method), as rustc's probe of `{integer}` selects the impl then. Its
 // result type; 0 when the method is not one such (FL6).
-fn int_var_method(n: i64, receiver: i64, v: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let (f0, g0, ft, gt) = crate::front::check::infer::int_impl_pair(name, pcx);
+fn int_var_method(n: i64, receiver: i64, v: i64, name: i64, tr: i64, ref_only: bool,
+    pcx: &mut Ctx<Comp>)
+    -> i64 {
+    let (f0, g0, ft, gt) = crate::front::check::infer::int_impl_pair(name, tr, pcx);
     let mut f = f0;
     let mut g = g0;
     if f < 0 || g < 0 || !is_method(f, pcx) || direct_kind(n, f, true, pcx) != 0 {
+        return 0;
+    }
+    // (through a reference, `x.cmp(&y)` of an `x: &{integer}`: a `&self`
+    // method only, which the dereferenced value's impl has)
+    if ref_only && !node_ref_self(f, pcx) {
         return 0;
     }
     // (a generic method, `hash<H: Hasher>(&self, state: &mut H)`: Self
@@ -1516,6 +1559,74 @@ fn names_self(t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
 pub fn int_trait_fn(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let f = method_of(t, name, pcx);
     if f >= 0 { f } else { crate::front::convert::sole_impl_fn(t, name, pcx) }
+}
+
+// RULE: F18.5 (0.30.2) The method `name` of integer type t from trait tr's
+// impl (int_var_method's pair, int_method_type, the end's retarget: the
+// trait the call named, `Tr::m(x)`, or the one the probe found); -1 when t
+// has none; tr -1: int_trait_fn's.
+pub fn int_trait_method(t: i64, name: i64, tr: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if tr < 0 {
+        return int_trait_fn(t, name, pcx);
+    }
+    for i in 0..pcx.methods.len() as i64 {
+        if pcx.methods[i as usize].ty == t && pcx.methods[i as usize].name == name {
+            let f = pcx.methods[i as usize].f;
+            let imp = crate::front::traits::impl_of_fn(f, pcx);
+            if imp >= 0 && pcx.traits_impls[imp as usize].tr == tr {
+                return f;
+            }
+        }
+    }
+    let s = crate::front::convert::sole_impl_fn(t, name, pcx);
+    let imp = if s >= 0 { crate::front::traits::impl_of_fn(s, pcx) } else { -1 };
+    if imp >= 0 && pcx.traits_impls[imp as usize].tr == tr { s } else { -1 }
+}
+
+// RULE: F18.5, F9.2 (0.30.2: synth_method) The traits in scope whose
+// impls for some integer type have method `name` (only `via` for
+// `Tr::m(x)`): (how many, to 2; the first). Two are rustc's E0034 for a
+// call on `{integer}`: the probe finds a candidate in each.
+fn int_method_traits(name: i64, via: i64, pcx: &mut Ctx<Comp>) -> (i64, i64) {
+    let mut first: i64 = -1;
+    for k in 0..10 {
+        let t = crate::front::check::infer::INT_TYPES[k as usize];
+        let mut any = false;
+        for i in 0..pcx.methods.len() as i64 {
+            if pcx.methods[i as usize].ty != t || pcx.methods[i as usize].name != name {
+                continue;
+            }
+            let imp = crate::front::traits::impl_of_fn(pcx.methods[i as usize].f, pcx);
+            if imp < 0 {
+                continue;
+            }
+            let tr = pcx.traits_impls[imp as usize].tr;
+            if via >= 0 && tr != via || via < 0 && !trait_in_scope(tr, pcx) {
+                continue;
+            }
+            any = true;
+            if first < 0 {
+                first = tr;
+            } else if tr != first {
+                return (2, first);
+            }
+        }
+        if !any {
+            let s = crate::front::convert::sole_impl_fn(t, name, pcx);
+            let imp = if s >= 0 { crate::front::traits::impl_of_fn(s, pcx) } else { -1 };
+            if imp >= 0 {
+                let tr = pcx.traits_impls[imp as usize].tr;
+                if via < 0 || tr == via {
+                    if first < 0 {
+                        first = tr;
+                    } else if tr != first {
+                        return (2, first);
+                    }
+                }
+            }
+        }
+    }
+    (if first >= 0 { 1 } else { 0 }, first)
 }
 
 // A parameter's (or the result's) type of a method of integer type fa (a)
