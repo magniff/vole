@@ -47,16 +47,57 @@ fn bound_sig(bound: i64, pcx: &mut Ctx<Comp>) -> i64 {
 }
 
 // The fn type of a value of type t a bound can take: a closure's
-// signature, or a plain fn type; 0.
-fn callable_sig(t: i64, pcx: &Ctx<Comp>) -> i64 {
+// signature, or a plain fn type; 0. (0.30.2, RT-166: an opaque value, or
+// a reference to one, as the closure it is within its own bound,
+// opaque.vl fn_bound_type; a reference to a closure, which std's `Fn*`
+// impls for references call through, as fn_bound_satisfied takes it:
+// `.map(&f)` infers its B from f's result)
+fn callable_sig(t0: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut t1 = t0;
+    while t1 > 0 && pcx.types[t1 as usize].kind == TyKind::Ptr && pcx.types[t1 as usize].b != 0
+        && pcx.types[t1 as usize].a > 0
+        && pcx.types[pcx.types[t1 as usize].a as usize].kind == TyKind::Ptr
+        && pcx.types[pcx.types[t1 as usize].a as usize].b != 0 {
+        t1 = pcx.types[t1 as usize].a;
+    }
+    // (an opaque result only: an Ω's signature is its bound's, which
+    // the impl being matched may be what resolves; asked here, the match
+    // asked itself again)
+    let base = if t1 > 0 && pcx.types[t1 as usize].kind == TyKind::Ptr { pcx.types[t1 as usize].a }
+        else { t1 };
+    let t = if crate::front::opaque::opaque_call_kind(base, pcx) != 0 {
+        crate::front::opaque::fn_bound_type(t1, -1, pcx)
+    } else { t1 };
     let c = closure_of_type(t, pcx);
     if c != 0 {
         return pcx.closures[(c - 1) as usize].sig;
+    }
+    if t > 0 && pcx.types[t as usize].kind == TyKind::Ptr && pcx.types[t as usize].b != 0
+        && closure_of_type(pcx.types[t as usize].a, pcx) != 0 {
+        return pcx.closures[(closure_of_type(pcx.types[t as usize].a, pcx) - 1) as usize].sig;
     }
     if t > 0 && pcx.types[t as usize].kind == TyKind::Fn && pcx.types[t as usize].b == 0 {
         return t;
     }
     0
+}
+
+// RULE: D19.5 (0.30.2, RT-195) Whether t, a callee's referent, is a
+// reference through which std's `Fn*` impls for references reach a value
+// a call takes: under its references a closure, an opaque value or a type
+// parameter with an `Fn*` bound, a fn type (`&&F`, `&mut &mut F`, `&mut
+// &&impl Fn`). Which of them may be called is the bound test's
+// (fn_bound_satisfied) and the borrow checker's.
+pub fn callable_through_ref(t: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if t <= 0 || pcx.types[t as usize].kind != TyKind::Ptr || pcx.types[t as usize].b == 0 {
+        return false;
+    }
+    let mut f = t;
+    while f > 0 && pcx.types[f as usize].kind == TyKind::Ptr && pcx.types[f as usize].b != 0 {
+        f = pcx.types[f as usize].a;
+    }
+    closure_of_type(f, pcx) != 0 || crate::front::opaque::fn_bounded(f, pcx)
+        || f > 0 && pcx.types[f as usize].kind == TyKind::Fn && pcx.types[f as usize].b == 0
 }
 
 // Whether type t satisfies the bound `bound` (a TyFn node, d = 2 for
@@ -65,7 +106,29 @@ pub fn fn_bound_satisfied(bound: i64, t0: i64, pcx: &mut Ctx<Comp>) -> bool {
     // RULE: D21.5 (0.30.2, RT-166, RT-196: an opaque value, or a reference
     // to one, as the closure it is, within its own bound; every caller of
     // this test, a blanket impl's bound among them)
-    let t = crate::front::opaque::fn_bound_type(t0, -1, pcx);
+    // (and D21.6, RT-213: an opaque value meets no bound of a stricter
+    // kind than its own, `impl FnOnce` no `F: Fn`, whatever its closure)
+    let own = crate::front::opaque::opaque_call_kind(t0, pcx);
+    if own > pcx.nodes[bound as usize].d {
+        return false;
+    }
+    // RULE: D19.5 (0.30.2, RT-195, RT-166: `&&F`, `&mut &F` and `&mut
+    // &mut F` are what the inner reference is, by std's impls for
+    // references: `&G: Fn` for `G: Fn`, `&mut G: FnMut` for `G: FnMut`; a
+    // `&&mut F` is no `Fn*`, as no `&mut G` is Fn)
+    let mut t1 = t0;
+    while t1 > 0 && pcx.types[t1 as usize].kind == TyKind::Ptr && pcx.types[t1 as usize].b != 0
+        && pcx.types[t1 as usize].a > 0
+        && pcx.types[pcx.types[t1 as usize].a as usize].kind == TyKind::Ptr
+        && pcx.types[pcx.types[t1 as usize].a as usize].b != 0 {
+        let inner = pcx.types[t1 as usize].a;
+        if pcx.types[t1 as usize].b != crate::front::types::REF_MUT
+            && pcx.types[inner as usize].b == crate::front::types::REF_MUT {
+            return false;
+        }
+        t1 = inner;
+    }
+    let t = crate::front::opaque::fn_bound_type(t1, -1, pcx);
     if t == pcx.ty_error {
         return true;
     }
@@ -251,6 +314,19 @@ pub fn param_call_kind(f: i64, local: i64, pcx: &Ctx<Comp>) -> i64 {
         }
     }
     0
+}
+
+// RULE: D19.5, D21.6 (0.30.2, RT-213) The call kind of a call of local
+// `local` of function f: its parameter's bound (param_call_kind), else the
+// bound of its opaque type (`let g = mk();` with mk an `impl FnOnce`:
+// opaque::opaque_call_kind); 0 when neither gives one (the closure's own
+// kind is the call's).
+pub fn value_call_kind(f: i64, local: i64, pcx: &Ctx<Comp>) -> i64 {
+    let k = param_call_kind(f, local, pcx);
+    if k != 0 || local < 0 || local >= pcx.locals.len() as i64 {
+        return k;
+    }
+    crate::front::opaque::opaque_call_kind(pcx.locals[local as usize].ty, pcx)
 }
 
 // Whether argument `arg` is inferred last (infer_from's third pass): a

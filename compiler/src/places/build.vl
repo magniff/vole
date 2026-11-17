@@ -1125,7 +1125,7 @@ fn expr_into(e: i64, dl: i64, dp: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Com
         // that is not Copy is no repeat by now, check/synth_mode.vl
         // repeat_literal; none drops the value, which goes now, as Rust
         // drops it)
-        if len > 1 && et > 0 && et != pcx.ty_error && !crate::places::regions::rust_copy(et, pcx) {
+        if repeat_needs_copy(elem, et, len, pcx) {
             repeat_copy_error(elem, et, pcx);
         }
         if len == 0 && needs_drop(et, pcx) {
@@ -1505,10 +1505,22 @@ fn static_mut_ref_error(l: i64, node: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Com
     pcx.err_kind = saved;
 }
 
+// RULE: F35.1 (0.30.2, RT-148, RT-215) Whether array repeat `[e; N]`, e of
+// type t, copies a value that may not be copied: N above 1 and t not Copy
+// (rust_copy, the one Copy test), e no use of a constant (whose repeat
+// makes each element from it, F35.2). Asked where the copies are made: the
+// places IR's RV_REPEAT (expr_into) and, for a static's or a constant's
+// value, which no body builds, the checker (synth_mode.vl repeat_literal).
+pub fn repeat_needs_copy(e: i64, t: i64, len: i64, pcx: &mut Ctx<Comp>) -> bool {
+    len > 1 && t > 0 && t != pcx.ty_error
+        && (pcx.nodes[e as usize].p & crate::front::ast::NODE_CONST_USE) == 0
+        && !crate::places::regions::rust_copy(t, pcx)
+}
+
 // (0.30.2, RT-148) error trait.repeat_copy: array repeat `[e; N]`, N > 1,
 // of a value of type t that is not Copy (rustc E0277): each element would
 // be a bitwise copy of it, each dropped. Reported for the template once.
-fn repeat_copy_error(elem: i64, t: i64, pcx: &mut Ctx<Comp>) {
+pub fn repeat_copy_error(elem: i64, t: i64, pcx: &mut Ctx<Comp>) {
     // RULE: D22.2 (an opaque instance's error where a concrete instance's
     // is reported already: not again, as the checker's, diag.vl error_key)
     if crate::front::opaque::omega_instance(pcx.cur_f, pcx)
@@ -2030,6 +2042,17 @@ fn lower_call(n: i64, dl: i64, dp: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Co
         settle_operand(pcx.nodes[n as usize].a, pcx.nodes[n as usize].count == 0, pbody, pcx);
         at = ops_add(at, count, pbody, pcx);
         count += 1;
+    } else if (pcx.nodes[n as usize].p & crate::front::ast::CALL_CONSUMES) != 0 {
+        // RULE: D21.6 (0.30.2, RT-213: an `impl FnOnce` value whose closure
+        // captures nothing, called: moved into a temporary of the call,
+        // which drops it; synth_call keeps it as the callee)
+        let callee = pcx.nodes[n as usize].a;
+        let t = new_temp(pcx.nodes[callee as usize].ty, callee, false, pbody, pcx);
+        expr_into(callee, t, 0, pbody, pcx);
+        if !reachable(pbody) {
+            return;
+        }
+        at = ops_mark(pbody);
     }
     let c_callee = f >= 0 && fn_is_extern(f, pcx);
     let mut ik: i64 = -1;
@@ -2218,14 +2241,19 @@ fn lower_arg(i: i64, arg: i64, mode: i64, pty: i64, c_callee: bool, variadic: bo
         if env && !crate::places::regions::closure_once(pcx.types[at_ty as usize].a, pcx)
             && pcx.nodes[operand_e as usize].kind == NodeKind::Ident
             && pcx.nodes[operand_e as usize].res == Res::Local
-            && crate::front::closures::fn_bounds::param_call_kind(pbody.fn_,
+            && crate::front::closures::fn_bounds::value_call_kind(pbody.fn_,
                 pcx.nodes[operand_e as usize].y,
                 pcx) == crate::front::closures::kinds::KIND_FN_ONCE {
             // RULE: D19.5 (an `Fn`/`FnMut` closure called as the `FnOnce` its
             // parameter is bound by: moved into a temporary of the call,
             // `_t = move Q`, which the env borrows and the statement drops)
             let c_ty = pcx.types[at_ty as usize].a;
-            place_operand(pl, pp, c_ty, true, pbody, pcx);
+            // (D21.6: an opaque value moves as its type, Copy only by its
+            // bounds, its closure Copy or not)
+            let local_ty = pcx.locals[pcx.nodes[operand_e as usize].y as usize].ty;
+            let move_ty = if crate::front::opaque::opaque_call_kind(local_ty, pcx) != 0 { local_ty }
+                else { c_ty };
+            place_operand(pl, pp, move_ty, true, pbody, pcx);
             let tc = new_temp(c_ty, arg, false, pbody, pcx);
             emit_use(tc, 0, arg, pbody, pcx);
             pl = tc;
@@ -2238,7 +2266,14 @@ fn lower_arg(i: i64, arg: i64, mode: i64, pty: i64, c_callee: bool, variadic: bo
             return;
         }
         if env {
-            let fnmut = crate::places::regions::closure_writes(pcx.types[at_ty as usize].a, pcx);
+            // (D21.6: an `impl FnMut` value is called as FnMut, its
+            // closure's kind or not: through a `mut` binding, E0596)
+            let fnmut = crate::places::regions::closure_writes(pcx.types[at_ty as usize].a, pcx)
+                || pcx.nodes[operand_e as usize].kind == NodeKind::Ident
+                && pcx.nodes[operand_e as usize].res == Res::Local
+                && crate::front::closures::fn_bounds::value_call_kind(pbody.fn_,
+                    pcx.nodes[operand_e as usize].y, pcx)
+                == crate::front::closures::kinds::KIND_FN_MUT;
             kind = if fnmut { BK_MUT2 } else { BK_SHARED };
             t_ty = ref_to(pcx.types[at_ty as usize].a, if fnmut { REF_MUT } else { REF_SHARED },
                 pcx);
