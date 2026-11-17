@@ -100,8 +100,8 @@ A correctness release, its branches merged as each is reviewed clean.
 
 #### Soundness holes closed
 
-- **An array repeat of a value that is not Copy (RT-148, RT-148b, RT-215), at
-  every -O, since 0.28.0.** `[v; 2]` of a Vec, `[D { k: 1 }; 3]` of a
+- **An array repeat of a value that is not Copy (RT-148, RT-148b,
+  RT-215, RT-302), at every -O, since 0.28.0.** `[v; 2]` of a Vec, `[D { k: 1 }; 3]` of a
   type with a Drop impl, a generic `[t; 2]` and `[f; 2]` of an `impl
   FnMut` were built: the value was copied bit for bit into each element
   and each copy dropped, a double free (a use after free once one
@@ -120,7 +120,11 @@ A correctness release, its branches merged as each is reviewed clean.
   a trait's or a type parameter's associated constant) is marked in
   one place, so `[T::ZERO; N]` in a generic body is a constant's repeat
   too. `[x; 0]` now drops x as soon as it is made (it leaked), `[C;
-  0]` makes nothing, `[x; 1]` moves x.
+  0]` makes nothing, `[x; 1]` moves x. A constant's value is a body of
+  its own (RT-302): a `return`, `?`, `break` or `continue` in it, which
+  left the function that read the constant, is refused (rustc E0572,
+  E0268), and `[C; N]` builds into a temporary whose guard drops
+  exactly the elements made on any exit.
 
 #### Miscompiles fixed
 
