@@ -22,8 +22,9 @@ use crate::front::types::{
 };
 use crate::gen0::gen::fn_symbol_prefix;
 use crate::gen0::target::{
-    cx_fmt, emit_symbol_ref, end, end_i, function_prefix, global_prefix, ins, ins_i, local_prefix,
-    log2, make_rt_note_sym, make_rt_panic_sym, o, o_label, o_str_label, oi, on,
+    cx_fmt, emit_label, emit_symbol_ref, end, end_i, function_prefix, global_prefix, ins, ins_i,
+    local_prefix, log2, make_rt_note_sym, make_rt_panic_sym, new_label, o, o_label, o_str_label, oi,
+    on,
 };
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::Cond;
@@ -583,13 +584,51 @@ pub fn a64_function_start(cx: &mut FnCtx<Comp>, symbol_prefix: *const u8, name: 
     buf_str(out, c"    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n");
 }
 
-pub fn a64_frame_reserve(cx: &mut FnCtx<Comp>, size: i64) {
-    if size < 4096 {
+// (0.30.1) The step of a frame's stack probes: a page of the smallest
+// size any target has (Apple's arm64 pages are 16 KiB, Linux's 4 KiB or
+// more), so no guard page is ever stepped over.
+pub const STACK_PROBE: i64 = 4096;
+
+// (0.30.1) Reserves a frame of `size` bytes and, for an `align` above 16,
+// aligns sp down to it. A frame whose reserve can reach STACK_PROBE bytes
+// below sp or more is probed (rustc's rule, stack clash protection): sp
+// moves a page at a time, top to bottom, and each page is touched before
+// the next, so the stack's guard page faults before any write can land
+// past it, in another thread's stack or the heap (with top-byte-ignore, a
+// frame past the address space's bottom aliased the stack itself). A
+// frame past sp's distance from 0 probes down to 0: the guard faults
+// first. x16 and x17 are the only registers used (scratch at entry).
+pub fn a64_frame_reserve(cx: &mut FnCtx<Comp>, size: i64, align: i64) {
+    let most = if align > 16 { size + align - 16 } else { size };
+    if most < STACK_PROBE {
         ins_i(cx, c"sub sp, sp, #", size, c"");
-    } else {
-        a64_load_imm(cx, 16, size as u64);
-        ins(cx, c"sub sp, sp, x16");
+        if align > 16 {
+            ins(cx, c"mov x16, sp");
+            a64_align_down(cx, 16, align);
+            ins(cx, c"mov sp, x16");
+        }
+        return;
     }
+    // x16: the frame's bottom, sp - size (0 when that borrows), aligned
+    a64_load_imm(cx, 16, size as u64);
+    ins(cx, c"mov x17, sp");
+    ins(cx, c"subs x16, x17, x16");
+    ins(cx, c"csel x16, xzr, x16, lo");
+    if align > 16 {
+        a64_align_down(cx, 16, align);
+    }
+    let again = new_label(cx);
+    let done = new_label(cx);
+    emit_label(cx, again);
+    ins_i(cx, c"sub sp, sp, #", STACK_PROBE, c"");
+    ins(cx, c"mov x17, sp");
+    ins(cx, c"cmp x17, x16");
+    a64_branch(cx, c"b.ls", done);
+    ins(cx, c"str xzr, [sp]");
+    a64_branch(cx, c"b", again);
+    emit_label(cx, done);
+    ins(cx, c"mov sp, x16");
+    ins(cx, c"str xzr, [sp]");
 }
 
 pub fn a64_epilogue(cx: &mut FnCtx<Comp>) {
@@ -639,8 +678,10 @@ pub fn a64_load_param(cx: &mut FnCtx<Comp>, location: i64, ty: i64, pcx: &Ctx<Co
     }
 }
 
+// (0.30.1) A call's stack arguments: probed as a frame is when they are a
+// page or more (a64_frame_reserve: x16 and x17, scratch here).
 pub fn a64_sp_sub(cx: &mut FnCtx<Comp>, size: i64) {
-    ins_i(cx, c"sub sp, sp, #", size, c"");
+    a64_frame_reserve(cx, size, 16);
 }
 
 pub fn a64_sp_add(cx: &mut FnCtx<Comp>, size: i64) {
