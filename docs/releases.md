@@ -224,7 +224,11 @@ A correctness release, its branches merged as each is reviewed clean.
   a qualified path, `<Bx<T> as H>::Item: Copy`. An impl's supertrait or
   associated-type bound proved through more than eight blanket impls is
   proved or refused, and past 127 refused with the overflow error
-  (RT-436: accepted before, unmet or not).
+  (RT-436: accepted before, unmet or not); that proof answers each goal
+  once per ask, so bounds shaped like a Fibonacci tree cost their count,
+  not 2^depth. `F::Output` under an `Fn() -> R` bound is the sugar's, and
+  `Self::Out` in a trait whose two supertraits declare Out is rustc's
+  E0221.
 - **std's HashMap and HashSet impls state `S: BuildHasher`**, the bound
   their types declare: the impls without it (their Drop, Debug,
   IntoIterator, DefaultIn and the plain methods) were never checked by
