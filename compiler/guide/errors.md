@@ -172,8 +172,10 @@ An unsuffixed literal takes the type the code around it gives: `if ok {
 line[i] } else { 0 }` is a `u8`, from the other branch; so are match arms
 and array elements beside a `u8`, and an array of literals beside an
 array (`if down { ACCENT } else { [0.2, 0.5, 0.7, 1.0] }` is a `[f32;
-4]` when `ACCENT` is). Alone, a literal is `i32` (`f64`), and a `let` of
-literals keeps that type: `let base = [0.2, 0.5, 0.7, 1.0];`
+4]` when `ACCENT` is). An integer literal nothing types there is
+`{integer}` until a later use in the function types it, `i32` if none
+does (0.30.2, as Rust). A float literal alone is `f64`, and a `let` of
+float literals keeps that type: `let base = [0.2, 0.5, 0.7, 1.0];`
 beside a `[f32; 4]` is an error whose note names the `let` and its
 annotation, `let base: [f32; 4] = ...`.
 
@@ -182,7 +184,7 @@ let x = 1;
 if x { }
 ```
 ```err
-error[type error] expected 'bool', got 'i32'
+error[type error] expected 'bool', got '{integer}'
 ```
 `if x != 0`.
 

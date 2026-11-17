@@ -640,7 +640,7 @@ f64 = 1.5" 'println("hi"); 1.5'
 rust_try_case nodebug 'P' 'struct P { x: i32 } P { x: 1 }'
 rust_try_case item 'i64 = 49' 'fn sq(x: i64) -> i64 { x * x } sq(7)'
 rust_try_case unit '' 'let x = 3;'
-rust_try_case error "snippet:2:1: error[type error] expected '&str', got 'i32'" 'let a = 1;
+rust_try_case error "snippet:2:5: error[type error] expected '{integer}', got '&str'" 'let a = 1;
 a + "b"'
 rust_try_case panic 'snippet:1:42: index out of bounds: index 3, length 0
 exit 101' 'let v: Vec<i64, Gpa> = Vec::new_in(gpa); v[3]'
