@@ -767,6 +767,23 @@ temporary, never a move out of the static (v0.30.1: `let a = A;` was
 slice's methods take it as a temporary (`array_const_use`). *Anchor:*
 `front/check/names.vl: inline_array_const`. *Cases:*
 `rt_214_const_array_each_use`, `rt_214_const_array_index_refused`.
+
+**F34.4 (a constant's value is a body of its own).** (0.30.2, RT-302)
+vole makes a constant at each use, its value checked there
+(`check_const_value`, the one check of a constant's value: names.vl
+inline_const, inline_array_const, assoc.vl assoc_const_value and
+inherent_const_value). A
+`return` or `?` in it outside a closure of its own, and a `break` or
+`continue` to a loop outside it, are refused (rustc E0572, E0268), as
+rustc's constant is a body of its own: v0.30.1 returned from whatever
+function read the constant, half way through a `[C; N]`. The using
+function's loops are out of reach (`loop_base`), and `const_value` (the
+closure depth it was entered at) tells a `return` in the value from one
+in a closure of it. *Anchor:* `front/check/names.vl: check_const_value,
+in_const_value, const_exit_error`. *Cases:*
+`rt_302_const_value_control_flow_escapes`,
+`rt_302_const_value_exits_more`, `rt_148_repeat_const_exit_*`.
+
 ### F35 Array repeat
 
 **F35.1 (the value is Copy).** (0.30.2, RT-148) An array repeat `[e;
@@ -797,10 +814,18 @@ a name, synth_path for a path's member), so none has a mark to forget
 it). A constant is made at each use (F34.2), so `[C; N]`, N above 1, of
 a constant whose type is not Copy makes each element from the
 constant: the places IR evaluates it N times in a loop
-(`repeat_each`: the first value repeated, which makes the array a value
-for the borrow checker, then element i written with a value of its own,
-an assignment that drops nothing, the first's bits being element 0's).
-Any length: no limit (0.30.2's first form expanded the AST and refused
+(`repeat_each`), into a temporary moved into the destination whole once
+it is made: the first value repeated, which makes the temporary a value
+for the borrow checker, then element i written with a value of its own
+(an assignment that drops nothing, the first's bits being element 0's).
+While the loop runs a guard scope (`EN_GUARD`, `emit_guard`) holds the
+temporary: an exit through it (a `return`, `break`, `continue` or `?`
+reaching it) moves the temporary out and drops elements 0 to i - 1,
+exactly the values made; the normal end emits nothing. No such exit can
+come from a constant's value (F34.4), so the guard is the second of two
+walls: 10d65043a filled the destination itself and an exit dropped the
+first's copies (a triple drop, a double free). A panic ends the
+program, no unwinding. Any length: no limit (0.30.2's first form expanded the AST and refused
 more than 4096). A constant whose value calls a function calls it once
 per element, as vole's constants do at each use (rustc computes the
 constant once and copies it, which a `const fn` makes the same). `[C;

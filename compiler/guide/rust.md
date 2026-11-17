@@ -197,7 +197,9 @@ A `const` whose value calls a function is made at each use, at run
 time (rustc needs a `const fn` and computes it once). So `[C; N]` of a
 constant whose type is not Copy makes each element from the constant,
 one call per element, any length; any other `[x; N]`, N above 1, needs
-x Copy, as in Rust (`trait.repeat_copy`), in a static's value too.
+x Copy, as in Rust (`trait.repeat_copy`), in a static's value too. A
+constant's value is a body of its own, as in Rust: a `return`, `?`,
+`break` or `continue` in it cannot leave it.
 
 ## Not in the language
 

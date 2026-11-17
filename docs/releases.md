@@ -100,8 +100,8 @@ A correctness release, its branches merged as each is reviewed clean.
 
 #### Soundness holes closed
 
-- **An array repeat of a value that is not Copy (RT-148, RT-148b, RT-215), at
-  every -O, since 0.28.0.** `[v; 2]` of a Vec, `[D { k: 1 }; 3]` of a
+- **An array repeat of a value that is not Copy (RT-148, RT-148b,
+  RT-215, RT-302), at every -O, since 0.28.0.** `[v; 2]` of a Vec, `[D { k: 1 }; 3]` of a
   type with a Drop impl, a generic `[t; 2]` and `[f; 2]` of an `impl
   FnMut` were built: the value was copied bit for bit into each element
   and each copy dropped, a double free (a use after free once one
@@ -120,7 +120,11 @@ A correctness release, its branches merged as each is reviewed clean.
   a trait's or a type parameter's associated constant) is marked in
   one place, so `[T::ZERO; N]` in a generic body is a constant's repeat
   too. `[x; 0]` now drops x as soon as it is made (it leaked), `[C;
-  0]` makes nothing, `[x; 1]` moves x.
+  0]` makes nothing, `[x; 1]` moves x. A constant's value is a body of
+  its own (RT-302): a `return`, `?`, `break` or `continue` in it, which
+  left the function that read the constant, is refused (rustc E0572,
+  E0268), and `[C; N]` builds into a temporary whose guard drops
+  exactly the elements made on any exit.
 
 #### Miscompiles fixed
 
@@ -208,6 +212,43 @@ A correctness release, its branches merged as each is reviewed clean.
   of `const A: [Option<D>; 2]` was refused as a move out of a static;
   one whose type is not Copy is now made at each use, moved, borrowed
   and dropped as rustc's temporary (front-rust.md F34.3).
+- **An impl is chosen by its whole trait reference** (the trait
+  obligation engine's selection, docs/design/obligations.md, M1). Where
+  the region checker met an instance's bound `T: Tr<A>`, it chose the
+  impl of Tr for the type without reading A, and since 0.30.1 required
+  the predicates of every impl that might be the one: beside `impl<'a:
+  'static> Tr<i32> for W<'a>`, a bound `T: Tr<i64>` met by `impl<'a>
+  Tr<i64> for W<'a>` refused a W of a short borrow (RT-C301-15), and a
+  bound `T: Sub` with `trait Sub: Sup<i32>` required Sup<i64>'s impl too.
+  One function, `front::obligations::select`, now chooses the impl for a
+  trait reference, by its type and its trait arguments with lifetimes
+  erased, as rustc selects; the front's bound checks ask it, it records
+  its choice, and the region checker reads that choice for each bound of
+  an instance, each supertrait and each bound of the chosen impl's
+  parameters, never choosing again. An impl whose parameter only the
+  trait arguments bind has that parameter's bounds checked too (`impl<U:
+  Bound> Tr<U> for W` is no impl of `Tr<B>` when B is no Bound, refused
+  at the bound that needs it, rustc E0277). A reference two impls prove
+  where an instance needs it is error `trait.ambiguous` (rustc E0283),
+  and a chain of impls deeper than the limit `trait.overflow` (E0275),
+  which the front reports too where a bound's search met the limit:
+  neither is a yes, and the limit is no "not implemented".
+- **A generic function's own bounds prove only what they say** (the
+  Param candidate of the same selection, RT-96). Inside a generic body,
+  `T: Tr<U>` (U a parameter) proved `T: Tr<i32>`, a supertrait `trait
+  Sub: Tr<i64>` proved Tr<i32>, a bound `T: Tr` of `trait Tr<U = i64>`
+  proved Tr with any arguments, and a bound's argument `P` naming the
+  function's parameter was read as a `struct P` of the module of the same
+  name: each accepted where rustc says E0277, and with an impl that needs
+  `'a: 'static` for Tr<i32>, a short borrow returned as `'static` (the
+  region checker's requiring every candidate impl's predicates had
+  refused those, at the price of RT-C301-15). A parameter's bounds and
+  `where` clauses are now read whole where they are written, the
+  defaults filled in and each supertrait's arguments substituted, and a
+  reference is proved by one of them exactly; one whose arguments do not
+  resolve proves nothing. An impl's bound naming `Self` (`impl<U:
+  Conv<Self>> Tr<U> for W`) is read with Self the impl's type, wherever
+  it is asked from.
 
 ### What's new in 0.30.1
 
