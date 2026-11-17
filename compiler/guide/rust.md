@@ -117,16 +117,17 @@ fn main() {
   `f64` does too. `i64::from(a)` is accepted as in Rust.
   An index is not widened to: it is a `usize`, as in Rust (`v[i as
   usize]` of an `i: u32`).
-- **Not an i32 computed from untyped literals** (0.30.1,
-  `type.widen_i32`): an integer literal nothing gives a type is i32,
-  and Rust types it from the later use instead. So `let a = [2000000000,
-  2]; let s = a[0] + a[0];` passed to an `i64` parameter is an error,
-  not an i32 sum widened after it overflowed: write the type where the
-  value is made (`let a: [i64; 2]`, `let mut n: i64 = 0`,
-  `s.parse::<i64>()`), or `i64::from(s)` when i32 is meant. A literal,
-  an element, a loop's binding and an i32 whose type is written (a
-  parameter, a field, a function's result) widen as before: their value
-  is the same in either type.
+- **An integer literal's type comes from its uses, as in Rust**
+  (0.30.2): an unsuffixed literal nothing types where it is written is
+  `{integer}` until a later use in the function types it (through a
+  closure, an `Option`, a generic call, a branch, an array, a trait
+  method such as `m.max(3)`), and `i32` if none does. `let a =
+  2000000000; let s = Some(a).map(|x| x + x).unwrap(); take(s)` with
+  `take(x: i64)` adds in i64. Two exceptions take `i32` where they are:
+  a method of a generic trait called on such a value (`x.into()`), and
+  a `format_args` hole. An i32
+  computed from literals there is not widened (`type.widen_i32`): write
+  the type (`let m: i64 = 3`).
 - **Overflow** panics at `-O0` (`attempt to add with overflow`) and
   wraps at `-O2`, as Rust's debug and release builds do; `wrapping_add`
   and its family always wrap.

@@ -3198,6 +3198,22 @@ pub fn implements(tr: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
         return has_error_type(t, pcx) || t == TY_NEVER
             || crate::front::auto_traits::holds_auto(tr, t, pcx);
     }
+    // RULE: F18.5 (0.30.2: an integer variable still free implements a
+    // trait some integer type implements, as rustc's obligation on it waits:
+    // `impl<A: Step> Iterator for Range<A>` is Range<{integer}>'s, its Item
+    // the variable; the type it takes is decided at the function's end, and
+    // an instance made with it checks its bounds again then)
+    if crate::front::check::infer::int_free(t, pcx) {
+        return tr < 0 || crate::front::check::infer::int_some_impl(tr, pcx);
+    }
+    // (one solved: its solution's, a variable being a distinct type marked
+    // opaque, below)
+    if crate::front::check::infer::is_int_var(t, pcx) {
+        let s = crate::front::check::infer::follow(t, pcx);
+        if s != t {
+            return implements(tr, s, pcx);
+        }
+    }
     // RULE: D21.3 (an `impl Tr` result: its bounds' traits only)
     if crate::front::opaque::is_opaque(t, pcx) {
         return tr < 0 || crate::front::opaque::implements(tr, t, pcx);
@@ -3244,6 +3260,55 @@ pub fn check_later_bounds(pcx: &mut Ctx<Comp>) {
     pcx.bounds_later.clear();
 }
 
+// RULE: F18.5 (0.30.2: infer.vl int_fallback) The type arguments of
+// instance f of template tf, made with a type variable (its bounds are
+// checked when it is made again with the solutions): each that holds an integer variable still free takes the one
+// integer type its bounds admit, and so does each such variable that is
+// the trait argument of one of its bounds (`S: Sum<{integer}>`), as
+// check_bounds does where the types are known: before the fallback.
+pub fn int_bound_vars(f: i64, tf: i64, pcx: &mut Ctx<Comp>) {
+    let params = pcx.nodes[pcx.fns[tf as usize].node as usize].g;
+    if params == 0 {
+        return;
+    }
+    let targs = pcx.fns[f as usize].targs;
+    let count = pcx.fns[f as usize].targ_count;
+    // (in the instance's module, its Self the one it was made with, as
+    // fn_instance checks its bounds: `S: Sum<Self::Item>`)
+    let (saved_mod, saved_self, saved_impl) = (pcx.cur_mod, pcx.self_type, pcx.self_impl);
+    pcx.cur_mod = pcx.fns[f as usize].module;
+    pcx.self_type = pcx.fns[f as usize].self_ty;
+    pcx.self_impl = impl_of_fn(tf, pcx);
+    let saved = env_enter(params, targs, count, pcx);
+    for k in 0..count {
+        let p = child(params, k, pcx);
+        let bounds = pcx.nodes[p as usize].h;
+        if bounds == 0 {
+            continue;
+        }
+        let t = pcx.tlists[(targs + k) as usize];
+        if crate::front::check::infer::int_open(t, pcx) {
+            crate::front::check::infer::int_bounds(t, p, true, pcx);
+        }
+        if crate::front::check::infer::int_open(t, pcx) {
+            continue;
+        }
+        let rt = crate::front::check::infer::resolve(t, pcx);
+        for i in 0..pcx.nodes[bounds as usize].count {
+            let b = child(bounds, i, pcx);
+            let tr = bound_trait(b, pcx);
+            if tr >= 0 && pcx.nodes[b as usize].g != 0 {
+                let bargs = bound_args(b, pcx);
+                crate::front::check::infer::int_trait_args(tr, rt, bargs, pcx);
+            }
+        }
+    }
+    env_leave(saved, pcx);
+    pcx.cur_mod = saved_mod;
+    pcx.self_type = saved_self;
+    pcx.self_impl = saved_impl;
+}
+
 // The type arguments TLISTS[targs..] of generic item `what` (its name),
 // with parameters `params`, satisfy their bounds; an error at pos if not.
 pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pcx: &mut Ctx<Comp>) {
@@ -3276,9 +3341,29 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
         if bounds == 0 {
             continue;
         }
-        let t = (pcx.tlists[(targs + k) as usize]);
+        let mut t = (pcx.tlists[(targs + k) as usize]);
         if t == pcx.ty_error && pcx.check_unchecked {
             continue;
+        }
+        // (with the solutions so far: a variable solved, `T = {integer}`
+        // that a later use made i64, is its type here, not itself)
+        if pcx.infer_live {
+            t = crate::front::check::infer::resolve(t, pcx);
+        }
+        // RULE: F18.5 (0.30.2: a type that is or holds an integer variable,
+        // `T = {integer}`, `I = Range<{integer}>`: the one integer type that
+        // satisfies the bounds there is the variable's; one several satisfy
+        // is checked when the instance is made again with its type)
+        // (an instance's body checked with one, `-> impl Show` of `id(3)`:
+        // checked when it is made again, as the variable's function's end)
+        if crate::front::check::infer::int_open(t, pcx) {
+            if pcx.infer_live {
+                crate::front::check::infer::int_bounds(t, p, true, pcx);
+            }
+            if crate::front::check::infer::int_open(t, pcx) {
+                continue;
+            }
+            t = crate::front::check::infer::resolve(t, pcx);
         }
         // RULE: F18.6 (g) (a free variable, `Vec::<u8, _>::new_in(gpa)`'s
         // `_`, is checked when it is solved: its instance is made again)
@@ -3316,6 +3401,16 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
             }
             // (0.15: `From<U>`, a generic trait's bound)
             let bargs: i64 = if pcx.nodes[b as usize].g != 0 { bound_args(b, pcx) } else { -1 };
+            // RULE: F18.5 (0.30.2: a trait argument that is an integer
+            // variable, `S: Sum<{integer}>` of `(1..4).sum()` into an i64:
+            // the one integer type an impl gives it, else checked when the
+            // instance is made again with its type)
+            if bargs >= 0 && pcx.infer_live
+                && !crate::front::check::infer::int_trait_args(tr, t, bargs, pcx)
+                && (0..count).any(|i| crate::front::check::infer::mentions(
+                    pcx.tlists[(targs + i) as usize], true, pcx)) {
+                continue;
+            }
             let holds = if bargs >= 0 { implements_with(tr, t, bargs, pcx) }
                 else { implements(tr, t, pcx) };
             if !holds {

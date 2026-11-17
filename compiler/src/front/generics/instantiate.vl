@@ -15,8 +15,7 @@ use crate::base::diag::{
 };
 use crate::front::assoc::{infer_from_assoc, is_projection_node};
 use crate::front::ast::{
-    NODE_CHECKED, NODE_REF, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push,
-    new_node,
+    NODE_REF, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::ast::NodeKind::{
     Arm, Assign, AssocType, Binary, Block, Break, Call, Cast, Closure, EnumPanic, ExprStmt,
@@ -39,7 +38,6 @@ use crate::front::generics::{
     instance_of, instance_targs, is_untyped_literal_expr, mangle_type, mark_synthed, param_default,
     same_targs, shown_targs, take_targs, targ_count_error, template_instance,
 };
-use crate::front::lexer::Tok;
 use crate::front::modules::module_of;
 use crate::front::traits::check_bounds;
 use crate::front::types::{
@@ -267,7 +265,13 @@ pub fn unify(params: i64, bound: &mut [i64], tmod: i64, p: i64, t: i64, pcx: &mu
                     }
                     // (0.15: two arguments of two integer types join in
                     // infer_from, where they are values)
-                    return (bound[k as usize]) == t;
+                    // RULE: F18.5 (0.30.2: a parameter bound to an integer
+                    // variable, `T` of an `Option<{integer}>`, meets the
+                    // type a function's signature gives it there: unified)
+                    return (bound[k as usize]) == t || pcx.infer_live
+                        && (crate::front::check::infer::int_free((bound[k as usize]), pcx)
+                            || crate::front::check::infer::int_free(t, pcx))
+                        && crate::front::check::infer::unify((bound[k as usize]), t, pcx);
                 }
                 Option::None => return true,
             }
@@ -1052,6 +1056,37 @@ pub fn fn_instance(tf: i64, mark: i64, origin: i64, pcx: &mut Ctx<Comp>) -> i64 
     pcx.self_type = saved_self;
     if vars {
         pcx.fns[f as usize].attrs |= crate::front::ast::FN_QUERY_ONLY;
+        // RULE: F18.5 (0.30.2: a type argument whose integer variable its
+        // bounds decide, `id(3)` for `id<T: Show>` with one integer type's
+        // `Show`: that type's instance, now, as rustc selects the one impl
+        // before it reads the call's result, `-> impl Show`)
+        // (only when they decided a variable: a call whose variables were
+        // solved before is the instance made with them, as before; its
+        // receiver's type names them, `Option<{integer}>::unwrap`)
+        let mut open = false;
+        for i in 0..count {
+            if crate::front::check::infer::int_open(pcx.tlists[(targs + i) as usize], pcx) {
+                open = true;
+            }
+        }
+        if open {
+            crate::front::traits::int_bound_vars(f, tf, pcx);
+        }
+        let mut decided = open;
+        for i in 0..count {
+            if crate::front::check::infer::int_open(pcx.tlists[(targs + i) as usize], pcx) {
+                decided = false;
+            }
+        }
+        let again = pcx.tscratch.len() as i64;
+        for i in 0..count {
+            let t = crate::front::check::infer::resolve(pcx.tlists[(targs + i) as usize], pcx);
+            pcx.tscratch.push(t);
+        }
+        if decided && !crate::front::check::infer::targs_mention(again, pcx) {
+            return fn_instance(tf, again, origin, pcx);
+        }
+        pcx.tscratch.truncate(again as usize);
     } else {
         pcx.inst_queue.push(f);
     }
@@ -1173,7 +1208,6 @@ pub fn instantiate_call(tf: i64, n: i64, first_param: i64, self_ty: i64, written
             (bound[(impl_count + i) as usize]) = resolve_type(w, pcx);
         }
     }
-    range_literal_by_bounds(params, bound, count, n, template, first_param, pcx);
     infer_from(params, bound, tmod, n, 0, template, first_param, true,
         pcx.nodes[template as usize].b, hint_for(n, pcx), pcx);
     if self_ty != 0 {
@@ -1189,7 +1223,6 @@ pub fn instantiate_call(tf: i64, n: i64, first_param: i64, self_ty: i64, written
     pcx.unify_self = saved_self;
     pcx.unify_self_ty = saved_self_ty;
     bind_impl_defaults(template, bound, pcx);
-    int_literal_by_bounds(params, bound, count, n, template, first_param, pcx);
     require_bound(params, bound, pcx.nodes[n as usize].start, pcx.fns[tf as usize].display, 0,
         impl_count, 0, pcx);
     let mark = pcx.tscratch.len() as i64;
@@ -1197,252 +1230,6 @@ pub fn instantiate_call(tf: i64, n: i64, first_param: i64, self_ty: i64, written
         pcx.tscratch.push((bound[i as usize]));
     }
     fn_instance(tf, mark, n, pcx)
-}
-
-// (0.27.2.1) Whether n is a range of unsuffixed integer literals, not
-// checked yet (`1..3`, `2..`, `..=4`).
-fn untyped_int_range(n: i64, pcx: &Ctx<Comp>) -> bool {
-    if pcx.nodes[n as usize].kind != NodeKind::Range
-        || (pcx.nodes[n as usize].p & NODE_CHECKED) != 0
-        || pcx.nodes[n as usize].a == 0 && pcx.nodes[n as usize].b == 0 {
-        return false;
-    }
-    for e in [pcx.nodes[n as usize].a, pcx.nodes[n as usize].b] {
-        if e != 0 && (pcx.nodes[e as usize].kind != NodeKind::Int
-            || pcx.nodes[e as usize].b != crate::front::lexer::SUF_NONE) {
-            return false;
-        }
-    }
-    true
-}
-
-// (0.27.2.1) A type parameter that only a range of unsuffixed integer
-// literals binds (`s.get(1..3)` for `fn get<I: SliceIndex<[T]>>(&self,
-// index: I)`), whose bounds its default `Range<i64>` fails: the range is
-// checked as the one `Range<N>` of an integer type N that meets them
-// (`Range<usize>`), before the arguments are inferred. A copy of the range
-// gives its template. RULE: F18.3
-fn range_literal_by_bounds(params: i64, bound: &mut [i64], count: i64, n: i64, template: i64,
-    first_param: i64, pcx: &mut Ctx<Comp>) {
-    if pcx.nodes[n as usize].kind != NodeKind::Call
-        && pcx.nodes[n as usize].kind != NodeKind::MethodCall {
-        return;
-    }
-    for j in 0..pcx.nodes[n as usize].count {
-        let a = child(n, j, pcx);
-        if !untyped_int_range(a, pcx) || j + first_param >= pcx.nodes[template as usize].count {
-            continue;
-        }
-        let tn = pcx.nodes[child(template, j + first_param, pcx) as usize].b;
-        if tn <= 0 || pcx.nodes[tn as usize].kind != NodeKind::TyName
-            || pcx.nodes[tn as usize].count != 0
-            || pcx.nodes[tn as usize].g != 0 {
-            continue;
-        }
-        let mut k: i64 = -1;
-        for i in 0..count {
-            if pcx.nodes[child(params, i, pcx) as usize].a == pcx.nodes[tn as usize].a {
-                k = i;
-            }
-        }
-        if k < 0 || (bound[k as usize]) != 0
-            || pcx.nodes[child(params, k, pcx) as usize].h == 0
-            || (0i64..count).any(|i| i != k && (bound[i as usize]) == 0) {
-            continue;
-        }
-        // (the template, from a copy of the range typed by the default)
-        let copy = new_node(NodeKind::Range, pcx.nodes[a as usize].start,
-            pcx.nodes[a as usize].end, pcx);
-        pcx.nodes[copy as usize].c = pcx.nodes[a as usize].c;
-        for side in 0..2 {
-            let e = if side == 0 { pcx.nodes[a as usize].a } else { pcx.nodes[a as usize].b };
-            if e != 0 {
-                let d = new_node(NodeKind::Int, pcx.nodes[e as usize].start,
-                    pcx.nodes[e as usize].end, pcx);
-                pcx.nodes[d as usize].a = pcx.nodes[e as usize].a;
-                if side == 0 { pcx.nodes[copy as usize].a = d; }
-                else { pcx.nodes[copy as usize].b = d; }
-            }
-        }
-        let dt = synth_expr(copy, pcx);
-        if pcx.types[dt as usize].kind != TyKind::Struct
-            || pcx.structs[pcx.types[dt as usize].a as usize].tmpl == 0
-            || int_meets_bounds(params, bound, count, k, dt, pcx) {
-            continue;
-        }
-        let tpl = pcx.structs[pcx.types[dt as usize].a as usize].tmpl;
-        let mut found: i64 = 0;
-        let mut several = false;
-        // (0.27.3: i64 too, the rust edition's default being i32)
-        for c in [TY_USIZE, TY_I32, TY_I64, TY_U32, TY_U64, TY_ISIZE, TY_U8, TY_I8, TY_U16,
-            TY_I16] {
-            let mark = pcx.tscratch.len() as i64;
-            pcx.tscratch.push(c);
-            let rt = template_instance(tpl, mark, pcx.nodes[a as usize].start, pcx);
-            if int_meets_bounds(params, bound, count, k, rt, pcx) {
-                if found != 0 {
-                    several = true;
-                }
-                found = rt;
-            }
-        }
-        if found != 0 && !several {
-            check_expr(a, found, pcx);
-            mark_synthed(a, pcx);
-        }
-    }
-}
-
-// (0.27.2) A type parameter bound only by an unsuffixed integer literal
-// argument of call n (`s.get(0)` for `fn get<I: SliceIndex<[T]>>(&self,
-// index: I)`), its default integer type failing the parameter's bounds:
-// the one integer type that meets them (usize), as rustc's selection of
-// the literal's type by the only applicable impl. RULE: F18.1
-fn int_literal_by_bounds(params: i64, bound: &mut [i64], count: i64, n: i64, template: i64,
-    first_param: i64, pcx: &mut Ctx<Comp>) {
-    if pcx.nodes[n as usize].kind != NodeKind::Call
-        && pcx.nodes[n as usize].kind != NodeKind::MethodCall {
-        return;
-    }
-    for k in 0..count {
-        let p = child(params, k, pcx);
-        let lit: i64 = if pcx.nodes[p as usize].h == 0
-            || !crate::front::types::is_integer((bound[k as usize])) { 0 }
-            else { literal_binds(p, n, template, first_param, pcx) };
-        if lit == 0 {
-            continue;
-        }
-        if int_meets_bounds(params, bound, count, k, (bound[k as usize]), pcx) {
-            continue;
-        }
-        let mut found: i64 = 0;
-        let mut several = false;
-        // (a negated literal, `&-9`, takes no unsigned type)
-        let inner = if pcx.nodes[lit as usize].kind == NodeKind::Unary
-            && pcx.nodes[lit as usize].op == Tok::Amp {
-            pcx.nodes[lit as usize].b } else { lit };
-        let negated = pcx.nodes[inner as usize].kind == NodeKind::Unary;
-        for c in [TY_USIZE, TY_I32, TY_U32, TY_I64, TY_U64, TY_ISIZE, TY_U8, TY_I8, TY_U16,
-            TY_I16] {
-            if c != (bound[k as usize]) && !(negated && !crate::front::types::is_signed(c))
-                && int_meets_bounds(params, bound, count, k, c, pcx) {
-                if found != 0 {
-                    several = true;
-                }
-                found = c;
-            }
-        }
-        if found != 0 && !several {
-            (bound[k as usize]) = found;
-            // (the literal, synthesized as the default, is of that type;
-            // `&1`, a reference to one)
-            let mut x = lit;
-            if pcx.nodes[x as usize].kind == NodeKind::Unary
-                && pcx.nodes[x as usize].op == Tok::Amp {
-                pcx.nodes[x as usize].ty = crate::front::types::ref_to(found,
-                    crate::front::types::REF_SHARED, pcx);
-                x = pcx.nodes[x as usize].b;
-            }
-            if pcx.nodes[x as usize].kind == NodeKind::Unary {
-                pcx.nodes[x as usize].ty = found;
-                x = pcx.nodes[x as usize].b;
-            }
-            pcx.nodes[x as usize].ty = found;
-        }
-    }
-}
-
-// The argument of call n that is an unsuffixed integer literal whose
-// parameter is declared with type parameter p itself, or 0.
-fn literal_binds(p: i64, n: i64, template: i64, first_param: i64, pcx: &Ctx<Comp>) -> i64 {
-    for j in 0..pcx.nodes[n as usize].count {
-        let mut a = child(n, j, pcx);
-        // (0.27.3: `&1` for a parameter `&Q`, `m.get(&1)`, F18.3)
-        let amp = pcx.nodes[a as usize].kind == NodeKind::Unary
-            && pcx.nodes[a as usize].op == Tok::Amp
-            && (pcx.nodes[a as usize].p & crate::front::ast::NODE_REF_MUT) == 0;
-        if amp {
-            a = pcx.nodes[a as usize].b;
-        }
-        if pcx.nodes[a as usize].kind == NodeKind::Unary
-            && pcx.nodes[a as usize].op == Tok::Minus {
-            a = pcx.nodes[a as usize].b;
-        }
-        if pcx.nodes[a as usize].kind != NodeKind::Int
-            || pcx.nodes[a as usize].b != crate::front::lexer::SUF_NONE
-            || j + first_param >= pcx.nodes[template as usize].count {
-            continue;
-        }
-        let mut tn = pcx.nodes[child(template, j + first_param, pcx) as usize].b;
-        if amp {
-            tn = if tn > 0 && pcx.nodes[tn as usize].kind == NodeKind::TyPtr
-                && (pcx.nodes[tn as usize].p & crate::front::ast::NODE_REF)
-                != 0 { pcx.nodes[tn as usize].a }
-                else { 0 };
-        }
-        if tn > 0 && pcx.nodes[tn as usize].kind == NodeKind::TyName
-            && pcx.nodes[tn as usize].count == 0
-            && pcx.nodes[tn as usize].g == 0
-            && pcx.nodes[tn as usize].a == pcx.nodes[p as usize].a {
-            return child(n, j, pcx);
-        }
-    }
-    0
-}
-
-// Whether integer type t meets the bounds of parameter k of params, the
-// others bound as bound[..] says (quietly: no error).
-fn int_meets_bounds(params: i64, bound: &mut [i64], count: i64, k: i64, t: i64,
-    pcx: &mut Ctx<Comp>) -> bool {
-    let mark = pcx.tscratch.len() as i64;
-    for i in 0..count {
-        pcx.tscratch.push(if i == k { t } else { (bound[i as usize]) });
-    }
-    let targs = take_targs(mark, pcx);
-    let saved = env_enter(params, targs, count, pcx);
-    let bounds = pcx.nodes[child(params, k, pcx) as usize].h;
-    let mut ok = true;
-    for i in 0..pcx.nodes[bounds as usize].count {
-        let b = child(bounds, i, pcx);
-        if pcx.nodes[b as usize].kind != NodeKind::TyName {
-            continue;
-        }
-        let tr = crate::front::traits::bound_trait(b, pcx);
-        if tr < 0 {
-            continue;
-        }
-        let holds = if pcx.nodes[b as usize].g != 0 {
-            crate::front::convert::implements_with(tr, t,
-                crate::front::convert::bound_args(b, pcx), pcx)
-        } else {
-            crate::front::traits::implements(tr, t, pcx)
-        };
-        if !holds {
-            ok = false;
-            break;
-        }
-    }
-    // (0.27.3: and another parameter's bound with arguments, which may
-    // name it: `K: Borrow<Q>` for `m.get(&1)`, F18.3)
-    for j in 0..(if ok { count } else { 0 }) {
-        let jb = pcx.nodes[child(params, j, pcx) as usize].h;
-        if j == k || (bound[j as usize]) <= 0 || jb == 0 {
-            continue;
-        }
-        for i in 0..pcx.nodes[jb as usize].count {
-            let b = child(jb, i, pcx);
-            if pcx.nodes[b as usize].kind != NodeKind::TyName || pcx.nodes[b as usize].g == 0 {
-                continue;
-            }
-            let tr = crate::front::traits::bound_trait(b, pcx);
-            if tr >= 0 && !crate::front::convert::implements_with(tr, (bound[j as usize]),
-                crate::front::convert::bound_args(b, pcx), pcx) {
-                ok = false;
-            }
-        }
-    }
-    env_leave(saved, pcx);
-    ok
 }
 
 // The instance of enum template `tpl` (encoded, < 0) a variant `member`

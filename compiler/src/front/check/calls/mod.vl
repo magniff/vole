@@ -688,16 +688,39 @@ pub fn synth_method(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // RULE: Z9.1c (0.27.5: a receiver `*v` of a view v, which Z4.1 reads
     // as v, is the place: its methods the place's; front/convert: dispatch)
     pcx.view_deref = 0;
-    // (an open local's receiver: open before its use closes it, F18.5)
-    let open_recv = crate::front::check::literals::open_scalar(receiver, pcx) >= 0;
     let mut receiver_ty = synth_expr(receiver, pcx);
     pcx.mut_place = outer_place;
     if pcx.view_deref == receiver && receiver > 0 {
         pcx.place_recv = n;
     }
     // RULE: D21.3 (an `impl Tr` result's methods: its bounds', its hidden
-    // type's)
+    // type's; 0.30.2: that type with the solutions so far, `id(3).show()`)
     receiver_ty = crate::front::opaque::reveal_receiver(n, receiver, receiver_ty, name, pcx);
+    if pcx.infer_live {
+        receiver_ty = crate::front::check::infer::follow(receiver_ty, pcx);
+    }
+    // RULE: F18.5 (0.30.2: a receiver of an integer variable's type: an
+    // integer type's own method is rustc's E0689; a method of a trait every
+    // integer type implements is called with Self the variable, its impl
+    // the type's the variable takes, int_var_method; another is the one
+    // integer type's that has it, else i32's, the variable taking the
+    // fallback here, FL6)
+    let int_recv = crate::front::check::infer::int_free(receiver_ty, pcx);
+    if int_recv {
+        if inherent_int_method(name, pcx) {
+            literal_method_error(receiver, name,
+                pcx.nodes[receiver as usize].kind == NodeKind::Ident, pcx);
+        } else if via < 0 && pcx.nodes[n as usize].g == 0 {
+            let r = int_var_method(n, receiver, receiver_ty, name, pcx);
+            if r != 0 {
+                return r;
+            }
+        }
+        let one = crate::front::check::infer::int_method_type(name, pcx);
+        crate::front::check::infer::unify(receiver_ty, one, pcx);
+        receiver_ty = one;
+        pcx.nodes[receiver as usize].ty = one;
+    }
     if hint != 0 {
         pcx.hint_node = n;
         pcx.hint_ty = hint;
@@ -732,14 +755,12 @@ pub fn synth_method(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return pcx.ty_error;
     }
     // RULE: F18.5 (0.27.7: an integer's inherent method called on a
-    // literal tree, whose type nothing gives, is rustc's E0689, not
-    // i32's method: `(1 << s).wrapping_sub(1)`; a trait's method, `1.max(2)`,
-    // `2.to_string()`, is i32's, as rustc's fallback; so is one on an
-    // open local, `let m = (1 << b) - 1;` then `m.count_ones()`)
-    if receiver_ty == TY_I32
-        && (open_recv || crate::front::check::literals::open_tree(receiver, pcx))
+    // literal tree typed i32 where no function is checked, a constant's
+    // initializer, is rustc's E0689 as on a variable's value above)
+    if !int_recv && receiver_ty == TY_I32
+        && crate::front::check::literals::open_tree(receiver, pcx)
         && inherent_int_method(name, pcx) {
-        literal_method_error(receiver, name, open_recv, pcx);
+        literal_method_error(receiver, name, false, pcx);
     }
     // (0.20) a string literal has `str`'s methods, as Rust's `&str`:
     // `"a,b".split(',')`, `" 7 ".trim()`; and the ones std has only as
@@ -1234,7 +1255,13 @@ pub fn synth_method(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     } else if pcx.nodes[n as usize].g != 0 {
         name_error(pcx.nodes[n as usize].start, c"method '", name, c"' is not generic", pcx);
     }
-    let self_ty = fn_param(f, 0, pcx);
+    // RULE: F18.6 (the receiver's type with the solutions so far: an
+    // instance its bounds made for an integer variable they decided, 0.30.2
+    // fn_instance, has the solution where the receiver has the variable)
+    let self_ty = if pcx.infer_live {
+        t = crate::front::check::infer::resolve(t, pcx);
+        crate::front::check::infer::resolve(fn_param(f, 0, pcx), pcx)
+    } else { fn_param(f, 0, pcx) };
     let mut arg = receiver;
     // (0.18.1: a raw `self: *T` takes the pointer as it is: safe)
     if through_pointer && !is_borrow(receiver, pcx)
@@ -1345,6 +1372,168 @@ pub fn synth_method(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     ensure_checked(f, n, pcx);
     check_call_safety(n, f, 1, pcx);
     pcx.fns[f as usize].ret
+}
+
+// RULE: F18.5 (0.30.2) Method call n, `x.name(..)` with x (receiver) of
+// integer variable v's type: when every integer type has the method of an
+// impl of one trait, not generic, its self by value or `&self`, and its
+// signature is the same in each but for Self (i32's and i64's compared:
+// `max(self, other: Self) -> Self`, `cmp(&self, other: &Self) ->
+// Ordering`), the call is i32's with Self the variable: the arguments are
+// checked against it, its result is it, and its callee becomes the method
+// of the type the variable takes at the function's end (infer.vl
+// int_method), as rustc's probe of `{integer}` selects the impl then. Its
+// result type; 0 when the method is not one such (FL6).
+fn int_var_method(n: i64, receiver: i64, v: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let (f0, g0, ft, gt) = crate::front::check::infer::int_impl_pair(name, pcx);
+    let mut f = f0;
+    let mut g = g0;
+    if f < 0 || g < 0 || !is_method(f, pcx) || direct_kind(n, f, true, pcx) != 0 {
+        return 0;
+    }
+    // (a generic method, `hash<H: Hasher>(&self, state: &mut H)`: Self
+    // only in its self, its own parameters from the arguments; checked as
+    // i32's, its instance made again for the type the variable takes)
+    // (a template's signature is resolved in its instances: its parameters
+    // after self are read as written, none naming Self or i32)
+    let generic = pcx.fns[f as usize].generic != 0;
+    if generic {
+        if pcx.fns[g as usize].generic == 0 {
+            return 0;
+        }
+        let mut i: i64 = 1;
+        while crate::front::conv::param_node(f, i, pcx) > 0 {
+            if names_self(pcx.nodes[crate::front::conv::param_node(f, i, pcx) as usize].b, 0,
+                pcx) {
+                return 0;
+            }
+            i += 1;
+        }
+    }
+    // (a template's count is its instances': a generic's written params)
+    let count = pcx.nodes[n as usize].count;
+    let written = if generic { written_params(f, pcx) } else { pcx.fns[f as usize].param_count };
+    let written_g = if generic { written_params(g, pcx) } else { pcx.fns[g as usize].param_count };
+    if written != count + 1 || written_g != count + 1 {
+        return 0;
+    }
+    if generic {
+        // (its arguments checked here, as synth_method's instance; its
+        // signature, but for its self, the same in every integer type's;
+        // a self not `self` or `&self`, or a result that holds i32, the
+        // instance's: the first type's, i32's when it has one, FL6)
+        f = instantiate_call(f, n, 1, ft, 0, pcx);
+        g = f;
+        let s0 = fn_param(f, 0, pcx);
+        if crate::front::check::infer::holds_type(pcx.fns[f as usize].ret, ft, pcx)
+            || s0 != ft && !(is_ref(s0, pcx) && pcx.types[s0 as usize].b == REF_SHARED
+                && pcx.types[s0 as usize].a == ft) {
+            crate::front::check::infer::unify(v, ft, pcx);
+        }
+    }
+    let mut tys: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..count + 1 {
+        let s = int_sig(fn_param(f, i, pcx), fn_param(g, i, pcx), ft, gt, v, pcx);
+        if s == 0 {
+            return 0;
+        }
+        tys.push(s);
+    }
+    if generic && crate::front::check::infer::int_free(v, pcx) {
+        let s0 = fn_param(f, 0, pcx);
+        tys[0] = if s0 == ft { v } else { crate::front::types::ptr_like(s0, v, pcx) };
+    }
+    let ret = int_sig(pcx.fns[f as usize].ret, pcx.fns[g as usize].ret, ft, gt, v, pcx);
+    let self_ty = tys[0];
+    let by_ref = self_ty != v;
+    if ret == 0 || by_ref && !(is_ref(self_ty, pcx) && pcx.types[self_ty as usize].b == REF_SHARED
+        && pcx.types[self_ty as usize].a == v) {
+        return 0;
+    }
+    let arg = if by_ref { synthetic_unary(Tok::Amp, receiver, self_ty, pcx) } else { receiver };
+    let mark = list_begin(pcx);
+    list_push(arg, pcx);
+    for i in 0..count {
+        let a = child(n, i, pcx);
+        crate::front::generics::check_call_arg_as(a, f, i + 1, tys[(i + 1) as usize], pcx);
+        list_push(a, pcx);
+    }
+    list_end(n, mark, pcx);
+    pcx.nodes[n as usize].kind = Call;
+    pcx.nodes[n as usize].a = 0;
+    pcx.nodes[n as usize].x = f + 1;
+    ensure_checked(f, n, pcx);
+    check_call_safety(n, f, 1, pcx);
+    crate::front::check::infer::int_method(n, v, name, pcx);
+    ret
+}
+
+// The number of parameters function f is written with, self too.
+fn written_params(f: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut i: i64 = 0;
+    while crate::front::conv::param_node(f, i, pcx) > 0 {
+        i += 1;
+    }
+    i
+}
+
+// Whether type node t, as written, names `Self` or `i32` (a builtin impl
+// for i32 writes its type so).
+fn names_self(t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if t <= 0 || depth > 16 {
+        return false;
+    }
+    let k = pcx.nodes[t as usize].kind;
+    if k == NodeKind::TyName && (sym_is_c(pcx.nodes[t as usize].a, c"Self", pcx)
+        || sym_is_c(pcx.nodes[t as usize].a, c"i32", pcx)) {
+        return true;
+    }
+    if (k == NodeKind::TyPtr || k == NodeKind::TyArray || k == NodeKind::TySlice
+        || k == NodeKind::TyFn) && names_self(pcx.nodes[t as usize].a, depth + 1, pcx) {
+        return true;
+    }
+    for i in 0..pcx.nodes[t as usize].count {
+        if names_self(child(t, i, pcx), depth + 1, pcx) {
+            return true;
+        }
+    }
+    let g = pcx.nodes[t as usize].g;
+    if k == NodeKind::TyName && g > 0 {
+        for i in 0..pcx.nodes[g as usize].count {
+            if names_self(child(g, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// RULE: F18.5 (0.30.2) The method `name` of integer type t that a call
+// on an integer variable's value takes (int_var_method; infer.vl
+// int_fallback, its callee for the type taken): t's own impls' (an
+// impl's or a trait's default), else the one generic-trait impl's that has
+// it (`eq` of `PartialEq<i32>`); -1 when none.
+pub fn int_trait_fn(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let f = method_of(t, name, pcx);
+    if f >= 0 { f } else { crate::front::convert::sole_impl_fn(t, name, pcx) }
+}
+
+// A parameter's (or the result's) type of a method of integer type fa (a)
+// and of integer type fb (b), the same method of their impls of one trait,
+// with Self integer variable v: the type both have, v where they are their
+// own types, `&v` where they are references to them; 0 for anything else.
+fn int_sig(a: i64, b: i64, fa: i64, fb: i64, v: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if a == b {
+        return a;
+    }
+    if a == fa && b == fb {
+        return v;
+    }
+    if is_ref(a, pcx) && is_ref(b, pcx) && pcx.types[a as usize].b == pcx.types[b as usize].b
+        && int_sig(pcx.types[a as usize].a, pcx.types[b as usize].a, fa, fb, v, pcx) == v {
+        return crate::front::types::ptr_like(a, v, pcx);
+    }
+    0
 }
 
 // RULE: D2.7 (0.30.1) Whether the `&mut self` method name on a receiver

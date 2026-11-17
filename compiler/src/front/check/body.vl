@@ -100,7 +100,6 @@ pub fn check_function(item: i64, pcx: &mut Ctx<Comp>) {
     param_drops(item, f, pcx);
     crate::front::check::assign::clear_inout_places(pcx);
     let deferred_at = pcx.deferred.len() as i64;
-    let open_at = pcx.open_lets.len() as i64;
     // RULE: F18.6 (the type variables the body makes are its own)
     let infer_at = crate::front::check::infer::begin(pcx);
     // RULE: D21.2 (an `impl Tr` result: the body's type is the hidden type,
@@ -131,8 +130,6 @@ pub fn check_function(item: i64, pcx: &mut Ctx<Comp>) {
             err_end_soft(pcx);
         }
     }
-    // RULE: F18.5 (what is still open has the fallback)
-    crate::front::check::literals::open_end(open_at, pcx);
     // RULE: F18.6 (what is still free is an error; the rest is retyped)
     crate::front::check::infer::end(infer_at, pcx);
     // (0.25: the inout accesses of let places, assign::check_inout_place)
@@ -317,30 +314,12 @@ fn check_let(stmt: i64, pcx: &mut Ctx<Comp>) -> bool {
             crate::front::check::rust::reborrow_to_mut(init, pcx);
         }
     } else {
-        // (0.27.3: a literal of its tree may not fit the fallback, F18.5)
-        if pcx.open_hints.len() as i64 > 0 && pcx.open_lets.len() as i64 > 0 {
-            crate::front::check::literals::open_hint(stmt, init, pcx);
-        }
-        let saved_init = pcx.open_init;
-        pcx.open_init = init;
-        // (`let r = &x;` of an open x keeps it open: open_let decides;
-        // 0.28.0: so does a tree of literals and open locals, `let b = a +
-        // 1;`, RULE: F18.5)
-        pcx.open_keep = (crate::front::check::literals::open_borrow_init(init, pcx)
-            || crate::front::check::literals::open_shape(init, false, pcx));
+        // RULE: F18.5 (0.30.2: an untyped literal's integer variable is the
+        // local's type, decided by unification and at the function's end)
         binding_ty = synth_expr(init, pcx);
-        pcx.open_keep = false;
-        pcx.open_init = saved_init;
         actual = binding_ty;
     }
     check_pattern(pcx.nodes[stmt as usize].a, binding_ty, pcx);
-    // RULE: F18.5 (an unannotated `let` of a literal tree: an open local)
-    if pcx.nodes[stmt as usize].b == 0 {
-        let bound: i64 = if pcx.nodes[pcx.nodes[stmt as usize].a as usize].kind
-            == NodeKind::PatBind {
-            pcx.nodes[pcx.nodes[stmt as usize].a as usize].x } else { -1 };
-        crate::front::check::literals::open_let(bound, init, pcx);
-    }
     check_irrefutable(pcx.nodes[stmt as usize].a, c"let", pcx);
     let pat = pcx.nodes[stmt as usize].a;
     if pcx.nodes[init as usize].kind == NodeKind::Unary && pcx.nodes[init as usize].op == Tok::Amp {
@@ -472,24 +451,7 @@ fn literal_array_takes(b: i64, ty: i64, pcx: &Ctx<Comp>) -> bool {
 pub fn synth_if(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let then_block = pcx.nodes[n as usize].b;
     let else_block = pcx.nodes[n as usize].c;
-    // RULE: F18.5 (0.28.0: in a tree of literals and open locals being
-    // checked, OPEN_KEEP, an `if` whose branches are such trees: its
-    // condition checked as any other, its branches synthesized, their open
-    // locals kept, `(if c { 63 - i } else { i }) as u64`)
-    if pcx.open_keep && else_block != 0
-        && crate::front::check::literals::open_value(then_block, pcx)
-        && crate::front::check::literals::open_value(else_block, pcx) {
-        pcx.open_keep = false;
-        check_recovering(pcx.nodes[n as usize].a, TY_BOOL, pcx);
-        pcx.open_keep = true;
-        let t = check_block(then_block, 0, pcx);
-        check_block(else_block, 0, pcx);
-        return t;
-    }
-    let saved_keep = pcx.open_keep;
-    pcx.open_keep = false;
     check_recovering(pcx.nodes[n as usize].a, TY_BOOL, pcx);
-    pcx.open_keep = saved_keep;
     // (0.9) `if c { None } else { Some(x) }`, (0.14) `if c { 0 } else {
     // b[i] }`: the type from the other branch.
     let mut then_ty: i64 = 0;
@@ -524,15 +486,11 @@ pub fn synth_if(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         // the then branch's type, `if c { p } else { null_mut() }`)
         || then_ty != pcx.ty_error
         && pcx.nodes[else_block as usize].kind == Block) {
-        // RULE: F18.5 (0.27.6: a tuple element the then branch gives by
-        // literals alone takes the else branch's type there)
-        let want = crate::front::check::literals::branch_expected(n, 1, else_block, then_ty, pcx);
-        check_branch(else_block, want, pcx);
-        if want != then_ty {
-            return crate::front::check::literals::branch_settle(n, 1, else_block, then_ty, want,
-                pcx);
-        }
-        return then_ty;
+        // RULE: F18.5 (0.30.2: a tuple element the then branch gives by
+        // literals is an integer variable, unified with the else
+        // branch's there, check_branch)
+        check_branch(else_block, then_ty, pcx);
+        return crate::front::check::infer::resolve(then_ty, pcx);
     }
     if else_block == 0 {
         if then_ty != TY_UNIT && then_ty != TY_NEVER {
@@ -688,28 +646,20 @@ pub fn check_for(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let end = pcx.nodes[range as usize].b;
     let mut elem_ty: i64 = 0;
     let pattern = pcx.nodes[n as usize].b;
-    // RULE: F18.5 (0.28.0: bounds of untyped literals and open locals,
-    // `0..64`, `0..n`, make the local open, its init the range: open_bounds)
-    let open = pcx.nodes[pattern as usize].kind == NodeKind::PatBind
-        && crate::front::check::literals::open_bounds(start, end, pcx);
-    if open {
-        let saved_init = pcx.open_init;
-        pcx.open_init = range;
-        pcx.open_keep = true;
-        elem_ty = synth_expr(start, pcx);
-        synth_expr(end, pcx);
-        pcx.open_keep = false;
-        pcx.open_init = saved_init;
-    } else if literal_takes_rhs_type(start, end, pcx) || pcx.open_lets.len() as i64 > 0
-        && crate::front::check::literals::open_local(start, pcx) >= 0
-        && !crate::front::check::widen::takes_context(end, pcx) {
+    // RULE: F18.5 (0.30.2: bounds of untyped literals, `0..64`, are an
+    // integer variable, the loop's local's type, decided by its uses)
+    if literal_takes_rhs_type(start, end, pcx) {
         elem_ty = synth_expr(end, pcx);
         check_expr(start, elem_ty, pcx);
     } else {
         elem_ty = synth_expr(start, pcx);
         check_expr(end, elem_ty, pcx);
     }
-    if !is_integer(elem_ty) {
+    // (with the solutions so far: `e0..np` with e0 a variable np's i64 solved)
+    if pcx.infer_live {
+        elem_ty = crate::front::check::infer::follow(elem_ty, pcx);
+    }
+    if !is_integer(elem_ty) && !crate::front::check::infer::int_free(elem_ty, pcx) {
         type_error_got(range, c"range bounds must be integers", elem_ty, pcx);
     }
     pcx.nodes[range as usize].ty = elem_ty;
@@ -718,9 +668,6 @@ pub fn check_for(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     }
     push_scope(pcx);
     check_pattern(pattern, elem_ty, pcx);
-    if open {
-        crate::front::check::literals::open_let(pcx.nodes[pattern as usize].x, range, pcx);
-    }
     check_irrefutable(pattern, c"for", pcx);
     check_loop_body(n, pcx.nodes[n as usize].d, pcx);
     pop_scope(pcx);

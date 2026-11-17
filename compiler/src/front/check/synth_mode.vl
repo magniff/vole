@@ -25,7 +25,7 @@ use crate::front::ast::NodeKind::{
     TyNever, TyPtr, TySlice, TyTuple, TyUnit, Unary, Unit, VariantLit, VecOp, While,
 };
 use crate::front::check::{
-    Res, has_error_type, is_std_named, lookup_local, type_error, type_error_got,
+    Res, has_error_type, is_std_named, lookup_local, mismatch_error, type_error, type_error_got,
 };
 use crate::front::check::args::misplaced_named_arg;
 use crate::front::check::assign::{check_assign, is_place};
@@ -237,21 +237,22 @@ fn is_valid_cast(from: i64, to: i64, pcx: &Ctx<Comp>) -> bool {
 
 fn synth_cast(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let operand = pcx.nodes[n as usize].a;
-    // RULE: F18.5 (0.27.7: a cast's operand gives its open local no type,
-    // as rustc's: `let max = (1 << b) - 1;` then `max as f64` keeps it open,
-    // and a later use types it)
-    // (0.28.0: a tree of literals and open locals too, `(i * 16) as u64`,
-    // open_kept)
-    let from_ty = if crate::front::check::literals::open_shape(operand, false, pcx) {
-        crate::front::check::literals::open_kept(operand, pcx)
-    } else {
-        synth_expr(operand, pcx)
-    };
+    // RULE: F18.5 (0.30.2: a cast's operand gives its integer variable no
+    // type, as rustc's: a later use types it; synth_cast below)
+    let from_ty = synth_expr(operand, pcx);
     // RULE: F29.1 (0.27.4: `e as *const _`, `e as *mut _`: the operand's
     // pointee)
     let to_ty = if crate::front::check::rust::raw_hole_cast(n, pcx) {
         crate::front::check::rust::raw_hole_target(n, from_ty, pcx)
     } else { resolve_type(pcx.nodes[n as usize].b, pcx) };
+    // RULE: F18.5 (0.30.2: an integer variable's value casts as an integer;
+    // the cast gives it no type, as rustc's, a later use or the fallback)
+    if pcx.infer_live && crate::front::check::infer::int_free(from_ty, pcx) {
+        let to = strip_distinct(to_ty, pcx);
+        if is_numeric(to) && to != pcx.char_type || is_pointer(to, pcx) {
+            return to_ty;
+        }
+    }
     // RULE: F18.6 (`x as τ` of a type not known yet)
     if pcx.infer_live {
         crate::front::check::infer::unknown_in(from_ty, pcx);
@@ -895,6 +896,14 @@ fn check_index_type(index: i64, raw: bool, pcx: &mut Ctx<Comp>) {
         return;
     }
     let mut index_ty = synth_expr(index, pcx);
+    // RULE: F18.5 (0.30.2: an integer variable's value is a usize here)
+    if crate::front::check::infer::int_free(index_ty, pcx) {
+        if !raw {
+            crate::front::check::infer::unify(index_ty, TY_USIZE, pcx);
+            pcx.nodes[index as usize].ty = TY_USIZE;
+        }
+        return;
+    }
     let mut through = false;
     if is_ref(index_ty, pcx) && is_integer(pcx.types[index_ty as usize].a) {
         let inner = new_node(NodeKind::Ident, pcx.nodes[index as usize].start,
@@ -1285,63 +1294,6 @@ pub fn is_context_value(e: i64, pcx: &Ctx<Comp>) -> bool {
 // (a pattern's binding on a reference, `n + 1`; a closure's `&i64`) is
 // read through, as Rust's operators on `&i64` do.
 fn synth_operands(lhs: i64, rhs: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    // RULE: F18.5 (a comparison of an open local with an untyped literal
-    // keeps it open: the literal is typed with it)
-    if pcx.open_lets.len() as i64 > 0 && pcx.binary_node > 0
-        && comparison_op(pcx.nodes[pcx.binary_node as usize].op) {
-        let mut o: i64 = 0;
-        let mut lit: i64 = 0;
-        if crate::front::check::literals::open_scalar(lhs, pcx) >= 0
-            && crate::front::check::literals::open_literal(rhs, pcx) {
-            o = lhs;
-            lit = rhs;
-        } else if crate::front::check::literals::open_scalar(rhs, pcx) >= 0
-            && crate::front::check::literals::open_literal(lhs, pcx) {
-            o = rhs;
-            lit = lhs;
-        }
-        if o != 0 {
-            pcx.open_keep = true;
-            let t = synth_expr(o, pcx);
-            pcx.open_keep = false;
-            check_expr(lit, t, pcx);
-            crate::front::check::literals::open_record(
-                crate::front::check::literals::open_local(o, pcx), lit, pcx);
-            return t;
-        }
-        // (0.28.0: two trees of literals and open locals, `a < b`, `i + 1
-        // == n`, keep them, one variable: open_group)
-        let ls = crate::front::check::literals::open_shape(lhs, true, pcx);
-        let rs = crate::front::check::literals::open_shape(rhs, true, pcx);
-        if (ls || crate::front::check::literals::open_literal(lhs, pcx))
-            && (rs || crate::front::check::literals::open_literal(rhs, pcx)) && (ls || rs) {
-            pcx.open_keep = true;
-            let t = synth_expr(lhs, pcx);
-            if rs {
-                synth_expr(rhs, pcx);
-            } else {
-                check_expr(rhs, t, pcx);
-            }
-            pcx.open_keep = false;
-            let k = crate::front::check::literals::open_owner(if ls { lhs } else { rhs }, pcx);
-            crate::front::check::literals::open_record(k, lhs, pcx);
-            crate::front::check::literals::open_record(k, rhs, pcx);
-            return t;
-        }
-    }
-    // RULE: F18.5 (0.28.0: in a tree of literals and open locals being
-    // checked, OPEN_KEEP, an operand with open locals that takes its type
-    // from context beside another such is synthesized too: its open locals
-    // are kept, the tree's leaves, `a * b`)
-    if pcx.open_keep && takes_context(lhs, pcx) && takes_context(rhs, pcx) {
-        let t = synth_expr(lhs, pcx);
-        if crate::front::check::literals::open_shape(rhs, false, pcx) {
-            synth_expr(rhs, pcx);
-        } else {
-            check_expr(rhs, t, pcx);
-        }
-        return t;
-    }
     if literal_takes_rhs_type(lhs, rhs, pcx)
         || takes_context(lhs, pcx) && !takes_context(rhs, pcx) {
         let rhs_ty = read_through(rhs, synth_expr(rhs, pcx), pcx);
@@ -1366,6 +1318,21 @@ fn synth_operands(lhs: i64, rhs: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return synth_expr(lhs, pcx);
     }
     let lhs_ty = read_through(lhs, synth_expr(lhs, pcx), pcx);
+    // RULE: F18.5 (0.30.2: an operand of an integer variable's type and an
+    // integer operand are one type: unified, rustc's `{integer}`)
+    if crate::front::check::infer::int_free(lhs_ty, pcx) {
+        pcx.hint_node = rhs;
+        pcx.hint_ty = lhs_ty;
+        let rhs_ty = read_through(rhs, synth_expr(rhs, pcx), pcx);
+        if rhs_ty == TY_NEVER || rhs_ty == pcx.ty_error {
+            return lhs_ty;
+        }
+        if !crate::front::check::infer::int_like(rhs_ty, pcx)
+            || !crate::front::check::infer::unify(lhs_ty, rhs_ty, pcx) {
+            mismatch_error(rhs, lhs_ty, rhs_ty, pcx);
+        }
+        return crate::front::check::infer::resolve(lhs_ty, pcx);
+    }
     if is_integer(lhs_ty) && !takes_context(rhs, pcx) {
         return join_operands(lhs, lhs_ty, rhs, pcx);
     }
@@ -1449,25 +1416,28 @@ fn synth_binary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let rhs = pcx.nodes[n as usize].c;
     if op == Tok::Shl || op == Tok::Shr {
         let value_ty = synth_expr(lhs, pcx);
-        // RULE: F18.5 (0.28.0: a shift amount gives its open locals no type,
-        // as rustc's: `1 << k` then `buf_int(out, k)` types k, open_kept)
-        let amount_ty = if crate::front::check::literals::open_shape(rhs, false, pcx) {
-            crate::front::check::literals::open_kept(rhs, pcx)
-        } else {
-            synth_expr(rhs, pcx)
-        };
+        // RULE: F18.5 (0.30.2: a shift amount gives its integer variable no
+        // type, as rustc's: `1 << k` then `buf_int(out, k)` types k)
+        let amount_ty = synth_expr(rhs, pcx);
+        // RULE: F18.5 (0.30.2: of an integer variable, its type the result's,
+        // the amount one of its own)
+        let var_value = crate::front::check::infer::int_free(value_ty, pcx);
+        if var_value && crate::front::check::infer::int_like(amount_ty, pcx) {
+            return value_ty;
+        }
         // RULE: F26.1 (0.27.2: `a << n` of a non-integer is Shl::shl)
-        if !is_integer(strip_distinct(value_ty, pcx)) {
+        if !var_value && !is_integer(strip_distinct(value_ty, pcx)) {
             require_op_bound(n, lhs, op, false, pcx);
             if crate::front::traits::rust_op_trait(op, value_ty, false, pcx) >= 0 {
                 return crate::front::traits::operator_call(n, value_ty, true, pcx);
             }
         }
         // (0.18: a distinct type over an integer shifts as it does)
-        if !is_integer(strip_distinct(value_ty, pcx)) {
+        if !var_value && !is_integer(strip_distinct(value_ty, pcx)) {
             type_error_got(n, c"shift operator requires integer type", value_ty, pcx);
         }
-        if !is_integer(strip_distinct(amount_ty, pcx)) {
+        if !crate::front::check::infer::int_like(amount_ty, pcx)
+            && !is_integer(strip_distinct(amount_ty, pcx)) {
             type_error_got(n, c"shift amount must be integer", amount_ty, pcx);
         }
         return value_ty;
@@ -1494,8 +1464,10 @@ fn synth_binary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         || op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq) {
         type_error_got(n, c"a char has no arithmetic (cast it, `c as u32`)", ty, pcx);
     }
-    // (0.27.3: not an Ω, whose operators are its bounds', FL11)
-    if is_distinct_type(ty, pcx) && !crate::front::opaque::is_omega(ty, pcx) {
+    // (0.27.3: not an Ω, whose operators are its bounds', FL11; 0.30.2: not
+    // an integer variable)
+    if is_distinct_type(ty, pcx) && !crate::front::opaque::is_omega(ty, pcx)
+        && !crate::front::check::infer::int_free(ty, pcx) {
         return distinct_binary(n, op, ty, pcx);
     }
     binary_result(n, op, ty, pcx)
@@ -1564,6 +1536,17 @@ pub fn binary_result(n: i64, op: Tok, ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let ty = crate::front::check::infer::resolve(ty, pcx);
     let lhs = pcx.nodes[n as usize].b;
     let rhs = pcx.nodes[n as usize].c;
+    // RULE: F18.5 (0.30.2: operands of an integer variable's type: an
+    // integer operator, its type decided with the variable's)
+    if crate::front::check::infer::int_free(ty, pcx) {
+        if op == Tok::AmpAmp || op == Tok::PipePipe {
+            type_error_got(n, c"logical operator requires bool", ty, pcx);
+        }
+        if comparison_op(op) {
+            return TY_BOOL;
+        }
+        return ty;
+    }
     if is_vector(ty, pcx) {
         return vector_binary(n, op, ty, pcx);
     }
@@ -1787,6 +1770,12 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         }
         // (0.18: a distinct type over a number negates as it does)
         // (0.19: Intel's opaque vectors have no operators)
+        // RULE: F18.5 (0.30.2: an integer variable negates; a type it takes
+        // later is checked signed, infer.vl int_fallback)
+        if crate::front::check::infer::int_free(ty, pcx) {
+            crate::front::check::infer::int_negated(n, ty, pcx);
+            return ty;
+        }
         if !is_numeric(strip_distinct(ty, pcx))
             && (!is_vector(ty, pcx) || is_opaque_vector(ty, pcx)) {
             let neg = std_trait(c"Neg", pcx);
@@ -1804,7 +1793,8 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         if ty == TY_BOOL || ty == pcx.ty_error {
             return TY_BOOL;
         }
-        if is_integer(strip_distinct(ty, pcx)) && ty != pcx.char_type {
+        if is_integer(strip_distinct(ty, pcx)) && ty != pcx.char_type
+            || crate::front::check::infer::int_free(ty, pcx) {
             pcx.nodes[n as usize].op = Tok::Tilde;
             return ty;
         }
@@ -1823,7 +1813,7 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     }
     if op == Tok::Tilde {
         let ty = synth_expr(operand, pcx);
-        if !is_integer(strip_distinct(ty, pcx)) {
+        if !is_integer(strip_distinct(ty, pcx)) && !crate::front::check::infer::int_free(ty, pcx) {
             type_error_got(n, c"bitwise NOT requires integer type", ty, pcx);
         }
         return ty;
