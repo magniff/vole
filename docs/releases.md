@@ -171,36 +171,59 @@ A correctness release, its branches merged as each is reviewed clean.
   a tuple field, an index, a Box, a Deref, a closure's capture and a
   `&&mut`. The checker of the places IR (`--verify-places`) no longer
   lets a copy of a `&mut` into a raw pointer pass, and the loan
-  check's second rule for it is gone.
+  check's second rule for it is gone. The position does not matter: a
+  block's tail, an if's arms, a match arm, a closure's result, an array
+  element, `Some`, a tuple, a `*mut [i64]` argument, `*r as *mut i64` of
+  an `r: &&mut i64`, an index of a `&[&mut [i64]]` (RT-284) are each the
+  operand the coercion reads, so each is its reborrow.
 
 - **The results of partition_in and unzip_in kept no borrow of their
-  items (RT-211), every -O, since 0.28.0.** `let (a, b): (Vec<&i64,
-  Gpa>, ..) = v.iter().partition_in(.., gpa); drop(v);` and then
-  reading a was a use after free from safe code; `unzip_in` the same.
-  It was not the tuple: a call's result regions are tied to its
-  arguments by the callee's predicates, and two kinds made no tie. A
-  bound whose trait has more than one impl for the type (Vec's
-  `Extend<T>` and `Extend<&'a T>`) found no impl and tied nothing
-  (partition_in's `B: Extend<Self::Item>`; a program's own trait with
-  two such impls lost the borrow the same way, `-> B` as `-> (B, B)`),
-  and a `where` predicate on a subject other than a type parameter
-  (unzip_in's `Self: Iterator<Item = (X, Y)>`) was never read. Now the
-  impl is chosen by the whole trait reference, its arguments resolved
-  in the instance (places/regions.vl `bound_impl`), and every predicate
-  of the signature, on a parameter, `Self`, a projection or any type,
-  is read by one function (`subject_ties`); where no one impl is
-  chosen, every region of the predicate is made one, more than any impl
-  relates, never less. A program's own collector, `fn f<I: Iterator, B:
+  items (RT-211, RT-261, RT-267, RT-268, RT-237b, RT-283), every -O,
+  since 0.28.0.** `let (a, b): (Vec<&i64, Gpa>, ..) =
+  v.iter().partition_in(.., gpa); drop(v);` and then reading a was a
+  use after free from safe code; `unzip_in` the same, and so a program's
+  collector called with `&v` (`fn f<C: IntoIterator, B: From<C::Item>>`,
+  `Extend<C::Item>`, `FromIteratorIn<C::Item, A>`, `<C::IntoIter as
+  Iterator>::Item`), a result tied to its argument only by std's blanket
+  `impl<T, U: From<T>> Into<U> for T`, and an impl's own bound proved by
+  an impl whose trait argument is `'static` (`impl<'a, T: Conv<W<'a>>>
+  Tr for H<'a, T>` with `impl Conv<W<'static>> for i64`: 'a was never
+  'static). A call's result regions are tied to its arguments by the
+  callee's predicates, read through the impl that proves each, and three
+  readings tied nothing: a `where` predicate on a subject other than a
+  type parameter (unzip_in's `Self: Iterator<Item = (X, Y)>`) was never
+  read; a projection `C::Item` was normalized only through a direct impl
+  or one blanket impl, never a pattern impl (`impl<'a, T, A> IntoIterator
+  for &'a Vec<T, A>`), so it read as elided; and an impl's trait
+  arguments and its nested obligations were not related to the bound's,
+  so a slot only the impl names (`'static`, or a parameter the header
+  does not bind, `U` of the Into blanket) was lost. Now every predicate
+  of the signature, on a parameter, `Self`, a projection or any type, is
+  read by one function (places/regions.vl `subject_ties`), through the
+  impl `front::obligations::select` chose for its whole reference, the
+  one chooser (a projection's too: `warm_selections`, `proj_walk`); that
+  impl's trait arguments are the bound's slot by slot, and its nested
+  obligations are met the same way, recursively, as rustc's confirmation
+  (`impl_bound_ties`, `arg_ties`). A lifetime of the impl its header does
+  not name (`impl<'a, T: Copy> Extend<&'a T> for Vec<T>`) is bound to the
+  bound's slot for the impl's own predicates and relates to nothing else
+  (0.30.2's first fix tied it to all, refusing `words.iter()
+  .partition_in(..)` of `Vec<&'static str>` and a dropped `words`, which
+  v0.30.1 and rustc build). Where no impl relates a slot (a projection
+  the walk cannot read), every region the predicate names is made one,
+  its projections' bases included, more than any impl relates, never
+  less and never none. A program's own collector, `fn f<I: Iterator, B:
   DefaultIn<A> + Extend<I::Item>>(it: I, a: A) -> B` (and `(B,)`, `(B,
   B)`, `Pair<B>`, `Option<B>`), refused in its own body since 0.30.1
-  (RT-225), now builds, and its result keeps the borrow at the caller
-  (RT-225b, a use after free on 0.30.0); so does a default method with
-  such a `where Self:` predicate, and a program's fn that returns what
-  partition_in or unzip_in made (RT-237). A `where` predicate on a
-  compound type met by an impl with lifetime bounds (`where V<T>:
-  Sup`, `where X<'a>: Sup` with `impl<'a: 'static> Sup for X<'a>`) is
-  now assumed in the body and proven at the call, as rustc does
-  (RT-C301-11's compound form; 0.30.1 refused the body).
+  (RT-225), builds, and its result keeps the borrow at the caller
+  (RT-225b); so does a default method with a `where Self:` predicate, a
+  fn that returns what partition_in or unzip_in made (RT-237, RT-237b),
+  and a fn whose result is a projection, `-> Option<C::Item>` (RT-265,
+  refused before as an elision). A `where` predicate on a compound type
+  met by an impl with lifetime bounds (`where V<T>: Sup`, `where X<'a>:
+  Sup` with `impl<'a: 'static> Sup for X<'a>`) is assumed in the fn's
+  body and proven at the call, as rustc does (RT-C301-11's compound
+  form; 0.30.1 refused the body).
 
 #### Bugs fixed
 
