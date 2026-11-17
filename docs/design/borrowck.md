@@ -2845,9 +2845,10 @@ kind that reads a 0 there is returned but not kept (`kind_unknown`), and
 neither is the kind of any type holding it (an `Option<O_f>`, an `(O_f,
 i64)`, a struct, a Vec, an array, an enum: whatever type_kind reaches
 through a field, an element, a variant or a type argument), nor its glue
-(`kind_kept`); when `H_f` becomes known (`result_value`, its one writer)
-every kept kind is forgotten (`forget_kept_kinds`), so none read while
-it was not survives. The places IR is built when every function is
+(`kind_kept`). (A type reached again while its kind is computed reads
+as plain there, through a reference only, the same before and after
+`H_f` is known: the cycle rule of every type, not an answer kept from
+before.) The places IR is built when every function is
 checked, so what it drops is decided from the hidden types: a closure
 that owns a Vec or a D, an iterator struct holding one, a tuple or an
 Option of them is dropped as rustc drops it (v0.30.1 dropped none;
@@ -2864,7 +2865,7 @@ Fn` is Fn, `&mut impl FnMut` is FnMut, `&mut impl Iterator` is an
 Iterator, RT-166), as a blanket impl over `F: Fn` covers `O_f` by its
 bound (RT-196) and `flat_map` takes `O_f` as an IntoIterator (RT-200).
 *Anchor:* `front/opaque.vl: decided_type, reveal_type, fn_bound_type`,
-`front/kinds.vl: type_kind, kind_kept, forget_kept_kinds`,
+`front/kinds.vl: type_kind, kind_kept`,
 `places/glue.vl: has_glue, glue_of`, `front/traits.vl: implements`.
 *Cases:* `rt_145_opaque_*`.
 
