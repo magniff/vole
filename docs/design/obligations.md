@@ -449,10 +449,6 @@ Where the code differs from §3:
     bounds entails the trait, with any arguments; asked with arguments,
     an `impl Tr<..>` result proves nothing (`implements_with` asks
     `select`, which has no candidate for it): M3;
-  - a bound written without arguments on a trait whose parameters have
-    no default (`T: Tr` of `trait Tr<U>`, rustc E0107) is not an error
-    at the bound: the front reads it as any arguments, the places with
-    every candidate's predicates (the stopgap, kept for this case);
   - `impl_regions::super_impls` and `check_super_predicates`: M5;
   - `auto_traits::vouched`, `alloc_rules::struct_implements`,
     `kinds::has_drop_impl`, `checkalloc::of_allocator_type`,
@@ -465,7 +461,23 @@ Where the code differs from §3:
   RT-7, RT-53). `select` says SEL_LIMIT there, and the front reports
   `trait.overflow`. An error that jumps out of a search restores the
   depth (`CheckState`), so that later searches are not cut sooner.
-- **A bound is its whole reference at every ask** (RT-270):
+- **A bound is its whole reference at every ask** (RT-270; the review
+  of M2, R2): a parameter left out with no default is E0107 at the bound
+  (`convert::bound_arity`, once, in collect_impls), a default that does
+  not resolve for the subject (`U = <Self as H>::Out`, no H) makes the
+  bound not hold, and the associated-type constraints
+  (`assoc_constraints_hold`, `constraint_error`: `constraint_got`) and
+  `projection_by_bounds` read the bound's whole reference too.
+  `T::Out` is the Out of the one trait of T's bounds, or their
+  supertraits, that declares it: none is E0220, two E0221
+  (`assoc_declarers`; C3). Every answer `select` gives about concrete
+  types is recorded, a nested one too, unless the depth limit cut it
+  (C1: the where check had made a chain exponential). An impl for one
+  type has its `where` predicates required as a generic one's
+  (`concrete_impl_preds_hold`, R1). The impl search's limit counts the
+  asked obligation as rustc does (`MAX_IMPL_DEPTH`, 127 proved, 128
+  E0275; C2), and a projection's limit is `trait.overflow` (R3).
+  Earlier text of this item:
   `convert::bound_ref` reads one written without arguments with the
   trait's defaults, and `bound_holds` is the one test of a trait bound
   (check_bounds, pred_holds, satisfies, int_meets_bounds,
@@ -515,4 +527,5 @@ the concrete type, a parameter only the trait arguments fix),
 `rust_o_m2_bound_own_projection_*` (RT-272: the `where` form, the
 order, nested, an impl's, a cycle, an unmet one), `rust_o_m2_default_self_*`
 and `rust_o_m2_assoc_bound_self_*` (RT-271), `rust_o_m2_unmade_*`
-(RT-275) and `rust_o_m2_depth_*` (RT-7).
+(RT-275), `rust_o_m2_depth_*` (RT-7) and, from the review of M2,
+`rust_o_m2_r1_*`, `_r2_*`, `_r3_*`, `_c1_*`, `_c2_*`, `_c3_*`.

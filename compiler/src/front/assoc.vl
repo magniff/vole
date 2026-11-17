@@ -22,7 +22,7 @@ use crate::front::closures::{closure_of_type, closure_sig};
 use crate::front::generics::{env_enter, env_leave, env_lookup};
 use crate::front::generics::instantiate::unify;
 use crate::front::modules::{is_within, module_of, within_std};
-use crate::front::traits::{bound_trait, implements};
+use crate::front::traits::bound_trait;
 use crate::front::types::{TyKind, err_type};
 
 // The AssocType node named `name` in holder h (0: none), or 0.
@@ -225,6 +225,12 @@ fn find_assoc(tr: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // reported as not implementing its trait)
 pub const MAX_ASSOC_DEPTH: i64 = 128;
 
+// (0.30.2, review of M2, C2) The depth of nested impl searches: rustc's
+// limit counts the obligation asked as its first level, so a chain of
+// impls 127 deep is its last proof, 128 its overflow (E0275); a
+// projection's levels are counted from its own.
+pub const MAX_IMPL_DEPTH: i64 = MAX_ASSOC_DEPTH - 1;
+
 // The type definition c (an AssocType node) of impl i gives type t.
 fn assoc_value(i: i64, c: i64, t: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
     assoc_value_with(i, c, t, pos, -1, pcx)
@@ -240,12 +246,22 @@ fn assoc_value_with(i: i64, c: i64, t: i64, pos: i64, binds: i64, pcx: &mut Ctx<
         return pcx.nodes[c as usize].ty;
     }
     if pcx.assoc_depth >= MAX_ASSOC_DEPTH {
+        // RULE: O-M1 (0.30.2, review of M2: the limit is an overflow, rustc
+        // E0275, as select's is: a chain deeper than it, or a cycle)
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"trait.overflow";
         err_begin(pos, pcx);
         err_fmt(format_args("the associated type '{}' of '",
             str::from_utf8(sym_text(pcx.nodes[c as usize].a, pcx)).unwrap()), pcx);
         err_type(t, pcx);
-        err_str(c"' is defined in terms of itself", pcx);
-        err_end(pcx);
+        err_fmt(
+            format_args("' is not resolved: its definition needs it again, deeper than {} steps",
+                MAX_ASSOC_DEPTH), pcx);
+        err_help(
+            c"rustc E0275, overflow evaluating the requirement: a projection must not need itself", pcx);
+        crate::base::diag::err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
+        crate::base::diag::err_jump(pcx);
     }
     pcx.assoc_depth += 1;
     let saved_mod = pcx.cur_mod;
@@ -556,6 +572,30 @@ fn projection_by_bounds(first: i64, t: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 
     }
     let name = pcx.nodes[n as usize].a;
     let bounds = pcx.nodes[p as usize].h;
+    // RULE: F11.3 (0.30.2, review of M2, C3: `T::Out` is the Out of the one
+    // trait of T's bounds, or their supertraits, that declares it: none
+    // is rustc's E0220, two are E0221; v0.30.1 took any impl of the type
+    // that defines a type of the name)
+    let mut declarer: i64 = -1;
+    let count = assoc_declarers(bounds, name, &mut declarer, pcx);
+    if count != 1 {
+        err_begin(pcx.nodes[n as usize].start, pcx);
+        if count == 0 {
+            err_fmt(format_args("no bound of '{}' declares an associated type '{}'",
+                str::from_utf8(sym_text(first, pcx)).unwrap(),
+                str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+            err_help(c"rustc E0220: bound the parameter by the trait that declares it", pcx);
+        } else {
+            err_fmt(
+                format_args(
+                    "'{}::{}' is ambiguous: more than one trait of its bounds declares '{}'",
+                    str::from_utf8(sym_text(first, pcx)).unwrap(),
+                    str::from_utf8(sym_text(name, pcx)).unwrap(),
+                    str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+            err_help(c"rustc E0221: name the trait, `<T as Tr>::Out`", pcx);
+        }
+        err_end(pcx);
+    }
     for k in 0..pcx.nodes[bounds as usize].count {
         let b = child(bounds, k, pcx);
         if pcx.nodes[b as usize].kind != NodeKind::TyName {
@@ -576,9 +616,9 @@ fn projection_by_bounds(first: i64, t: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 
             return 0;
         }
         pcx.assoc_depth += 1;
-        let bargs: i64 = if pcx.nodes[b as usize].g
-            != 0 { crate::front::convert::bound_ref(b, t, pcx) }
-            else { -1 };
+        // (0.30.2, review of M2, R2: its whole reference, the defaults
+        // too: `T: Tr` of `trait Tr<U = i32>` reads Tr<i32>'s Out)
+        let bargs: i64 = crate::front::convert::bound_ref(b, t, pcx);
         pcx.assoc_depth -= 1;
         let saved_tr = pcx.assoc_trait;
         let saved_args = pcx.assoc_targs;
@@ -598,6 +638,41 @@ fn projection_by_bounds(first: i64, t: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 
         return assoc_value_with(i, c, t, pcx.nodes[n as usize].start, binds, pcx);
     }
     0
+}
+
+// (0.30.2, review of M2, C3) The traits of bounds (a Generics holder) and
+// their supertraits that declare the associated type `name`: the first in
+// `first`, the count of distinct ones returned (rustc: `T::Out` names the
+// one trait of T's bounds that declares Out; none is E0220, two E0221).
+fn assoc_declarers(bounds: i64, name: i64, first: &mut i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut found = Vec::<i64, Comp>::new_in(Comp {});
+    for k in 0..pcx.nodes[bounds as usize].count {
+        let b = child(bounds, k, pcx);
+        if pcx.nodes[b as usize].kind != NodeKind::TyName {
+            continue;
+        }
+        declarers_of(bound_trait(b, pcx), name, &mut found, 0, pcx);
+    }
+    *first = if found.len() > 0 { found[0] } else { -1 };
+    found.len() as i64
+}
+
+// Trait tr and its supertraits that declare associated type `name`, each
+// once, pushed onto found.
+fn declarers_of(tr: i64, name: i64, found: &mut Vec<i64, Comp>, depth: i64, pcx: &mut Ctx<Comp>) {
+    if tr < 0 || depth > MAX_ASSOC_DEPTH {
+        return;
+    }
+    if assoc_in(pcx.nodes[pcx.traits[tr as usize].node as usize].b, name, pcx) != 0 {
+        if !found.contains(&tr) {
+            found.push(tr);
+        }
+        return;
+    }
+    let supers = crate::front::traits::trait_supers(tr, pcx);
+    for i in 0..(if supers > 0 { pcx.nodes[supers as usize].count } else { 0 }) {
+        declarers_of(bound_trait(child(supers, i, pcx), pcx), name, found, depth + 1, pcx);
+    }
 }
 
 // Whether type node n is a projection, `T::Item` or `Self::Item` (not a
@@ -631,20 +706,35 @@ fn constraint_type(c: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // implement the bound's trait meets them: that is the bound's error.)
 pub fn assoc_constraints_hold(bound: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
     let tr = bound_trait(bound, pcx);
-    if tr < 0 || has_error_type(t, pcx) || !implements(tr, t, pcx) {
+    // (0.30.2, review of M2, R2: the bound's whole reference, `Tr<Out =
+    // i64>` of `trait Tr<U = i64>` is Tr<i64>'s Out, never any impl's)
+    if tr < 0 || has_error_type(t, pcx) || !crate::front::convert::bound_holds(bound, t, pcx) {
         return true;
     }
     let holder = pcx.nodes[bound as usize].h;
     for i in 0..pcx.nodes[holder as usize].count {
         let c = child(holder, i, pcx);
         let want = constraint_type(c, pcx);
-        let got = trait_projection(tr, t, pcx.nodes[c as usize].a, pcx.nodes[c as usize].start,
-            pcx);
+        let got = constraint_got(tr, bound, t, c, pcx);
         if got != 0 && !has_error_type(got, pcx) && !has_error_type(want, pcx) && got != want {
             return false;
         }
     }
     true
+}
+
+// (0.30.2, review of M2, R2) The type constraint c (an AssocType node of
+// bound `bound`, of trait tr) names for t: the projection by the bound's
+// whole reference (its arguments and the defaults), `Tr<Out = i64>` of
+// `trait Tr<U = i64>` is Tr<i64>'s Out; an Ω's by its bounds.
+fn constraint_got(tr: i64, bound: i64, t: i64, c: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let bargs = crate::front::convert::bound_ref(bound, t, pcx);
+    if bargs >= 0 && !crate::front::opaque::is_omega(t, pcx) {
+        trait_projection_with(tr, t, bargs, pcx.nodes[c as usize].a, pcx.nodes[c as usize].start,
+            pcx)
+    } else {
+        trait_projection(tr, t, pcx.nodes[c as usize].a, pcx.nodes[c as usize].start, pcx)
+    }
 }
 
 // The error for the first constraint of `bound` type t does not meet:
@@ -659,7 +749,7 @@ pub fn constraint_error(bound: i64, t: i64, param: i64, what: i64, pos: i64, pcx
     for i in 0..pcx.nodes[holder as usize].count {
         c = child(holder, i, pcx);
         want = constraint_type(c, pcx);
-        got = trait_projection(tr, t, pcx.nodes[c as usize].a, pcx.nodes[c as usize].start, pcx);
+        got = constraint_got(tr, bound, t, c, pcx);
         if got != 0 && got != want {
             break;
         }

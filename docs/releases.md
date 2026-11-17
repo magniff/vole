@@ -205,8 +205,22 @@ A correctness release, its branches merged as each is reviewed clean.
   Tr<Self>`; v0.30.1: unknown type 'Self'). `T: H2 + Tr<T::Out>` no longer
   crashes the compiler: only a bound whose trait declares Out is read to
   find T::Out, and a true cycle (`T: H<T::Out>`) is an error.
-- **The depth limit of trait searches is rustc's, 128** (RT-7, RT-53;
-  32 before, so that a type nested 34 deep did not implement its trait).
+- **The depth limit of trait searches is rustc's** (RT-7, RT-53): a
+  chain of impls 127 deep is proved and 128 is `trait.overflow` (E0275),
+  as is a projection's (32 before, so that a type nested 34 deep did not
+  implement its trait). Every answer about concrete types is recorded, so
+  a chain whose impls prove a bound twice per level is linear, not
+  exponential.
+- **A bound's arguments are checked against its trait** (rustc E0107:
+  `T: Tr` of `trait Tr<U>`), a default that does not resolve for the type
+  (`U = <Self as H>::Out` for a type with no H) makes the bound fail, and
+  `T::Out` names the one trait of T's bounds that declares Out (E0220
+  for none, E0221 for two; v0.30.1 took any impl of the type). An impl
+  for one type (`impl Tr for W where Bx<i64>: Conv`) has its `where`
+  clause required too.
+- **std's HashMap, HashSet and their entries no longer bound `S` on the
+  type** (Rust's have no bound there; the impls that hash keep `S:
+  BuildHasher`): their impls without it were never checked.
 - **No generic function is left unchecked in silence** (RT-275). One
   whose opaque instance cannot be made gets warning generic.unchecked,
   and one whose header does not meet its Self type's bound by its own
