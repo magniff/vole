@@ -220,10 +220,18 @@ A correctness release, its branches merged as each is reviewed clean.
   a Vec on the scope, are refused at the call instead of inside std
   (RT-378), and the same calls given a fn item that keeps no borrow
   build (v0.30.1 refused them inside std). A local that surely holds a
-  fn item (`let p = st;`) is read by that item's signature too. A
+  fn item (`let p = st;`, written by that one statement) is read by that
+  item's signature too, and a parameter of the body given on is its
+  caller's value only when the body never writes it: every write counts,
+  an assignment, `&mut` (allowed of a parameter that is not `mut`), a
+  `ref mut` binding, `&raw`, a `&mut self` autoref (places/ir.vl
+  `held_value`, the one rule both readers ask). A
   function that takes such a callable as a type parameter cannot itself
   be used as a value (a call through the value would reach its body
-  unchecked); one taking a written `fn(..)` type can. The `'static` a bound needs only
+  unchecked); one taking a written `fn(..)` type can, and its callers
+  may give that parameter any `fn` value: its body calls it as R6 reads
+  the erased type, so only a type parameter's records are checked at a
+  call (`regions::bound_param`). The `'static` a bound needs only
   through an associated-type equality, a `where` clause, an impl's
   `where 'a: 'static`, a two-level blanket impl or the bound trait's
   type argument (`T: KeepQ<&'static i64>`) is read from the signature

@@ -1981,21 +1981,29 @@ outside the holes named below.
   whose first region is the call's own (an elided lifetime of the
   bound's input, `F: FnMut(&T) -> K`) is no universal's: it is a strict
   record (`Sig.strict`), checked where the value is given
-  (`fn_values::check_callables`, from `build.vl lower_call`): a fn item
+  (`fn_values::check_callables`, from `build.vl lower_call`), when the
+  callee's body reads it, of a parameter typed by a type parameter
+  (`regions::bound_param`, as `indirect_call` asks it): a fn item
   whose signature relates them, a `fn` value, or a parameter forwarded
   from a body that has no such record is `borrowck.fn_value_bound`
   (rustc E0308). What a value is, is read from the call's lowered
   operands (`build::held_callable`): a fn item (any path naming it), a
-  local that is not `mut` and is assigned once from one (`let p = st;`,
-  `let k: fn(&i64) -> &'static i64 = st;`: its item's signature decides),
-  or a parameter of the body that is not `mut` and is typed by a type
-  parameter (forwarded: the body's own record, checked by its callers,
-  holds it). Since every caller is checked by them, the callee's body is
+  local written once, by one or by a copy of a local that holds one
+  (`let p = st;`, `let k: fn(&i64) -> &'static i64 = st;`: its item's
+  signature decides), or a parameter of the body that the body never
+  writes and is typed by a type parameter (forwarded: the body's own
+  record, checked by its callers, holds it). Whether a local is written
+  after its definition is one rule (`ir::held_value`), which
+  `indirect_call` asks too: every write counts, whatever the local's
+  flags say (a parameter that is not `mut` may be borrowed mutably): an
+  assignment or a call into it or a part of it, and a borrow of it or a
+  part that is not shared (`&mut`, a `ref mut` binding in any pattern, a
+  `&mut self` autoref, `&raw mut`, `&raw const`, a closure's unique
+  capture, a match's fake borrow). Since every caller is checked by them, the callee's body is
   checked by the bound, not by the erased type, for a parameter typed by
   a type parameter (`f: F`, `regions::bound_param`): a call through that
   parameter (or the temporary a call by value moves it into), when the
-  body never assigns it nor borrows it so that it may be written (a
-  closure's capture, a `ref mut`: `param_copied`), makes no edge a strict
+  body never writes it (`ir::held_value`), makes no edge a strict
   record names (`constraints::indirect_call`, `strict_pair`). So std's
   `or_insert_with_key` and `arena_scope` given a fn item that keeps no
   borrow build, and one that does is refused at the call, not inside std
@@ -2004,7 +2012,9 @@ outside the holes named below.
   `borrowck.fn_value_bound`. A `fn(..)` type written for a parameter
   asks nothing of the body (its calls are read as R6 reads that type, as
   before), so such a function is a value as any other (`pick<'a>(d: &'a
-  i64, k: fn(&i64) -> &'a i64)`). A struct or an enum whose field is a `fn` type
+  i64, k: fn(&i64) -> &'a i64)`), and its callers may give it any `fn`
+  value (a forwarded `fn(..)` parameter, an array's element), at the top
+  of the parameter's type or below it (`&[fn(..)]`). A struct or an enum whose field is a `fn` type
   (`struct H<A, B> { f: fn(A) -> B }`) has the same relations as its
   declaration's requirements (`regions::fn_field_reqs`, through
   `adt_reqs`), its parameters' regions standing for every slot of what
