@@ -21,6 +21,7 @@ use std::alloc::Allocator; use crate::base::{buf_int, buf_new, buf_str, sym_text
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::ast::{NODE_REF, NODE_REF_MUT, NodeKind, child};
+use crate::front::obligations::obligation_error;
 use crate::front::parser::rust::lifetimes_of;
 use crate::front::types::{REF_MUT, REF_RAW, REF_SHARED, TyKind, fn_param, type_elem, variant_field};
 use crate::places::front::{enum_info, fn_node, fn_param_count, fn_ret, tlist_at};
@@ -432,9 +433,11 @@ fn copy_in(t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
         return pcx.types[t as usize].b != REF_MUT;
     }
     // RULE: D21.3 (0.27.2.1: an `impl Tr` result is Copy iff a bound says so)
+    // (0.30.2, review of M1: an Ω by the front's selection, its own
+    // predicates first: front::traits::implements)
     if crate::front::opaque::is_opaque(t, pcx) {
         let copy = crate::front::traits::std_trait(c"Copy", pcx);
-        return copy >= 0 && crate::front::opaque::implements(copy, t, pcx);
+        return copy >= 0 && crate::front::traits::implements(copy, t, pcx);
     }
     if k == TyKind::Array || k == TyKind::Distinct {
         return copy_in(pcx.types[t as usize].a, depth + 1, pcx);
@@ -1814,34 +1817,6 @@ fn blanket_impl(i: i64, pcx: &Ctx<Comp>) -> bool {
         && param_index(pcx.nodes[inode as usize].g, pcx.nodes[h as usize].a, pcx) >= 0
 }
 
-// (0.30.1, review 4) How impl i is for type s: 1 a direct impl (impl_for),
-// 2 a pattern impl whose header matches s (`&'a T`, front's impl_bindings),
-// 3 a blanket impl (its header a bare parameter), 0 not for s.
-fn impl_class(i: i64, s: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    if impl_for(i, s, pcx) {
-        return 1;
-    }
-    if blanket_impl(i, pcx) {
-        return 3;
-    }
-    if pcx.traits_impls[i as usize].tpl == crate::front::generics::TPL_PATTERN
-        && crate::front::traits::impl_bindings(i, s, pcx) >= 0 {
-        return 2;
-    }
-    0
-}
-
-// (0.30.1, review 5) Whether pattern or blanket impl i may be the one for
-// s: front's impl_applies (its header matches, its bounds hold, lifetimes
-// erased); past front's depth of nested searches, yes (never a no it did
-// not prove).
-fn may_apply(i: i64, s: i64, pcx: &mut Ctx<Comp>) -> bool {
-    if pcx.assoc_depth + 1 >= crate::front::assoc::MAX_ASSOC_DEPTH {
-        return true;
-    }
-    crate::front::traits::impl_applies(i, s, pcx) >= 0
-}
-
 // RULE: D4.4 The slots of type node vn (type t) of impl i for type s (an
 // associated type's, a trait argument's), whose slots are base's
 // entries: each slot of vn's type the impl's header
@@ -2656,12 +2631,25 @@ fn bound_ties(f: i64, tps: i64, self_node: i64, sig: &mut Sig<Comp>, pcx: &mut C
             for j in 0..slot_count(s, pcx) {
                 push_entry(B_PARAM, k, j, -1, &mut sbase);
             }
-            impl_bound_ties(s, &sbase, tr, tps, 0, 0, sig, pcx);
+            // (0.30.2, obligations M1: the bound's whole reference, its
+            // arguments read with the instance's types, `T: Tr<i64>`)
+            let n = if pcx.nodes[tps as usize].count < pcx.fns[f as usize].targ_count {
+                pcx.nodes[tps as usize].count
+            } else { pcx.fns[f as usize].targ_count };
+            let m = crate::front::modules::module_of(b, pcx);
+            let targs = crate::front::obligations::bound_ref_args(b, tr, s, m, tps,
+                pcx.fns[f as usize].targs, n, pcx.fns[f as usize].self_ty, pcx);
+            // (a reference no one impl proves is reported at the call that
+            // made the instance, else at the bound)
+            let origin = pcx.fns[f as usize].origin;
+            let pos = if origin > 0 { pcx.nodes[origin as usize].start }
+                else { pcx.nodes[b as usize].start };
+            impl_bound_ties(s, &sbase, tr, targs, tps, 0, 0, pos, sig, pcx);
             if holder <= 0 && args <= 0 {
                 continue;
             }
             if args > 0 {
-                trait_arg_ties(k, s, tr, args, tps, self_node, f, sig, pcx);
+                trait_arg_ties(k, s, tr, args, targs, tps, self_node, f, sig, pcx);
             }
             if holder <= 0 {
                 continue;
@@ -2703,87 +2691,49 @@ fn bound_ties(f: i64, tps: i64, self_node: i64, sig: &mut Sig<Comp>, pcx: &mut C
     }
 }
 
-// RULE: L14, D4.6 (d) (0.27.3) A substitution s (its slots base's entries)
-// meets a bound's trait tr through the one impl of tr for s (`impl<A:
-// Iterator, B: Iterator<Item = A::Item>> Iterator for Chain<A, B>`), whose
-// instance assumes the impl's own equality bounds: they hold of s's slots
-// too, `B::Item`'s and `A::Item`'s slot by slot one region, both ways; and
-// so on for the impls its parameters' substitutions meet their bounds by
-// (`Rev<Chain<..>>`'s `I: DoubleEndedIterator`, Chain's impl of it).
-fn impl_bound_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, tps: i64, depth: i64, sup: i64,
-    sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+// RULE: L14, D4.6 (d), O-M1 (0.27.3; 0.30.2 obligations M1) A substitution
+// s (its slots base's entries) meets a bound's trait reference `tr<targs>`
+// through the impl the front's selection chose for it (chosen: by the
+// whole reference, its trait arguments too, never again here), whose
+// instance assumes the impl's own predicates and equality bounds: they
+// hold of s's slots too (`impl<A: Iterator, B: Iterator<Item = A::Item>>
+// Iterator for Chain<A, B>`: `B::Item`'s and `A::Item`'s slot by slot one
+// region, both ways); and so on for the impls its parameters'
+// substitutions meet their bounds by (`Rev<Chain<..>>`'s `I:
+// DoubleEndedIterator`, Chain's impl of it), each by its own whole
+// reference. pos: the bound's, where a reference no one impl proves is
+// reported.
+fn impl_bound_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, targs: i64, tps: i64, depth: i64,
+    sup: i64, pos: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
     if s <= 0 || tr < 0 {
+        return;
+    }
+    // (0.30.2, test-only: VOLE_PLANT_OBLIG=depth lowers the limit to 2, a
+    // chain the front proves meets it here)
+    let limit = if pcx.plant_oblig == 1 { 2 } else { crate::front::assoc::MAX_ASSOC_DEPTH };
+    if depth > limit {
+        // (a limit is an error, never a yes)
+        obligation_error(true, false, tr, s, pos, pcx);
         return;
     }
     // (0.30.1, review 4: a bound's supertraits are met by their own impls
     // for s, whose predicates the instance needs too, `T: Sub` calling
     // Sup's `up`; sup counts the steps, a cycle of supertraits is front's
-    // error)
+    // error; 0.30.2: each by its whole reference, `trait Sub: Sup<i32>`'s
+    // Sup<i32>, review 4 F3)
     let supers = crate::front::traits::trait_supers(tr, pcx);
     if supers > 0 && sup <= pcx.traits.len() as i64 {
         for k in 0..pcx.nodes[supers as usize].count {
             let b = child(supers, k, pcx);
             if is_node(b, NodeKind::TyName, pcx) {
                 let tr2 = crate::front::traits::bound_trait(b, pcx);
-                impl_bound_ties(s, base, tr2, tps, depth, sup + 1, sig, pcx);
+                let targs2 = super_args(tr, b, s, targs, pcx);
+                impl_bound_ties(s, base, tr2, targs2, tps, depth, sup + 1, pos, sig, pcx);
             }
         }
     }
-    // (the impls of tr for s, the direct ones first, then (0.30.1, review
-    // 4) the pattern impls, `impl<'a, T> Tr for &'a T`, then the blanket
-    // ones, `impl<I: Iterator> IntoIterator for I`, which s meets through
-    // its own bound)
-    let mut found: i64 = -1;
-    let mut many = false;
-    let mut class: i64 = 1;
-    while class <= 3 && found < 0 {
-        for i in 0..pcx.traits_impls.len() as i64 {
-            if pcx.traits_impls[i as usize].tr == tr && impl_class(i, s, pcx) == class {
-                many = many || found >= 0;
-                found = i;
-            }
-        }
-        class += 1;
-    }
+    let found = chosen(tr, s, targs, base, tps, depth, pos, sig, pcx);
     if found < 0 {
-        return;
-    }
-    // (0.30.1, review 5: every impl of tr that may be the one for s, of
-    // any class, `Tr<i32>`'s pattern impl for `&'a T` beside `Tr<i64>`'s
-    // direct one for `&'a str`: trait arguments are not told apart here,
-    // so the predicates of each are required, theirs and their
-    // parameters' impls', which is more than the one chosen needs, never
-    // less; the one chosen by class below is also tied whole)
-    for i in 0..pcx.traits_impls.len() as i64 {
-        if i == found || pcx.traits_impls[i as usize].tr != tr {
-            continue;
-        }
-        let c = impl_class(i, s, pcx);
-        if c == 0 || c != 1 && !may_apply(i, s, pcx) {
-            continue;
-        }
-        let inode = pcx.traits_impls[i as usize].node;
-        let mut head = Vec::<i64, Comp>::new_in(Comp {});
-        bind_walk(pcx.nodes[inode as usize].b, s, pcx.nodes[inode as usize].g, 0, -1, &mut head,
-            0, pcx, -1);
-        impl_predicates(i, s, &head, base, tps, sig, pcx);
-        param_bound_predicates(i, s, &head, base, tps, depth, sig, pcx);
-    }
-    if many {
-        // (0.30.1, review 4: impls of tr for s with other trait arguments,
-        // `Tr<i32>` and `Tr<i64>`, not told apart here: the predicates of
-        // each are required, theirs and their parameters' impls', which is
-        // more than the one chosen needs, never less)
-        for i in 0..pcx.traits_impls.len() as i64 {
-            if pcx.traits_impls[i as usize].tr == tr && impl_class(i, s, pcx) == class - 1 {
-                let inode = pcx.traits_impls[i as usize].node;
-                let mut head = Vec::<i64, Comp>::new_in(Comp {});
-                bind_walk(pcx.nodes[inode as usize].b, s, pcx.nodes[inode as usize].g, 0, -1,
-                    &mut head, 0, pcx, -1);
-                impl_predicates(i, s, &head, base, tps, sig, pcx);
-                param_bound_predicates(i, s, &head, base, tps, depth, sig, pcx);
-            }
-        }
         return;
     }
     let inode = pcx.traits_impls[found as usize].node;
@@ -2795,6 +2745,7 @@ fn impl_bound_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, tps: i64, depth: i64,
     if itps <= 0 {
         return;
     }
+    let binds = impl_binds(found, s, targs, pcx);
     for q in 0..pcx.nodes[itps as usize].count {
         let bounds = pcx.nodes[child(itps, q, pcx) as usize].h;
         if bounds <= 0 {
@@ -2804,7 +2755,6 @@ fn impl_bound_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, tps: i64, depth: i64,
         if sq <= 0 {
             // (0.30.1, review 4: a header the walk does not read, a
             // tuple's: the binding front made)
-            let binds = crate::front::traits::impl_bindings(found, s, pcx);
             sq = if binds >= 0 { tlist_at(binds + q, pcx) } else { 0 };
         }
         if sq <= 0 {
@@ -2822,7 +2772,10 @@ fn impl_bound_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, tps: i64, depth: i64,
             if tr2 < 0 {
                 continue;
             }
-            impl_bound_ties(sq, &bq, tr2, tps, depth + 1, 0, sig, pcx);
+            let targs2 = crate::front::obligations::bound_ref_args(b, tr2, sq,
+                pcx.traits_impls[found as usize].module, itps, binds,
+                pcx.nodes[itps as usize].count, s, pcx);
+            impl_bound_ties(sq, &bq, tr2, targs2, tps, depth + 1, 0, pos, sig, pcx);
             let holder = pcx.nodes[b as usize].h;
             let count: i64 = if holder > 0 { pcx.nodes[holder as usize].count } else { 0 };
             for ci in 0..count {
@@ -2855,6 +2808,91 @@ fn impl_bound_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, tps: i64, depth: i64,
             }
         }
     }
+}
+
+// RULE: O-M1 (0.30.2, obligations M1) The impl the front's selection chose
+// for `s: tr<targs>` (front::obligations::select: its record, read; s's
+// slots base's entries), or -1: none (the reference holds without one, an
+// Ω's bound, a builtin; or does not, which the front reported). Two impls
+// for a reference whose arguments are known: trait.ambiguous; the depth
+// limit met: trait.overflow (neither is a yes); so for a trait without
+// arguments. A reference whose arguments are not known here (a bound written without them on a trait
+// that has some, `T: PartialEq`; or naming what does not resolve here):
+// each impl that may be the one is required, its predicates and its
+// parameters' bounds', more than the one needs, never less.
+fn chosen(tr: i64, s: i64, targs: i64, base: &Vec<i64, Comp>, tps: i64, depth: i64, pos: i64,
+    sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let r = crate::front::obligations::select(tr, s, targs, pcx);
+    if r >= 0 {
+        return r;
+    }
+    if r == crate::front::obligations::SEL_LIMIT {
+        obligation_error(true, false, tr, s, pos, pcx);
+        return -1;
+    }
+    if r != crate::front::obligations::SEL_AMBIG {
+        return -1;
+    }
+    if targs >= 0 || pcx.traits[tr as usize].params == 0 {
+        obligation_error(false, false, tr, s, pos, pcx);
+        return -1;
+    }
+    let mut cands = Vec::<i64, Comp>::new_in(Comp {});
+    crate::front::obligations::candidates(tr, s, -1, &mut cands, pcx);
+    for i in cands {
+        let inode = pcx.traits_impls[i as usize].node;
+        let itps = pcx.nodes[inode as usize].g;
+        let mut head = Vec::<i64, Comp>::new_in(Comp {});
+        bind_walk(pcx.nodes[inode as usize].b, s, itps, 0, -1, &mut head, 0, pcx, -1);
+        impl_predicates(i, s, &head, base, tps, sig, pcx);
+        let binds = impl_binds(i, s, -1, pcx);
+        for q in 0..(if itps > 0 { pcx.nodes[itps as usize].count } else { 0 }) {
+            let bounds = pcx.nodes[child(itps, q, pcx) as usize].h;
+            if bounds <= 0 {
+                continue;
+            }
+            let mut sq = header_param_type(pcx.nodes[inode as usize].b, s, itps, q, 0, pcx);
+            if sq <= 0 {
+                sq = if binds >= 0 { tlist_at(binds + q, pcx) } else { 0 };
+            }
+            if sq <= 0 {
+                continue;
+            }
+            let mut bq = Vec::<i64, Comp>::new_in(Comp {});
+            param_base(q, sq, &head, base, &mut bq, pcx);
+            for bi in 0..pcx.nodes[bounds as usize].count {
+                let b = child(bounds, bi, pcx);
+                if !is_node(b, NodeKind::TyName, pcx) {
+                    continue;
+                }
+                let tr2 = crate::front::traits::bound_trait(b, pcx);
+                let targs2 = crate::front::obligations::bound_ref_args(b, tr2, sq,
+                    pcx.traits_impls[i as usize].module, itps, binds,
+                    pcx.nodes[itps as usize].count, s, pcx);
+                impl_bound_ties(sq, &bq, tr2, targs2, tps, depth + 1, 0, pos, sig, pcx);
+            }
+        }
+    }
+    -1
+}
+
+// The arguments of supertrait bound b of trait tr (`trait Sub<P>:
+// Sup<P>`), for `s: tr<targs>`: resolved with tr's parameters bound to
+// targs and `Self` s, or the supertrait's defaults (bound_ref_args); -1
+// when one does not resolve.
+fn super_args(tr: i64, b: i64, s: i64, targs: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let params = pcx.traits[tr as usize].params;
+    let count: i64 = if targs >= 0 && params > 0 { pcx.nodes[params as usize].count } else { 0 };
+    let tr2 = crate::front::traits::bound_trait(b, pcx);
+    crate::front::obligations::bound_ref_args(b, tr2, s, pcx.traits[tr as usize].module, params,
+        if count > 0 { targs } else { -1 }, count, s, pcx)
+}
+
+// The types impl i's parameters are for `s: tr<targs>` (a TLISTS index;
+// 0 for one neither the header nor the trait arguments bind; -1: the
+// impl is not for s): the front's bindings, completed from targs.
+fn impl_binds(i: i64, s: i64, targs: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    crate::front::obligations::bindings(i, s, targs, pcx)
 }
 
 // RULE: L14 (0.30.1, review 4: rustc's impl confirmation, its nested
@@ -2936,39 +2974,6 @@ fn impl_predicates(found: i64, s: i64, head: &Vec<i64, Comp>, base: &Vec<i64, Co
                 }
             }
             i += 1;
-        }
-    }
-}
-
-// (0.30.1, review 4) The predicates of the impls impl i's parameters'
-// bounds are met by (`impl<T: Sup> Tr<i32> for V<T>`: Sup's impl for T's
-// substitution), at depth + 1: impl_bound_ties' recursion, for an impl
-// chosen among others (its equalities not tied: only what must hold).
-fn param_bound_predicates(i: i64, s: i64, head: &Vec<i64, Comp>, base: &Vec<i64, Comp>,
-    tps: i64, depth: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
-    let inode = pcx.traits_impls[i as usize].node;
-    let itps = pcx.nodes[inode as usize].g;
-    for q in 0..(if itps > 0 { pcx.nodes[itps as usize].count } else { 0 }) {
-        let bounds = pcx.nodes[child(itps, q, pcx) as usize].h;
-        if bounds <= 0 {
-            continue;
-        }
-        let mut sq = header_param_type(pcx.nodes[inode as usize].b, s, itps, q, 0, pcx);
-        if sq <= 0 {
-            let binds = crate::front::traits::impl_bindings(i, s, pcx);
-            sq = if binds >= 0 { tlist_at(binds + q, pcx) } else { 0 };
-        }
-        if sq <= 0 {
-            continue;
-        }
-        let mut bq = Vec::<i64, Comp>::new_in(Comp {});
-        param_base(q, sq, head, base, &mut bq, pcx);
-        for bi in 0..pcx.nodes[bounds as usize].count {
-            let b = child(bounds, bi, pcx);
-            if is_node(b, NodeKind::TyName, pcx) {
-                let tr2 = crate::front::traits::bound_trait(b, pcx);
-                impl_bound_ties(sq, &bq, tr2, tps, depth + 1, 0, sig, pcx);
-            }
         }
     }
 }
@@ -3265,17 +3270,11 @@ fn header_param_type(n: i64, t: i64, itps: i64, q: i64, depth: i64, pcx: &Ctx<Co
 // (`impl<T, A> FromIteratorIn<T, A> for Vec<T, A>`) says each argument is
 // its own trait argument, read in s's slots; each slot of the two is one
 // region, both ways.
-fn trait_arg_ties(k: i64, s: i64, tr: i64, args: i64, tps: i64, self_node: i64, f: i64,
-    sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
-    let mut found: i64 = -1;
-    for i in 0..pcx.traits_impls.len() as i64 {
-        if pcx.traits_impls[i as usize].tr == tr && impl_for(i, s, pcx) {
-            if found >= 0 {
-                return;
-            }
-            found = i;
-        }
-    }
+fn trait_arg_ties(k: i64, s: i64, tr: i64, args: i64, targs: i64, tps: i64, self_node: i64,
+    f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    // (0.30.2, obligations M1: the impl the front's selection chose for the
+    // whole reference, targs; -1 its arguments not known here)
+    let found = crate::front::obligations::select(tr, s, targs, pcx);
     if found < 0 {
         return;
     }
