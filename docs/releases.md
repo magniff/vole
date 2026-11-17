@@ -166,7 +166,11 @@ A correctness release, its branches merged as each is reviewed clean.
   of a generic trait with two impls for S, `T::mk()` under `T: Tr<i64>`
   for a type with impls of `Tr<i32>` and `Tr<i64>`, and `<T as B>::Out`
   beside `<T as A>::Out` in a generic body (one opaque type for both
-  before).
+  before); `<T as Tr<i64>>::get(t)` under `T: Sub` with `trait Sub:
+  Tr<i64>` (RT-392), and `T::Out` under `T: Sub` read by Sub's
+  supertrait in an instance whose type has another trait's `Out` too
+  (RT-426b). `T::Out` with two bounds declaring `Out` is now E0221
+  (RT-399).
 
 #### What the checkers now refuse
 
@@ -225,7 +229,8 @@ expression can start, decided in three places the parser asks
 turbofish (`f::<<T as Tr>::A>()`, `M.m::<<<S as A>::B as C>::E>()`,
 `<S as G>::g::<<S as A>::Out>()`), a bound's arguments (`U:
 G<<T as A>::Out>`, `trait A: B<<Self as A>::X>`), a `where` predicate
-(`where <T as A>::Out: B`, RT-356; `Option<<T as A>::Out>: Default`),
+(`where <T as A>::Out: B`, RT-356; `where <Self as H>::Out: Conv` on an
+impl, RT-403; `Option<<T as A>::Out>: Default`),
 `return` and `break` values and a range's end (`return <<S as A>::Out as
 B>::D`, `break 'a <S as A>::C`, `0..<S as A>::C`). The same list gives
 `return ..` its value (a RangeFull, as rustc's; it was an empty return).
