@@ -1552,6 +1552,7 @@ pub fn check_impl_signatures(pcx: &mut Ctx<Comp>) {
         let ty = pcx.traits_impls[i as usize].ty;
         let tr = pcx.traits_impls[i as usize].tr;
         check_impl_statics(i, pcx);
+        check_concrete_where(i, pcx);
         crate::front::coherence::check_constrained(i, pcx);
         if ty == 0 && pcx.traits_impls[i as usize].tpl != TPL_NONE {
             crate::front::coherence::check_generic_obligations(i, pcx);
@@ -2444,6 +2445,69 @@ fn concrete_impl_preds_hold(i: i64, b: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool
     let ok = impl_preds_hold(node, t, pcx);
     env_leave(saved, pcx);
     pcx.assoc_depth -= 1;
+    ok
+}
+
+// RULE: F10.2 (0.30.2, review of M2, RT-393) The `where` predicates of
+// impl i, one with no type parameters (`impl Tr for W where Bx<i64>:
+// Conv`), at the impl: each must hold of its types, as rustc's E0277 at
+// the clause (a predicate on no parameter cannot become true for some
+// use); one whose proof meets the depth limit (two such impls needing
+// each other) is trait.overflow, E0275.
+fn check_concrete_where(i: i64, pcx: &mut Ctx<Comp>) {
+    let node = pcx.traits_impls[i as usize].node;
+    let ty = pcx.traits_impls[i as usize].ty;
+    let params = pcx.nodes[node as usize].g;
+    if ty == 0 || params > 0 && pcx.nodes[params as usize].count > 0 {
+        return;
+    }
+    let mut next = wp_start(node, pcx);
+    while next >= 0 {
+        let k = next;
+        next = wp_after(k, pcx);
+        let subject = pcx.where_preds[k as usize].subject;
+        let cuts = pcx.depth_cuts;
+        if impl_preds_hold_one(node, k, ty, pcx) {
+            continue;
+        }
+        let pos = pcx.nodes[subject as usize].start;
+        let saved_self = pcx.self_type;
+        let saved_mod = pcx.cur_mod;
+        pcx.self_type = ty;
+        pcx.cur_mod = module_of(subject, pcx);
+        let t = resolve_type_or_error(subject, pcx);
+        pcx.self_type = saved_self;
+        pcx.cur_mod = saved_mod;
+        let bounds = pcx.where_preds[k as usize].bounds;
+        let b = child(bounds, 0, pcx);
+        let tr = bound_trait(b, pcx);
+        if pcx.depth_cuts != cuts && tr >= 0 {
+            crate::front::obligations::obligation_error(true, false, tr, t, pos, pcx);
+            continue;
+        }
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"trait.unmet";
+        err_begin(pos, pcx);
+        err_fmt(format_args("the impl's `where` clause '{}' does not hold: '",
+            &str::from_utf8(
+                get_src()[
+                    pcx.nodes[subject as usize].start as usize..pcx.nodes[bounds as usize].end as usize]).unwrap()), pcx);
+        err_type(t, pcx);
+        err_str(c"' does not implement it", pcx);
+        err_help(
+            c"rustc E0277: a predicate on no type parameter of the impl must hold of its types",
+            pcx);
+        err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
+    }
+}
+
+// Whether where predicate k of impl node `node` holds for its type ty,
+// quietly (impl_preds_hold's, for one).
+fn impl_preds_hold_one(node: i64, k: i64, ty: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mark = crate::base::diag::errors_mark(pcx);
+    let ok = pred_holds(node, k, ty, 0, false, pcx);
+    crate::base::diag::errors_forget(mark, pcx);
     ok
 }
 
@@ -3377,7 +3441,15 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
             let tr = bound_trait(b, pcx);
             // RULE: AT3 (`T: Send`: sync.not_send, with the failing part)
             if crate::front::auto_traits::is_auto(tr, pcx) {
-                crate::front::auto_traits::check_bound(tr, t, p, what, pos, pcx);
+                // (0.30.2, review of M2, RT-401: an auto trait's bound of the
+                // header, `struct G<T: Send>` of `impl<A> G<A>`, as any other's)
+                let sure = pcx.opaque_sure;
+                let own = header_sure(t, pcx);
+                if own {
+                    pcx.opaque_sure = true;
+                }
+                crate::front::auto_traits::check_bound(tr, t, p, what, pos, own, pcx);
+                pcx.opaque_sure = sure;
                 continue;
             }
             // (0.15: `From<U>`, a generic trait's bound)
@@ -3396,9 +3468,7 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
                 // template has no other predicate, and select said no
                 // without a cut or an unread bound: the program's error,
                 // recorded, never the model's, forgotten)
-                if pcx.opaque_assume && pcx.opaque_header_sure && !pcx.opaque_unsure
-                    && crate::front::opaque::is_omega(t, pcx)
-                    && pcx.nodes[pcx.types[t as usize].b as usize].x == 0 {
+                if header_sure(t, pcx) {
                     pcx.opaque_sure = true;
                 }
                 err_begin(pos, pcx);
@@ -3430,6 +3500,17 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
         }
     }
     env_leave(saved, pcx);
+}
+
+// RULE: D22.2 (0.30.2, RT-275, RT-401) Whether a bound of a template's
+// header that t does not meet is the program's error, not the model's:
+// while its opaque instance is made, t an Ω of the template's own
+// parameter, the template with no other predicate, and select's no
+// without a cut or an unread bound.
+fn header_sure(t: i64, pcx: &Ctx<Comp>) -> bool {
+    pcx.opaque_assume && pcx.opaque_header_sure && !pcx.opaque_unsure
+        && crate::front::opaque::is_omega(t, pcx)
+        && pcx.nodes[pcx.types[t as usize].b as usize].x == 0
 }
 
 // RULE: D4.5, F10.2 (0.30.1, rustc E0310) Type parameter p's bounds
