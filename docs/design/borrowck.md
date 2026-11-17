@@ -2003,6 +2003,12 @@ outside the holes named below.
   (0.27.5) Narrowed by D2.8: a promotable rvalue's temporary is the
   body's, so a borrow of one used after its statement or branch is
   accepted; one that escapes the function is still refused.
+  (0.30.2, RT-383) A field typed `&'static T` binds its literal's part
+  to 'static, so `V { a: &7 }` and a const's `Vs { n: &[4, 11] }`
+  (a const's value is made again where it is used) are
+  `borrowck.dropped_borrowed` too; before, no region of a literal of a
+  type without regions was related, and the reference pointed into the
+  using function's frame.
 - L3 Temporaries' scopes are vole's (the statement; the block for `let
   r = &f(x)`), not Rust 2024's tail-expression rule: a difference only
   in `match`/block tail temporaries. (0.27.5) Nor rustc's extension of a `let`
