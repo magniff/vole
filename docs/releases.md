@@ -190,8 +190,8 @@ A correctness release, its branches merged as each is reviewed clean.
 
 - **A callable meeting an Fn bound kept no borrow of its argument
   (RT-282, RT-297, RT-297b, RT-297c, RT-299, RT-304, RT-308, RT-309,
-  RT-310, RT-311, RT-364, RT-367, RT-368), every -O, in v0.30.1 and
-  before.** A fn item whose result
+  RT-310, RT-311, RT-364, RT-367, RT-368, RT-421), every -O, in v0.30.1
+  and before.** A fn item whose result
   borrows its argument, `fn idr2<'a>(x: &'a i64) -> &'a i64`, given to
   `v.first().map(idr2)`, `and_then`, `sort_by_key`, Iterator's `scan`,
   `find_map`, `map_while`, `fold`, a program's `F: Fn(T) -> U` or `f:
@@ -222,8 +222,9 @@ A correctness release, its branches merged as each is reviewed clean.
   callable cannot itself be used as a value (a call through the value
   would reach its body unchecked). The `'static` a bound needs only
   through an associated-type equality, a `where` clause, an impl's
-  `where 'a: 'static` or a two-level blanket impl is read from the
-  signature too (RT-364). One rule
+  `where 'a: 'static`, a two-level blanket impl or the bound trait's
+  type argument (`T: KeepQ<&'static i64>`) is read from the signature
+  too (RT-364, RT-421). One rule
   for closures, fn items, fn pointers, method paths, generic fns with
   their arguments and opaque `impl Fn` values (borrowck.md R6). With it,
   a fn item or a `fn` value given to Iterator's adapters (`map`,

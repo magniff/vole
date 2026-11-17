@@ -1960,7 +1960,7 @@ outside the holes named below.
   Stricter than rustc for a fn item whose result is `'static` (the erased
   type says every argument region outlives every result region).
   *(0.30.2, RT-282, RT-297..301, RT-304, RT-308..311, RT-364, RT-367,
-  RT-368, RT-378) One rule where a
+  RT-368, RT-378, RT-421) One rule where a
   callable meets an Fn bound or a `fn` type.* A call through such a
   callable in a signature's body relates the regions of its parts as
   `indirect_call` reads the erased type (every argument region outlives
