@@ -1,5 +1,5 @@
 #!/bin/sh
-# XFAIL: RT-443: `volec fmt` lays out the arguments of a type whose name ends in a digit as a comparison: `impl<'a> Deref for W2<'a>` becomes `W2 < 'a >`, and `fn f(w: W3<i64>) -> W3<i64>` becomes `W3 < i64 >` (W, Wx, Wa2b are kept) (0.30.2)
+# XFAIL: RT-443: `volec fmt` lays out the arguments of a type whose name has two or more characters and no lowercase letter (a constant's shape: W2, W3, UL, AB, HTTP) as a comparison: `impl<'a> Deref for W2<'a>` becomes `W2 < 'a >`, and `fn f(w: W3<i64>) -> W3<i64>` becomes `W3 < i64 >` (W, Wx, Ab2, W2b, Http are kept; RT-443b) (0.30.2)
 # rustfmt keeps `W2<'a>`. From the paused g302temps work (PAUSED.md,
 # findings not yet reported: "fmt mangles impl<'a> Deref for W2<'a>");
 # the digit at the name's end is the trigger, found while checking it.

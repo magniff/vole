@@ -162,6 +162,11 @@ fn main() {
   &'static i64` keeps no borrow of v; one whose result borrows an
   argument the bound lends for the call alone (`sort_by_key(idr)`) is
   `borrowck.fn_value_bound`, as rustc's E0308.
+- A borrowed literal is not promoted to a static: `&7` lives in the
+  function that makes it, so `let r: &'static u64 = &7;` and a
+  `&'static` field set to `&7` (or to a const's `&[1, 2]`) are refused;
+  borrow a `static` instead (`static SEVEN: u64 = 7;` then `&SEVEN`). A
+  string literal is `&'static str`, as in Rust.
 
 ## C
 
