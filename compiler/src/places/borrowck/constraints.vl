@@ -14,10 +14,10 @@ use crate::base::ctx::Ctx;
 use crate::front::types::{REF_MUT, REF_RAW, REF_SHARED, TyKind, type_elem};
 use crate::places::borrowck::{Bck, MODE_MUT, MODE_RAW, MODE_SHARED, edge};
 use crate::places::ir::{
-    AK_CLOSURE, AK_VARIANT, BK_MUT, BK_MUT2, BK_RAW, BK_RAW_MUT, BK_SHARED, Body, OK_FN, PJ_CONST,
-    PJ_DEREF, PJ_INDEX, RV_AGG, RV_CAST, RV_REF, RV_REPEAT, RV_SLICE, RV_USE, SK_ASSIGN, SK_CALL,
-    TK_RETURN, full_place_type, local_ty, op_a, op_b, op_is_place, op_kind, proj_kind, proj_parent,
-    proj_val, step_type, undistinct,
+    AK_CLOSURE, AK_VARIANT, BK_MUT, BK_MUT2, BK_RAW, BK_RAW_MUT, BK_SHARED, Body, OK_COPY, OK_FN,
+    OK_MOVE, PJ_CONST, PJ_DEREF, PJ_INDEX, RV_AGG, RV_CAST, RV_REF, RV_REPEAT, RV_SLICE, RV_USE,
+    SK_ASSIGN, SK_CALL, SK_INTRINSIC, TK_RETURN, full_place_type, local_ty, op_a, op_b, op_is_place,
+    op_kind, proj_kind, proj_parent, proj_val, step_type, undistinct,
 };
 use crate::places::regions::{
     RO_UNIVERSAL, U_NAMED, U_OUTER, V_CO, V_CONTRA, V_INV, field_map, place_regions, region_count,
@@ -552,8 +552,24 @@ fn outer_region(sym: i64, pbody: &Body<Comp>) -> i64 {
 // (`fn store<'a>(x: &mut &'a T, y: &'a T)` as `fn(&mut &T, &T)`), which
 // the erased type cannot say; stricter than rustc, which keeps the
 // elided regions apart (L13).
+// RULE: R6, D20.1 (0.30.2) But a relation the body's signature keeps as a
+// strict record of the parameter called (regions::callable_ties: a call's
+// own region, the bound's elided input, outliving another position) is
+// not made: every caller gave there a fn item whose signature keeps them
+// apart, or was refused (fn_values::check_callables), as rustc checks the
+// body against the bound (`F: FnOnce(&K) -> V`: V does not borrow the
+// key). The callee is the parameter itself, unprojected.
 fn indirect_call(loc: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let st = pbody.stmts[loc as usize];
+    let mut strict = Vec::<i64, Comp>::new_in(Comp {});
+    let mut sp: i64 = -1;
+    if st.nops > 0 && op_is_place(op_kind(st.ops, 0, pbody)) && op_b(st.ops, 0, pbody) <= 0 {
+        let p = param_copied(op_a(st.ops, 0, pbody), pbody);
+        if p >= 0 {
+            crate::places::regions::strict_records(pbody.fn_, &mut strict, pcx);
+            sp = p;
+        }
+    }
     if st.a >= 0 {
         walk_place(st.a, st.b, bck, pbody, pcx);
         bck.regs_b.clear();
@@ -567,7 +583,9 @@ fn indirect_call(loc: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ct
             walk_place(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), bck, pbody, pcx);
             for a in 0..bck.regs.len() as i64 {
                 for d in 0..bck.regs_b.len() as i64 {
-                    edge(bck.regs[a as usize], bck.regs_b[d as usize], loc, bck);
+                    if !strict_pair(&strict, sp, i - 1, a, -1, d) {
+                        edge(bck.regs[a as usize], bck.regs_b[d as usize], loc, bck);
+                    }
                 }
             }
         }
@@ -581,19 +599,28 @@ fn indirect_call(loc: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ct
         bck.vars.clear();
         slot_variances(bck.w_type, V_CO, &mut bck.vars, pcx);
         bck.regs_a.clear();
+        let mut ks = Vec::<i64, Comp>::new_in(Comp {});
         for k in 0..bck.regs.len() as i64 {
             if k < bck.vars.len() as i64 && bck.vars[k as usize] == V_INV {
                 bck.regs_a.push(bck.regs[k as usize]);
+                ks.push(k);
             }
         }
+        let oj = if j == st.nops { -1 } else { j - 1 };
         for i in 1..(if bck.regs_a.len() > 0 { st.nops + 1 } else { 0 }) {
             if i == j || !indirect_operand(i, loc, bck, pbody, pcx) {
                 continue;
             }
+            let oi = if i == st.nops { -1 } else { i - 1 };
             for a in 0..bck.regs.len() as i64 {
                 for d in 0..bck.regs_a.len() as i64 {
-                    edge(bck.regs[a as usize], bck.regs_a[d as usize], loc, bck);
-                    edge(bck.regs_a[d as usize], bck.regs[a as usize], loc, bck);
+                    let k = ks[d as usize];
+                    if !strict_pair(&strict, sp, oi, a, oj, k) {
+                        edge(bck.regs[a as usize], bck.regs_a[d as usize], loc, bck);
+                    }
+                    if !strict_pair(&strict, sp, oj, k, oi, a) {
+                        edge(bck.regs_a[d as usize], bck.regs[a as usize], loc, bck);
+                    }
                 }
             }
         }
@@ -629,4 +656,62 @@ fn ret(loc: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
         bck.regs.push(pbody.ret_var[j as usize]);
     }
     sub(0, 0, t, V_CO, loc, bck, pcx);
+}
+
+// Whether strict (regions::Sig.strict's records) holds one of parameter p
+// that position (o, s) outlive position (o2, s2) (an operand of the call
+// through it, -1 its result; s a slot).
+fn strict_pair(strict: &Vec<i64, Comp>, p: i64, o: i64, s: i64, o2: i64, s2: i64) -> bool {
+    if p < 0 {
+        return false;
+    }
+    let mut r: usize = 0;
+    while r + 5 <= strict.len() {
+        if strict[r] == p && strict[r + 1] == o && strict[r + 2] == s && strict[r + 3] == o2
+            && strict[r + 4] == s2 {
+            return true;
+        }
+        r += 5;
+    }
+    false
+}
+
+// The parameter (its index) local l is, unprojected: itself, never
+// assigned in the body (what the caller gave, which check_callables
+// checked), or a local assigned once, by a copy or a move of one that is
+// (the temporary a call by value `f(x)` moves the parameter into); -1
+// else.
+fn param_copied(l0: i64, pbody: &Body<Comp>) -> i64 {
+    let mut l = l0;
+    // (each step goes to another local: at most one per local)
+    for _ in 0..pbody.locals.len() as i64 + 1 {
+        let mut from: i64 = -1;
+        let mut writes: i64 = 0;
+        for s in 0..pbody.stmts.len() as i64 {
+            let st = pbody.stmts[s as usize];
+            // (a borrow of it that may write: a write too)
+            if st.kind == SK_ASSIGN && st.c == RV_REF && st.d != BK_SHARED && st.nops > 0
+                && op_a(st.ops, 0, pbody) == l {
+                writes += 2;
+            }
+            if (st.kind == SK_ASSIGN || st.kind == SK_CALL || st.kind == SK_INTRINSIC)
+                && st.a == l {
+                writes += 1;
+                if st.kind == SK_ASSIGN && st.b <= 0 && st.c == RV_USE && st.nops > 0
+                    && (op_kind(st.ops, 0, pbody) == OK_MOVE
+                        || op_kind(st.ops, 0, pbody) == OK_COPY)
+                    && op_b(st.ops, 0, pbody) <= 0 {
+                    from = op_a(st.ops, 0, pbody);
+                }
+            }
+        }
+        if l >= 1 && l <= pbody.params {
+            return if writes == 0 { l - 1 } else { -1 };
+        }
+        if writes != 1 || from < 0 || from == l {
+            return -1;
+        }
+        l = from;
+    }
+    -1
 }
