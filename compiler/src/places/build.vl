@@ -498,30 +498,27 @@ fn place_operand(l: i64, p: i64, ty: i64, moving: bool, pbody: &Body<Comp>, pcx:
     }
 }
 
-// RULE: D3.6 (0.27.7) Whether place (l, p), read as a value of type ty,
-// is a rust body's `&mut T` coerced to a raw pointer (ty `*T`).
-fn raw_from_mut(l: i64, p: i64, ty: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) -> bool {
-    let to = undistinct(ty, pcx);
-    if !pcx.rust_body || l < 0 || to <= 0
-        || pcx.types[to as usize].kind != TyKind::Ptr || pcx.types[to as usize].b != 0 {
-        return false;
-    }
-    let from = undistinct(place_type(l, p, pbody, pcx), pcx);
-    from > 0 && pcx.types[from as usize].kind == TyKind::Ptr
-        && pcx.types[from as usize].b == REF_MUT
-}
-
-// RULE: D3.6 (0.30.1) Place (l, p) of a rust body, read as a value of
-// type ty, when it is an exclusive reference coerced to a shared one (a
-// `&mut T` read as `&T`, a mutable view as a shared view): its shared
-// reborrow, `_t = &(*Q)` or `_t = slice Q[..]` (implicit_reslice, typed
-// ty), the operand. A coercion site that is no call argument (a `let`
-// with a type, an assignment, a field of a struct or a variant, an array
-// element, a result): before, the place was copied, Copy as its shared
-// type is, with no loan, and `let b: &[T] = s; s[0] = x;` with b live
-// was accepted (a write under a live shared view). Lowered here, the
-// operand of a call argument is the temporary, which lower_arg leaves.
-fn shared_coercion(l: i64, p: i64, ty: i64, e: i64, pbody: &mut Body<Comp>,
+// RULE: D3.6, I7 (0.30.1; 0.30.2, RT-197: the one place) Place (l, p) of
+// a rust body, an exclusive reference (`&mut T`, a mutable view), read as
+// a value of pointer type ty at a coercion site that is no call argument
+// (a `let` with a type, an assignment, a field of a struct or a variant,
+// an array element, a result) or as the operand of a cast (`as`, goal the
+// cast's node; e itself otherwise): never a copy of the reference (I7),
+// but its reborrow of the kind ty asks, typed ty, the operand:
+// - `*mut T` (`*mut [T]`): `_t = &raw mut (*Q)` (`slice Q[..]` marked
+//   `&mut`), a write, refused behind a `&` (rustc E0596, as its coercion
+//   and its cast both are); `*const T`: `&raw const (*Q)`, a read;
+// - `&T` (a shared view): `_t = &(*Q)` (`slice Q[..]`), with its loan;
+// - `&mut T` (a mutable view) of a cast, `r as &mut T`: `_t = &mut (*Q)`
+//   (`slice Q[..]`), with its loan, E0596 behind a `&`.
+// Whether ty is `*mut` is the checker's (raw_mut_goal of goal). Before,
+// a cast read the place by copying it, `h.r as *mut i64` and `h.r as &mut
+// i64` of an `h: &H` made a second `&mut` with nothing asked, and a
+// mutable view coerced or cast to a raw one was copied too. False: the
+// place is not exclusive, or ty no pointer it converts to (a `&mut T`
+// read as itself moves, place_operand's). A call's argument is
+// lower_arg's, which reborrows by its parameter.
+fn exclusive_read(l: i64, p: i64, ty: i64, e: i64, goal: i64, pbody: &mut Body<Comp>,
     pcx: &mut Ctx<Comp>) -> bool {
     let to = undistinct(ty, pcx);
     if !pcx.rust_body || l < 0 || to <= 0 {
@@ -532,18 +529,32 @@ fn shared_coercion(l: i64, p: i64, ty: i64, e: i64, pbody: &mut Body<Comp>,
         || pcx.types[from as usize].b != REF_MUT {
         return false;
     }
-    if pcx.types[to as usize].kind == TyKind::Ptr && pcx.types[to as usize].b == REF_SHARED {
+    let cast = goal != e;
+    let tb = pcx.types[to as usize].b;
+    if pcx.types[to as usize].kind == TyKind::Ptr {
+        let bk = if tb == 0 { if raw_mut_goal(goal, pcx) { BK_RAW_MUT } else { BK_RAW } }
+            else if tb == REF_SHARED { BK_SHARED }
+            else if tb == REF_MUT && cast { BK_MUT }
+            else { -1 };
+        if bk < 0 {
+            return false;
+        }
         let t = new_temp(ty, e, false, pbody, pcx);
         let dp = proj(p, PJ_DEREF, 0, pbody);
-        emit_ref(t, 0, l, dp, BK_SHARED, e, pbody, pcx);
+        emit_ref(t, 0, l, dp, bk, e, pbody, pcx);
         set_op(OK_MOVE, t, 0, pcx);
         return true;
     }
-    if pcx.types[to as usize].kind == TyKind::Slice && pcx.types[to as usize].b != REF_MUT
-        && !crate::front::types::is_raw_view(to, pcx)
-        && !crate::front::types::is_raw_view(from, pcx) {
+    if pcx.types[to as usize].kind == TyKind::Slice
+        && !crate::front::types::is_raw_view(from, pcx)
+        && (tb != REF_MUT || cast) {
         let t = new_temp(ty, e, false, pbody, pcx);
         let ix = implicit_reslice(e, ty, pcx);
+        if crate::front::types::is_raw_view(to, pcx) && raw_mut_goal(goal, pcx) {
+            // (a `*mut [T]`: the slicing is `&raw mut`, the borrow
+            // checker's write and its E0596, as `&mut s[..]` made one)
+            pcx.nodes[ix as usize].p |= crate::front::ast::NODE_REF_MUT;
+        }
         set_op(OK_PLACE, l, p, pcx);
         let mut at = ops_add(ops_mark(pbody), 0, pbody, pcx);
         set_op(OK_UNIT, 0, TY_UNIT, pcx);
@@ -571,6 +582,14 @@ pub fn raw_mut_goal(e: i64, pcx: &Ctx<Comp>) -> bool {
 
 // An operand for the value of expression e (moved when `moving`).
 fn operand(e: i64, moving: bool, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
+    operand_to(e, moving, 0, e, pbody, pcx);
+}
+
+// An operand for the value of expression e converted by goal, a cast
+// whose type is goal_ty (goal e: none, e's own value): an exclusive
+// reference place's reborrow of the kind goal_ty asks (exclusive_read).
+fn operand_to(e: i64, moving: bool, goal_ty: i64, goal: i64, pbody: &mut Body<Comp>,
+    pcx: &mut Ctx<Comp>) {
     let k = pcx.nodes[e as usize].kind;
     let ty = pcx.nodes[e as usize].ty;
     if k == NodeKind::Int || k == NodeKind::Char {
@@ -612,20 +631,10 @@ fn operand(e: i64, moving: bool, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
         if place_of(e, pbody, pcx) {
             let l = pcx.pl_l;
             let p = pcx.pl_p;
-            if raw_from_mut(l, p, ty, pbody, pcx) {
-                // RULE: D3.6 (0.27.7: a `&mut T` place where a raw pointer
-                // goes, a `let`'s value, a result, an assigned value, a
-                // field's: reborrowed raw, not copied, I7; `_t = &raw mut
-                // (*Q)`, a write, where `*mut T` is written, else `&raw
-                // const (*Q)`, a read, as rustc's coercion to `*const T`)
-                let t = new_temp(ty, e, false, pbody, pcx);
-                let dp = proj(p, PJ_DEREF, 0, pbody);
-                emit_ref(t, 0, l, dp, if raw_mut_goal(e, pcx) { BK_RAW_MUT } else { BK_RAW }, e,
-                    pbody, pcx);
-                set_op(OK_MOVE, t, 0, pcx);
-                return;
-            }
-            if shared_coercion(l, p, ty, e, pbody, pcx) {
+            // RULE: D3.6 (0.27.7: a `&mut T` place where another pointer
+            // goes, a `let`'s value, a result, an assigned value, a
+            // field's, a cast's operand: reborrowed, never copied, I7)
+            if exclusive_read(l, p, if goal != e { goal_ty } else { ty }, e, goal, pbody, pcx) {
                 return;
             }
             place_operand(l, p, ty, moving, pbody, pcx);
@@ -1102,7 +1111,9 @@ fn expr_into(e: i64, dl: i64, dp: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Com
         return;
     }
     if k == NodeKind::Cast {
-        operand(pcx.nodes[e as usize].a, false, pbody, pcx);
+        // (the operand converted by the cast: a `&mut T` place's raw or
+        // reference reborrow, exclusive_read, as a coercion's)
+        operand_to(pcx.nodes[e as usize].a, false, ty, e, pbody, pcx);
         if !reachable(pbody) {
             return;
         }
@@ -3754,7 +3765,7 @@ fn rust_let_place(pat: i64, init: i64, ir: i64, s: i64, view: bool, pbody: &mut 
         return;
     }
     // (a `&mut [T]`'s: the binding is typed `&[T]`, the mutable view's
-    // shared reborrow `slice (*_k)[..]` (shared_coercion, the one
+    // shared reborrow `slice (*_k)[..]` (exclusive_read, the one
     // coercion of an exclusive reference to a shared one), until `*s` of a
     // slice view, Z9.1; before, the view was copied, I7)
     if !take && exclusive && (hidden || view) {
@@ -3762,7 +3773,7 @@ fn rust_let_place(pat: i64, init: i64, ir: i64, s: i64, view: bool, pbody: &mut 
         pbody.locals[ir as usize].ty = vt;
         let (bl, bp) = if k >= 0 { (k, proj(0, PJ_DEREF, 0, pbody)) }
             else { (pcx.pl_l, pcx.pl_p) };
-        if shared_coercion(bl, bp, vt, init, pbody, pcx) {
+        if exclusive_read(bl, bp, vt, init, init, pbody, pcx) {
             if reachable(pbody) {
                 emit_use(ir, 0, init, pbody, pcx);
             }
