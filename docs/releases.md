@@ -197,14 +197,43 @@ A correctness release, its branches merged as each is reviewed clean.
   C function's) unknown memory: both are refused, in the clause, its
   `old(..)` and whatever it calls, a fn value, a trait method or a
   closure. A `&mut` made from a raw pointer is a write through it,
-  whatever form it takes: `&mut (*sp)[..]`, `slice::from_raw_parts_mut(p,
-  n)`, `&mut *sp` of a `*mut str`, a `&mut self` receiver `(*p).m()`, a
-  `ref mut` binding. A read through a raw pointer is allowed. `query
-  effects F --why raw_write` shows the chain (`raw_src`: where a pointer
-  of unknown provenance is made).
+  whatever form it takes: `&mut (*sp)[..]`, `&mut (*p).0[..]`,
+  `slice::from_raw_parts_mut(p, n)`, `&mut *sp` of a `*mut str`, a
+  `&mut self` receiver `(*p).m()`, a `ref mut` binding. A read through
+  a raw pointer is allowed, and so is C given a `*const` source:
+  `ptr::copy_nonoverlapping(p, &raw mut own, n)` writes only its
+  destination. `query effects F --why raw_write` shows the chain
+  (`raw_src`: where a pointer of unknown provenance is made).
 - **A clause touches no thread-local static** (RT-199) and **`old(e)`
   is effect-checked** (RT-198): `ensures old(say()) == 1` with `say`
   printing was accepted.
+
+#### Soundness holes closed
+
+- **A frame larger than the guard page stepped over it** (RT-83, every
+  release before, every level, both arches). The prologue moved sp by
+  the whole frame at once and touched none of the pages in between, so
+  safe code with a large local, even in a branch not taken, wrote into
+  the memory mapped below its thread's guard page: another thread's
+  live stack (macOS maps a thread's stack just above the one made
+  before it, the first just above the main thread's), and ran on; with
+  arm64's top-byte-ignore a frame of 2^59 bytes moved sp onto the
+  caller's own frame and the program exited 0, its output lost. Now,
+  as rustc's stack clash protection, every lowering of sp by an amount
+  that can reach 4 KiB goes through one function per arch
+  (gen0's `a64_frame_reserve`, `x64_frame_reserve`): a frame with its
+  realignment, at -O0 and -O2, -O0's outgoing argument area and its
+  realigned argument area on x86-64. It moves sp a page at a time, top
+  down, writing each page before the next, so the thread dies on its
+  guard page (SIGBUS on macOS, SIGSEGV on Linux) before anything past
+  it is written; a frame past sp's distance from 0 probes down to 0.
+  Frames under a page are as before. The cases (stack_probe_*) run
+  each form on aarch64 and x86-64 at -O0 and -O2: the large local in a
+  branch not taken, in a callee -O2 inlines, in a closure's body and
+  its environment, in a generic instance, an argument passed by value,
+  a 1 MiB frame, a frame just over the 16 KiB guard page, the smallest
+  stack std gives, the main thread's stack written by a thread, a
+  frame of 2^61 bytes; and which frames get a probe, on every target.
 
 #### Bugs fixed
 
