@@ -96,7 +96,11 @@ def expects_errors(root):
         return True
     if os.sep + "tests" + os.sep not in root:
         return False
-    return "// ERROR" in text[:4096]
+    # (0.30.2) an XFAIL case is a known bug kept as a test: its errors, a
+    # refusal where rustc builds the program included, are what it records
+    # (tests/run.sh: `// XFAIL: RT-N: ...`)
+    head = text[:4096]
+    return "// ERROR" in head or any(l.startswith("// XFAIL") for l in head.splitlines()[:5])
 
 
 def needs_check(event, st, root, start):

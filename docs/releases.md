@@ -96,6 +96,62 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.30.2
 
+A correctness release, its branches merged as each is reviewed clean.
+
+#### Miscompiles fixed
+
+- **A raw slice parameter taken for a `&[T]` (RT-46), at -O1 and -O2,
+  since 0.28.0.** A function's `*const [T]`, `*mut [T]` or `*const
+  str` parameter was given the facts of a shared reference: the
+  optimizer took the memory it points to as unchanged for the call, so
+  `let a = (*p)[1]; poke(q, 50); let b = (*p)[1];` reused the first
+  load after a call that wrote that element through another raw
+  pointer (2002 for rustc's 2050), a write to a static the slice
+  points into was not seen, a vector loop copying within that static
+  ran without its overlap test, and a Vec's length read through a raw
+  slice of Vecs was kept across a push. The class of a parameter
+  (middle/gvn.vl `param_class_of`) tested `b == REF_MUT` for a slice
+  and took every other slice as shared, a raw one with them. Now the
+  reference kind of every type is read in one place
+  (front/types.vl `ref_aliasing`, a match over every type kind): only
+  `&T`, `&[T]` (shared) and `&mut T`, `&mut [T]` (unique) give facts,
+  and a raw pointer, thin or fat, gives none whatever it points to.
+  Every alias fact of the optimizer (a frozen parameter across a call,
+  two parameters apart, a parameter apart from a static, a Vec's header
+  kept, the vectorizer's overlap test, LICM's) reads that class. `&[T]`
+  and `&mut [T]` parameters keep their facts: the compiler's source
+  built at -O2 by 0.30.1 and by 0.30.2 gives the same assembly, byte
+  for byte. `--no-noalias` was the workaround.
+
+- **A scan vectorized as a reduction (RT-61), at -O2, in safe code.** A
+  value carried from one iteration of a loop to the next and also read
+  inside it, `acc = acc ^ b[i]; a[i] = acc`, was kept in vector lanes as
+  a reduction: each lane held its part of the running value, so the
+  store wrote b[i] (or the lanes' partial sums) for the prefix, at every
+  integer width (u8 to i64) and with every operation the vectorizer
+  takes (+ - * & | ^, wrapping or not, min, max); a running maximum
+  stored, the running value compared, stored to another array or
+  summed again (`s1 += b[i]; s2 += s1`, with no store at all) were
+  wrong the same way. The value returned after the loop was right.
+  The vectorizer checked that the phi was read by its update alone, never
+  who read the update. What a reduction is is now decided in one place,
+  `middle::vectorize::reduction::reduction_set`: its running value (the
+  phi and every value computed from it in the loop) is read inside the
+  loop only by its own steps, a minimum's comparison or the overflow
+  check of its step, and after the loop as its last value; any other
+  reader (a store, a comparison, a call, an address, a conversion,
+  another carried value, a branch) makes it a scan, which stays scalar.
+  The run-time unroller, whose rule that was, asks the same function;
+  that rule judged each value at its first visit, in block order, so a
+  step `acc = acc + u` whose u was made from acc in an earlier block
+  visited later was split into partial sums (RT-89, in 0.30.1 at -O2;
+  `--no-unroll-runtime` was the workaround). The set is now grown whole
+  before any of it is judged.
+  Floats were never vectorized as reductions; the outer-loop vectorizer
+  and SLP compute each lane exactly and were right. Seen on 0.28.0 (the
+  first release that builds the case) to 0.30.1; `--no-vectorize` was
+  the workaround.
+
 #### Bugs fixed
 
 - **Integer literals are typed as rustc types them** (F18.5). An
