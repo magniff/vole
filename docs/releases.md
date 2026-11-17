@@ -217,7 +217,11 @@ A correctness release, its branches merged as each is reviewed clean.
   `T::Out` names the one trait of T's bounds that declares Out (E0220
   for none, E0221 for two; v0.30.1 took any impl of the type). An impl
   for one type (`impl Tr for W where Bx<i64>: Conv`) has its `where`
-  clause required too.
+  clause required too, and checked at the impl (E0277). `T::Out` under a
+  bound whose supertrait declares Out, and `Self::Output` written in a
+  trait whose supertrait declares it (std's IndexMut beside a Mul impl),
+  are that trait's (RT-426: "ambiguous" before). A `where` subject may be
+  a qualified path, `<Bx<T> as H>::Item: Copy`.
 - **std's HashMap, HashSet and their entries no longer bound `S` on the
   type** (Rust's have no bound there; the impls that hash keep `S:
   BuildHasher`): their impls without it were never checked.

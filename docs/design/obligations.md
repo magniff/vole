@@ -477,6 +477,15 @@ Where the code differs from §3:
   (`concrete_impl_preds_hold`, R1). The impl search's limit counts the
   asked obligation as rustc does (`MAX_IMPL_DEPTH`, 127 proved, 128
   E0275; C2), and a projection's limit is `trait.overflow` (R3).
+  An impl with no type parameters has each `where` predicate checked
+  at the impl too (`check_concrete_where`, RT-393: E0277 at the clause,
+  `trait.overflow` for two that need each other). A header's auto-trait
+  bound of the template's own parameter is answered by its bounds
+  (`header_sure`, RT-401). A projection's trait is the one its bound or
+  its text names, then that trait's supertraits: `T::Out` under `T: Sub`
+  of `trait Sub: Tr` is Tr's, and `Self::Output` written in `trait Get:
+  Index<usize>` is Index's (`enclosing_trait`, `super_projection`,
+  RT-426), never another trait's of the type by the name.
   Earlier text of this item:
   `convert::bound_ref` reads one written without arguments with the
   trait's defaults, and `bound_holds` is the one test of a trait bound
