@@ -150,6 +150,16 @@ A correctness release, its branches merged as each is reviewed clean.
   `&[T]`) is the view, as rustc's, so `Show::show(&**self)` in an impl
   for `&T` calls T's. rustc's errors for the rest: E0277 (`&S: T0`
   unmet), E0308 (the argument not of the parameter's shape).
+- **A path took another trait's item by its name (RT-C301-8), in safe
+  code.** `Self::K` in a trait's default constant read another trait's
+  or the inherent `K` (0.30.1 printed 200 for rustc's 10), `Self::K` in
+  a default copied into `impl<T: Base> A for T` read Base's, and
+  `<i64 as MyFrom<i32>>::from(x)` or `T::from(x)` under `T: MyFrom<u8>`
+  called std's `From` (an integer widening) instead of the program's
+  trait. The trait a path names is decided once, by `path_trait`, and
+  every later step (the item, the impl, the dispatch of a generic
+  trait's call) takes that trait and its arguments; none picks again
+  by the name.
 - **Refused where rustc accepts, fixed with it (RT-C301-9, RT-87):**
   `<T as B>::m` as a value in a generic function, `<S as Conv<i64>>::c`
   of a generic trait with two impls for S, `T::mk()` under `T: Tr<i64>`
@@ -170,6 +180,26 @@ A correctness release, its branches merged as each is reviewed clean.
   written, with no autoref (rustc's); `<S as B>::m` where B declares no
   `m` is `trait.no_item` (E0576), and one where S has no impl of B is
   `trait.unmet` (E0277).
+- A supertrait cycle (`trait A: B`, `trait B: A`): error `trait.cycle`
+  (rustc E0391) at the trait's declaration, whether or not a path walks
+  it. A path through supertraits has no depth limit any more (0.30.2's
+  first cut refused a chain deeper than 8).
+- `<i64 as MyFrom<i32>>::from(x)` with no `impl MyFrom<i32>`, and
+  `i64::from(x)` where a program's trait gives i64 a `from` beside
+  std's `From`: `trait.unmet` (E0277) and `method.ambiguous` (E0034);
+  a path whose trait is decided calls that trait's function (std's
+  `From` by its intrinsic impls only when the path says `From`), never
+  the first `from` by its name.
+
+How a path picks its trait, in one place
+(`front::check::calls::qualified::path_trait`): `Self::` in a trait's
+default, function or constant, is that trait's (before the bounds of
+an `impl<T: Base> A for T`); a supertrait carries its arguments
+(`trait Sub: Conv<i64>` gives `T: Sub` the items of `Conv<i64>`); `_`
+in a qualified path's trait arguments (`<S as Conv<_>>::mk(x)`,
+`<u8 as TryFrom<_>>::try_from(v)`) is filled from the impls; and a
+`try:` line of `method.ambiguous` is a path that can be pasted, with
+the trait's arguments (`<T as Conv<i32>>::K`).
 
 - **A scan vectorized as a reduction (RT-61), at -O2, in safe code.** A
   value carried from one iteration of a loop to the next and also read
