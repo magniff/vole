@@ -190,7 +190,8 @@ A correctness release, its branches merged as each is reviewed clean.
 
 - **A callable meeting an Fn bound kept no borrow of its argument
   (RT-282, RT-297, RT-297b, RT-297c, RT-299, RT-304, RT-308, RT-309,
-  RT-310, RT-311), every -O, in v0.30.1 and before.** A fn item whose result
+  RT-310, RT-311, RT-364, RT-367, RT-368), every -O, in v0.30.1 and
+  before.** A fn item whose result
   borrows its argument, `fn idr2<'a>(x: &'a i64) -> &'a i64`, given to
   `v.first().map(idr2)`, `and_then`, `sort_by_key`, Iterator's `scan`,
   `find_map`, `map_while`, `fold`, a program's `F: Fn(T) -> U` or `f:
@@ -210,7 +211,19 @@ A correctness release, its branches merged as each is reviewed clean.
   i64` keeps no borrow, as rustc reads it), and a value whose result may
   borrow what the bound's elided input lends for the call alone is
   refused where it is given, `borrowck.fn_value_bound` (rustc E0308;
-  `v.iter().scan(0, bad)` with a `bad` that returns its state). One rule
+  `v.iter().scan(0, bad)` with a `bad` that returns its state;
+  `dedup_by_key`, `max_by_key` and `min_by_key` with a key that borrows
+  its argument, RT-368). The callee's body is then checked by the bound,
+  not by the erased type: `entry(5).or_insert_with_key(kk)` with a `kk`
+  returning its key, and `arena_scope(&gpa, mk)` with an `mk` returning
+  a Vec on the scope, are refused at the call instead of inside std
+  (RT-378), and the same calls given a fn item that keeps no borrow
+  build (v0.30.1 refused them inside std). A function that takes such a
+  callable cannot itself be used as a value (a call through the value
+  would reach its body unchecked). The `'static` a bound needs only
+  through an associated-type equality, a `where` clause, an impl's
+  `where 'a: 'static` or a two-level blanket impl is read from the
+  signature too (RT-364). One rule
   for closures, fn items, fn pointers, method paths, generic fns with
   their arguments and opaque `impl Fn` values (borrowck.md R6). With it,
   a fn item or a `fn` value given to Iterator's adapters (`map`,

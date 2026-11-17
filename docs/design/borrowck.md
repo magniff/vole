@@ -1959,7 +1959,8 @@ outside the holes named below.
   the result outlive the argument (case `rust_b_err_fn_item_bound_result`).
   Stricter than rustc for a fn item whose result is `'static` (the erased
   type says every argument region outlives every result region).
-  *(0.30.2, RT-282, RT-297..301, RT-304, RT-308..311) One rule where a
+  *(0.30.2, RT-282, RT-297..301, RT-304, RT-308..311, RT-364, RT-367,
+  RT-368, RT-378) One rule where a
   callable meets an Fn bound or a `fn` type.* A call through such a
   callable in a signature's body relates the regions of its parts as
   `indirect_call` reads the erased type (every argument region outlives
@@ -1983,7 +1984,16 @@ outside the holes named below.
   (`fn_values::check_callables`, from `build.vl lower_call`): a fn item
   whose signature relates them, a `fn` value, or a parameter forwarded
   from a body that has no such record is `borrowck.fn_value_bound`
-  (rustc E0308). A struct or an enum whose field is a `fn` type
+  (rustc E0308). Since every caller is checked by them, the callee's
+  body is checked by the bound, not by the erased type: a call through
+  the parameter itself (or the temporary a call by value moves it into;
+  a parameter the body never assigns or borrows mutably) makes no edge
+  a strict record names (`constraints::indirect_call`, `strict_pair`),
+  so std's `or_insert_with_key` and `arena_scope` given a fn item that
+  keeps no borrow build, and one that does is refused at the call, not
+  inside std (RT-378). A function with strict records used as a value
+  is `borrowck.fn_value_bound` too: a call through the value would reach
+  its body unchecked. A struct or an enum whose field is a `fn` type
   (`struct H<A, B> { f: fn(A) -> B }`) has the same relations as its
   declaration's requirements (`regions::fn_field_reqs`, through
   `adt_reqs`), its parameters' regions standing for every slot of what
@@ -1996,8 +2006,8 @@ outside the holes named below.
   from the signature too (`check_fn_value`, RT-308). Stricter than
   rustc: a `fn` value (not an item) relates every argument to its
   result, as before; HRTB bounds (`for<'a>`) are not parsed (RT-207).
-  *Cases:* the tags, `rust_b_fn_value_r6_ok`, `rust_b_err_fn_value_r6_drop`,
-  `rust_b_err_fn_value_r6_given`.
+  *Cases:* the tags, `rust_b_fn_value_r6_ok`, `rust_b_fn_value_r6_std_ok`,
+  `rust_b_err_fn_value_r6_drop`, `rust_b_err_fn_value_r6_given`.
 - R7 Constant index projections `P[k]` vs `P[k']` with `k ≠ k'` were
   disjoint (D1.5), so `&mut a[0]` and `&mut a[1]` could coexist on an
   array and through a `&mut [T]`, and so could `a[i]` and `a[j]` by
