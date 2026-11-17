@@ -1738,16 +1738,10 @@ fn proj_walk(n: i64, t: i64, tps: i64, self_node: i64, up: i64, out: &mut Vec<i6
         // (0.30.1: `Self::A` in the impl the function is in is its own
         // definition, first, read in this signature's terms; so also for a
         // template, which has no self type: places::impl_regions)
-        for i in 0..pcx.traits_impls.len() as i64 {
-            let inode = pcx.traits_impls[i as usize].node;
-            if pcx.nodes[inode as usize].b == self_node {
-                let c = assoc_named(pcx.nodes[inode as usize].c, pcx.nodes[n as usize].a, pcx);
-                if c != 0 {
-                    bind_walk(pcx.nodes[c as usize].b, t, tps, self_node, up, out, depth + 1, pcx,
-                        f);
-                    return true;
-                }
-            }
+        let c = own_assoc(pcx.nodes[n as usize].a, self_node, pcx);
+        if c != 0 {
+            bind_walk(pcx.nodes[c as usize].b, t, tps, self_node, up, out, depth + 1, pcx, f);
+            return true;
         }
         s = pcx.fns[f as usize].self_ty;
         bind_walk(self_node, s, tps, 0, -1, &mut base, depth + 1, pcx, f);
@@ -1840,6 +1834,25 @@ fn may_apply(i: i64, s: i64, pcx: &mut Ctx<Comp>) -> bool {
         return true;
     }
     crate::front::traits::impl_applies(i, s, pcx) >= 0
+}
+
+// The definition (its AssocType node) of associated type `name` in the
+// impl whose header is self_node, the impl a function is in: `Self::A`
+// there is it, read in the function's terms; 0: none.
+fn own_assoc(name: i64, self_node: i64, pcx: &Ctx<Comp>) -> i64 {
+    if self_node <= 0 {
+        return 0;
+    }
+    for i in 0..pcx.traits_impls.len() as i64 {
+        let inode = pcx.traits_impls[i as usize].node;
+        if pcx.nodes[inode as usize].b == self_node {
+            let c = assoc_named(pcx.nodes[inode as usize].c, name, pcx);
+            if c != 0 {
+                return c;
+            }
+        }
+    }
+    0
 }
 
 // RULE: D4.4 The slots of type node vn (type t) of impl i for type s (an
@@ -2618,86 +2631,163 @@ fn subst_wf(k: i64, s: i64, tps: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) 
     }
 }
 
-// RULE: D4.6 (d) In instance f, a bound's associated-type constraint `P:
-// Tr<A = X>` (generics tps) says P::A is X: each slot of P::A, normalized
-// (proj_map, in P's slots), and the same slot of X are one region, both
-// ways (rustc's `Extend<T>::extend<I: IntoIterator<Item = T>>` pushes an
-// I::Item where a T is required).
+// RULE: D4.6 (d), F10.1 In instance f, the predicates of its signature
+// relate the regions of their types (generics tps): each type
+// parameter's bounds (written inline or in a `where`), and (0.30.2,
+// RT-211) every other `where` predicate, one on `Self`, a projection or
+// any other type (`Self: Iterator<Item = (X, Y)>` of unzip_in), each
+// subject's slots read as the signature's walk reads them. A predicate
+// no tie is made of let a call keep no borrow its result holds: unzip_in's
+// `FromX: Extend<X>` tied the result to X, and nothing tied X to the
+// items, whose `Self: Iterator<Item = (X, Y)>` is such a predicate.
 fn bound_ties(f: i64, tps: i64, self_node: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
-    if tps <= 0 || pcx.fns[f as usize].tmpl < 0 {
+    if pcx.fns[f as usize].tmpl < 0 {
         return;
     }
-    for k in 0..pcx.nodes[tps as usize].count {
+    for k in 0..(if tps > 0 { pcx.nodes[tps as usize].count } else { 0 }) {
         if k >= pcx.fns[f as usize].targ_count {
             break;
         }
         subst_wf(k, tlist_at(pcx.fns[f as usize].targs + k, pcx), tps, sig, pcx);
         let bounds = pcx.nodes[child(tps, k, pcx) as usize].h;
-        if bounds <= 0 {
+        let s = tlist_at(pcx.fns[f as usize].targs + k, pcx);
+        if bounds <= 0 || s <= 0 {
             continue;
         }
-        let s = tlist_at(pcx.fns[f as usize].targs + k, pcx);
+        let mut base = Vec::<i64, Comp>::new_in(Comp {});
+        for j in 0..slot_count(s, pcx) {
+            push_entry(B_PARAM, k, j, -1, &mut base);
+        }
+        subject_ties(s, &base, false, bounds, tps, self_node, f, sig, pcx);
+    }
+    where_ties(f, tps, self_node, sig, pcx);
+}
+
+// RULE: F10.1, D4.6 (d) (0.30.2, RT-211) The `where` predicates of
+// instance f's item on a subject that is no type parameter of tps
+// (front/traits.vl WherePred: `Self: Iterator<Item = (X, Y)>`, `I::Item:
+// Tr<..>`), as a parameter's bounds are: the subject's type in the
+// instance (resolved with f's type arguments and its Self, as the front's
+// where_preds_hold checks it at the call), its slots the walk of the
+// subject's node against it (a `Self` of a trait's default method: the
+// U_SUBST of `Self`, the `self` parameter's).
+fn where_ties(f: i64, tps: i64, self_node: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    let item = fn_node(crate::places::front::fn_template(f, pcx), pcx);
+    if item <= 0 {
+        return;
+    }
+    let mut next = crate::front::traits::wp_start(item, pcx);
+    while next >= 0 {
+        let k = next;
+        next = crate::front::traits::wp_after(k, pcx);
+        let subject = pcx.where_preds[k as usize].subject;
+        let bounds = pcx.where_preds[k as usize].bounds;
+        let s = instance_type(subject, f, tps, pcx);
         if s <= 0 {
             continue;
         }
-        for bi in 0..pcx.nodes[bounds as usize].count {
-            let b = child(bounds, bi, pcx);
-            if !is_node(b, NodeKind::TyName, pcx) {
+        let mut base = Vec::<i64, Comp>::new_in(Comp {});
+        bind_walk(subject, s, tps, self_node, -1, &mut base, 0, pcx, f);
+        if base.len() as i64 != 4 * slot_count(s, pcx) {
+            continue;
+        }
+        let self_subject = is_node(subject, NodeKind::TyName, pcx)
+            && pcx.nodes[subject as usize].list == 0 && pcx.nodes[subject as usize].g == 0
+            && sym_text(pcx.nodes[subject as usize].a, pcx) == b"Self";
+        subject_ties(s, &base, self_subject, bounds, tps, self_node, f, sig, pcx);
+    }
+}
+
+// (0.30.2, RT-211) Type node n of instance f's signature resolved with
+// f's type arguments bound to tps and its Self, quietly: its type, 0 when
+// it does not resolve (the errors it raised forgotten).
+fn instance_type(n: i64, f: i64, tps: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let count = if tps > 0 && pcx.nodes[tps as usize].count < pcx.fns[f as usize].targ_count {
+        pcx.nodes[tps as usize].count
+    } else if tps > 0 { pcx.fns[f as usize].targ_count } else { 0 };
+    let saved = crate::front::generics::env_enter(tps, pcx.fns[f as usize].targs, count, pcx);
+    let saved_self = pcx.self_type;
+    let saved_mod = pcx.cur_mod;
+    if pcx.fns[f as usize].self_ty > 0 {
+        pcx.self_type = pcx.fns[f as usize].self_ty;
+    }
+    pcx.cur_mod = crate::front::modules::module_of(n, pcx);
+    let mark = crate::base::diag::errors_mark(pcx);
+    let t = crate::front::check::resolve::resolve_type(n, pcx);
+    let failed = crate::base::diag::errors_mark(pcx) > mark;
+    crate::base::diag::errors_forget(mark, pcx);
+    pcx.cur_mod = saved_mod;
+    pcx.self_type = saved_self;
+    crate::front::generics::env_leave(saved, pcx);
+    if failed || t <= 0 || crate::front::check::has_error_type(t, pcx) { 0 } else { t }
+}
+
+// RULE: D4.6 (d), L14 The bounds node `bounds` of a subject whose type in
+// instance f is s, its slots base's entries: for each bound on a trait,
+// the impl chosen for s and its own equality bounds (impl_bound_ties),
+// each trait argument's slots and the chosen impl's (trait_arg_ties), and
+// each associated-type constraint `Tr<A = X>`: s::A is X, each slot of
+// s::A, normalized (proj_map, in s's slots), and the same slot of X one
+// region, both ways (rustc's `Extend<T>::extend<I: IntoIterator<Item =
+// T>>` pushes an I::Item where a T is required).
+fn subject_ties(s: i64, base: &Vec<i64, Comp>, self_subject: bool, bounds: i64, tps: i64,
+    self_node: i64, f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    for bi in 0..pcx.nodes[bounds as usize].count {
+        let b = child(bounds, bi, pcx);
+        if !is_node(b, NodeKind::TyName, pcx) {
+            continue;
+        }
+        let holder = pcx.nodes[b as usize].h;
+        let args = pcx.nodes[b as usize].g;
+        let tr = crate::front::traits::bound_trait(b, pcx);
+        if tr < 0 {
+            continue;
+        }
+        // RULE: L14 (the impl chosen for s, its own equality bounds)
+        impl_bound_ties(s, base, tr, tps, 0, 0, sig, pcx);
+        if args > 0 {
+            trait_arg_ties(s, base, tr, args, tps, self_node, f, sig, pcx);
+        }
+        if holder <= 0 {
+            continue;
+        }
+        for ci in 0..pcx.nodes[holder as usize].count {
+            let c = child(holder, ci, pcx);
+            if !is_node(c, NodeKind::AssocType, pcx) || pcx.nodes[c as usize].b <= 0 {
                 continue;
             }
-            let holder = pcx.nodes[b as usize].h;
-            let args = pcx.nodes[b as usize].g;
-            let tr = crate::front::traits::bound_trait(b, pcx);
-            if tr < 0 {
+            let name = pcx.nodes[c as usize].a;
+            let gt = crate::front::assoc::super_projection(tr, s, name, pcx.nodes[c as usize].start,
+                pcx);
+            let i = direct_impl(pcx.found_impl, s, name, pcx);
+            if gt <= 0 {
                 continue;
             }
-            // RULE: L14 (the impl chosen for s, its own equality bounds)
-            let mut sbase = Vec::<i64, Comp>::new_in(Comp {});
-            for j in 0..slot_count(s, pcx) {
-                push_entry(B_PARAM, k, j, -1, &mut sbase);
+            let mut want = Vec::<i64, Comp>::new_in(Comp {});
+            bind_walk(pcx.nodes[c as usize].b, gt, tps, self_node, -1, &mut want, 0, pcx, f);
+            let mut proj = Vec::<i64, Comp>::new_in(Comp {});
+            // (`Self: Tr<A = X>` in the impl the function is in: `Self::A`
+            // is its own definition, read in the function's terms, as
+            // proj_walk reads `Self::A`; unzip_in's `Self: Iterator<Item =
+            // (X, Y)>` copied into Map's impl, whose `type Item = B`)
+            let own = if self_subject { own_assoc(name, self_node, pcx) } else { 0 };
+            let ac = if own == 0 && i >= 0 {
+                assoc_named(pcx.nodes[pcx.traits_impls[i as usize].node as usize].c, name, pcx)
+            } else { 0 };
+            if own != 0 {
+                bind_walk(pcx.nodes[own as usize].b, gt, tps, self_node, -1, &mut proj, 0, pcx, f);
+            } else if ac != 0 {
+                proj_map(i, pcx.nodes[ac as usize].b, gt, s, base, -1, &mut proj, 0, pcx);
             }
-            impl_bound_ties(s, &sbase, tr, tps, 0, 0, sig, pcx);
-            if holder <= 0 && args <= 0 {
+            if own == 0 && ac == 0 || proj.len() != want.len() {
+                // (a limit is never a yes: s::A not read here, every region
+                // of s and of X one)
+                tie_entries(base, &want, tps, sig, pcx);
                 continue;
             }
-            if args > 0 {
-                trait_arg_ties(k, s, tr, args, tps, self_node, f, sig, pcx);
-            }
-            if holder <= 0 {
-                continue;
-            }
-            for ci in 0..pcx.nodes[holder as usize].count {
-                let c = child(holder, ci, pcx);
-                if !is_node(c, NodeKind::AssocType, pcx) || pcx.nodes[c as usize].b <= 0 {
-                    continue;
-                }
-                let name = pcx.nodes[c as usize].a;
-                let gt = crate::front::assoc::super_projection(tr, s, name,
-                    pcx.nodes[c as usize].start, pcx);
-                let i = direct_impl(pcx.found_impl, s, name, pcx);
-                if gt <= 0 || i < 0 {
-                    continue;
-                }
-                let ac = assoc_named(pcx.nodes[pcx.traits_impls[i as usize].node as usize].c, name,
-                    pcx);
-                if ac == 0 {
-                    continue;
-                }
-                let mut base = Vec::<i64, Comp>::new_in(Comp {});
-                for j in 0..slot_count(s, pcx) {
-                    push_entry(B_PARAM, k, j, -1, &mut base);
-                }
-                let mut proj = Vec::<i64, Comp>::new_in(Comp {});
-                proj_map(i, pcx.nodes[ac as usize].b, gt, s, &base, -1, &mut proj, 0, pcx);
-                let mut want = Vec::<i64, Comp>::new_in(Comp {});
-                bind_walk(pcx.nodes[c as usize].b, gt, tps, self_node, -1, &mut want, 0, pcx, f);
-                if proj.len() != want.len() {
-                    continue;
-                }
-                for e in 0..proj.len() as i64 / 4 {
-                    tie_universals(walk_universal(&proj, e, tps, sig, pcx),
-                        walk_universal(&want, e, tps, sig, pcx), sig);
-                }
+            for e in 0..proj.len() as i64 / 4 {
+                tie_universals(walk_universal(&proj, e, tps, sig, pcx),
+                    walk_universal(&want, e, tps, sig, pcx), sig);
             }
         }
     }
@@ -3261,53 +3351,143 @@ fn header_param_type(n: i64, t: i64, itps: i64, q: i64, depth: i64, pcx: &Ctx<Co
 }
 
 // RULE: D4.6 (d) A bound's trait arguments, `B: FromIteratorIn<Self::Item, A>`
-// of parameter k (substitution s): the one impl of trait tr for s
-// (`impl<T, A> FromIteratorIn<T, A> for Vec<T, A>`) says each argument is
-// its own trait argument, read in s's slots; each slot of the two is one
-// region, both ways.
-fn trait_arg_ties(k: i64, s: i64, tr: i64, args: i64, tps: i64, self_node: i64, f: i64,
-    sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
-    let mut found: i64 = -1;
-    for i in 0..pcx.traits_impls.len() as i64 {
-        if pcx.traits_impls[i as usize].tr == tr && impl_for(i, s, pcx) {
-            if found >= 0 {
-                return;
-            }
-            found = i;
-        }
-    }
+// of a subject whose type is s (its slots base's entries): the impl of
+// trait tr for s that proves the bound (`impl<T, A> FromIteratorIn<T, A>
+// for Vec<T, A>`) says each argument is its own trait argument, read in
+// s's slots; each slot of the two is one region, both ways. (0.30.2,
+// RT-211) The impl is the one for the whole reference, its arguments
+// too: Vec has `Extend<T>` and `Extend<&'a T>`, and before, two impls of
+// tr for s's type made no tie at all, so partition_in's `B: Extend<
+// Self::Item>` left its result free of the items' borrow.
+fn trait_arg_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, args: i64, tps: i64, self_node: i64,
+    f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    let (found, ta) = bound_impl(s, tr, args, f, tps, pcx);
     if found < 0 {
+        // (a limit is never a yes: no one impl chosen here for a bound
+        // the front found met, every region of s and of each argument is
+        // one, more than any impl relates, never less)
+        tie_all(base, args, f, tps, self_node, sig, pcx);
         return;
     }
     let iargs = pcx.nodes[pcx.nodes[pcx.traits_impls[found as usize].node as usize].a as usize].g;
-    if iargs <= 0 || pcx.nodes[iargs as usize].count != pcx.nodes[args as usize].count {
+    if iargs <= 0 || pcx.nodes[iargs as usize].count != pcx.nodes[args as usize].count || ta < 0 {
+        tie_all(base, args, f, tps, self_node, sig, pcx);
         return;
-    }
-    let ta = crate::front::traits::impl_targs_for(found, s, pcx);
-    if ta < 0 {
-        return;
-    }
-    let mut base = Vec::<i64, Comp>::new_in(Comp {});
-    for j in 0..slot_count(s, pcx) {
-        push_entry(B_PARAM, k, j, -1, &mut base);
     }
     for a in 0..pcx.nodes[args as usize].count {
         let t = tlist_at(ta + a, pcx);
         if t <= 0 {
-            continue;
+            tie_all(base, args, f, tps, self_node, sig, pcx);
+            return;
         }
         let mut have = Vec::<i64, Comp>::new_in(Comp {});
-        proj_map(found, child(iargs, a, pcx), t, s, &base, -1, &mut have, 0, pcx);
+        proj_map(found, child(iargs, a, pcx), t, s, base, -1, &mut have, 0, pcx);
         let mut want = Vec::<i64, Comp>::new_in(Comp {});
         bind_walk(child(args, a, pcx), t, tps, self_node, -1, &mut want, 0, pcx, f);
         if have.len() != want.len() {
-            continue;
+            tie_all(base, args, f, tps, self_node, sig, pcx);
+            return;
         }
         for e in 0..have.len() as i64 / 4 {
             tie_universals(walk_universal(&have, e, tps, sig, pcx),
                 walk_universal(&want, e, tps, sig, pcx), sig);
         }
     }
+}
+
+// (0.30.2, RT-211) The bound `s: Tr<args>` of instance f whose impl is
+// not chosen here (bound_impl): each region of s (base's entries) and of
+// each argument, resolved in f, one region, both ways.
+fn tie_all(base: &Vec<i64, Comp>, args: i64, f: i64, tps: i64, self_node: i64,
+    sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    let mut w = Vec::<i64, Comp>::new_in(Comp {});
+    for a in 0..pcx.nodes[args as usize].count {
+        let t = instance_type(child(args, a, pcx), f, tps, pcx);
+        if t > 0 {
+            bind_walk(child(args, a, pcx), t, tps, self_node, -1, &mut w, 0, pcx, f);
+        }
+    }
+    tie_entries(base, &w, tps, sig, pcx);
+}
+
+// Every universal walk entries a and b name, one region, both ways (an
+// elided or unresolved entry names none).
+fn tie_entries(a: &Vec<i64, Comp>, b: &Vec<i64, Comp>, tps: i64, sig: &mut Sig<Comp>,
+    pcx: &Ctx<Comp>) {
+    let mut first: i64 = -1;
+    for w in [a, b] {
+        for e in 0..w.len() as i64 / 4 {
+            let u = walk_universal(w, e, tps, sig, pcx);
+            if u >= 0 && first < 0 {
+                first = u;
+            } else if u >= 0 && u != first {
+                tie_universals(first, u, sig);
+            }
+        }
+    }
+}
+
+// RULE: L14 (0.30.2, RT-211) The impl of trait tr for type s that proves
+// bound node b's reference `s: tr<args>` in instance f, and that impl's
+// trait arguments for s (a TLISTS index): of the impls that may be the
+// one (impl_class, may_apply: a direct impl, a pattern impl `impl<'a, T>
+// Tr<..> for &'a T`, a blanket one), the one whose trait arguments are
+// args resolved in f (instance_type), as the front's implements_with
+// chose it; (-1, -1) when none is, or more than one.
+fn bound_impl(s: i64, tr: i64, args: i64, f: i64, tps: i64, pcx: &mut Ctx<Comp>) -> (i64, i64) {
+    let n = pcx.nodes[args as usize].count;
+    let mut want = Vec::<i64, Comp>::new_in(Comp {});
+    for a in 0..n {
+        let t = instance_type(child(args, a, pcx), f, tps, pcx);
+        if t <= 0 {
+            return (-1, -1);
+        }
+        want.push(t);
+    }
+    let mut chosen: i64 = -1;
+    for i in 0..pcx.traits_impls.len() as i64 {
+        if pcx.traits_impls[i as usize].tr != tr {
+            continue;
+        }
+        let c = impl_class(i, s, pcx);
+        if c == 0 || c != 1 && !may_apply(i, s, pcx) {
+            continue;
+        }
+        let ta = impl_args(i, s, &want, pcx);
+        let mut same = ta >= 0;
+        for k in 0..(if same { n } else { 0 }) {
+            if tlist_at(ta + k, pcx) != want[k as usize] {
+                same = false;
+            }
+        }
+        if !same {
+            continue;
+        }
+        if chosen >= 0 {
+            return (-1, -1);
+        }
+        chosen = i;
+    }
+    if chosen < 0 {
+        return (-1, -1);
+    }
+    // (read again for the one chosen: the TLISTS words of a reading are
+    // not kept past the next resolution, which may take them back)
+    (chosen, impl_args(chosen, s, &want, pcx))
+}
+
+// The trait arguments of impl i for type s (a TLISTS index, -1: unknown):
+// its own, or a pattern impl's completed by those a bound asks for, want.
+fn impl_args(i: i64, s: i64, want: &Vec<i64, Comp>, pcx: &mut Ctx<Comp>) -> i64 {
+    let ta = crate::front::traits::impl_targs_for(i, s, pcx);
+    if ta >= 0 {
+        return ta;
+    }
+    let w = pcx.tlists.len() as i64;
+    for &t in want.as_slice() {
+        pcx.tlists.push(t);
+    }
+    crate::front::traits::impl_targs_by(i, s, w, pcx)
 }
 
 // The universal walk entry e of w binds, when it names one (an elided or
