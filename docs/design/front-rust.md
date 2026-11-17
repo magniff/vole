@@ -2427,21 +2427,27 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   and given the `i32` fallback at its end, F18.3's context rule before.
   A method called on such a value (directly, through shared references,
   `Tr::m(x)`, with a turbofish) whose trait several integer types
-  implement with Self alone varying is called with Self the variable,
-  its callee the impl of the type taken (E0277 when that type has none;
-  two traits' methods of the name are E0034); `T::from(x)` and
+  implement is called with Self the variable, its callee the impl of the
+  type taken (E0277 when that type has none; two traits' methods of the
+  name, a blanket impl's among them, are E0034): with Self alone varying
+  between the impls, i32's signature with Self the variable; else (a
+  `&mut self` one, a generic one naming `Self` in another parameter or
+  its result) the trait's declaration with Self the variable, as rustc's
+  probe (`make_virtual`); a pattern impl's (`impl<T: Display> ToString
+  for T`) is its instance with T the variable. `T::from(x)` and
   `x.into()` are the cast, their From impl checked with the type taken;
-  a format hole, of a direct call or of a `format_args` value, leaves the
-  variable as it is. One use still takes the fallback where it is, where
-  rustc keeps the variable: a method that several integer types have
-  whose signature differs between them otherwise (a generic one whose
-  other parameters name `Self`, a `&mut self` one): vole takes `i32`'s,
-  the variable `i32` from there (one integer type alone having it: that
-  type; an integer type's own method is E0689, as rustc's). An `i32`
-  taken there and passed where an `i64` goes is widened (F29.3's
-  widening, vole's), and `type.widen_i32` refuses it when it was
-  computed, so neither gives another value: each is a refusal where
-  rustc accepts. A `{:c}` hole (vole's: a byte as a character) is a use
+  `x.into()` with nothing at the call saying what it converts to is the
+  cast to a fresh variable, both types left to the end (E0282 when
+  nothing gives the target; a target that is no number, `impl From<i64>
+  for M`, is refused there: vole makes that call only with its type at
+  the call). A format hole, of a direct call or of a `format_args`
+  value, leaves the variable as it is. No use chooses a type before the
+  function's end: one integer type alone having a method is that type
+  (the only one without an error, as rustc's selection of one
+  candidate); an integer type's own method is E0689, as rustc's; a
+  generic trait's method whose impls' signatures differ beyond Self is
+  refused (`type.infer`, where rustc infers the trait's arguments too),
+  never i32's. A `{:c}` hole (vole's: a byte as a character) is a use
   that types the variable `u8`, as a `u8` parameter does. Outside a
   function's body (a const's or static's value, an array length) an
   unsuffixed literal is `i32` at once. No float-literal variables (an

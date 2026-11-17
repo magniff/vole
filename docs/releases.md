@@ -241,14 +241,17 @@ A correctness release, its branches merged as each is reviewed clean.
   E0600), and one variable met by two integer types that do not widen to
   one another (E0308): each was typed `i32` before, and passed or failed
   elsewhere.
-- Still the fallback where it is (FL6): a method several integer types
-  have whose signature differs between them but for Self (a generic one
-  whose other parameters name `Self`, a `&mut self` one); an `i32`
-  computed there is refused where it is widened (`type.widen_i32`),
-  never widened to another value.
+- A trait's method whose impls' signatures differ between the integer
+  types (a `&mut self` one, a generic one naming `Self` in another
+  parameter or its result) is the trait's declaration with Self the
+  variable, its impl the type's it takes at the end, as rustc's
+  (0.30.1 called i32's and computed in i32); `x.into()` with nothing at
+  the call saying what it converts to leaves both types to the end, its
+  From checked there (0.30.1 refused it). A generic trait's method whose
+  impls differ beyond Self is refused (`type.infer`), never i32's.
 - A method of two traits that integer types implement, called on such a
-  value (`a.m()` with `impl A for i32` and `impl B for i64`), is rustc's
-  E0034 (0.30.1 called i32's).
+  value (`a.m()` with `impl A for i32` and `impl B for i64`, or a
+  blanket `impl<T> B for T`), is rustc's E0034 (0.30.1 called one).
 
 ### What's new in 0.30.1
 

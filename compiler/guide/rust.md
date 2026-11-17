@@ -123,11 +123,9 @@ fn main() {
   closure, an `Option`, a generic call, a branch, an array, a trait
   method such as `m.max(3)`), and `i32` if none does. `let a =
   2000000000; let s = Some(a).map(|x| x + x).unwrap(); take(s)` with
-  `take(x: i64)` adds in i64. One exception takes `i32` where it is: a
-  method whose signature differs between the integer types but for
-  Self (a generic one naming `Self` in another parameter). An i32
-  computed from literals there is not widened (`type.widen_i32`): write
-  the type (`let m: i64 = 3`).
+  `take(x: i64)` adds in i64. An i32 computed from literals is not
+  widened to i64 (`type.widen_i32`): write the type (`let m: i64 =
+  3`).
 - **Overflow** panics at `-O0` (`attempt to add with overflow`) and
   wraps at `-O2`, as Rust's debug and release builds do; `wrapping_add`
   and its family always wrap.
