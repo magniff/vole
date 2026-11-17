@@ -163,6 +163,11 @@ fn main() {
   difference: `u.m.k = v` through a ManuallyDrop field's `DerefMut`,
   which rustc refuses, is allowed in `unsafe`, and drops the old `k` as
   rustc's `(*u.m).k = v` does.
+- A borrowed literal is not promoted to a static: `&7` lives in the
+  function that makes it, so `let r: &'static u64 = &7;` and a
+  `&'static` field set to `&7` (or to a const's `&[1, 2]`) are refused;
+  borrow a `static` instead (`static SEVEN: u64 = 7;` then `&SEVEN`). A
+  string literal is `&'static str`, as in Rust.
 
 ## C
 
