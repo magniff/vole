@@ -1,5 +1,5 @@
 #!/bin/sh
-# XFAIL: RT-353: through a supertrait diamond chain (T_i: T_{i-1} + T_{i-2}), `y.top()` under `Y: T33` is refused from depth 18 on ("no method 'top' on type parameter 'Y'", rustc prints 3), and on a build that accepts it `check` time grows exponentially (about 9 s at depth 34; v0.30.1 59 s at 32) (0.30.2)
+# RT-353 (fixed in 0.30.2: each supertrait is walked once, traits::super_closure, regions::super_refs): through a supertrait diamond chain (T_i: T_{i-1} + T_{i-2}), `y.top()` under `Y: T33` is refused from depth 18 on ("no method 'top' on type parameter 'Y'", rustc prints 3), and on a build that accepts it `check` time grows exponentially (about 9 s at depth 34; v0.30.1 59 s at 32) (0.30.2)
 # The time is in front::obligations (param_candidate, param_preds, select).
 # From the re-review of the qualified-path work. It passes when check
 # accepts the program within 20 s; rustc is instant.

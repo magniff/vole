@@ -253,30 +253,42 @@ pub fn trait_supers(tr: i64, pcx: &Ctx<Comp>) -> i64 {
     if tr < 0 { 0 } else { pcx.nodes[pcx.traits[tr as usize].node as usize].h }
 }
 
-// RULE: F2.2 (0.30.2, RT-171) Error trait.cycle at each trait whose
-// supertraits lead back to it (`trait A: B {} trait B: A {}`, rustc
-// E0391), reported at the declaration whether or not a path walks it:
-// every walk of the supertraits (qualified::reached_all, opaque::reaches,
-// ..) then needs no depth limit. Depth-first over the traits, each once:
-// a supertrait on the walk's stack closes a cycle.
+// RULE: F2.2 (0.30.2, RT-171; re-review: a cycle stops the checking)
+// Error trait.cycle at each supertrait bound that closes a cycle (`trait
+// A: B {} trait B: A {}`, rustc E0391), at the declaration, whether or not
+// a path walks it. Depth-first over the traits, each once: a supertrait on
+// the walk's stack closes a cycle. That bound then names no trait (its
+// bound_trait is -1, as a bound whose trait is an error), so the graph of
+// supertraits every later walk reads has no cycle, also in the tools that
+// go on after an error (query, the LSP); and the checking stops here, as
+// rustc's does at E0391. No walk of the supertraits (super_closure, and
+// those that carry arguments: qualified::reached_all,
+// obligations::elaborate, regions::super_refs) needs a depth limit or
+// arguments that repeat to end: a walk of a finite graph without cycles
+// ends.
 pub fn check_super_cycles(pcx: &mut Ctx<Comp>) {
     let count = pcx.traits.len();
     let mut state: Vec<i64, Comp> = Vec::new_in(Comp {});
     state.resize(count, 0);
+    let mut cycles: i64 = 0;
     for tr in 0..count as i64 {
         if state[tr as usize] == 0 {
-            super_cycle_walk(tr, &mut state, pcx);
+            super_cycle_walk(tr, &mut state, &mut cycles, pcx);
         }
+    }
+    if cycles > 0 {
+        crate::base::diag::exit_if_errors(pcx);
     }
 }
 
-// (state: 0 not seen, 1 on the walk, 2 done)
-fn super_cycle_walk(tr: i64, state: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+// (state: 0 not seen, 1 on the walk, 2 done; cycles: the bounds cut)
+fn super_cycle_walk(tr: i64, state: &mut Vec<i64, Comp>, cycles: &mut i64, pcx: &mut Ctx<Comp>) {
     state[tr as usize] = 1;
     let supers = trait_supers(tr, pcx);
     let count: i64 = if supers > 0 { pcx.nodes[supers as usize].count } else { 0 };
     for i in 0..count {
-        let st = bound_trait(child(supers, i, pcx), pcx);
+        let b = child(supers, i, pcx);
+        let st = bound_trait(b, pcx);
         if st < 0 || st as usize >= state.len() {
             continue;
         }
@@ -292,38 +304,52 @@ fn super_cycle_walk(tr: i64, state: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
                 c"a trait cannot be its own supertrait: remove one bound of the cycle", pcx);
             crate::base::diag::err_end_soft(pcx);
             pcx.err_kind = saved_kind;
+            // (the bound that closes it names no trait from here on)
+            pcx.nodes[b as usize].x = -1;
+            *cycles += 1;
         } else if state[st as usize] == 0 {
-            super_cycle_walk(st, state, pcx);
+            super_cycle_walk(st, state, cycles, pcx);
         }
     }
     state[tr as usize] = 2;
 }
 
-// (0.27.2) Whether trait tr or one of its supertraits, to any depth
-// (bounded by MAX_ASSOC_DEPTH), declares function `name`. RULE: F2.2
+// RULE: F2.2 (0.30.2, re-review: RT-353, RT-360) Trait tr and its
+// supertraits, to every depth, each once, pushed onto out depth-first in
+// the order they are written, tr first (a bound that names no trait left
+// out; what out holds already is not walked again, so a caller may gather
+// several bounds' in one out). It needs no depth limit: the graph has no
+// cycle (check_super_cycles), and a trait in out is not walked again, so
+// a diamond (`trait T2: T1 + T0`) is walked once, in time linear in its
+// traits. Every walk of the supertraits by trait alone is this one.
+pub fn super_closure(tr: i64, out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+    if tr < 0 || out.contains(&tr) {
+        return;
+    }
+    out.push(tr);
+    let supers = trait_supers(tr, pcx);
+    let count: i64 = if supers > 0 { pcx.nodes[supers as usize].count } else { 0 };
+    for i in 0..count {
+        let st = bound_trait(child(supers, i, pcx), pcx);
+        super_closure(st, out, pcx);
+    }
+}
+
+// (0.27.2) Whether trait tr or one of its supertraits, to any depth,
+// declares function `name` (0.30.2: super_closure, no depth limit; a cut
+// read as no refused RT-360's 34-deep chain). RULE: F2.2
 pub fn trait_declares_closure(tr: i64, name: i64, pcx: &mut Ctx<Comp>) -> bool {
-    if trait_declares(tr, name, pcx) {
+    if tr < 0 {
         return true;
     }
-    let supers = trait_supers(tr, pcx);
-    if supers == 0 {
-        return false;
-    }
-    if pcx.assoc_depth >= crate::front::assoc::MAX_ASSOC_DEPTH {
-        // (0.30.2: a search cut short, never recorded as a no, obligations)
-        pcx.depth_cuts += 1;
-        return false;
-    }
-    pcx.assoc_depth += 1;
-    let mut found = false;
-    for i in 0..pcx.nodes[supers as usize].count {
-        let s = bound_trait(child(supers, i, pcx), pcx);
-        if s >= 0 && trait_declares_closure(s, name, pcx) {
-            found = true;
+    let mut reached: Vec<i64, Comp> = Vec::new_in(Comp {});
+    super_closure(tr, &mut reached, pcx);
+    for k in 0..reached.len() {
+        if trait_fn(reached[k], name, pcx) != 0 {
+            return true;
         }
     }
-    pcx.assoc_depth -= 1;
-    found
+    false
 }
 
 // (0.27.2) Whether the `where` predicates of item (a Fn node) hold for
@@ -1107,7 +1133,7 @@ fn check_impl_statics(i: i64, pcx: &mut Ctx<Comp>) {
     }
     let saved_mod = pcx.cur_mod;
     pcx.cur_mod = pcx.traits_impls[i as usize].module;
-    if trait_static(tr, 0, pcx) {
+    if trait_static(tr, pcx) {
         let bad = non_static_in(pcx.nodes[inode as usize].b, inode, 0, false, 0, pcx);
         if bad != 0 {
             impl_static_error(tr, bad, c"its type", pcx);
@@ -1431,7 +1457,7 @@ fn param_static(p: i64, pcx: &mut Ctx<Comp>) -> bool {
     }
     let bounds = pcx.nodes[p as usize].h;
     for e in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
-        if trait_static(bound_trait(child(bounds, e, pcx), pcx), 0, pcx) {
+        if trait_static(bound_trait(child(bounds, e, pcx), pcx), pcx) {
             return true;
         }
     }
@@ -1448,12 +1474,12 @@ fn param_static(p: i64, pcx: &mut Ctx<Comp>) -> bool {
 fn param_assoc_static(p: i64, name: i64, qtrait: i64, pcx: &mut Ctx<Comp>) -> bool {
     let mut statics: i64 = 0;
     if qtrait >= 0 {
-        return assoc_static_in(qtrait, name, 0, &mut statics, pcx) && statics > 0;
+        return assoc_static_in(qtrait, name, &mut statics, pcx) && statics > 0;
     }
     let bounds = pcx.nodes[p as usize].h;
     for e in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
         let btr = bound_trait(child(bounds, e, pcx), pcx);
-        if btr >= 0 && !assoc_static_in(btr, name, 0, &mut statics, pcx) {
+        if btr >= 0 && !assoc_static_in(btr, name, &mut statics, pcx) {
             return false;
         }
     }
@@ -1461,29 +1487,22 @@ fn param_assoc_static(p: i64, name: i64, qtrait: i64, pcx: &mut Ctx<Comp>) -> bo
 }
 
 // Whether every declaration of associated type `name` in trait tr and its
-// supertraits is bounded 'static (each one counted in statics).
-fn assoc_static_in(tr: i64, name: i64, depth: i64, statics: &mut i64, pcx: &mut Ctx<Comp>) -> bool {
-    if tr < 0 || depth > pcx.traits.len() as i64 {
-        return true;
-    }
-    let declared = pcx.nodes[pcx.traits[tr as usize].node as usize].b;
-    for k in 0..(if declared > 0 { pcx.nodes[declared as usize].count } else { 0 }) {
-        let d = child(declared, k, pcx);
-        if pcx.nodes[d as usize].kind == NodeKind::AssocType && pcx.nodes[d as usize].a == name {
-            if pcx.nodes[d as usize].h > 0 && static_outlives(pcx.nodes[d as usize].h, pcx) {
-                *statics += 1;
-            } else {
-                return false;
-            }
-        }
-    }
-    let supers = trait_supers(tr, pcx);
-    for k in 0..(if supers > 0 { pcx.nodes[supers as usize].count } else { 0 }) {
-        let b = child(supers, k, pcx);
-        if pcx.nodes[b as usize].kind == NodeKind::TyName {
-            let st = bound_trait(b, pcx);
-            if !assoc_static_in(st, name, depth + 1, statics, pcx) {
-                return false;
+// supertraits (super_closure, each once) is bounded 'static (each one
+// counted in statics).
+fn assoc_static_in(tr: i64, name: i64, statics: &mut i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mut reached: Vec<i64, Comp> = Vec::new_in(Comp {});
+    super_closure(tr, &mut reached, pcx);
+    for r in 0..reached.len() {
+        let declared = pcx.nodes[pcx.traits[reached[r] as usize].node as usize].b;
+        for k in 0..(if declared > 0 { pcx.nodes[declared as usize].count } else { 0 }) {
+            let d = child(declared, k, pcx);
+            if pcx.nodes[d as usize].kind == NodeKind::AssocType
+                && pcx.nodes[d as usize].a == name {
+                if pcx.nodes[d as usize].h > 0 && static_outlives(pcx.nodes[d as usize].h, pcx) {
+                    *statics += 1;
+                } else {
+                    return false;
+                }
             }
         }
     }
@@ -3596,7 +3615,7 @@ fn omega_static(node: i64, pcx: &mut Ctx<Comp>) -> bool {
     }
     for i in 0..pcx.nodes[bounds as usize].count {
         let b = child(bounds, i, pcx);
-        if trait_static(bound_trait(b, pcx), 0, pcx) {
+        if trait_static(bound_trait(b, pcx), pcx) {
             return true;
         }
     }
@@ -3620,23 +3639,14 @@ fn static_outlives(n: i64, pcx: &Ctx<Comp>) -> bool {
     }
 }
 
-// Whether trait tr, or a supertrait of it, is bounded `'static` (`trait
-// St: 'static`); (review 3: no limit says no: a chain longer than the
-// number of traits is a cycle, an error of its own)
-fn trait_static(tr: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
-    if tr < 0 || depth > pcx.traits.len() as i64 {
-        return false;
-    }
-    let supers = trait_supers(tr, pcx);
-    if supers <= 0 {
-        return false;
-    }
-    if static_outlives(supers, pcx) {
-        return true;
-    }
-    for i in 0..pcx.nodes[supers as usize].count {
-        let b = child(supers, i, pcx);
-        if trait_static(bound_trait(b, pcx), depth + 1, pcx) {
+// Whether trait tr, or a supertrait of it (super_closure), is bounded
+// `'static` (`trait St: 'static`).
+fn trait_static(tr: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mut reached: Vec<i64, Comp> = Vec::new_in(Comp {});
+    super_closure(tr, &mut reached, pcx);
+    for k in 0..reached.len() {
+        let supers = trait_supers(reached[k], pcx);
+        if supers > 0 && static_outlives(supers, pcx) {
             return true;
         }
     }
