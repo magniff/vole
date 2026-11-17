@@ -22,6 +22,7 @@ use crate::front::convert::{
 use crate::front::generics::{env_enter, env_leave};
 use crate::front::traits::{generic_bounds, impl_applies, impls_after, impls_start, satisfies};
 use crate::front::types::{TyKind, type_elem};
+use crate::middle::lower::ssa::HMap;
 
 // What select gives besides an impl's index (>= 0): nothing proves the
 // reference (it may still hold by a builtin or the front's own rules);
@@ -113,22 +114,61 @@ fn param_candidate(tr: i64, t: i64, targs: i64, n: i64, pcx: &mut Ctx<Comp>) -> 
         return 0;
     }
     let row = param_preds(t, pcx);
-    let count = pcx.param_rows[(row + 3) as usize];
-    let mut r: i64 = 0;
-    for e in 0..count {
-        let at = row + 4 + 2 * e;
-        if pcx.param_rows[at as usize] != tr {
-            continue;
+    // (0.30.2: by the pairs' index, param_pair_map, each hit checked, as
+    // the scan of them all checked each)
+    if n <= 0 {
+        let any = pair_key(row * 1000003 + tr, PAIR_ANY, 0, pcx);
+        let mut v = pcx.param_pair_map.get(any);
+        while v > 0 {
+            let at = (v & !PAIR_ANY_BIT) - 1;
+            if pair_in(row, at, pcx) && pcx.param_rows[at as usize] == tr {
+                return 1;
+            }
+            v = pcx.param_pair_prev.get(v);
         }
-        let args = pcx.param_rows[(at + 1) as usize];
-        if n <= 0 || args >= 0 && same_list(args, targs, n, pcx) {
-            return 1;
-        }
-        if args == PRED_UNREAD {
-            r = -1;
+        return 0;
+    }
+    if targs >= 0 {
+        let exact = pair_key(row * 1000003 + tr, targs, n, pcx);
+        let mut at = pcx.param_pair_map.get(exact) - 1;
+        while at >= 0 {
+            let args = pcx.param_rows[(at + 1) as usize];
+            if pair_in(row, at, pcx) && pcx.param_rows[at as usize] == tr && args >= 0
+                && same_list(args, targs, n, pcx) {
+                return 1;
+            }
+            at = pcx.param_pair_prev.get(at + 1) - 1;
         }
     }
-    r
+    let unread = pair_key(row * 1000003 + tr, PRED_UNREAD, 0, pcx);
+    let mut at = pcx.param_pair_map.get(unread) - 1;
+    while at >= 0 {
+        if pair_in(row, at, pcx) && pcx.param_rows[at as usize] == tr
+            && pcx.param_rows[(at + 1) as usize] == PRED_UNREAD {
+            return -1;
+        }
+        at = pcx.param_pair_prev.get(at + 1) - 1;
+    }
+    0
+}
+
+// (param_candidate) The key of a pair in param_pair_map with no
+// arguments' types (`n` 0), and the bit that keeps that chain's positions
+// apart from the exact keys' in param_pair_prev.
+const PAIR_ANY: i64 = -7;
+const PAIR_ANY_BIT: i64 = 1i64 << 60;
+
+// (param_preds) Indexes the pair at position pos (+ 1, or with
+// PAIR_ANY_BIT) under key.
+fn pair_index(key: i64, pos: i64, pcx: &mut Ctx<Comp>) {
+    let prev = pcx.param_pair_map.get(key);
+    pcx.param_pair_prev.put(pos, prev);
+    pcx.param_pair_map.put(key, pos);
+}
+
+// (param_candidate) Whether position at is a pair of row row.
+fn pair_in(row: i64, at: i64, pcx: &Ctx<Comp>) -> bool {
+    at >= row + 4 && at < row + 4 + 2 * pcx.param_rows[(row + 3) as usize]
 }
 
 // RULE: O-M1 (0.30.2, review of M1) What Ω t's bounds say, each read whole,
@@ -160,6 +200,8 @@ fn param_preds(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     pcx.param_rows.push(0);
     pcx.param_map.put(t, busy + 1);
     let mut preds = Vec::<i64, Comp>::new_in(Comp {});
+    let mut seen = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+    let mut chain = Vec::<i64, Comp>::new_in(Comp {});
     for i in 0..(if h > 0 { pcx.nodes[h as usize].count } else { 0 }) {
         let b = child(h, i, pcx);
         let bt = crate::front::traits::bound_trait(b, pcx);
@@ -181,8 +223,9 @@ fn param_preds(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
                 args = PRED_UNREAD;
             }
         }
-        elaborate(bt, args, t, 0, &mut preds, pcx);
+        elaborate(bt, args, t, 0, &mut preds, &mut seen, &mut chain, pcx);
     }
+    seen.release();
     let row = pcx.param_rows.len() as i64;
     pcx.param_rows.push(h);
     pcx.param_rows.push(home);
@@ -190,6 +233,15 @@ fn param_preds(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     pcx.param_rows.push(preds.len() as i64 / 2);
     for p in preds {
         pcx.param_rows.push(p);
+    }
+    for e in 0..pcx.param_rows[(row + 3) as usize] {
+        let at = row + 4 + 2 * e;
+        let tr = pcx.param_rows[at as usize];
+        let args = pcx.param_rows[(at + 1) as usize];
+        let exact = pair_key(row * 1000003 + tr, args, trait_param_count(tr, pcx), pcx);
+        pair_index(exact, at + 1, pcx);
+        let any = pair_key(row * 1000003 + tr, PAIR_ANY, 0, pcx);
+        pair_index(any, (at + 1) | PAIR_ANY_BIT, pcx);
     }
     pcx.param_map.put(t, row + 1);
     row
@@ -200,18 +252,25 @@ fn param_preds(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // (`trait Sub<Q>: Tr<Q>`; none written, the defaults). A chain deeper than
 // the depth limit is read no further: what it would give is no predicate,
 // never a yes.
+// (0.30.2: the pairs had are found by a hash of the pair, seen: its key
+// -> the last pair of the key + 1, chain[pair] the one before it + 1; a
+// scan of all of them was quadratic in them, 2^16 pairs of a supertrait
+// tree took 20 s)
 fn elaborate(tr: i64, args: i64, t: i64, depth: i64, preds: &mut Vec<i64, Comp>,
-    pcx: &mut Ctx<Comp>) {
+    seen: &mut HMap, chain: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
     let n = trait_param_count(tr, pcx);
-    let mut e: i64 = 0;
-    while e < preds.len() as i64 {
+    let key = pair_key(tr, args, n, pcx);
+    let mut e = seen.get(key) - 1;
+    while e >= 0 {
         let had = preds[(e + 1) as usize];
         if preds[e as usize] == tr
             && (had == args || n > 0 && had >= 0 && args >= 0 && same_list(had, args, n, pcx)) {
             return;
         }
-        e += 2;
+        e = chain[(e / 2) as usize] - 1;
     }
+    chain.push(seen.get(key));
+    seen.put(key, preds.len() as i64 + 1);
     preds.push(tr);
     preds.push(args);
     let supers = crate::front::traits::trait_supers(tr, pcx);
@@ -240,8 +299,23 @@ fn elaborate(tr: i64, args: i64, t: i64, depth: i64, preds: &mut Vec<i64, Comp>,
                 args2 = PRED_UNREAD;
             }
         }
-        elaborate(tr2, args2, t, depth + 1, preds, pcx);
+        elaborate(tr2, args2, t, depth + 1, preds, seen, chain, pcx);
     }
+}
+
+// (elaborate) The key of pair (tr, args) in its seen map (never 0): of
+// the arguments' types when there are some, else of args itself.
+fn pair_key(tr: i64, args: i64, n: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut h: u64 = (tr as u64).wrapping_mul(1000003u64);
+    if args >= 0 && n > 0 {
+        for k in 0..n {
+            h = h.wrapping_mul(1000003u64) ^ (pcx.tlists[(args + k) as usize] as u64);
+        }
+    } else {
+        h = h.wrapping_mul(1000003u64) ^ (args as u64);
+    }
+    let key = (h >> 1) as i64;
+    if key == 0 { 1 } else { key }
 }
 
 // Type nodes g, the arguments of Ω t's i-th bound, resolved quietly in
