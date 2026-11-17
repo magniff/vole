@@ -152,6 +152,51 @@ A correctness release, its branches merged as each is reviewed clean.
   first release that builds the case) to 0.30.1; `--no-vectorize` was
   the workaround.
 
+#### Soundness holes closed
+
+- **A `&mut` behind a `&` cast to a raw pointer or a `&mut` (RT-197),
+  every -O, since 0.28.0.** `h.r as *mut i64` with `h: &H` and `r: &'a
+  mut i64` was accepted, and a write through the pointer changed `x`
+  behind a shared reference; `h.r as &mut i64` made a second `&mut` in
+  safe code, and a mutable view coerced or cast to a raw one (`let p:
+  *mut [i64] = h.s;`, `h.s as *mut [i64]`) was the same. The coercion
+  `let p: *mut i64 = h.r` was refused: it was lowered as rustc's `&raw
+  mut (*h.r)`, whose borrow is asked, while a cast read its operand by
+  copying the reference, which only the loan check knew for a write.
+  Now one function (places/build.vl `exclusive_read`) decides what
+  every read of an exclusive reference as another pointer is, a
+  coercion's and a cast's alike: its reborrow of the kind the target
+  asks, `&raw mut`, `&raw const`, `&` or `&mut` (a view's `slice
+  Q[..]`), each refused as its borrow is (rustc E0596) through a field,
+  a tuple field, an index, a Box, a Deref, a closure's capture and a
+  `&&mut`. The checker of the places IR (`--verify-places`) no longer
+  lets a copy of a `&mut` into a raw pointer pass, and the loan
+  check's second rule for it is gone.
+
+- **The results of partition_in and unzip_in kept no borrow of their
+  items (RT-211), every -O, since 0.28.0.** `let (a, b): (Vec<&i64,
+  Gpa>, ..) = v.iter().partition_in(.., gpa); drop(v);` and then
+  reading a was a use after free from safe code; `unzip_in` the same.
+  It was not the tuple: a call's result regions are tied to its
+  arguments by the callee's predicates, and two kinds made no tie. A
+  bound whose trait has more than one impl for the type (Vec's
+  `Extend<T>` and `Extend<&'a T>`) found no impl and tied nothing
+  (partition_in's `B: Extend<Self::Item>`; a program's own trait with
+  two such impls lost the borrow the same way, `-> B` as `-> (B, B)`),
+  and a `where` predicate on a subject other than a type parameter
+  (unzip_in's `Self: Iterator<Item = (X, Y)>`) was never read. Now the
+  impl is chosen by the whole trait reference, its arguments resolved
+  in the instance (places/regions.vl `bound_impl`), and every predicate
+  of the signature, on a parameter, `Self`, a projection or any type,
+  is read by one function (`subject_ties`); where no one impl is
+  chosen, every region of the predicate is made one, more than any impl
+  relates, never less. A program's own collector, `fn f<I: Iterator, B:
+  DefaultIn<A> + Extend<I::Item>>(it: I, a: A) -> B` (and `(B,)`, `(B,
+  B)`, `Pair<B>`, `Option<B>`), refused in its own body since 0.30.1
+  (RT-225), now builds, and its result keeps the borrow at the caller
+  (RT-225b, a use after free on 0.30.0); so does a default method with
+  such a `where Self:` predicate.
+
 ### What's new in 0.30.1
 
 The safety nets' release: checks that passed without looking, found
