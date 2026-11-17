@@ -222,9 +222,10 @@ A correctness release, its branches merged as each is reviewed clean.
   trait whose supertrait declares it (std's IndexMut beside a Mul impl),
   are that trait's (RT-426: "ambiguous" before). A `where` subject may be
   a qualified path, `<Bx<T> as H>::Item: Copy`.
-- **std's HashMap, HashSet and their entries no longer bound `S` on the
-  type** (Rust's have no bound there; the impls that hash keep `S:
-  BuildHasher`): their impls without it were never checked.
+- **std's HashMap and HashSet impls state `S: BuildHasher`**, the bound
+  their types declare: the impls without it (their Drop, Debug,
+  IntoIterator, DefaultIn and the plain methods) were never checked by
+  their generic instance (rustc E0277 for that header).
 - **No generic function is left unchecked in silence** (RT-275). One
   whose opaque instance cannot be made gets warning generic.unchecked,
   and one whose header does not meet its Self type's bound by its own
