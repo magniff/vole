@@ -219,13 +219,18 @@ A correctness release, its branches merged as each is reviewed clean.
   returning its key, and `arena_scope(&gpa, mk)` with an `mk` returning
   a Vec on the scope, are refused at the call instead of inside std
   (RT-378), and the same calls given a fn item that keeps no borrow
-  build (v0.30.1 refused them inside std). A function that takes such a
-  callable cannot itself be used as a value (a call through the value
-  would reach its body unchecked). The `'static` a bound needs only
+  build (v0.30.1 refused them inside std). A local that surely holds a
+  fn item (`let p = st;`) is read by that item's signature too. A
+  function that takes such a callable as a type parameter cannot itself
+  be used as a value (a call through the value would reach its body
+  unchecked); one taking a written `fn(..)` type can. The `'static` a bound needs only
   through an associated-type equality, a `where` clause, an impl's
   `where 'a: 'static`, a two-level blanket impl or the bound trait's
   type argument (`T: KeepQ<&'static i64>`) is read from the signature
-  too (RT-364, RT-421). One rule
+  too (RT-364, RT-421), through std's blanket Into as well (`ki<T:
+  Into<&'static i64>>` used as a value). `&mut` of a fn pointer meets
+  FnMut and FnOnce bounds, not Fn (rustc E0277), as `&mut` of a closure.
+  One rule
   for closures, fn items, fn pointers, method paths, generic fns with
   their arguments and opaque `impl Fn` values (borrowck.md R6). With it,
   a fn item or a `fn` value given to Iterator's adapters (`map`,
