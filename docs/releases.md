@@ -156,7 +156,8 @@ A correctness release, its branches merged as each is reviewed clean.
   a default copied into `impl<T: Base> A for T` read Base's, and
   `<i64 as MyFrom<i32>>::from(x)` or `T::from(x)` under `T: MyFrom<u8>`
   called std's `From` (an integer widening) instead of the program's
-  trait. The trait a path names is decided once, by `path_trait`, and
+  trait, and `let b: S = Mk2::mk()`, Self from the expected type, ran
+  Mk's `mk` (RT-325). The trait a path names is decided once, by `path_trait`, and
   every later step (the item, the impl, the dispatch of a generic
   trait's call) takes that trait and its arguments; none picks again
   by the name.
@@ -182,8 +183,30 @@ A correctness release, its branches merged as each is reviewed clean.
   `trait.unmet` (E0277).
 - A supertrait cycle (`trait A: B`, `trait B: A`): error `trait.cycle`
   (rustc E0391) at the trait's declaration, whether or not a path walks
-  it. A path through supertraits has no depth limit any more (0.30.2's
+  it, and the checking stops there, as rustc's does. A cycle whose
+  arguments grow at each step (`trait A<T>: B<Option<T>>`, `trait B<T>:
+  A<Option<T>>`) made the branch's first cut run without end, a walk
+  keyed by trait and arguments never meeting the same pair twice; the
+  bound that closes a cycle now names no trait after its error, so no
+  walk, in the checker or in a tool that goes on after an error, meets
+  a cycle. A path through supertraits has no depth limit any more (the
   first cut refused a chain deeper than 8).
+- **No walk of the supertraits has a depth limit, and each meets a
+  trait once (RT-360, RT-353).** `Y::top(y)` under `Y: T33` with
+  `top` declared 34 supertraits down was refused (a cut at 32 read as
+  "no function in the bounds"), and so were a method call, `Y::K` and
+  `Y::Out` 40 down, a bound `Z: T0` proved from `Y: T11` 12 down (a cut
+  at 8), and an impl's bound giving T0's method through 12. Through a
+  supertrait diamond (`trait T_i: T_{i-1} + T_{i-2}`) the time grew
+  exponentially (v0.30.1: 59 s at depth 32; refused from depth 18).
+  One walk, `front::traits::super_closure`, gives a trait's supertraits
+  each once; every walk by trait alone is it (the bounds' functions,
+  `opaque::entails`, `coherence::trait_implies`, the `'static` bounds,
+  an associated type through supertraits), and those that carry the
+  trait's arguments (`qualified::reached_all`, `obligations::elaborate`,
+  the region checker's `super_refs`) meet each (trait, arguments) once.
+  They end because the graph has no cycle: depth 40 of the diamond
+  checks in 0.05 s.
 - `<i64 as MyFrom<i32>>::from(x)` with no `impl MyFrom<i32>`, and
   `i64::from(x)` where a program's trait gives i64 a `from` beside
   std's `From`: `trait.unmet` (E0277) and `method.ambiguous` (E0034);
@@ -195,7 +218,22 @@ A qualified path takes any type before `as` (RT-93): `<<T as A>::B as
 C>::D` (rustfmt's form; 0.30.1 read the `<<` as a shift, a parser
 error, and `volec fmt` glued it to what came before), `< <S as A>::Out
 as C>::K`, `<&S as Tr>::f`, `<W<i64> as Tr>::K`, in a type and in an
-expression; 0.30.1 took only a name in an expression.
+expression; 0.30.1 took only a name in an expression. A `<` or `<<`
+starts a qualified path wherever a type, type arguments or an
+expression can start, decided in three places the parser asks
+(`types::opens_args`, `types::starts_type`, `exprs::starts_expr`): a
+turbofish (`f::<<T as Tr>::A>()`, `M.m::<<<S as A>::B as C>::E>()`,
+`<S as G>::g::<<S as A>::Out>()`), a bound's arguments (`U:
+G<<T as A>::Out>`, `trait A: B<<Self as A>::X>`), a `where` predicate
+(`where <T as A>::Out: B`, RT-356; `Option<<T as A>::Out>: Default`),
+`return` and `break` values and a range's end (`return <<S as A>::Out as
+B>::D`, `break 'a <S as A>::C`, `0..<S as A>::C`). The same list gives
+`return ..` its value (a RangeFull, as rustc's; it was an empty return).
+`volec fmt` prints each qualified path as written: `<&S as T1>::h`,
+`<[i64] as Z>::z` and `<W<i64> as Conv<bool>>::c` were spaced as
+comparisons (`< W<i64> as Conv<bool >>::c`, and every later line of the
+block indented 4 more), and `id::<<<S as A>::Out as B>::E>` became
+`id::<< <S`.
 
 How a path picks its trait, in one place
 (`front::check::calls::qualified::path_trait`): `Self::` in a trait's
@@ -237,6 +275,12 @@ the trait's arguments (`<T as Conv<i32>>::K`).
   the workaround.
 
 #### Bugs fixed
+
+- **`#[derive(Clone)]` of a generic struct with a reference for T
+  (RT-212, its derive form).** `Rep { v: &w }.clone()` was refused in
+  the derived body, whose `Clone::clone(&self.v)` took the method
+  probe's auto-deref and called W's clone for a `&W` field; the path
+  call now takes Self from its argument as written (RT-159), `&W`.
 
 - **An impl is chosen by its whole trait reference** (the trait
   obligation engine's selection, docs/design/obligations.md, M1). Where
