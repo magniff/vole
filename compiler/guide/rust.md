@@ -155,6 +155,11 @@ fn main() {
 - A slice has no fields (0.29): its length is `s.len()`, its pointer
   `s.as_ptr()` or `s.as_mut_ptr()`.
 - Raw pointers are for `unsafe` code, as in Rust (`guide unsafe`).
+- A borrowed literal is not promoted to a static: `&7` lives in the
+  function that makes it, so `let r: &'static u64 = &7;` and a
+  `&'static` field set to `&7` (or to a const's `&[1, 2]`) are refused;
+  borrow a `static` instead (`static SEVEN: u64 = 7;` then `&SEVEN`). A
+  string literal is `&'static str`, as in Rust.
 
 ## C
 

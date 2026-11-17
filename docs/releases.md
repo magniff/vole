@@ -263,6 +263,34 @@ A correctness release, its branches merged as each is reviewed clean.
   Conv<Self>> Tr<U> for W`) is read with Self the impl's type, wherever
   it is asked from.
 
+#### What the checkers now refuse
+
+- **A `&'static` field set from a borrow that does not last (RT-383,
+  RT-422), unsound since 0.27.1.** A struct, union or variant field
+  typed `&'static T` (or holding one: `Option<&'static T>`, `[&'static
+  T; N]`, a tuple, `&'static [&'static T]`, `&'static mut T`) took
+  `&e` of a local, a parameter's borrow or `s.as_str()` of a local
+  String in a literal, and the reference outlived what it borrowed:
+  `V { a: &e }` returned, `E::A(&*b)` kept after `drop(b)`, `Some(V {
+  .. })`, a nested literal, `Self { .. }`, a closure's literal, a
+  generic body's `W { t, a: &e }`; -O0 read freed stack, --check-alloc
+  stopped with a use after free (rustc E0597). The region checker
+  related a literal's parts to the field types' regions only when the
+  literal's type had regions of its own (a lifetime or a type
+  argument holding one), so a type with none, `struct V { a: &'static
+  u64 }`, related nothing; `v.a = &e`, `V<&'static u64>` and
+  `let r: &'static u64 = &e` were refused already. Now every part of
+  every literal is related to its field's declared regions
+  (places/borrowck/constraints.vl, the aggregate rule), whatever the
+  literal's own type. A static's borrow, `Box::leak`, a string literal
+  and a `&'static` parameter are accepted as before. Because vole does
+  not promote a borrowed literal to a static (borrowck.md L2, RT-117),
+  `V { a: &7 }` and a const `Vs { n: &[4, 11] }` used for such a field
+  are refused too (borrowck.dropped_borrowed), where rustc promotes
+  them: before, they were accepted and pointed into the stack frame of
+  the function that used them, which dangled once the value was
+  returned.
+
 ### What's new in 0.30.1
 
 The safety nets' release: checks that passed without looking, found
