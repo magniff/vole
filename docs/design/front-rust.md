@@ -764,9 +764,17 @@ its own that its user moves, borrows (`C.len()`, `&C[0]`, its
 temporary dropped at the statement's end) and drops, as rustc's
 temporary, never a move out of the static (v0.30.1: `let a = A;` was
 `borrowck.move_out`, "a static"). `C[0]` by value stays E0508. Its
-slice's methods take it as a temporary (`array_const_use`). *Anchor:*
-`front/check/names.vl: inline_array_const`. *Cases:*
-`rt_214_const_array_each_use`, `rt_214_const_array_index_refused`.
+slice's methods take it as a temporary (`array_const_use`). A shared
+borrow whose place is based on such a use (`&C`, `&C[0]`, `&C[1].k`)
+is of the static when the type has no drop glue and no interior
+mutability, as rustc promotes it to a `'static` (`places/build.vl
+shared_place, promoted_base`; 0.30.2's first try refused `fn r() ->
+&'static [N; 2] { &C }` as a local's, which v0.30.1 accepted). RT-317's
+struct literal and RT-117's literals need a static made for the value,
+not this one. *Anchor:*
+`front/check/names.vl: inline_array_const`, `places/build.vl:
+promoted_const`. *Cases:* `rt_214_const_array_each_use`,
+`rt_214_const_array_index_refused`, `rt_214_const_array_borrow_promoted`.
 
 **F34.4 (a constant's value is a body of its own).** (0.30.2, RT-302)
 vole makes a constant at each use, its value checked there

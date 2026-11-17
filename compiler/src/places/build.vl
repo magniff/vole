@@ -847,11 +847,48 @@ fn copied_call(e: i64, pcx: &mut Ctx<Comp>) -> bool {
 // The place of e, whatever e is: a place expression's, or a temporary's
 // holding its value.
 fn as_place(e: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
+    if e == pcx.pl_promote {
+        pcx.pl_l = static_local(pcx.array_const_uses.get(e + 1) - 1, e, pbody, pcx);
+        pcx.pl_p = 0;
+        return;
+    }
     if is_place_expr(e, pcx) && place_of(e, pbody, pcx) {
         return;
     }
     pcx.pl_l = place_temp(e, pbody, pcx);
     pcx.pl_p = 0;
+}
+
+// (F34.3) The base of shared borrow e's place through its projections
+// (a field, a tuple field, an element), when it is a promoted_const; 0
+// when it is not one.
+fn promoted_base(e: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut b = e;
+    loop {
+        let k = pcx.nodes[b as usize].kind;
+        if k == NodeKind::FieldAccess && pcx.nodes[b as usize].y != 1
+            || k == NodeKind::TupleField {
+            b = pcx.nodes[b as usize].a;
+        } else if k == NodeKind::Index
+            && pcx.nodes[pcx.nodes[b as usize].b as usize].kind != NodeKind::Range {
+            b = pcx.nodes[b as usize].a;
+        } else {
+            break;
+        }
+    }
+    if promoted_const(b, pcx) { b } else { 0 }
+}
+
+// RULE: F34.3 (0.30.2, RT-214) Whether e, the base of a place a shared
+// borrow takes (shared_place), is a use of an array constant made at each
+// use (inline_array_const) that rustc promotes to a static: its type has
+// no drop glue and no interior mutability (is_freeze). The borrow is of
+// the constant's static then (`&Q`, `&Q[0]`, returned as `'static`), as
+// the value would be the same; any other use is a value of its own.
+fn promoted_const(e: i64, pcx: &mut Ctx<Comp>) -> bool {
+    pcx.nodes[e as usize].kind == NodeKind::Block && pcx.array_const_uses.get(e + 1) != 0
+        && !crate::places::glue::has_glue(pcx.nodes[e as usize].ty, pcx)
+        && crate::front::cells::is_freeze(pcx.nodes[e as usize].ty, pcx)
 }
 
 // RULE: D2.8 (0.27.5) Whether rvalue e is promotable: a literal, `-` of a
@@ -887,7 +924,11 @@ fn promotable(e: i64, pcx: &Ctx<Comp>) -> bool {
 // statement and its branch, not the function), else as_place's.
 fn shared_place(e: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
     if !pcx.rust_body || !promotable(e, pcx) {
+        // (F34.3: an array constant's use at its base, its static)
+        let saved = pcx.pl_promote;
+        pcx.pl_promote = promoted_base(e, pcx);
         as_place(e, pbody, pcx);
+        pcx.pl_promote = saved;
         return;
     }
     let l = new_local(pcx.nodes[e as usize].ty, LF_TEMP | crate::places::ir::LF_PROMOTED, -1, e,
@@ -2184,10 +2225,12 @@ fn lower_call(n: i64, dl: i64, dp: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Co
         settle_operand(pcx.nodes[n as usize].a, pcx.nodes[n as usize].count == 0, pbody, pcx);
         at = ops_add(at, count, pbody, pcx);
         count += 1;
-    } else if (pcx.nodes[n as usize].p & crate::front::ast::CALL_CONSUMES) != 0 {
-        // RULE: D21.6 (0.30.2, RT-213: an `impl FnOnce` value whose closure
-        // captures nothing, called: moved into a temporary of the call,
-        // which drops it; synth_call keeps it as the callee)
+    } else if (pcx.nodes[n as usize].p & crate::front::ast::CALL_CONSUMES) != 0
+        && pcx.nodes[n as usize].a != 0 {
+        // RULE: D21.6 (0.30.2, RT-213: a callee called as FnOnce whose
+        // closure captures nothing: moved into a temporary of the call,
+        // which drops it; closure_call keeps it as the callee. One with an
+        // env is moved by lower_arg)
         let callee = pcx.nodes[n as usize].a;
         let t = new_temp(pcx.nodes[callee as usize].ty, callee, false, pbody, pcx);
         expr_into(callee, t, 0, pbody, pcx);
@@ -2219,7 +2262,8 @@ fn lower_call(n: i64, dl: i64, dp: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Co
         // (an argument past a C function's parameters: its `...`)
         let variadic = c_callee && !pre && i >= pcx.fns[f as usize].param_count;
         let pty: i64 = if f >= 0 && i < fn_param_count(f, pcx) { fn_param(f, i, pcx) } else { 0 };
-        lower_arg(i, arg, mode, pty, c_callee || pre, variadic, pbody, pcx);
+        lower_arg(i, arg, mode, pty, c_callee || pre, variadic, pcx.nodes[n as usize].p, pbody,
+            pcx);
         if pre && pcx.opk == OK_COPY && !has_flag(pcx.opa, LF_BORROWED, pbody)
             && type_glue(pcx.nodes[arg as usize].ty, pcx) {
             let t = new_temp(pcx.nodes[arg as usize].ty, arg, true, pbody, pcx);
@@ -2354,8 +2398,9 @@ fn arg_mode_of(arg: i64, pcx: &Ctx<Comp>) -> i64 {
     P_VALUE
 }
 
-// Argument i (node arg) of call n: its operand (OPK..).
-fn lower_arg(i: i64, arg: i64, mode: i64, pty: i64, c_callee: bool, variadic: bool,
+// Argument i (node arg) of call n: its operand (OPK..). call_p: the call's
+// flags (CALL_CONSUMES, CALL_AS_FN_MUT: how a closure's env is lent).
+fn lower_arg(i: i64, arg: i64, mode: i64, pty: i64, c_callee: bool, variadic: bool, call_p: i64,
     pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
     let k = pcx.nodes[arg as usize].kind;
     let temp = k == NodeKind::Block && own_temp_block(arg, pcx) && own_temp_addr(arg, pcx);
@@ -2381,19 +2426,18 @@ fn lower_arg(i: i64, arg: i64, mode: i64, pty: i64, c_callee: bool, variadic: bo
         let mut pl = pl;
         let mut pp = pp;
         if env && !crate::places::regions::closure_once(pcx.types[at_ty as usize].a, pcx)
-            && pcx.nodes[operand_e as usize].kind == NodeKind::Ident
-            && pcx.nodes[operand_e as usize].res == Res::Local
-            && crate::front::closures::fn_bounds::value_call_kind(pbody.fn_,
-                pcx.nodes[operand_e as usize].y,
-                pcx) == crate::front::closures::kinds::KIND_FN_ONCE {
-            // RULE: D19.5 (an `Fn`/`FnMut` closure called as the `FnOnce` its
-            // parameter is bound by: moved into a temporary of the call,
-            // `_t = move Q`, which the env borrows and the statement drops)
+            && (call_p & crate::front::ast::CALL_CONSUMES) != 0 {
+            // RULE: D19.5, D21.6 (an `Fn`/`FnMut` closure called as the
+            // `FnOnce` its parameter or its opaque type is bound by,
+            // closures/mod.vl closure_call: moved into a temporary of the
+            // call, `_t = move Q`, which the env borrows and the statement
+            // drops)
             let c_ty = pcx.types[at_ty as usize].a;
-            // (D21.6: an opaque value moves as its type, Copy only by its
-            // bounds, its closure Copy or not)
-            let local_ty = pcx.locals[pcx.nodes[operand_e as usize].y as usize].ty;
-            let move_ty = if crate::front::opaque::opaque_call_kind(local_ty, pcx) != 0 { local_ty }
+            // (an opaque value moves as its type, Copy only by its bounds,
+            // its closure Copy or not: closure_call gave the callee that
+            // type)
+            let own_ty = pcx.nodes[operand_e as usize].ty;
+            let move_ty = if crate::front::opaque::opaque_call_kind(own_ty, pcx) != 0 { own_ty }
                 else { c_ty };
             place_operand(pl, pp, move_ty, true, pbody, pcx);
             let tc = new_temp(c_ty, arg, false, pbody, pcx);
@@ -2403,19 +2447,21 @@ fn lower_arg(i: i64, arg: i64, mode: i64, pty: i64, c_callee: bool, variadic: bo
         }
         if env && crate::places::regions::closure_once(pcx.types[at_ty as usize].a, pcx) {
             // RULE: D19.5, D19.7 an `FnOnce` closure's env is the closure
-            // itself, moved (copied when it is Copy)
-            place_operand(pl, pp, pcx.types[at_ty as usize].a, true, pbody, pcx);
+            // itself, moved (copied when it is Copy); D21.6: called as an
+            // opaque type's FnOnce (CALL_CONSUMES), moved as that type,
+            // Copy only by its bounds
+            let own_ty = pcx.nodes[operand_e as usize].ty;
+            let move_ty = if (call_p & crate::front::ast::CALL_CONSUMES) != 0
+                && crate::front::opaque::opaque_call_kind(own_ty, pcx) != 0 { own_ty }
+                else { pcx.types[at_ty as usize].a };
+            place_operand(pl, pp, move_ty, true, pbody, pcx);
             return;
         }
         if env {
-            // (D21.6: an `impl FnMut` value is called as FnMut, its
-            // closure's kind or not: through a `mut` binding, E0596)
+            // (D21.6: a callee called as FnMut, its closure's kind or not,
+            // closure_call: an exclusive borrow)
             let fnmut = crate::places::regions::closure_writes(pcx.types[at_ty as usize].a, pcx)
-                || pcx.nodes[operand_e as usize].kind == NodeKind::Ident
-                && pcx.nodes[operand_e as usize].res == Res::Local
-                && crate::front::closures::fn_bounds::value_call_kind(pbody.fn_,
-                    pcx.nodes[operand_e as usize].y, pcx)
-                == crate::front::closures::kinds::KIND_FN_MUT;
+                || (call_p & crate::front::ast::CALL_AS_FN_MUT) != 0;
             kind = if fnmut { BK_MUT2 } else { BK_SHARED };
             t_ty = ref_to(pcx.types[at_ty as usize].a, if fnmut { REF_MUT } else { REF_SHARED },
                 pcx);
