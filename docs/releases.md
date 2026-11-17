@@ -174,8 +174,19 @@ A correctness release, its branches merged as each is reviewed clean.
   check's second rule for it is gone. The position does not matter: a
   block's tail, an if's arms, a match arm, a closure's result, an array
   element, `Some`, a tuple, a `*mut [i64]` argument, `*r as *mut i64` of
-  an `r: &&mut i64`, an index of a `&[&mut [i64]]` (RT-284) are each the
+  an `r: &&mut i64`, an index of a `&[&mut [i64]]` (RT-284), an array
+  repeat `[h.r; 2]` and a closure's `return h.r` (RT-314) are each the
   operand the coercion reads, so each is its reborrow.
+- **A `&mut` behind a `&` was usable as the `&mut` through `*&` (RT-321),
+  every -O, since v0.30.1 at least.** `k(&y)` with `y: &mut S` and `fn
+  k(x: &mut S)` mutated through the shared borrow, and so did `k(*&y)`,
+  `let w: &mut S = *&y` and `(*&y).k += 1`. The place of `*&x` was
+  folded to x for any borrow, so the `&` was lost; now only `&mut x` and
+  `&raw` are folded, and `*&y` is a place behind a `&`: the checker's
+  `*` of `&y` (where `&mut S` goes) and each written form is refused,
+  `borrowck.borrow_immutable` or `borrowck.assign_immutable` (rustc E0308
+  for `k(&y)`, E0596/E0594 for the rest). Reads through `*&y` still
+  build.
 
 - **The results of partition_in and unzip_in kept no borrow of their
   items (RT-211, RT-261, RT-267, RT-268, RT-237b, RT-283), every -O,
