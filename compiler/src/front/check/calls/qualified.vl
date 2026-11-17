@@ -50,8 +50,10 @@ pub fn no_trait() -> PathTrait {
 //   stands for in an instance): the one of its bounds, or of their
 //   supertraits, that declares name, with that bound's arguments; two are
 //   rustc's E0034;
-// - `Self` in a trait's default function copied into an impl: that
-//   trait, the impl's own (or a supertrait), as rustc reads Self there.
+// - `Self` in a trait's default, a function copied into an impl or a
+//   constant's value read for one (default_impl): that trait, the impl's
+//   own (or a supertrait), as rustc reads Self there, before X's bounds
+//   when Self is a type parameter (a blanket impl's);
 // Else no trait: concrete_trait decides, after the type's inherent items.
 pub fn path_trait(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTrait {
     let qn = crate::front::parser::rust::lifetimes_of(crate::front::parser::rust::qpath_key(n),
@@ -81,7 +83,7 @@ pub fn path_trait(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTrait {
             crate::base::diag::err_int(nargs, pcx);
             err_end(pcx);
         }
-        return PathTrait { tr: tr, args: bound_args(qn, pcx), nargs: nargs, imp: -1 };
+        return PathTrait { tr: tr, args: qpath_args(qn, pcx), nargs: nargs, imp: -1 };
     }
     // `Tr::f(args)` whose Self the checker took from an argument or from
     // the expected type (F8.2, paths::self_from_args, trait_assoc_self:
@@ -91,26 +93,72 @@ pub fn path_trait(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTrait {
         if k > 0 {
             // (Tr's own, or the one supertrait's that declares it)
             let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
-            declaring_all(k - 1, name, 0, &mut seen, pcx);
+            declaring_all(k - 1, name, &mut seen, pcx);
             if seen.len() > 1 {
-                ambiguous_error(n, t, name, seen[0], seen[1], pcx);
+                ambiguous_error(n, t, name, whole(seen[0]), whole(seen[1]), pcx);
             }
             if seen.len() == 1 {
                 return PathTrait { tr: seen[0], args: -1, nargs: 0, imp: -1 };
             }
         }
     }
-    let p = param_node(n, t, pcx);
-    if p > 0 {
-        return bound_choice(n, t, p, name, pcx);
-    }
+    // (`Self` in a trait's default, a function's or a constant's, before
+    // a type parameter's bounds: in a default copied into `impl<T: Base>
+    // A for T` Self is T, and `Self::K` is A's, not Base's)
     if pcx.nodes[n as usize].count == 0 && pcx.nodes[n as usize].a == pcx.self_type_sym {
-        let i = default_copy_impl(pcx);
+        let i = default_impl(n, pcx);
         if i >= 0 {
             return default_choice(n, t, i, name, pcx);
         }
     }
+    let p = param_node(n, t, pcx);
+    if p > 0 {
+        return bound_choice(n, t, p, name, pcx);
+    }
     no_trait()
+}
+
+// RULE: F8.3, F19.1 (0.30.2) The trait arguments a qualified path's trait
+// node qn writes (`<S as Conv<_>>`), resolved in its module, pushed to
+// TLISTS: its index. A `_` is 0 there, a hole any argument fills
+// (agrees): rustc infers it from the impls and the call's arguments.
+fn qpath_args(qn: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let g = pcx.nodes[qn as usize].g;
+    let saved = pcx.cur_mod;
+    pcx.cur_mod = crate::front::modules::module_of(qn, pcx);
+    let mark = pcx.tscratch.len() as i64;
+    for i in 0..pcx.nodes[g as usize].count {
+        let w = child(g, i, pcx);
+        let hole = pcx.nodes[w as usize].kind == NodeKind::TyName
+            && pcx.nodes[w as usize].count == 0 && pcx.nodes[w as usize].g == 0
+            && sym_text(pcx.nodes[w as usize].a, pcx) == b"_";
+        let t = if hole { 0 } else { crate::front::check::resolve::resolve_type(w, pcx) };
+        pcx.tscratch.push(t);
+    }
+    pcx.cur_mod = saved;
+    let targs = pcx.tlists.len() as i64;
+    for i in mark..pcx.tscratch.len() as i64 {
+        pcx.tlists.push(pcx.tscratch[i as usize]);
+    }
+    pcx.tscratch.truncate(mark as usize);
+    targs
+}
+
+// Whether the count trait arguments at TLISTS[have..] are those at
+// want.., a 0 of want (a `_`, qpath_args) taking any.
+pub fn agrees(have: i64, want: i64, count: i64, pcx: &Ctx<Comp>) -> bool {
+    for k in 0..count {
+        let w = pcx.tlists[(want + k) as usize];
+        if w != 0 && pcx.tlists[(have + k) as usize] != w {
+            return false;
+        }
+    }
+    true
+}
+
+// Whether pt's arguments hold a `_` (qpath_args).
+fn has_hole(pt: PathTrait, pcx: &Ctx<Comp>) -> bool {
+    pt.args >= 0 && (0..pt.nargs).any(|k| pcx.tlists[(pt.args + k) as usize] == 0)
 }
 
 // Whether trait tr itself declares a function or a constant `name`.
@@ -123,22 +171,92 @@ fn declares(tr: i64, name: i64, pcx: &Ctx<Comp>) -> bool {
 }
 
 // The traits, tr and its supertraits (F2.2), that declare `name`, pushed
-// onto out once each. Supertraits deeper than 8 are an error.
-fn declaring_all(tr: i64, name: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
-    if tr < 0 {
+// onto out once each (reached_all, the arguments not read).
+fn declaring_all(tr: i64, name: i64, out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+    let mut reached: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
+    reached_all(tr, -1, 0, name, 0, &mut reached, &mut seen, pcx);
+    let mut k: usize = 0;
+    while k < reached.len() {
+        if !out.contains(&reached[k]) {
+            out.push(reached[k]);
+        }
+        k += 3;
+    }
+}
+
+// RULE: F2.2, F8.3 (0.30.2) The traits, tr and its supertraits, that
+// declare `name`, each with the trait arguments it is reached with, pushed
+// onto out as (trait, args, nargs) once each (args a TLISTS index, -1 when
+// not known). tr's are args; a supertrait's, its bound's arguments read
+// with tr's parameters bound to tr's arguments and Self = t (`trait Sub:
+// Conv<i64>` reaches Conv<i64>; `trait Sub<U>: Conv<U>` under `Sub<i32>`,
+// Conv<i32>), -1 when they would need a parameter of tr whose argument is
+// not known, or t is not. No depth limit: the supertraits have no cycle
+// (traits::check_super_cycles refuses one at its declaration, rustc
+// E0391), and seen, the (trait, args) walked already, walks a diamond once
+// and ends a cycle that error reported.
+fn reached_all(tr: i64, args: i64, nargs: i64, name: i64, t: i64, out: &mut Vec<i64, Comp>,
+    seen: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+    if tr < 0 || in_reached(seen, tr, args, nargs, pcx) {
         return;
     }
-    if declares(tr, name, pcx) && !out.contains(&tr) {
+    seen.push(tr);
+    seen.push(args);
+    seen.push(nargs);
+    if declares(tr, name, pcx) && !in_reached(out, tr, args, nargs, pcx) {
         out.push(tr);
+        out.push(args);
+        out.push(nargs);
     }
     let supers = trait_supers(tr, pcx);
     let count: i64 = if supers > 0 { pcx.nodes[supers as usize].count } else { 0 };
-    if count > 0 && depth >= 8 {
-        supertrait_depth_error(tr, pcx);
-    }
     for i in 0..count {
-        declaring_all(bound_trait(child(supers, i, pcx), pcx), name, depth + 1, out, pcx);
+        let sb = child(supers, i, pcx);
+        let st = bound_trait(sb, pcx);
+        if st < 0 {
+            continue;
+        }
+        let (sa, sn) = super_args(tr, args, nargs, sb, t, pcx);
+        reached_all(st, sa, sn, name, t, out, seen, pcx);
     }
+}
+
+// Whether the (trait, args, nargs) triples of v hold tr with these
+// arguments (both not known, or the same list).
+fn in_reached(v: &Vec<i64, Comp>, tr: i64, args: i64, nargs: i64, pcx: &Ctx<Comp>) -> bool {
+    let mut k: usize = 0;
+    while k + 2 < v.len() {
+        if v[k] == tr && v[k + 2] == nargs
+            && (v[k + 1] == args
+                || v[k + 1] >= 0 && args >= 0 && same_list(v[k + 1], args, nargs, pcx)) {
+            return true;
+        }
+        k += 3;
+    }
+    false
+}
+
+// The trait arguments of supertrait bound sb of trait tr, tr reached with
+// (args, nargs) and Self = t: (TLISTS index, count), (-1, 0) when the
+// bound writes none, or reading them would need what is not known.
+fn super_args(tr: i64, args: i64, nargs: i64, sb: i64, t: i64, pcx: &mut Ctx<Comp>) -> (i64, i64) {
+    let g = pcx.nodes[sb as usize].g;
+    if g == 0 || t <= 0 {
+        return (-1, 0);
+    }
+    let count = crate::front::convert::trait_param_count(tr, pcx);
+    if count > 0 && (args < 0 || nargs != count) {
+        return (-1, 0);
+    }
+    let saved_self = pcx.self_type;
+    pcx.self_type = t;
+    let saved = crate::front::generics::env_enter(pcx.traits[tr as usize].params,
+        if count > 0 { args } else { 0 }, count, pcx);
+    let r = bound_args(sb, pcx);
+    crate::front::generics::env_leave(saved, pcx);
+    pcx.self_type = saved_self;
+    (r, pcx.nodes[g as usize].count)
 }
 
 // (0.30.2, RT-159) The function `name` that trait tr or one of its
@@ -148,7 +266,7 @@ fn declaring_all(tr: i64, name: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: 
 // item a path names is path_trait's.
 pub fn declared_fn(tr: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let mut out: Vec<i64, Comp> = Vec::new_in(Comp {});
-    declaring_all(tr, name, 0, &mut out, pcx);
+    declaring_all(tr, name, &mut out, pcx);
     for k in 0..out.len() as i64 {
         let f = trait_fn(out[k as usize], name, pcx);
         if f != 0 {
@@ -156,20 +274,6 @@ pub fn declared_fn(tr: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
         }
     }
     0
-}
-
-// error trait.depth: trait tr's supertraits nest deeper than the
-// checker follows (8): a limit, never read as "none declares it".
-pub fn supertrait_depth_error(tr: i64, pcx: &mut Ctx<Comp>) -> ! {
-    let saved_kind = pcx.err_kind;
-    pcx.err_kind = c"trait.depth";
-    err_begin(pcx.nodes[pcx.traits[tr as usize].node as usize].start, pcx);
-    err_str(c"the supertraits of trait '", pcx);
-    err_sym(pcx.traits[tr as usize].name, pcx);
-    err_str(c"' nest deeper than 8", pcx);
-    err_end_soft(pcx);
-    pcx.err_kind = saved_kind;
-    err_jump(pcx)
 }
 
 // The type parameter node path n's X names, its bounds in .h: t's when t
@@ -195,34 +299,41 @@ fn param_node(n: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
 }
 
 // path_trait for X a type parameter p: the trait of its bounds, or of
-// their supertraits, that declares `name`, with the bound's arguments
-// when it names that trait itself; none when none declares it (the
-// bounds' check reports it: require_in_bounds); two, or one trait with
-// two bounds' different arguments: error method.ambiguous (rustc E0034).
+// their supertraits, that declares `name`, with the arguments the bound
+// names it with, a supertrait's read through the bound's (reached_all:
+// `T: Sub` with `trait Sub: Conv<i64>` is Conv<i64>); none when none
+// declares it (the bounds' check reports it: require_in_bounds); two
+// traits, or one trait with two different arguments: error
+// method.ambiguous (rustc E0034, E0283).
 fn bound_choice(n: i64, t: i64, p: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTrait {
     let bounds = pcx.nodes[p as usize].h;
     let mut found = no_trait();
-    let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
     for i in 0..pcx.nodes[bounds as usize].count {
         let b = child(bounds, i, pcx);
         let bt = bound_trait(b, pcx);
         if bt < 0 {
             continue;
         }
-        seen.clear();
-        declaring_all(bt, name, 0, &mut seen, pcx);
-        for k in 0..seen.len() as i64 {
-            let tr = seen[k as usize];
-            let g: i64 = if tr == bt { pcx.nodes[b as usize].g } else { 0 };
-            let here = if g != 0 {
-                PathTrait { tr: tr, args: bound_args(b, pcx), nargs: pcx.nodes[g as usize].count,
-                    imp: -1 }
-            } else { PathTrait { tr: tr, args: -1, nargs: 0, imp: -1 } };
+        let g = pcx.nodes[b as usize].g;
+        let (ba, bn) = if g != 0 { (bound_args(b, pcx), pcx.nodes[g as usize].count) }
+            else { (-1, 0) };
+        let mut reached: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
+        reached_all(bt, ba, bn, name, t, &mut reached, &mut seen, pcx);
+        let mut k: usize = 0;
+        while k + 2 < reached.len() {
+            let here = PathTrait { tr: reached[k], args: reached[k + 1], nargs: reached[k + 2],
+                imp: -1 };
+            k += 3;
             if found.tr < 0 {
                 found = here;
-            } else if found.tr != here.tr || found.nargs != here.nargs
-                || found.args >= 0 && !same_list(found.args, here.args, found.nargs, pcx) {
-                ambiguous_error(n, t, name, found.tr, here.tr, pcx);
+            } else if found.tr != here.tr
+                || found.args >= 0 && here.args >= 0
+                && (found.nargs != here.nargs
+                    || !same_list(found.args, here.args, found.nargs, pcx)) {
+                ambiguous_error(n, t, name, found, here, pcx);
+            } else if found.args < 0 {
+                found = here;
             }
         }
     }
@@ -243,18 +354,39 @@ fn default_copy_impl(pcx: &Ctx<Comp>) -> i64 {
     impl_of_fn(g, pcx)
 }
 
+// RULE: F8.3 (0.30.2) The impl whose trait's default path n's `Self` is
+// read in: the function being checked was copied from the trait as its
+// default (default_copy_impl), or n is written in the declaration of the
+// trait of impl self_impl, whose default constant's value
+// assoc::impl_const_value checks for that impl (`const L: i64 = Self::K
+// * 2;`: Self::K the trait's K, not an inherent K of the type); -1
+// otherwise.
+fn default_impl(n: i64, pcx: &Ctx<Comp>) -> i64 {
+    let i = default_copy_impl(pcx);
+    if i >= 0 {
+        return i;
+    }
+    let s = pcx.self_impl;
+    if s < 0 || s >= pcx.traits_impls.len() as i64 {
+        return -1;
+    }
+    let tn = pcx.traits[pcx.traits_impls[s as usize].tr as usize].node;
+    let at = pcx.nodes[n as usize].start;
+    if pcx.nodes[tn as usize].start <= at && at < pcx.nodes[tn as usize].end { s } else { -1 }
+}
+
 // path_trait for `Self::name` in a default of impl i's trait: the trait
 // (the item of impl i) or the supertrait that declares name; none when
 // none does; two: method.ambiguous.
 fn default_choice(n: i64, t: i64, i: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTrait {
     let own = pcx.traits_impls[i as usize].tr;
     let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
-    declaring_all(own, name, 0, &mut seen, pcx);
+    declaring_all(own, name, &mut seen, pcx);
     if seen.len() == 0 {
         return no_trait();
     }
     if seen.len() > 1 {
-        ambiguous_error(n, t, name, seen[0], seen[1], pcx);
+        ambiguous_error(n, t, name, whole(seen[0]), whole(seen[1]), pcx);
     }
     let tr = seen[0];
     PathTrait { tr: tr, args: -1, nargs: 0, imp: if tr == own { i } else { -1 } }
@@ -296,6 +428,14 @@ pub fn concrete_trait(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTra
             trs.push(tr);
         }
     }
+    // (std's From has an impl for every type, `From<T> for T`, intrinsic:
+    // `i64::from(x)` beside a program's `impl MyFrom<u8> for i64` is two
+    // traits' `from`, rustc's E0034)
+    let from = crate::front::traits::std_trait(c"From", pcx);
+    if from >= 0 && !trs.contains(&from)
+        && crate::front::traits::trait_fn(from, name, pcx) != 0 {
+        trs.push(from);
+    }
     if trs.len() == 0 {
         return no_trait();
     }
@@ -309,7 +449,7 @@ pub fn concrete_trait(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTra
             }
         }
         if hits != 1 {
-            ambiguous_error(n, t, name, trs[0], trs[1], pcx);
+            ambiguous_error(n, t, name, whole(trs[0]), whole(trs[1]), pcx);
         }
     }
     let mut imp: i64 = -1;
@@ -320,7 +460,7 @@ pub fn concrete_trait(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> PathTra
             count += 1;
         }
     }
-    PathTrait { tr: tr, args: -1, nargs: 0, imp: if count == 1 { imp } else { -1 } }
+    PathTrait { tr: tr, args: -1, nargs: 0, imp: if count == 1 && tr != from { imp } else { -1 } }
 }
 
 // The constant `name` impl i gives (its own, else its trait's default):
@@ -378,6 +518,10 @@ fn args_agree(i: i64, t: i64, pt: PathTrait, pcx: &mut Ctx<Comp>) -> bool {
         return true;
     }
     let mut have = impl_targs(i, t, pcx);
+    // (a `_`: the impl's own arguments agree where the path writes one)
+    if have < 0 && has_hole(pt, pcx) {
+        return true;
+    }
     if have < 0 {
         let header = pcx.nodes[pcx.nodes[pcx.traits_impls[i as usize].node as usize].a as usize].g;
         if header == 0 || pcx.nodes[header as usize].count != pt.nargs {
@@ -389,7 +533,7 @@ fn args_agree(i: i64, t: i64, pt: PathTrait, pcx: &mut Ctx<Comp>) -> bool {
         }
         have = crate::front::convert::impl_targs_with(i, b, pcx);
     }
-    have >= 0 && same_list(have, pt.args, pt.nargs, pcx)
+    have >= 0 && agrees(have, pt.args, pt.nargs, pcx)
 }
 
 // RULE: F8.4 (0.30.2) The function `name` of pt's trait for path n's type
@@ -409,14 +553,16 @@ pub fn trait_fn_of(n: i64, t: i64, pt: PathTrait, name: i64, pcx: &mut Ctx<Comp>
             return crate::front::opaque::virtual_fn_of(t, pt.tr, b, name, pcx);
         }
     }
-    let i = trait_impl(t, pt, pcx);
-    if i == -2 {
+    // (From's intrinsic impls, none of TRAITS_IMPLS, beside its others:
+    // the type itself, a narrower integer, `<i64 as From<i32>>::from(7)`;
+    // convert::trait_call chooses by the arguments, of From's impls only.
+    // Any other trait with no impl for t is unmet, `<i64 as
+    // MyFrom<i32>>::from(5)` rustc's E0277)
+    if pt.imp < 0 && intrinsic_from(pt.tr, pcx) {
         return -2;
     }
-    // (a generic trait's impl that is none of TRAITS_IMPLS, an intrinsic
-    // conversion, `<i64 as From<i32>>::from(7)`: the call's arguments
-    // choose, convert::generic_trait_call)
-    if i < 0 && crate::front::convert::trait_param_count(pt.tr, pcx) > 0 {
+    let i = trait_impl(t, pt, pcx);
+    if i == -2 {
         return -2;
     }
     if i < 0 {
@@ -428,6 +574,15 @@ pub fn trait_fn_of(n: i64, t: i64, pt: PathTrait, name: i64, pcx: &mut Ctx<Comp>
         unmet_error(n, t, pt.tr, pcx);
     }
     f
+}
+
+// RULE: F8.4 (0.30.2) Whether trait tr is std's From, whose impls for
+// every type (`impl<T> From<T> for T`, rustc's blanket) and the integer
+// widenings are intrinsic (convert::dispatch makes them), none in
+// TRAITS_IMPLS: they count as impls as any other's (concrete_trait,
+// trait_fn_of).
+fn intrinsic_from(tr: i64, pcx: &mut Ctx<Comp>) -> bool {
+    tr >= 0 && tr == crate::front::traits::std_trait(c"From", pcx)
 }
 
 // RULE: F8.4, F3.2 (0.30.2) The constant `name` of pt's trait for path n's
@@ -458,9 +613,10 @@ pub fn trait_const_of(n: i64, t: i64, pt: PathTrait, name: i64, pcx: &mut Ctx<Co
     r
 }
 
-// error method.ambiguous: `name` is an item of traits a and b for path
-// n's X (rustc E0034), with the qualified path of each.
-fn ambiguous_error(n: i64, t: i64, name: i64, a: i64, b: i64, pcx: &mut Ctx<Comp>) -> ! {
+// error method.ambiguous: `name` is an item of traits a and b (with the
+// arguments each names, when known) for path n's X (rustc E0034), with
+// the qualified path of each, as it can be written (`<T as Conv<i32>>::K`).
+fn ambiguous_error(n: i64, t: i64, name: i64, a: PathTrait, b: PathTrait, pcx: &mut Ctx<Comp>) -> ! {
     let saved_kind = pcx.err_kind;
     pcx.err_kind = c"method.ambiguous";
     err_begin(pcx.nodes[n as usize].start, pcx);
@@ -477,15 +633,54 @@ fn ambiguous_error(n: i64, t: i64, name: i64, a: i64, b: i64, pcx: &mut Ctx<Comp
     }
     err_str(c"'", pcx);
     err_help(c"name the trait in a qualified path to say which", pcx);
-    let x = sym_text(pcx.nodes[n as usize].a, pcx);
-    for tr in [a, b] {
-        err_try_fmt(format_args("<{} as {}>::{}", str::from_utf8(x).unwrap(),
-            str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap(),
-            str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+    for pt in [a, b] {
+        try_qualified(sym_text(pcx.nodes[n as usize].a, pcx), pt, name, pcx);
     }
     err_end_soft(pcx);
     pcx.err_kind = saved_kind;
     err_jump(pcx)
+}
+
+// A try: line of the qualified path `<x as Tr<args>>::name` for pt, as it
+// can be pasted: the trait's arguments when known, else a `_` for each of
+// a generic trait's (qpath_args reads it as a hole). (0.30.2, C4)
+fn try_qualified(x: &[u8], pt: PathTrait, name: i64, pcx: &mut Ctx<Comp>) {
+    let out = crate::base::buf_new();
+    crate::base::buf_str(out, c"<");
+    crate::base::buf_bytes(out, x);
+    crate::base::buf_str(out, c" as ");
+    crate::base::buf_bytes(out, sym_text(pcx.traits[pt.tr as usize].name, pcx));
+    let count = crate::front::convert::trait_param_count(pt.tr, pcx);
+    if pt.args >= 0 && pt.nargs > 0 {
+        crate::base::buf_str(out, c"<");
+        for k in 0..pt.nargs {
+            if k > 0 {
+                crate::base::buf_str(out, c", ");
+            }
+            let a = pcx.tlists[(pt.args + k) as usize];
+            if a == 0 {
+                crate::base::buf_str(out, c"_");
+            } else {
+                crate::front::types::buf_type(out, a, pcx);
+            }
+        }
+        crate::base::buf_str(out, c">");
+    } else if count > 0 {
+        crate::base::buf_str(out, c"<");
+        for k in 0..count {
+            crate::base::buf_str(out, if k > 0 { c", _" } else { c"_" });
+        }
+        crate::base::buf_str(out, c">");
+    }
+    crate::base::buf_str(out, c">::");
+    crate::base::buf_bytes(out, sym_text(name, pcx));
+    let text = crate::base::buf_copy(out);
+    err_try_fmt(format_args("{}", str::from_utf8(&text).unwrap()), pcx);
+}
+
+// The PathTrait of trait tr, its arguments not said.
+fn whole(tr: i64) -> PathTrait {
+    PathTrait { tr: tr, args: -1, nargs: 0, imp: -1 }
 }
 
 // error trait.unmet: path n's type t has no impl of trait tr (rustc
@@ -599,7 +794,7 @@ pub fn check_dispatched(n: i64, callee: i64, t: i64, pt: PathTrait, name: i64, r
                 impl_of_fn(pcx.fns[(x - 1) as usize].tmpl - 1, pcx)
             } else { -1 };
         if i0 >= 0 && pcx.traits_impls[i0 as usize].tr != pt.tr {
-            ambiguous_error(callee, t, name, pt.tr, pcx.traits_impls[i0 as usize].tr, pcx);
+            ambiguous_error(callee, t, name, pt, whole(pcx.traits_impls[i0 as usize].tr), pcx);
         }
         if i0 >= 0 && !args_agree(i0, t, pt, pcx) {
             unmet_error(callee, t, pt.tr, pcx);
@@ -718,11 +913,8 @@ fn ambiguous_template_error(n: i64, tpl: i64, name: i64, a: i64, b: i64, pcx: &m
     err_sym(crate::front::generics::template_name(tpl, pcx), pcx);
     err_str(c"'", pcx);
     err_help(c"name the trait in a qualified path to say which", pcx);
-    let x = sym_text(pcx.nodes[n as usize].a, pcx);
     for tr in [a, b] {
-        err_try_fmt(format_args("<{} as {}>::{}", str::from_utf8(x).unwrap(),
-            str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap(),
-            str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+        try_qualified(sym_text(pcx.nodes[n as usize].a, pcx), whole(tr), name, pcx);
     }
     err_end_soft(pcx);
     pcx.err_kind = saved_kind;
@@ -737,7 +929,7 @@ fn ambiguous_template_error(n: i64, tpl: i64, name: i64, a: i64, b: i64, pcx: &m
 pub fn bound_assoc_trait(p_name: i64, bounds: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
     for i in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
-        type_declaring_all(bound_trait(child(bounds, i, pcx), pcx), name, 0, &mut seen, pcx);
+        type_declaring_all(bound_trait(child(bounds, i, pcx), pcx), name, &mut seen, pcx);
     }
     if seen.len() > 1 {
         let saved_kind = pcx.err_kind;
@@ -754,10 +946,7 @@ pub fn bound_assoc_trait(p_name: i64, bounds: i64, name: i64, pos: i64, pcx: &mu
         err_str(c"' both declare it", pcx);
         err_help(c"name the trait in a qualified path to say which", pcx);
         for k in 0..2 {
-            err_try_fmt(format_args("<{} as {}>::{}",
-                str::from_utf8(sym_text(p_name, pcx)).unwrap(),
-                str::from_utf8(sym_text(pcx.traits[seen[k as usize] as usize].name, pcx)).unwrap(),
-                str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+            try_qualified(sym_text(p_name, pcx), whole(seen[k as usize]), name, pcx);
         }
         err_end_soft(pcx);
         pcx.err_kind = saved_kind;
@@ -766,23 +955,28 @@ pub fn bound_assoc_trait(p_name: i64, bounds: i64, name: i64, pos: i64, pcx: &mu
     if seen.len() == 1 { seen[0] } else { -1 }
 }
 
-// The traits, tr and its supertraits (F2.2), that declare an associated
-// type `name`, pushed onto out once each; deeper than 8 is an error.
-fn type_declaring_all(tr: i64, name: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
-    if tr < 0 {
+// The traits, tr and its supertraits, that declare an associated type
+// `name`, pushed onto out once each. No depth limit (reached_all: the
+// supertraits have no cycle; walked keeps a diamond walked once).
+fn type_declaring_all(tr: i64, name: i64, out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+    let mut walked: Vec<i64, Comp> = Vec::new_in(Comp {});
+    type_declaring_walk(tr, name, out, &mut walked, pcx);
+}
+
+fn type_declaring_walk(tr: i64, name: i64, out: &mut Vec<i64, Comp>, walked: &mut Vec<i64, Comp>,
+    pcx: &mut Ctx<Comp>) {
+    if tr < 0 || walked.contains(&tr) {
         return;
     }
+    walked.push(tr);
     let d = assoc_in_trait(tr, name, pcx);
     if d != 0 && (pcx.nodes[d as usize].p & NODE_ASSOC_CONST) == 0 && !out.contains(&tr) {
         out.push(tr);
     }
     let supers = trait_supers(tr, pcx);
     let count: i64 = if supers > 0 { pcx.nodes[supers as usize].count } else { 0 };
-    if count > 0 && depth >= 8 {
-        supertrait_depth_error(tr, pcx);
-    }
     for i in 0..count {
-        type_declaring_all(bound_trait(child(supers, i, pcx), pcx), name, depth + 1, out, pcx);
+        type_declaring_walk(bound_trait(child(supers, i, pcx), pcx), name, out, walked, pcx);
     }
 }
 
@@ -791,7 +985,7 @@ fn type_declaring_all(tr: i64, name: i64, depth: i64, out: &mut Vec<i64, Comp>, 
 // as Tr>::Out`, rustc's reading); -1 when none does; two: E0221 at pos.
 pub fn trait_type_declaring(tr: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
-    type_declaring_all(tr, name, 0, &mut seen, pcx);
+    type_declaring_all(tr, name, &mut seen, pcx);
     if seen.len() > 1 {
         let saved_kind = pcx.err_kind;
         pcx.err_kind = c"type.ambiguous";
@@ -831,7 +1025,7 @@ pub fn virtual_trait_of(f: i64, pcx: &Ctx<Comp>) -> i64 {
 pub fn bound_assoc_count(bounds: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
     for i in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
-        type_declaring_all(bound_trait(child(bounds, i, pcx), pcx), name, 0, &mut seen, pcx);
+        type_declaring_all(bound_trait(child(bounds, i, pcx), pcx), name, &mut seen, pcx);
     }
     seen.len() as i64
 }
