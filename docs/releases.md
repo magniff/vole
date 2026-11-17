@@ -269,7 +269,17 @@ A correctness release, its branches merged as each is reviewed clean.
   met by an impl with lifetime bounds (`where V<T>: Sup`, `where X<'a>:
   Sup` with `impl<'a: 'static> Sup for X<'a>`) is assumed in the fn's
   body and proven at the call, as rustc does (RT-C301-11's compound
-  form; 0.30.1 refused the body).
+  form; 0.30.1 refused the body). An impl parameter bound only by
+  another's Fn bound's output, B of `impl<B, I: Iterator, F:
+  FnMut(I::Item) -> B> Iterator for Map<I, F>`, is read as rustc's
+  `<C as FnOnce>::Output`, through the closure C's own signature
+  (`fn_output_slot`): the closure's capture is in B only when its result
+  borrows it (`.map(|_x| &w[0])` keeps w borrowed, a use after free in
+  0.30.1), so `first(v.iter().map(|x| { w.len(); x }))` (and FilterMap,
+  MapWhile, Scan, an enumerate after it) keeps v borrowed and not w, as
+  rustc; this release's first fix took every region of the Map and
+  refused dropping w. A for loop over a program's adapter of an adapter
+  whose item holds a reference builds (RT-106, refused since 0.28.0).
 
 #### Bugs fixed
 
