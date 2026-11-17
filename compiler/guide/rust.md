@@ -155,6 +155,13 @@ fn main() {
 - A slice has no fields (0.29): its length is `s.len()`, its pointer
   `s.as_ptr()` or `s.as_mut_ptr()`.
 - Raw pointers are for `unsafe` code, as in Rust (`guide unsafe`).
+- A `fn(&T) -> &U` value names no lifetimes of its own: a call through
+  it, or through an `F: Fn(..)` it is given for, ties its result to
+  every argument. A function given by its name is read by its
+  signature (0.30.2): `v.first().map(st)` with `fn st(x: &i64) ->
+  &'static i64` keeps no borrow of v; one whose result borrows an
+  argument the bound lends for the call alone (`sort_by_key(idr)`) is
+  `borrowck.fn_value_bound`, as rustc's E0308.
 
 ## C
 

@@ -15,9 +15,10 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{err_begin, err_end_soft, err_fmt, err_help};
 use crate::front::ast::{NODE_REF, NodeKind, child};
+use crate::front::check::Res;
 use crate::front::parser::rust::{lifetimes_of, outlives_of, where_key};
 use crate::places::front::{fn_node, fn_template};
-use crate::places::regions::{B_NAMED, B_STATIC, lifetime_binding, slot_count};
+use crate::places::regions::{B_NAMED, B_STATIC, Sig, lifetime_binding, sig_new, sig_of, slot_count};
 
 // RULE: D4.7 (0.30.1) Function f used as a value at expression e: the
 // first parameter whose type needs `'static` is the error.
@@ -38,6 +39,23 @@ pub fn check_fn_value(f: i64, e: i64, pcx: &mut Ctx<Comp>) {
         if needs_static(pcx.nodes[pn as usize].b, f, node, self_node, &statics, param_ty, 0, pcx) {
             report(f, pn, e, pcx);
             return;
+        }
+    }
+    // (0.30.2, RT-308: a 'static its signature's bounds ask of a parameter's
+    // slot that its text does not say: the impl select chose for a bound,
+    // `kb::<&i64>` with `T: Keep` and only `impl Keep for &'static i64`, or
+    // a supertrait's, `trait St: 'static`; read afresh, the builder asks)
+    let mut sig = crate::places::regions::sig_new();
+    crate::places::regions::sig_fresh(f, &mut sig, pcx);
+    for p in 0..pcx.nodes[node as usize].count {
+        if p + 1 >= sig.param_at.len() as i64 {
+            break;
+        }
+        for j in sig.param_at[p as usize]..sig.param_at[(p + 1) as usize] {
+            if outlives_in(&sig, sig.params[j as usize], 0) {
+                report(f, child(node, p, pcx), e, pcx);
+                return;
+            }
         }
     }
 }
@@ -254,4 +272,169 @@ fn report(f: i64, pn: i64, e: i64, pcx: &mut Ctx<Comp>) {
     err_help(c"call the function by its name, or let it take a reference of any lifetime (`&T`, not `&'static T`): a `fn` type's lifetimes are erased, so `fn(&'static T)` is read as `fn(&T)` (rustc E0308: one type is more general than the other)", pcx);
     err_end_soft(pcx);
     pcx.err_kind = saved;
+}
+
+// RULE: R6, D20.1 (0.30.2) At call n of f, the callables given to f's
+// parameters that its signature's strict records name
+// (regions::callable_ties): a relation R6 reads of a call through the
+// value that no region of f can hold, a call's own region outliving
+// another (`F: FnMut(&T) -> K` with K a reference: the argument's region
+// would reach K). A fn item given there is checked by its own signature:
+// the relation holds when its bounds keep that parameter's slot from
+// outliving the other position (`fn sc<'a>(st: &mut i64, x: &'a i64) ->
+// Option<&'a i64>` for scan's `FnMut(&mut St, Self::Item) -> Option<B>`).
+// A parameter of the body given on (fwd: its index, -1 for another
+// argument) holds it when the body's own signature has the record, which
+// its callers checked. Anything else is read as R6 reads its erased type:
+// borrowck.fn_value_bound (rustc E0308: one type is more general than the
+// other).
+pub fn check_callables(f: i64, n: i64, fwd: &Vec<i64, Comp>, body_fn: i64, pcx: &mut Ctx<Comp>) {
+    let mut strict = Vec::<i64, Comp>::new_in(Comp {});
+    crate::places::regions::strict_records(f, &mut strict, pcx);
+    let len = strict.len() as i64;
+    if len == 0 {
+        return;
+    }
+    let mut own = Vec::<i64, Comp>::new_in(Comp {});
+    let mut own_read = false;
+    let mut done = Vec::<i64, Comp>::new_in(Comp {});
+    let mut r: i64 = 0;
+    while r + 5 <= len {
+        let at = r;
+        r += 5;
+        let p = strict[at as usize];
+        if done.contains(&p) {
+            continue;
+        }
+        let arg = if p >= 0 && p < pcx.nodes[n as usize].count { child(n, p, pcx) } else { -1 };
+        let mut ok = false;
+        if arg > 0 && pcx.nodes[arg as usize].kind == NodeKind::Ident
+            && pcx.nodes[arg as usize].res == Res::Fn {
+            ok = keeps_apart(pcx.nodes[arg as usize].y, &strict, at, pcx);
+        } else if p >= 0 && p < fwd.len() as i64 && fwd[p as usize] >= 0 && body_fn >= 0 {
+            if !own_read {
+                crate::places::regions::strict_records(body_fn, &mut own, pcx);
+                own_read = true;
+            }
+            ok = has_record(&own, fwd[p as usize], &strict, at);
+        }
+        if !ok {
+            report_bound(f, if arg > 0 { arg } else { n }, pcx);
+            done.push(p);
+        }
+    }
+}
+
+// Whether fn item g's signature keeps record at's first position from
+// outliving its second (check_callables).
+fn keeps_apart(g: i64, strict: &Vec<i64, Comp>, at: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if g < 0 {
+        return false;
+    }
+    let mut gs = sig_new();
+    crate::places::regions::sig_fresh(g, &mut gs, pcx);
+    let a = sig_position(&gs, strict[(at + 1) as usize], strict[(at + 2) as usize]);
+    let b = sig_position(&gs, strict[(at + 3) as usize], strict[(at + 4) as usize]);
+    a >= 0 && b >= 0 && !outlives_in(&gs, a, b)
+}
+
+// The universal of slot `slot` of parameter o of s (-1: its result), -1
+// when it has none.
+fn sig_position(s: &Sig<Comp>, o: i64, slot: i64) -> i64 {
+    if o < 0 {
+        return if slot >= 0 && slot < s.ret.len() as i64 { s.ret[slot as usize] } else { -1 };
+    }
+    if o + 1 >= s.param_at.len() as i64 {
+        return -1;
+    }
+    let i = s.param_at[o as usize] + slot;
+    if slot >= 0 && i < s.param_at[(o + 1) as usize] { s.params[i as usize] } else { -1 }
+}
+
+// Whether universal a outlives b by s's bounds (one, 'static, or a chain).
+fn outlives_in(s: &Sig<Comp>, a: i64, b: i64) -> bool {
+    if a == b || a == 0 {
+        return true;
+    }
+    let mut seen = Vec::<i64, Comp>::new_in(Comp {});
+    let mut stack = Vec::<i64, Comp>::new_in(Comp {});
+    stack.push(a);
+    seen.push(a);
+    while stack.len() > 0 {
+        let x = stack[stack.len() - 1];
+        stack.truncate(stack.len() - 1);
+        let mut k: usize = 0;
+        while k + 1 < s.bounds.len() {
+            if s.bounds[k] == x {
+                let y = s.bounds[k + 1];
+                if y == b {
+                    return true;
+                }
+                if !seen.contains(&y) {
+                    seen.push(y);
+                    stack.push(y);
+                }
+            }
+            k += 2;
+        }
+        // (and the relations of a call through a callable it reads)
+        let mut v: usize = 0;
+        while v + 7 <= s.vties.len() {
+            if s.vties[v + 1] == x {
+                let y = s.vties[v + 2];
+                if y == b {
+                    return true;
+                }
+                if !seen.contains(&y) {
+                    seen.push(y);
+                    stack.push(y);
+                }
+            }
+            v += 7;
+        }
+    }
+    false
+}
+
+// Whether records own hold one for parameter q with record at's positions.
+fn has_record(own: &Vec<i64, Comp>, q: i64, strict: &Vec<i64, Comp>, at: i64) -> bool {
+    let mut i: usize = 0;
+    while i + 5 <= own.len() {
+        if own[i] == q && own[i + 1] == strict[(at + 1) as usize]
+            && own[i + 2] == strict[(at + 2) as usize] && own[i + 3] == strict[(at + 3) as usize]
+            && own[i + 4] == strict[(at + 4) as usize] {
+            return true;
+        }
+        i += 5;
+    }
+    false
+}
+
+// RULE: R6 error borrowck.fn_value_bound
+fn report_bound(f: i64, e: i64, pcx: &mut Ctx<Comp>) {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"borrowck.fn_value_bound";
+    let name = str::from_utf8(sym_text(pcx.nodes[fn_node(fn_template(f, pcx), pcx) as usize].a,
+        pcx)).unwrap();
+    err_begin(pcx.nodes[e as usize].start, pcx);
+    err_fmt(format_args("this value cannot be given to '{}': its bound lets the call's argument end with the call, and the value's result may borrow from it (a `fn` value's result borrows from every argument, unless it is a function whose signature says otherwise)",
+        name), pcx);
+    err_help(c"pass a closure whose result does not borrow from that argument (`|x| *x`, `|x| x.clone()`), or the function itself by its name (rustc E0308: one type is more general than the other)", pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved;
+}
+
+// RULE: R6 (0.30.2) Whether fn item g, given where a call through it makes
+// relation k of vties (regions::Sig: a parameter, two universals, two
+// positions), relates those positions by its own signature: the first
+// outlives the second by its bounds. A position it has not: it does.
+pub fn relates(g: i64, vties: &Vec<i64, Comp>, k: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if g < 0 {
+        return true;
+    }
+    let mut gs = sig_new();
+    sig_of(g, &mut gs, pcx);
+    let a = sig_position(&gs, vties[(k + 3) as usize], vties[(k + 4) as usize]);
+    let b = sig_position(&gs, vties[(k + 5) as usize], vties[(k + 6) as usize]);
+    a < 0 || b < 0 || outlives_in(&gs, a, b)
 }

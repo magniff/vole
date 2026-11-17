@@ -148,6 +148,14 @@ pub fn assign_regions(pbody: &mut Body<Comp>, pcx: &mut Ctx<Comp>) {
         pbody.ubounds.push(sig.bounds[(i + 1) as usize] + 1);
         i += 2;
     }
+    // RULE: R6 (0.30.2: the relations of a call through a callable the
+    // signature reads, assumed by the body, callable_ties)
+    i = 0;
+    while i + 7 <= sig.vties.len() as i64 {
+        pbody.ubounds.push(sig.vties[(i + 1) as usize] + 1);
+        pbody.ubounds.push(sig.vties[(i + 2) as usize] + 1);
+        i += 7;
+    }
     // RULE: D3.2 (a parameter's slots are its signature's universals; any
     // other local's, variables of their own)
     for l in 0..pbody.locals.len() as i64 {
@@ -949,15 +957,29 @@ fn decl_pairs(t: i64, off: i64, depth: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<
     let mut r: i64 = 0;
     while r + 1 < reqs.len() as i64 {
         let a = reqs[r as usize];
-        let b: i64 = if reqs[(r + 1) as usize] < 0 { -1 } else { off + reqs[(r + 1) as usize] };
+        let b0 = reqs[(r + 1) as usize];
         r += 2;
-        if a < nl {
-            out.push(off + a);
-            out.push(b);
-        } else if a - nl < offs.len() as i64 {
-            for s in 0..slot_count(adt_targ(t, a - nl, pcx), pcx) {
-                out.push(offs[(a - nl) as usize] + s);
+        // (b: 'static, a lifetime's slot, or, 0.30.2 (fn_field_reqs), every
+        // slot of a type parameter's substitution)
+        let mut bs = Vec::<i64, Comp>::new_in(Comp {});
+        if b0 < 0 {
+            bs.push(-1);
+        } else if b0 < nl {
+            bs.push(off + b0);
+        } else if b0 - nl < offs.len() as i64 {
+            for s in 0..slot_count(adt_targ(t, b0 - nl, pcx), pcx) {
+                bs.push(offs[(b0 - nl) as usize] + s);
+            }
+        }
+        for &b in bs.iter() {
+            if a < nl {
+                out.push(off + a);
                 out.push(b);
+            } else if a - nl < offs.len() as i64 {
+                for s in 0..slot_count(adt_targ(t, a - nl, pcx), pcx) {
+                    out.push(offs[(a - nl) as usize] + s);
+                    out.push(b);
+                }
             }
         }
     }
@@ -1229,6 +1251,10 @@ fn req_walk(n: i64, t: i64, enc: i64, dn: i64, memo: &mut ReqMemo<Comp>, out: &m
         }
         return;
     }
+    if k == NodeKind::TyFn && pcx.nodes[n as usize].d < 2 {
+        fn_field_reqs(n, t, dn, out, pcx);
+        return;
+    }
     if k != NodeKind::TyName {
         return;
     }
@@ -1278,20 +1304,193 @@ fn req_walk(n: i64, t: i64, enc: i64, dn: i64, memo: &mut ReqMemo<Comp>, out: &m
         let a = sub[r as usize];
         let b0 = sub[(r + 1) as usize];
         r += 2;
-        let b: i64 = if b0 < 0 { -1 } else if b0 < nlts {
-            req_lifetime(pcx.nodes[child(lts, b0, pcx) as usize].a, dn, pcx)
-        } else { -2 };
-        if b == -2 {
-            continue;
-        }
-        if a < dm {
-            if a < nlts {
-                req_push(req_lifetime(pcx.nodes[child(lts, a, pcx) as usize].a, dn, pcx), b, out);
+        // (b: 'static, a lifetime n writes, or, 0.30.2 (fn_field_reqs), a
+        // type parameter of the named type: every region n writes for it)
+        let mut bs = Vec::<i64, Comp>::new_in(Comp {});
+        if b0 < 0 {
+            bs.push(-1);
+        } else if b0 < dm {
+            if b0 < nlts {
+                bs.push(req_lifetime(pcx.nodes[child(lts, b0, pcx) as usize].a, dn, pcx));
             }
-        } else if a - dm < nargs && a - dm < adt_targ_count(t, pcx) {
-            req_walk(child(args, a - dm, pcx), adt_targ(t, a - dm, pcx), b, dn, memo, out,
-                pcx);
+        } else if b0 - dm < nargs && b0 - dm < adt_targ_count(t, pcx) {
+            let mut inv = Vec::<bool, Comp>::new_in(Comp {});
+            named_regions(child(args, b0 - dm, pcx), adt_targ(t, b0 - dm, pcx), dn, false,
+                &mut bs, &mut inv, 0, pcx);
         }
+        for &b in bs.iter() {
+            if b == -2 {
+                continue;
+            }
+            if a < dm {
+                if a < nlts {
+                    req_push(req_lifetime(pcx.nodes[child(lts, a, pcx) as usize].a, dn, pcx), b,
+                        out);
+                }
+            } else if a - dm < nargs && a - dm < adt_targ_count(t, pcx) {
+                req_walk(child(args, a - dm, pcx), adt_targ(t, a - dm, pcx), b, dn, memo, out,
+                    pcx);
+            }
+        }
+    }
+}
+
+// RULE: R6, D4.6 (0.30.2, RT-282) A `fn` type node n (checker type t) in a
+// field of declaration dn: a call through the value relates the regions
+// of its parts as R6 reads its erased type (callable_ties), so they are
+// the declaration's requirements, in its terms (adt_reqs' pairs: a
+// lifetime's index, or a type parameter's, nl + its index, standing for
+// every slot of what it is given): every region an argument names
+// outlives every region the result names; one an argument or the result
+// names in an invariant position and every region another names are one.
+// `struct Holder<A, B> { f: fn(A) -> B }`: A outlives B, so a body given a
+// `Holder<T, U>` that calls `(h.f)(t)` may return it as U, and its caller
+// is held to it. An elided region of a part is the call's own: none.
+fn fn_field_reqs(n: i64, t: i64, dn: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    let mut regs = Vec::<i64, Comp>::new_in(Comp {});
+    let mut inv = Vec::<bool, Comp>::new_in(Comp {});
+    let mut at = Vec::<i64, Comp>::new_in(Comp {});
+    let np = pcx.nodes[n as usize].count;
+    for i in 0..np + 1 {
+        at.push(regs.len() as i64);
+        let (cn, ct) = if i < np {
+            (child(n, i, pcx),
+                if t > 0 && pcx.types[t as usize].kind == TyKind::Fn
+                    && i < pcx.types[t as usize].count { type_elem(t, i, pcx) } else { 0 })
+        } else {
+            (pcx.nodes[n as usize].a, if t > 0 && pcx.types[t as usize].kind == TyKind::Fn {
+                pcx.types[t as usize].a
+            } else { 0 })
+        };
+        named_regions(cn, ct, dn, false, &mut regs, &mut inv, 0, pcx);
+    }
+    at.push(regs.len() as i64);
+    let r0 = at[np as usize];
+    for a in 0..r0 {
+        for b in r0..regs.len() as i64 {
+            req_push(regs[a as usize], regs[b as usize], out);
+        }
+    }
+    for o in 0..np + 1 {
+        for e in at[o as usize]..at[(o + 1) as usize] {
+            if !inv[e as usize] {
+                continue;
+            }
+            for o2 in 0..np + 1 {
+                if o2 == o {
+                    continue;
+                }
+                for x in at[o2 as usize]..at[(o2 + 1) as usize] {
+                    req_push(regs[e as usize], regs[x as usize], out);
+                    req_push(regs[x as usize], regs[e as usize], out);
+                }
+            }
+        }
+    }
+}
+
+// The regions type node n (checker type t, 0: unknown) of declaration dn
+// names, in adt_reqs' terms (a lifetime's index, -1 'static, nl + a type
+// parameter's index), each with whether it is in an invariant position
+// (under a `&mut`, a raw pointer, an invariant parameter of a struct or
+// an enum; a projection's, read as its parameter's, invariant), pushed to
+// regs and inv. A `fn` type inside names none (its value has no region).
+fn named_regions(n: i64, t: i64, dn: i64, under: bool, regs: &mut Vec<i64, Comp>,
+    inv: &mut Vec<bool, Comp>, depth: i64, pcx: &Ctx<Comp>) {
+    // (no depth limit: a type node is a finite tree; a limit would drop
+    // requirements)
+    if n <= 0 {
+        return;
+    }
+    let k = pcx.nodes[n as usize].kind;
+    let tk = if t > 0 { pcx.types[t as usize].kind } else { TyKind::None };
+    if k == NodeKind::TyPtr {
+        let inner_t: i64 = if tk == TyKind::Ptr { pcx.types[t as usize].a } else { 0 };
+        let mut below = under;
+        if (pcx.nodes[n as usize].p & NODE_REF) != 0 {
+            let me = req_lifetime(pcx.nodes[n as usize].c, dn, pcx);
+            if me != -2 {
+                regs.push(me);
+                inv.push(under);
+            }
+            below = under || (pcx.nodes[n as usize].p & NODE_REF_MUT) != 0;
+        } else {
+            below = true;
+        }
+        named_regions(pcx.nodes[n as usize].a, inner_t, dn, below, regs, inv, depth + 1, pcx);
+        return;
+    }
+    if k == NodeKind::TySlice || k == NodeKind::TyArray {
+        if k == NodeKind::TySlice {
+            let me = req_lifetime(pcx.nodes[n as usize].c, dn, pcx);
+            if me != -2 {
+                regs.push(me);
+                inv.push(under);
+            }
+        }
+        let inner_t: i64 = if tk == TyKind::Slice || tk == TyKind::Array { pcx.types[t as usize].a }
+            else { 0 };
+        named_regions(pcx.nodes[n as usize].a, inner_t, dn, under, regs, inv, depth + 1, pcx);
+        return;
+    }
+    if k == NodeKind::TyTuple {
+        for i in 0..pcx.nodes[n as usize].count {
+            let et: i64 = if tk == TyKind::Tuple
+                && i < pcx.types[t as usize].count { type_elem(t, i, pcx) } else { 0 };
+            named_regions(child(n, i, pcx), et, dn, under, regs, inv, depth + 1, pcx);
+        }
+        return;
+    }
+    if k != NodeKind::TyName {
+        return;
+    }
+    let nl = decl_lifetimes(dn, pcx);
+    let g = pcx.nodes[dn as usize].g;
+    if pcx.nodes[n as usize].list != 0 {
+        // (a projection, `I::Item`: its parameter's regions, invariant)
+        let first = if pcx.nodes[n as usize].count > 0 { pcx.nodes[child(n, 0, pcx) as usize].a }
+            else { pcx.nodes[n as usize].a };
+        let i = param_index(g, first, pcx);
+        if i >= 0 {
+            regs.push(nl + i);
+            inv.push(true);
+        }
+        return;
+    }
+    if pcx.nodes[n as usize].g == 0 {
+        let i = param_index(g, pcx.nodes[n as usize].a, pcx);
+        if i >= 0 {
+            regs.push(nl + i);
+            inv.push(under);
+            return;
+        }
+        if sym_text(pcx.nodes[n as usize].a, pcx) == b"str" {
+            let me = req_lifetime(pcx.nodes[n as usize].c, dn, pcx);
+            if me != -2 {
+                regs.push(me);
+                inv.push(under);
+            }
+            return;
+        }
+    }
+    let adt = t > 0 && (tk == TyKind::Struct || tk == TyKind::Enum);
+    let d = if adt { decl_index(t, pcx) } else { -1 };
+    let lts = lifetimes_of(n, pcx);
+    let nlts: i64 = if lts > 0 { pcx.nodes[lts as usize].count } else { 0 };
+    for i in 0..nlts {
+        let me = req_lifetime(pcx.nodes[child(lts, i, pcx) as usize].a, dn, pcx);
+        if me != -2 {
+            regs.push(me);
+            inv.push(under || !adt || decl_variance(d, i, pcx) == V_INV);
+        }
+    }
+    let args = pcx.nodes[n as usize].g;
+    let nargs: i64 = if args > 0 { pcx.nodes[args as usize].count } else { 0 };
+    let dl = if adt { decl_lifetimes(adt_node(t, pcx), pcx) } else { 0 };
+    for i in 0..nargs {
+        let at: i64 = if adt && i < adt_targ_count(t, pcx) { adt_targ(t, i, pcx) } else { 0 };
+        let below = under || !adt || decl_variance(d, dl + i, pcx) == V_INV;
+        named_regions(child(args, i, pcx), at, dn, below, regs, inv, depth + 1, pcx);
     }
 }
 
@@ -2189,6 +2388,20 @@ pub struct Sig<A: Allocator> {
     // of each position of slots(C) (D19.4)
     pub closure: i64,
     pub cslots: Vec<i64, A>,
+    // (0.30.2, R6) what a callable given to a parameter must not relate,
+    // five words each (callable_ties): the parameter (-1: one no callable
+    // is given to as a value), then two positions, an operand of the call
+    // through it (-1: its result) and a slot of it: the callable may not
+    // make the first outlive the second (checked where it is given:
+    // fn_values::check_callables)
+    pub strict: Vec<i64, A>,
+    // (0.30.2, R6) the relations a call through a callable given to a
+    // parameter makes between the signature's universals, seven words each
+    // (callable_ties): the parameter (-1: none), universal a outliving b,
+    // and the two positions as strict's; the body assumes each, and a call
+    // requires it unless the value given there is a fn item whose own
+    // signature does not relate those positions
+    pub vties: Vec<i64, A>,
     walk: Vec<i64, A>,
 }
 
@@ -2202,6 +2415,8 @@ pub fn sig_new() -> Sig<Comp> {
         elision: 0,
         closure: -1,
         cslots: Vec::new_in(Comp {}),
+        strict: Vec::new_in(Comp {}),
+        vties: Vec::new_in(Comp {}),
         walk: Vec::new_in(Comp {}),
     }
 }
@@ -2248,6 +2463,8 @@ pub fn sig_of(f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
         memo_push(&sig.ret, &mut pcx.sig_memo);
         memo_push(&sig.bounds, &mut pcx.sig_memo);
         memo_push(&sig.cslots, &mut pcx.sig_memo);
+        memo_push(&sig.strict, &mut pcx.sig_memo);
+        memo_push(&sig.vties, &mut pcx.sig_memo);
         pcx.sig_memo.push(sig.elision);
         pcx.sig_memo.push(sig.closure);
         pcx.sig_memo_at.put(f + 1, at + 1);
@@ -2259,6 +2476,8 @@ pub fn sig_of(f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
     memo_load(&mut sig.ret, &mut at, &pcx.sig_memo);
     memo_load(&mut sig.bounds, &mut at, &pcx.sig_memo);
     memo_load(&mut sig.cslots, &mut at, &pcx.sig_memo);
+    memo_load(&mut sig.strict, &mut at, &pcx.sig_memo);
+    memo_load(&mut sig.vties, &mut at, &pcx.sig_memo);
     sig.elision = pcx.sig_memo[at as usize];
     sig.closure = pcx.sig_memo[(at + 1) as usize];
 }
@@ -2294,6 +2513,8 @@ fn sig_compute(f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
     sig.elision = 0;
     sig.closure = -1;
     sig.cslots.clear();
+    sig.strict.clear();
+    sig.vties.clear();
     let _ = add_universal(U_STATIC, 0, 0, sig);
     // (an instance's node is a clone without its generics and lifetimes:
     // its template's is read, with the instance's types)
@@ -2496,6 +2717,7 @@ fn sig_compute(f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
     // name, an impl parameter only a bound gives, `T` of `impl<'a, T, I:
     // Iterator<Item = &'a T>> Iterator for Copied<I>`, finds its universal)
     bound_ties(f, tps, self_node, sig, pcx);
+    callable_ties(f, tps, self_node, sig, pcx);
     subst_requirements(f, tps, sig, pcx);
 }
 
@@ -2508,9 +2730,11 @@ fn subst_requirements(f: i64, tps: i64, sig: &mut Sig<Comp>, pcx: &Ctx<Comp>) {
         return;
     }
     for k in 0..nt {
-        let t = tlist_at(pcx.fns[f as usize].targs + k, pcx);
-        if t <= 0 || pcx.types[t as usize].kind != TyKind::Struct
-            || k >= pcx.nodes[tps as usize].count {
+        let t0 = tlist_at(pcx.fns[f as usize].targs + k, pcx);
+        // (0.30.2: C behind a `&` or `&mut`, `map(&mut c)`, its slots after
+        // the reference's; an opaque `impl Fn` result, its hidden C's)
+        let (t, off) = closure_callable(t0, pcx);
+        if t <= 0 || k >= pcx.nodes[tps as usize].count {
             continue;
         }
         let id = pcx.structs[pcx.types[t as usize].a as usize].closure - 1;
@@ -2521,7 +2745,7 @@ fn subst_requirements(f: i64, tps: i64, sig: &mut Sig<Comp>, pcx: &Ctx<Comp>) {
         // RULE: D4.5 (and C's implied bounds: a capture's `&'c τ` gives
         // `'t ⊒ 'c` for τ's slots, as in the closure's own body)
         sig.walk.clear();
-        bind_walk(0, t, 0, 0, -1, &mut sig.walk, 0, pcx, -1);
+        bind_walk(0, t0, 0, 0, -1, &mut sig.walk, 0, pcx, -1);
         for e in 0..sig.walk.len() as i64 / 4 {
             let up = sig.walk[(4 * e + 3) as usize];
             let a = find_universal(U_SUBST, sym, e, sig);
@@ -2575,20 +2799,543 @@ fn subst_requirements(f: i64, tps: i64, sig: &mut Sig<Comp>, pcx: &Ctx<Comp>) {
                             pcx.nodes[child(tps, read[(4 * e + 1) as usize], pcx) as usize].a,
                             read[(4 * e + 2) as usize], sig)
                     } else { -1 };
-                    tie_universals(find_universal(U_SUBST, sym, nenv + q, sig), b, sig);
+                    tie_universals(find_universal(U_SUBST, sym, off + nenv + q, sig), b, sig);
                 }
             }
         }
         for q in 0..pcx.closures[id as usize].req_n {
             let i = pcx.capture_list[(pcx.closures[id as usize].req_at + 2 * q) as usize];
             let j = pcx.capture_list[(pcx.closures[id as usize].req_at + 2 * q + 1) as usize];
-            let a = find_universal(U_SUBST, sym, i, sig);
-            let b: i64 = if j < 0 { 0 } else { find_universal(U_SUBST, sym, j, sig) };
+            let a = find_universal(U_SUBST, sym, off + i, sig);
+            let b: i64 = if j < 0 { 0 } else { find_universal(U_SUBST, sym, off + j, sig) };
             if a >= 0 && b >= 0 {
                 sig.bounds.push(a);
                 sig.bounds.push(b);
             }
         }
+    }
+}
+
+// RULE: R6, D20.1 (0.30.2, RT-282, RT-297, RT-309..311) A callable that
+// is not a closure (a fn item, a fn pointer, a method path, a generic fn
+// value, an opaque `impl Fn`) is called through as its erased type reads
+// (constraints.vl indirect_call): every region of an argument outlives
+// every region of the result, and a region in an invariant position of
+// one is equal to every region of another. Where such a callable meets
+// instance f's signature, by a bound `F: Fn*(A..) -> R` its type argument
+// (or the referent of a `&`, `&mut` one) meets, inline or in a `where`,
+// or as a `fn(A..) -> R` written in a parameter's type (behind a
+// reference, in an array, a tuple, a type argument), those relations,
+// read over the bound's (the written type's) types in f's signature, are
+// bounds of f, as a closure's requirements are (subst_requirements): the
+// body assumes them where it calls the value, and every call of f
+// requires them at its call regions. So the caller's argument and result
+// are related as a call through the value relates them, and the body is
+// checked by the bound, never by which callable the instance was made
+// with. A relation no region of f can hold (an argument's elided region,
+// the call's own, outliving a region of f: `F: FnMut(&T) -> K` with K a
+// reference) is kept in sig.strict, for the callable given to that
+// parameter to be checked where it is given (fn_values::check_callables:
+// a fn item by its own signature, else borrowck.fn_value_bound, rustc's
+// E0308: one type is more general than the other).
+fn callable_ties(f: i64, tps: i64, self_node: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    let node = fn_node(crate::places::front::fn_template(f, pcx), pcx);
+    if !is_node(node, NodeKind::Fn, pcx) {
+        return;
+    }
+    let np = fn_param_count(f, pcx);
+    for i in 0..np {
+        written_fn_ties(param_node(node, i, pcx), fn_param(f, i, pcx), i, tps, self_node, f, sig,
+            pcx);
+    }
+    if pcx.fns[f as usize].tmpl > 0 && tps > 0 {
+        for k in 0..pcx.nodes[tps as usize].count {
+            if k >= pcx.fns[f as usize].targ_count {
+                break;
+            }
+            let s = tlist_at(pcx.fns[f as usize].targs + k, pcx);
+            let bounds = pcx.nodes[child(tps, k, pcx) as usize].h;
+            let (ct, _) = closure_callable(s, pcx);
+            if bounds > 0 && (ct > 0 || plain_callable(s, pcx)) {
+                // (an impl's parameter, `F` of `impl<.., F: FnMut(&mut St,
+                // I::Item) -> Option<B>> Iterator for Scan<I, St, F>`: the
+                // value was given to what made Self, std's `scan` under the
+                // same bound, and checked there; a program's struct literal
+                // gives it with no bound, and its impl's body, checked, reads
+                // the call as R6 does)
+                let own = k
+                    >= (if is_node(tps, NodeKind::Generics, pcx) { pcx.nodes[tps as usize].a }
+                        else { 0 });
+                // (the parameters a value of type F is given to)
+                let sym = pcx.nodes[child(tps, k, pcx) as usize].a;
+                let mut ps = Vec::<i64, Comp>::new_in(Comp {});
+                for i in 0..np {
+                    let tn = param_node(node, i, pcx);
+                    if is_node(tn, NodeKind::TyName, pcx) && pcx.nodes[tn as usize].list == 0
+                        && pcx.nodes[tn as usize].g == 0 && pcx.nodes[tn as usize].a == sym {
+                        ps.push(i);
+                    }
+                }
+                if ct > 0 {
+                    // RULE: D20.3, D19.10 (a closure checked against another
+                    // bound: its own bound regions, closure_group_ties)
+                    closure_group_ties(ct, k, &ps, own, tps, self_node, f, sig, pcx);
+                } else {
+                    bound_fn_ties(bounds, &ps, own, tps, self_node, f, sig, pcx);
+                }
+            }
+        }
+        // (a `where` predicate on another subject, `I::F: Fn(..)`)
+        let mut next = crate::front::traits::wp_start(node, pcx);
+        while next >= 0 {
+            let k = next;
+            next = crate::front::traits::wp_after(k, pcx);
+            let bounds = pcx.where_preds[k as usize].bounds;
+            let s = instance_type(pcx.where_preds[k as usize].subject, f, tps, pcx);
+            if bounds > 0 && s > 0 && plain_callable(s, pcx) {
+                let none = Vec::<i64, Comp>::new_in(Comp {});
+                bound_fn_ties(bounds, &none, true, tps, self_node, f, sig, pcx);
+            }
+        }
+    }
+}
+
+// The closure type a callable of type t is (a closure, or the hidden
+// closure of an opaque `impl Fn` result), and how many slots of t come
+// before its own (1 behind a `&` or `&mut`); (0, 0) when it is none.
+pub fn closure_callable(t: i64, pcx: &Ctx<Comp>) -> (i64, i64) {
+    let mut c = t;
+    let mut off: i64 = 0;
+    if c > 0 && pcx.types[c as usize].kind == TyKind::Ptr && is_ref_kind(pcx.types[c as usize].b) {
+        c = pcx.types[c as usize].a;
+        off = 1;
+    }
+    if c > 0 && crate::front::opaque::is_opaque(c, pcx) {
+        c = pcx.types[c as usize].a;
+    }
+    if c > 0 && pcx.types[c as usize].kind == TyKind::Struct
+        && pcx.structs[pcx.types[c as usize].a as usize].closure != 0 {
+        (c, off)
+    } else {
+        (0, 0)
+    }
+}
+
+// RULE: D20.3, D19.10 (4) (0.30.2) Closure type ct given for type parameter k
+// of instance f (generics tps), whose `Fn*` bound is not the one ct was
+// checked against (`mkc(|x| x)` under `F: Fn(&i64) -> &i64`, then given
+// to Option::map's `F: FnOnce(T) -> U`; an opaque `impl Fn(&i64) -> &i64`
+// result): a bound region of ct's own signature, the call's, at an
+// argument's position and at the result's (E2) relates the bound's
+// regions there, the argument's outliving the result's, as a call of ct
+// relates them. Where the argument's region is the bound's own (an elided
+// region of the bound's argument) and the result's one of f, no region of
+// f holds it: a strict record for the parameters ps (subst_requirements
+// ties ct's external positions; this is its bound regions').
+fn closure_group_ties(ct: i64, k: i64, ps: &Vec<i64, Comp>, strict: bool, tps: i64, self_node: i64,
+    f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    let id = pcx.structs[pcx.types[ct as usize].a as usize].closure - 1;
+    let bnode = crate::front::closures::fn_bounds::fn_bound_of(tps, k, pcx);
+    if id < 0 || bnode <= 0 || pcx.closures[id as usize].exp_node == bnode {
+        return;
+    }
+    let mut walk = Vec::<i64, Comp>::new_in(Comp {});
+    let mut at = Vec::<i64, Comp>::new_in(Comp {});
+    let mut codes = Vec::<i64, Comp>::new_in(Comp {});
+    let _ = closure_sig_walk(id, pcx.closures[id as usize].exp_node,
+        pcx.closures[id as usize].exp_tps, &mut walk, &mut at, &mut codes, F_MARK, 0, pcx);
+    let mut read = Vec::<i64, Comp>::new_in(Comp {});
+    let mut at2 = Vec::<i64, Comp>::new_in(Comp {});
+    let mut codes2 = Vec::<i64, Comp>::new_in(Comp {});
+    let _ = closure_sig_walk(id, bnode, tps, &mut read, &mut at2, &mut codes2, f, self_node, pcx);
+    if read.len() != walk.len() || at.len() < 2 {
+        return;
+    }
+    let n = at.len() as i64 - 2;
+    let r0 = at[n as usize];
+    let mut cs = Vec::<i64, Comp>::new_in(Comp {});
+    let mut pos = Vec::<i64, Comp>::new_in(Comp {});
+    for e in 0..codes.len() as i64 {
+        let mut o: i64 = 0;
+        while o < n && at[(o + 1) as usize] <= e {
+            o += 1;
+        }
+        // (the bound's own region there, a call's: -2; else its universal)
+        let rb = read[(4 * e) as usize];
+        cs.push(if rb == B_ELIDED { -2 } else { region_code(&read, e, tps, sig, pcx) });
+        pos.push(if o < n { o } else { -1 });
+        pos.push(e - at[o as usize]);
+    }
+    for b in r0..codes.len() as i64 {
+        let g = codes[b as usize];
+        if g > -2 {
+            continue;
+        }
+        for a in 0..r0 {
+            if codes[a as usize] == g {
+                r6_pair(a, b, &cs, &pos, ps, strict, sig);
+            }
+        }
+    }
+}
+
+// Function f's strict records (callable_ties) into out, read afresh, with
+// nothing memoized (the places builder asks, before the bodies whose
+// closures a signature reads are checked: sig_of would keep a signature
+// made too early). None for a closure's body, or a function whose
+// parameters and type arguments hold no callable read as its erased type.
+pub fn strict_records(f: i64, out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+    out.clear();
+    if f < 0 || closure_of_fn(f, pcx) >= 0 {
+        return;
+    }
+    let mut any = false;
+    for i in 0..fn_param_count(f, pcx) {
+        any = any || holds_fn_type(fn_param(f, i, pcx), 0, pcx);
+    }
+    for k in 0..(if pcx.fns[f as usize].tmpl > 0 { pcx.fns[f as usize].targ_count } else { 0 }) {
+        let s = tlist_at(pcx.fns[f as usize].targs + k, pcx);
+        any = any || plain_callable(s, pcx) || closure_callable(s, pcx).0 > 0;
+    }
+    if !any {
+        return;
+    }
+    let node = fn_node(crate::places::front::fn_template(f, pcx), pcx);
+    if !is_node(node, NodeKind::Fn, pcx) {
+        return;
+    }
+    // (the impls select chose for the bounds, as sig_compute reads them:
+    // a projection `C::Item` of `C = &'a Vec<T>` is read through its pattern
+    // impl, not as elided, the call's own region)
+    warm_selections(f, pcx.nodes[node as usize].g, pcx);
+    let mut sig = sig_new();
+    callable_ties(f, pcx.nodes[node as usize].g, pcx.nodes[node as usize].h, &mut sig, pcx);
+    for &x in sig.strict.iter() {
+        out.push(x);
+    }
+}
+
+// Whether type t holds a `fn` type or an opaque one, behind references and
+// pointers, in arrays, views, tuples, or a struct's or an enum's type
+// arguments (written_fn_ties' reach).
+fn holds_fn_type(t: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if t <= 0 || depth > 64 {
+        return t > 0;
+    }
+    let k = pcx.types[t as usize].kind;
+    if k == TyKind::Fn || crate::front::opaque::is_opaque(t, pcx) {
+        return true;
+    }
+    if k == TyKind::Ptr || k == TyKind::Slice || k == TyKind::Array {
+        return holds_fn_type(pcx.types[t as usize].a, depth + 1, pcx);
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[t as usize].count {
+            if holds_fn_type(type_elem(t, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (k == TyKind::Struct || k == TyKind::Enum)
+        && !(k == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].closure != 0) {
+        for i in 0..adt_targ_count(t, pcx) {
+            if holds_fn_type(adt_targ(t, i, pcx), depth + 1, pcx) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Function f's signature regions into sig, made afresh, not memoized
+// (sig_of's, for a fn item the places builder checks a callable by).
+pub fn sig_fresh(f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    sig_compute(f, sig, pcx);
+}
+
+// The type node of parameter i of function node `node`, 0: none.
+fn param_node(node: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
+    let pn: i64 = if i < pcx.nodes[node as usize].count { child(node, i, pcx) } else { 0 };
+    if is_node(pn, NodeKind::Param, pcx) { pcx.nodes[pn as usize].b } else { 0 }
+}
+
+// Whether type t (or the referent of a `&t`, `&mut t`) is a callable
+// called through its erased type: a `fn` type or an opaque `impl Fn`
+// result; not a closure (subst_requirements reads its own signature).
+fn plain_callable(t: i64, pcx: &Ctx<Comp>) -> bool {
+    let mut c = t;
+    while c > 0 && pcx.types[c as usize].kind == TyKind::Ptr
+        && is_ref_kind(pcx.types[c as usize].b) {
+        c = pcx.types[c as usize].a;
+    }
+    c > 0 && (pcx.types[c as usize].kind == TyKind::Fn
+        || crate::front::opaque::is_opaque(c, pcx) && closure_callable(c, pcx).0 == 0)
+}
+
+// The `Fn*` bounds of bounds node `bounds` read as a call through a
+// callable's erased type (callable_ties): their parameter and result
+// types resolved in instance f; ps the parameters such a callable is
+// given to.
+fn bound_fn_ties(bounds: i64, ps: &Vec<i64, Comp>, strict: bool, tps: i64, self_node: i64, f: i64,
+    sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    for bi in 0..pcx.nodes[bounds as usize].count {
+        let b = child(bounds, bi, pcx);
+        if !is_node(b, NodeKind::TyFn, pcx) || pcx.nodes[b as usize].d < 2 {
+            continue;
+        }
+        let mut nodes = Vec::<i64, Comp>::new_in(Comp {});
+        let mut types = Vec::<i64, Comp>::new_in(Comp {});
+        let mut known = true;
+        for i in 0..pcx.nodes[b as usize].count {
+            let an = child(b, i, pcx);
+            let at = instance_type(an, f, tps, pcx);
+            known = known && at > 0;
+            nodes.push(an);
+            types.push(at);
+        }
+        let rn = pcx.nodes[b as usize].a;
+        if rn > 0 {
+            let rt = instance_type(rn, f, tps, pcx);
+            known = known && rt > 0;
+            nodes.push(rn);
+            types.push(rt);
+        }
+        if !known {
+            // (a type the instance cannot read: every region of the
+            // predicate one, more than the call relates, never less)
+            let mut ks = Vec::<i64, Comp>::new_in(Comp {});
+            mentioned_params(b, tps, &mut ks, 0, pcx);
+            tie_params(&ks, tps, f, sig, pcx);
+            continue;
+        }
+        r6_ties(&nodes, &types, pcx.nodes[b as usize].count, ps, strict, tps, self_node, f, sig,
+            pcx);
+    }
+}
+
+// The `fn` types type node n writes for type t (a parameter's), at any
+// depth: behind a reference or a raw pointer, in an array, a view, a
+// tuple, a struct's or an enum's type argument; each read as a call
+// through it (r6_ties). A type parameter is its bound's (bound_fn_ties);
+// a `fn` type named another way (an alias, a projection) relates every
+// region of each parameter it mentions. p: the parameter whose type n is,
+// -1 below its top.
+fn written_fn_ties(n: i64, t: i64, p: i64, tps: i64, self_node: i64, f: i64, sig: &mut Sig<Comp>,
+    pcx: &mut Ctx<Comp>) {
+    if n <= 0 || t <= 0 {
+        return;
+    }
+    let k = pcx.types[t as usize].kind;
+    if k == TyKind::Fn {
+        if is_node(n, NodeKind::TyFn, pcx) && pcx.nodes[n as usize].d < 2 {
+            let mut nodes = Vec::<i64, Comp>::new_in(Comp {});
+            let mut types = Vec::<i64, Comp>::new_in(Comp {});
+            let np = pcx.types[t as usize].count;
+            for i in 0..np {
+                nodes.push(if i < pcx.nodes[n as usize].count { child(n, i, pcx) } else { 0 });
+                types.push(type_elem(t, i, pcx));
+            }
+            nodes.push(pcx.nodes[n as usize].a);
+            types.push(pcx.types[t as usize].a);
+            let mut ps = Vec::<i64, Comp>::new_in(Comp {});
+            ps.push(p);
+            r6_ties(&nodes, &types, np, &ps, true, tps, self_node, f, sig, pcx);
+            // (a `fn` type among its parts is the callee's to call)
+            return;
+        }
+        let bare = is_node(n, NodeKind::TyName, pcx) && pcx.nodes[n as usize].list == 0
+            && pcx.nodes[n as usize].g == 0 && param_index(tps, pcx.nodes[n as usize].a, pcx) >= 0;
+        if !bare {
+            let mut ks = Vec::<i64, Comp>::new_in(Comp {});
+            mentioned_params(n, tps, &mut ks, 0, pcx);
+            tie_params(&ks, tps, f, sig, pcx);
+        }
+        return;
+    }
+    if k == TyKind::Ptr {
+        let a = if is_node(n, NodeKind::TyPtr, pcx) { pcx.nodes[n as usize].a } else { 0 };
+        written_fn_ties(a, pcx.types[t as usize].a, -1, tps, self_node, f, sig, pcx);
+        return;
+    }
+    if k == TyKind::Slice {
+        let sn = if is_node(n, NodeKind::TyPtr, pcx) { pcx.nodes[n as usize].a } else { n };
+        let a = if is_node(sn, NodeKind::TySlice, pcx) { pcx.nodes[sn as usize].a } else { 0 };
+        written_fn_ties(a, pcx.types[t as usize].a, -1, tps, self_node, f, sig, pcx);
+        return;
+    }
+    if k == TyKind::Array {
+        let a = if is_node(n, NodeKind::TyArray, pcx) { pcx.nodes[n as usize].a } else { 0 };
+        written_fn_ties(a, pcx.types[t as usize].a, -1, tps, self_node, f, sig, pcx);
+        return;
+    }
+    if k == TyKind::Tuple {
+        if is_node(n, NodeKind::TyTuple, pcx) {
+            for i in 0..pcx.types[t as usize].count {
+                if i < pcx.nodes[n as usize].count {
+                    written_fn_ties(child(n, i, pcx), type_elem(t, i, pcx), -1, tps, self_node, f,
+                        sig, pcx);
+                }
+            }
+        }
+        return;
+    }
+    if (k == TyKind::Struct || k == TyKind::Enum) && is_node(n, NodeKind::TyName, pcx)
+        && !(k == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].closure != 0) {
+        let args = pcx.nodes[n as usize].g;
+        for i in 0..adt_targ_count(t, pcx) {
+            if args > 0 && i < pcx.nodes[args as usize].count {
+                written_fn_ties(child(args, i, pcx), adt_targ(t, i, pcx), -1, tps, self_node, f,
+                    sig, pcx);
+            }
+        }
+    }
+}
+
+// Every universal of the type parameters ks of tps (mentioned_params'
+// indices; `Self` skipped) one region, in instance f.
+fn tie_params(ks: &Vec<i64, Comp>, tps: i64, f: i64, sig: &mut Sig<Comp>, pcx: &Ctx<Comp>) {
+    let mut us = Vec::<i64, Comp>::new_in(Comp {});
+    for &q in ks.iter() {
+        if q < 0 || tps <= 0 || q >= pcx.fns[f as usize].targ_count {
+            continue;
+        }
+        let sym = pcx.nodes[child(tps, q, pcx) as usize].a;
+        for j in 0..slot_count(tlist_at(pcx.fns[f as usize].targs + q, pcx), pcx) {
+            us.push(add_universal(U_SUBST, sym, j, sig));
+        }
+    }
+    tie_wild(&us, sig);
+}
+
+// RULE: R6 (0.30.2) A call through a callable's erased type, its
+// operands' type nodes and types in instance f (the first nin the
+// arguments, then the result, when there is one), as bounds of f: every
+// region of an argument outlives every region of the result; a region in
+// an invariant position of one operand is equal to every region of
+// another. A region is a universal of f, or the call's own: an elided
+// region of an argument (each its own), and an elided one of the result
+// when the arguments write one region (E2; else no region). A relation
+// that asks a call's own region to outlive another is no bound: it is
+// kept in sig.strict for each parameter of ps (-1 when ps is empty).
+fn r6_ties(nodes: &Vec<i64, Comp>, types: &Vec<i64, Comp>, nin: i64, ps: &Vec<i64, Comp>,
+    strict: bool, tps: i64, self_node: i64, f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
+    let mut codes = Vec::<i64, Comp>::new_in(Comp {});
+    // (each entry's operand, -1 the result, and its slot in it)
+    let mut pos = Vec::<i64, Comp>::new_in(Comp {});
+    let mut vars = Vec::<i64, Comp>::new_in(Comp {});
+    let mut at = Vec::<i64, Comp>::new_in(Comp {});
+    let mut groups: i64 = 0;
+    let mut written: i64 = 0;
+    let mut only: i64 = -1;
+    for o in 0..nodes.len() as i64 {
+        at.push(codes.len() as i64);
+        let t = types[o as usize];
+        let ns = slot_count(t, pcx);
+        let mut w = Vec::<i64, Comp>::new_in(Comp {});
+        bind_walk(nodes[o as usize], t, tps, self_node, -1, &mut w, 0, pcx, f);
+        let mut v = Vec::<i64, Comp>::new_in(Comp {});
+        slot_variances(t, V_CO, &mut v, pcx);
+        for e in 0..ns {
+            let b: i64 = if 4 * e < w.len() as i64 { w[(4 * e) as usize] } else { B_ELIDED };
+            let mut c: i64 = -1;
+            if b == B_ELIDED {
+                if o < nin {
+                    c = -2 - groups;
+                    groups += 1;
+                } else if written == 1 {
+                    c = only;
+                }
+            } else {
+                c = region_code(&w, e, tps, sig, pcx);
+            }
+            if o < nin && param_kind(b) != B_PARAM && b != B_SELF && b != B_OUTER && b != B_FREE
+                && b != B_UNIV {
+                if written == 0 {
+                    only = c;
+                }
+                written += 1;
+            }
+            codes.push(c);
+            pos.push(if o < nin { o } else { -1 });
+            pos.push(e);
+            vars.push(if e < v.len() as i64 { v[e as usize] } else { V_INV });
+        }
+    }
+    at.push(codes.len() as i64);
+    let nops = nodes.len() as i64;
+    let in_end = at[(if nin < nops { nin } else { nops }) as usize];
+    for a in 0..in_end {
+        for r in in_end..codes.len() as i64 {
+            r6_pair(a, r, &codes, &pos, ps, strict, sig);
+        }
+    }
+    for o in 0..nops {
+        for e in at[o as usize]..at[(o + 1) as usize] {
+            if vars[e as usize] != V_INV {
+                continue;
+            }
+            for o2 in 0..nops {
+                if o2 == o {
+                    continue;
+                }
+                for x in at[o2 as usize]..at[(o2 + 1) as usize] {
+                    r6_pair(e, x, &codes, &pos, ps, strict, sig);
+                    r6_pair(x, e, &codes, &pos, ps, strict, sig);
+                }
+            }
+        }
+    }
+}
+
+// The universal walk entry e of w binds (walk_universal's, and an Ω's
+// projection's named region, a known universal), or -1.
+fn region_code(w: &Vec<i64, Comp>, e: i64, tps: i64, sig: &mut Sig<Comp>, pcx: &Ctx<Comp>) -> i64 {
+    let b = w[(4 * e) as usize];
+    if b == B_OUTER {
+        return add_universal(U_OUTER, w[(4 * e + 1) as usize], 0, sig);
+    }
+    if b == B_UNIV {
+        return w[(4 * e + 1) as usize];
+    }
+    if tps <= 0 && (param_kind(b) == B_PARAM) {
+        return -1;
+    }
+    walk_universal(w, e, tps, sig, pcx)
+}
+
+// Entry a outlives entry b (r6_ties' codes: a universal, -1 none, -2 - g
+// a call's own region g; pos their positions): a bound of sig, nothing,
+// or, a's being a call's own region, a strict record for each of ps.
+fn r6_pair(a: i64, b: i64, codes: &Vec<i64, Comp>, pos: &Vec<i64, Comp>, ps: &Vec<i64, Comp>,
+    strict: bool, sig: &mut Sig<Comp>) {
+    let ca = codes[a as usize];
+    let cb = codes[b as usize];
+    if ca == -1 || cb == -1 || ca == cb || cb <= -2 && ca >= 0 {
+        return;
+    }
+    let n = if ps.len() > 0 { ps.len() as i64 } else { 1 };
+    if ca >= 0 {
+        for i in 0..n {
+            sig.vties.push(if ps.len() > 0 { ps[i as usize] } else { -1 });
+            sig.vties.push(ca);
+            sig.vties.push(cb);
+            sig.vties.push(pos[(2 * a) as usize]);
+            sig.vties.push(pos[(2 * a + 1) as usize]);
+            sig.vties.push(pos[(2 * b) as usize]);
+            sig.vties.push(pos[(2 * b + 1) as usize]);
+        }
+        return;
+    }
+    if !strict {
+        return;
+    }
+    for i in 0..n {
+        sig.strict.push(if ps.len() > 0 { ps[i as usize] } else { -1 });
+        sig.strict.push(pos[(2 * a) as usize]);
+        sig.strict.push(pos[(2 * a + 1) as usize]);
+        sig.strict.push(pos[(2 * b) as usize]);
+        sig.strict.push(pos[(2 * b + 1) as usize]);
     }
 }
 
