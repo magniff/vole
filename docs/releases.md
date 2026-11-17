@@ -278,7 +278,14 @@ A correctness release, its branches merged as each is reviewed clean.
   0.30.1), so `first(v.iter().map(|x| { w.len(); x }))` (and FilterMap,
   MapWhile, Scan, an enumerate after it) keeps v borrowed and not w, as
   rustc; this release's first fix took every region of the Map and
-  refused dropping w. A for loop over a program's adapter of an adapter
+  refused dropping w. An F that is an fn item or an fn pointer is read
+  by its type's elision, as a call through an fn value is (a vole fn
+  type carries no regions): B is the bound's only input region, or
+  'static with none (`MyMap { i: v.iter(), f: id }` keeps v borrowed,
+  a use after free in 0.30.1, and not another borrow the adapter holds);
+  an fn item that returns `&'static` from a reference input is still
+  read as borrowing it, as a direct call through the fn value is (since
+  0.30.1, rustc builds both). A for loop over a program's adapter of an adapter
   whose item holds a reference builds (RT-106, refused since 0.28.0).
 
 #### Bugs fixed
