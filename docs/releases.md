@@ -175,7 +175,8 @@ A correctness release, its branches merged as each is reviewed clean.
   block's tail, an if's arms, a match arm, a closure's result, an array
   element, `Some`, a tuple, a `*mut [i64]` argument, `*r as *mut i64` of
   an `r: &&mut i64`, an index of a `&[&mut [i64]]` (RT-284), an array
-  repeat `[h.r; 2]` and a closure's `return h.r` (RT-314) are each the
+  repeat `[h.r; 2]` and a closure's `return h.r` (RT-314), a loop's
+  `break h.r`, a closure's match arm and `a[0] = h.r` (RT-366) are each the
   operand the coercion reads, so each is its reborrow.
 - **A `&mut` behind a `&` was usable as the `&mut` through `*&` (RT-321),
   every -O, since v0.30.1 at least.** `k(&y)` with `y: &mut S` and `fn
@@ -189,7 +190,8 @@ A correctness release, its branches merged as each is reviewed clean.
   build.
 
 - **The results of partition_in and unzip_in kept no borrow of their
-  items (RT-211, RT-261, RT-267, RT-268, RT-237b, RT-283), every -O,
+  items (RT-211, RT-261, RT-267, RT-268, RT-237b, RT-283, RT-387,
+  RT-388), every -O,
   since 0.28.0.** `let (a, b): (Vec<&i64, Gpa>, ..) =
   v.iter().partition_in(.., gpa); drop(v);` and then reading a was a
   use after free from safe code; `unzip_in` the same, and so a program's
@@ -212,9 +214,7 @@ A correctness release, its branches merged as each is reviewed clean.
   of the signature, on a parameter, `Self`, a projection or any type, is
   read by one function (places/regions.vl `subject_ties`), through the
   impl `front::obligations::select` chose for its whole reference, the
-  one chooser (a projection's too: `warm_selections`, `proj_walk`, so
-  `T::Out` under `T: Tr<i64>` is no longer read from `Tr<i32>`'s impl by
-  its name, RT-86, a short borrow returned as 'static); that
+  one chooser; that
   impl's trait arguments are the bound's slot by slot, and its nested
   obligations are met the same way, recursively, as rustc's confirmation
   (`impl_bound_ties`, `arg_ties`). A lifetime of the impl its header does
@@ -222,10 +222,34 @@ A correctness release, its branches merged as each is reviewed clean.
   bound's slot for the impl's own predicates and relates to nothing else
   (0.30.2's first fix tied it to all, refusing `words.iter()
   .partition_in(..)` of `Vec<&'static str>` and a dropped `words`, which
-  v0.30.1 and rustc build). Where no impl relates a slot (a projection
-  the walk cannot read), every region the predicate names is made one,
-  its projections' bases included, more than any impl relates, never
-  less and never none. A program's own collector, `fn f<I: Iterator, B:
+  v0.30.1 and rustc build); one neither the header nor the trait
+  arguments name (`'a` of std's `impl<'a, T: Copy + 'a, I: Iterator<Item
+  = &'a T>> Iterator for Copied<I>`) is one region of its own that the
+  impl's nested obligations relate. Its associated-type equalities are
+  met too (`impl<'a, T: Get<Out = W<'a>>> Tr for H<'a, T>` with only
+  `type Out = W<'static>`: 'a is 'static, RT-388, a use after free
+  before), and so are its `where` predicates on a subject that is no
+  parameter of it (`where i64: Conv<W<'a>>`, `where T::K: ..`: kept on
+  the impl by the parser, never read before). Every projection of a
+  signature, `C::Item`, `Self::Item`, a qualified `<C as
+  IntoIterator>::Item` or `<C::IntoIter as Iterator>::Item`, is
+  normalized before the walk through the impl `select` chose for its
+  whole reference (`warm_projections`, `norm_proj`), and the impl's own
+  projections again the same way (Zip's `type Item = (A::Item,
+  B::Item)`, Enumerate's `(usize, I::Item)`: `norm_nested`). Before, a
+  qualified projection, a projection inside an impl's value and one no
+  impl was found for by its name were read as elided: the result was
+  given to the only reference parameter, `fn nth<I: Iterator>(i: I, k:
+  &usize) -> Option<<I as Iterator>::Item>` kept k borrowed and not
+  `v.iter()` (RT-387, a use after free), and one with no reference
+  parameter was refused as an elision (RT-389, which rustc builds); `T::Out`
+  under `T: Tr<i64>` was read from `Tr<i32>`'s impl (RT-86). Where no
+  impl normalizes a projection (none, two, the limit), every region of
+  its base is one region and the projection's slot that one, never
+  elided and never an impl picked by its name. `I: Iterator<Item = (X,
+  Y)>` with I a Zip of two borrows now keeps X and Y apart (the first fix
+  made them one region and refused dropping the other vector, which
+  v0.30.1 and rustc build). A program's own collector, `fn f<I: Iterator, B:
   DefaultIn<A> + Extend<I::Item>>(it: I, a: A) -> B` (and `(B,)`, `(B,
   B)`, `Pair<B>`, `Option<B>`), refused in its own body since 0.30.1
   (RT-225), builds, and its result keeps the borrow at the caller
