@@ -185,6 +185,17 @@ A correctness release, its branches merged as each is reviewed clean.
   written, with no autoref (rustc's); `<S as B>::m` where B declares no
   `m` is `trait.no_item` (E0576), and one where S has no impl of B is
   `trait.unmet` (E0277).
+- A qualified path's self type is a type, a name too, read where a
+  type is read: `<W as Conv<bool>>::c(x)`, `<W>::mk()`, `<W as Mk>::C`
+  and `<E as Mk>::f` with W or E generic and written without its
+  arguments are refused as `let x: W` is ("'W' is generic: write its
+  type arguments", rustc E0107), in a generic function's body too,
+  whether or not it is called. v0.30.1 inferred W's arguments for a
+  call (`let x: W<u8> = <W as Mk>::mk()` printed); the branch's first
+  cut chose the impl by the path's trait. `<W<_> as Mk>::mk()`,
+  `<Self as Mk>`, a parameter's `<T as Mk>`, and `<D as Mk>::C` with
+  D's parameters defaulted (D's default instance, refused by 0.30.1)
+  are taken.
 - A supertrait cycle (`trait A: B`, `trait B: A`): error `trait.cycle`
   (rustc E0391) at the trait's declaration, whether or not a path walks
   it, and the checking stops there, as rustc's does. A cycle whose
@@ -238,7 +249,12 @@ B>::D`, `break 'a <S as A>::C`, `0..<S as A>::C`). The same list gives
 `<[i64] as Z>::z` and `<W<i64> as Conv<bool>>::c` were spaced as
 comparisons (`< W<i64> as Conv<bool >>::c`, and every later line of the
 block indented 4 more), and `id::<<<S as A>::Out as B>::E>` became
-`id::<< <S`.
+`id::<< <S`. A `<` after a `}` is read by Rust's rule
+(`tools::fmt::layout::statement_braces`): after a block-like
+expression that is an operand (`let c = unsafe { a } < b as i64`, a
+`match`, an `if .. else`) it compares, after one that is a whole
+statement (`if t { .. } <S as A>::g();`, an item) it opens a qualified
+path; a comment before the `<` changes nothing.
 
 How a path picks its trait, in one place
 (`front::check::calls::qualified::path_trait`): `Self::` in a trait's

@@ -1379,9 +1379,15 @@ generic body, or `<S as Conv<i64>>::c`, was refused (RT-C301-9). 0.30.2:
 one function decides the trait of every path's item,
 `qualified::path_trait` (else `concrete_trait`), and the item is found
 in that trait only (`trait_fn_of`, `trait_const_of`); nothing finds a
-trait's item of a path by its name alone. A `τ` that is not a name
-(`<Vec<T> as Tr>::f`, `<&S as Tr>::f`) is a parser error. *Anchor:*
-`front/parser/exprs.vl: parse_primary`, `front/check/calls/qualified.vl`.
+trait's item of a path by its name alone. `τ` is any type
+(`<Vec<T> as Tr>::f`, `<&S as Tr>::f`, 0.30.2; a parser error before),
+a name too, read as a type is (`paths::path_target`): a generic type
+written without its arguments (`<W as Tr>::f`, `<W>::f`) is E0107, as
+`let x: W` is, not W's arguments inferred (0.30.1 inferred them for a
+call); `<W<_> as Tr>::f` infers them, and a type whose parameters all
+have defaults is its default instance. *Anchor:*
+`front/parser/exprs.vl: parse_primary`, `front/check/calls/paths.vl:
+path_target`, `front/check/calls/qualified.vl`.
 Cases `rust_f_f8_qualified_call_ok`, `rt_c301_008_*`, `rt_c301_009_*`.
 
 ### F9 Method name clash
