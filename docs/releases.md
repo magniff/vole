@@ -100,20 +100,27 @@ A correctness release, its branches merged as each is reviewed clean.
 
 #### Soundness holes closed
 
-- **An array repeat of a value that is not Copy (RT-148), at every -O,
-  since 0.28.0.** `[v; 2]` of a Vec, `[D { k: 1 }; 3]` of a type with a
-  Drop impl, a generic `[t; 2]` and `[f; 2]` of an `impl FnMut` were
-  built: the value was copied bit for bit into each element and each
-  copy dropped, a double free (a use after free once one closure's Vec
-  grew) or a Drop run N times, from safe code. Neither the checker's
-  Repeat arms nor the places IR asked for Copy. Now the places IR asks
-  `rust_copy`, the one Copy test, where it makes the copies
-  (`RV_REPEAT`), so every repeat meets it: `error trait.repeat_copy`,
-  rustc's E0277 (front-rust.md F35.1). Rust's other form, a path to a
-  constant, makes each element from the constant, one use each (F35.2:
-  vole makes a constant at each use, so one whose value calls a function
-  calls it once per element), at most 4096. `[x; 0]` now drops x at once
-  (it leaked), `[x; 1]` moves it.
+- **An array repeat of a value that is not Copy (RT-148, RT-148b, RT-215), at
+  every -O, since 0.28.0.** `[v; 2]` of a Vec, `[D { k: 1 }; 3]` of a
+  type with a Drop impl, a generic `[t; 2]` and `[f; 2]` of an `impl
+  FnMut` were built: the value was copied bit for bit into each element
+  and each copy dropped, a double free (a use after free once one
+  closure's Vec grew) or a Drop run N times, from safe code; a static's
+  `[D { k: 1 }; 2]` or `[None; 2]` was written the same way. Neither the checker's
+  Repeat arms, the places IR nor the constant writer asked for Copy.
+  Now one predicate, `repeat_needs_copy` (Copy by `rust_copy`, the one
+  Copy test), is asked where the copies are made: the places IR's
+  `RV_REPEAT` for a body and `const_write` for a static's or a
+  constant's data: `error trait.repeat_copy`, rustc's E0277, once a
+  position (front-rust.md F35.1). Rust's other form, a path to a
+  constant, makes each element from the constant (F35.2): a loop of
+  the places IR evaluates it N times, any N, and vole makes a constant
+  at each use, so one whose value calls a function calls it once per
+  element. Every resolver of a constant (a name, a path to an inherent,
+  a trait's or a type parameter's associated constant) is marked in
+  one place, so `[T::ZERO; N]` in a generic body is a constant's repeat
+  too. `[x; 0]` now drops x as soon as it is made (it leaked), `[C;
+  0]` makes nothing, `[x; 1]` moves x.
 
 #### Miscompiles fixed
 
@@ -168,6 +175,39 @@ A correctness release, its branches merged as each is reviewed clean.
   and SLP compute each lane exactly and were right. Seen on 0.28.0 (the
   first release that builds the case) to 0.30.1; `--no-vectorize` was
   the workaround.
+
+#### Bugs fixed
+
+- **An `impl Trait` value is its hidden type for drop and layout, its
+  bounds for what a caller may do (RT-145, RT-79, RT-147, since 0.27.2.1).**
+  A value returned as `impl Trait` was never dropped: a closure's
+  captured String or Vec and an iterator struct's Vec were leaked, at
+  every -O. A function returning one whose hidden type has a Drop impl
+  or owns memory was refused (`distinct.kind` at line 1, column 1), and
+  one returning another function's `impl Trait` had no methods. Now the
+  opaque type's glue is its deep hidden type's (`glue_of`, `reveal_type`),
+  it moves as its hidden type and is Copy only when a bound says so
+  (borrowck.md D21.5).
+- **A reference to an `impl Trait` value has std's impls for references
+  (RT-166, RT-196, RT-200).** `&impl Fn` was not Fn, `&mut impl FnMut`
+  not FnMut, `&mut impl Iterator` failed in std's projection; a blanket
+  `impl<F: Fn(i64) -> i64> Apply for F` did not cover an `impl Fn`, and
+  `flat_map` over an opaque iterator said IntoIterator is not
+  implemented. The bound test and the impl search see an opaque value
+  through its bounds (D21.5).
+- **An `impl Fn*` value is called as its bound says (RT-213, RT-79c).**
+  An `impl FnOnce` whose closure is Fn passed an `F: Fn` bound and could
+  be called twice; one capturing a Drop value got `distinct.kind` and
+  false use_moved errors; a call that a bound makes FnOnce asked for a
+  `mut` binding. The call kind is now the bound's (`opaque_call_kind`,
+  D21.6).
+- **A call through two references (RT-195).** `(&&c)(1)` and `(&mut
+  &mut g)()` were "cannot call non-function type": a callee is now
+  autoderefed through every reference to a callable, as rustc's (D21.6).
+- **An array constant is a value at each use (RT-214).** `let a = A;`
+  of `const A: [Option<D>; 2]` was refused as a move out of a static;
+  one whose type is not Copy is now made at each use, moved, borrowed
+  and dropped as rustc's temporary (front-rust.md F34.3).
 
 ### What's new in 0.30.1
 

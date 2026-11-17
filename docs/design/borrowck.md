@@ -2832,6 +2832,44 @@ body needs `H_f` while it is being found (a recursive call's method):
 `opaque.cycle` (E0720). No `use<..>`: every input lifetime is captured.
 `-> impl Fn*(A..) -> R` is the returned-closure case (D19.8).
 
+**D21.5 (layout, drop, moves: the hidden type; what a caller may do:
+the bounds).** (0.30.2, RT-145, RT-79, RT-147) `O_f` is `H_f` for
+layout, for drop and for its own Copy: `places/glue.vl glue_of` gives
+`O_f` the glue of `reveal_type(O_f)` (the deep hidden type: a nested
+opaque result is its inner one's), so a closure that owns a Vec or a D,
+an iterator struct holding one, an array or an Option of them is
+dropped as rustc drops it (v0.30.1 dropped none: `needs_drop` saw a
+distinct type over nothing). A move is `rust_copy`'s: `O_f` is Copy
+only when a bound says `Copy`, whatever `H_f` is (a captureless closure
+is Copy, its `impl Fn` is not). `check_distinct_kinds` skips opaque
+types (distinct.kind refused every `H_f` that owns memory, RT-79); a
+projection of `O_f` (`<O_f as Iterator>::Item`) is `H_f`'s; a reference
+to `O_f` has std's impls for references through `O_f`'s bounds
+(`&impl Fn` is Fn, `&mut impl FnMut` is FnMut, `&mut impl Iterator` is
+an Iterator, RT-166), as a blanket impl over `F: Fn` covers `O_f` by
+its bound (RT-196) and `flat_map` takes `O_f` as an IntoIterator
+(RT-200). *Anchor:* `front/opaque.vl: reveal_type, fn_bound_type`,
+`places/glue.vl: glue_of`, `front/traits.vl: implements`.
+
+**D21.6 (the call kind is the bound's).** (0.30.2, RT-213, RT-79c) A
+call of a value of `O_f` is the call its `Fn*` bound says, never its
+hidden closure's (`opaque_call_kind`): an `impl FnOnce` is called once
+(the call consumes it: a closure that captures nothing keeps its callee
+in the call, `CALL_CONSUMES`, which `lower_call` moves; one that
+captures moves its env, `lower_arg`), an `impl FnMut` through a `mut`
+binding (E0596), and neither meets a stricter bound (`fn_bound_satisfied`
+refuses an `impl FnOnce` for `F: Fn`, E0277). A call that a parameter's
+or `O_f`'s bound makes `FnOnce` needs no `mut` binding (the value moves
+into the call). A callee is autoderefed through any references to a
+callable base (`callable_through_ref`: `(&&c)(1)`, `(&mut &mut g)()`,
+`&mut &&impl Fn`, RT-195), and `&&F`, `&mut &F`, `&mut &mut F` meet a
+bound as the inner reference does (std's impls for references; `&&mut
+F` is no `Fn*`). *Anchor:* `front/opaque.vl: opaque_call_kind`,
+`front/closures/fn_bounds.vl: fn_bound_satisfied, value_call_kind,
+callable_through_ref`, `front/check/calls/paths.vl: synth_call`,
+`places/build.vl: lower_call, lower_arg`. *Cases:*
+`rt_213_opaque_call_kinds`, `rt_213*`, `rt_195*`, `rt_166*`.
+
 - **L10** (0.27.2.1) One opaque type per function, at the top of its
   result; the hidden type's associated types are seen by the caller
   (`Iterator<Item = X>`'s `next` gives `H_f`'s item type, which the bound

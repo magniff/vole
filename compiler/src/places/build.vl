@@ -1122,15 +1122,26 @@ fn expr_into(e: i64, dl: i64, dp: i64, pbody: &mut Body<Comp>, pcx: &mut Ctx<Com
         let et = pcx.nodes[elem as usize].ty;
         // RULE: F35.1 (0.30.2, RT-148: the value is copied into each
         // element, so more than one needs it Copy, rustc E0277; a constant
-        // that is not Copy is no repeat by now, check/synth_mode.vl
-        // repeat_literal; none drops the value, which goes now, as Rust
-        // drops it)
+        // that is not Copy makes each, repeat_each; none drops the value
+        // as soon as it is made, in a scope of its own, as rustc drops it)
         if repeat_needs_copy(elem, et, len, pcx) {
             repeat_copy_error(elem, et, pcx);
         }
+        if len > 1 && const_each(elem, et, pcx) {
+            repeat_each(e, elem, et, len, dl, dp, pbody, pcx);
+            return;
+        }
+        // (`[C; 0]` of a constant makes no element and so nothing from
+        // it, as rustc's; any other value is made and dropped)
+        if len == 0 && (pcx.nodes[elem as usize].p & crate::front::ast::NODE_CONST_USE) != 0 {
+            emit(SK_ASSIGN, dl, dp, RV_AGG, AK_ARRAY, 0, ops_mark(pbody), 0, e, pbody);
+            return;
+        }
         if len == 0 && needs_drop(et, pcx) {
+            let s = push_scope(SC_STMT, elem, true, pcx);
             let t = new_temp(et, elem, false, pbody, pcx);
             expr_into(elem, t, 0, pbody, pcx);
+            pop_scope_at(s, pbody, pcx);
             if !reachable(pbody) {
                 return;
             }
@@ -1505,26 +1516,93 @@ fn static_mut_ref_error(l: i64, node: i64, pbody: &Body<Comp>, pcx: &mut Ctx<Com
     pcx.err_kind = saved;
 }
 
-// RULE: F35.1 (0.30.2, RT-148, RT-215) Whether array repeat `[e; N]`, e of
+// RULE: F35.1 (0.30.2, RT-148, RT-148b) Whether array repeat `[e; N]`, e of
 // type t, copies a value that may not be copied: N above 1 and t not Copy
 // (rust_copy, the one Copy test), e no use of a constant (whose repeat
-// makes each element from it, F35.2). Asked where the copies are made: the
-// places IR's RV_REPEAT (expr_into) and, for a static's or a constant's
-// value, which no body builds, the checker (synth_mode.vl repeat_literal).
+// makes each element from it, F35.2, repeat_each). Asked where the copies
+// are made: the places IR's RV_REPEAT (expr_into) and the writer of a
+// static's or a constant's data (consteval.vl const_write).
 pub fn repeat_needs_copy(e: i64, t: i64, len: i64, pcx: &mut Ctx<Comp>) -> bool {
-    len > 1 && t > 0 && t != pcx.ty_error
-        && (pcx.nodes[e as usize].p & crate::front::ast::NODE_CONST_USE) == 0
+    len > 1 && t > 0 && t != pcx.ty_error && !const_each(e, t, pcx)
         && !crate::places::regions::rust_copy(t, pcx)
+}
+
+// RULE: F35.2 Whether element e of a repeat, of type t, is a use of a
+// constant (NODE_CONST_USE, names.vl const_use) of a type that is not
+// Copy: each element is made from it (repeat_each).
+fn const_each(e: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
+    (pcx.nodes[e as usize].p & crate::front::ast::NODE_CONST_USE) != 0
+        && !crate::places::regions::rust_copy(t, pcx)
+}
+
+// RULE: F35.2 (0.30.2, RT-148) `[C; N]`, N > 1, of constant C whose type
+// et is not Copy, into (dl, dp): each element made from the constant, N
+// evaluations in order, as rustc makes each element from it. The first
+// is copied into every element (`dl = [move t0; N]`, which makes the
+// array a value for the borrow checker), then a loop writes element i,
+// 1 to N - 1, with a value of its own: an assignment, not a drop of what
+// it replaces, the first's bits, which element 0 owns. A panic in an
+// evaluation ends the program (no unwinding drops the array).
+fn repeat_each(e: i64, elem: i64, et: i64, len: i64, dl: i64, dp: i64, pbody: &mut Body<Comp>,
+    pcx: &mut Ctx<Comp>) {
+    let t0 = new_temp(et, elem, false, pbody, pcx);
+    expr_into(elem, t0, 0, pbody, pcx);
+    if !reachable(pbody) {
+        return;
+    }
+    let at = ops_mark(pbody);
+    set_op(OK_MOVE, t0, 0, pcx);
+    push_now(pbody, pcx);
+    emit(SK_ASSIGN, dl, dp, RV_REPEAT, len, 0, at, 1, e, pbody);
+    let usize_t = crate::front::types::TY_USIZE;
+    let i = new_temp(usize_t, e, false, pbody, pcx);
+    set_op(OK_INT, 1, usize_t, pcx);
+    emit_use(i, 0, e, pbody, pcx);
+    let head = new_block(pbody);
+    let body = new_block(pbody);
+    let exit = new_block(pbody);
+    goto(head, pbody);
+    enter_block(head, pbody);
+    let c = new_temp(crate::front::types::TY_BOOL, e, false, pbody, pcx);
+    let at1 = ops_mark(pbody);
+    set_op(OK_COPY, i, 0, pcx);
+    push_now(pbody, pcx);
+    set_op(OK_INT, len, usize_t, pcx);
+    push_now(pbody, pcx);
+    emit(SK_ASSIGN, c, 0, RV_BINARY, BO_LT, e, at1, 2, e, pbody);
+    let at2 = ops_mark(pbody);
+    set_op(OK_COPY, c, 0, pcx);
+    push_now(pbody, pcx);
+    switch_bool(at2, exit, body, e, pbody);
+    enter_block(body, pbody);
+    let s = push_scope(SC_STMT, elem, true, pcx);
+    let tk = new_temp(et, elem, false, pbody, pcx);
+    expr_into(elem, tk, 0, pbody, pcx);
+    if reachable(pbody) {
+        set_op(OK_MOVE, tk, 0, pcx);
+        let ep = proj(dp, PJ_INDEX, i, pbody);
+        emit_use(dl, ep, e, pbody, pcx);
+    }
+    pop_scope_at(s, pbody, pcx);
+    if reachable(pbody) {
+        let at3 = ops_mark(pbody);
+        set_op(OK_COPY, i, 0, pcx);
+        push_now(pbody, pcx);
+        set_op(OK_INT, 1, usize_t, pcx);
+        push_now(pbody, pcx);
+        emit(SK_ASSIGN, i, 0, binary_rv(BO_ADD, usize_t, pbody, pcx), BO_ADD, e, at3, 2, e, pbody);
+        goto_back(head, pbody);
+    }
+    enter_block(exit, pbody);
 }
 
 // (0.30.2, RT-148) error trait.repeat_copy: array repeat `[e; N]`, N > 1,
 // of a value of type t that is not Copy (rustc E0277): each element would
-// be a bitwise copy of it, each dropped. Reported for the template once.
+// be a bitwise copy of it, each dropped. Once for its position, however
+// many instances build it (a generic's, a closure's in one, its opaque
+// instance; D22.2, as the checker's, diag.vl error_key).
 pub fn repeat_copy_error(elem: i64, t: i64, pcx: &mut Ctx<Comp>) {
-    // RULE: D22.2 (an opaque instance's error where a concrete instance's
-    // is reported already: not again, as the checker's, diag.vl error_key)
-    if crate::front::opaque::omega_instance(pcx.cur_f, pcx)
-        && crate::base::diag::error_recorded_at(pcx.nodes[elem as usize].start, pcx) {
+    if crate::base::diag::error_recorded_at(pcx.nodes[elem as usize].start, pcx) {
         return;
     }
     let saved = pcx.err_kind;
