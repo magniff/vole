@@ -191,7 +191,7 @@ A correctness release, its branches merged as each is reviewed clean.
 
 - **The results of partition_in and unzip_in kept no borrow of their
   items (RT-211, RT-261, RT-267, RT-268, RT-237b, RT-283, RT-387,
-  RT-388), every -O,
+  RT-387f, RT-388, RT-404), every -O,
   since 0.28.0.** `let (a, b): (Vec<&i64, Gpa>, ..) =
   v.iter().partition_in(.., gpa); drop(v);` and then reading a was a
   use after free from safe code; `unzip_in` the same, and so a program's
@@ -241,7 +241,9 @@ A correctness release, its branches merged as each is reviewed clean.
   impl was found for by its name were read as elided: the result was
   given to the only reference parameter, `fn nth<I: Iterator>(i: I, k:
   &usize) -> Option<<I as Iterator>::Item>` kept k borrowed and not
-  `v.iter()` (RT-387, a use after free), and one with no reference
+  `v.iter()` (RT-387, a use after free; a method's, `fn first<C:
+  IntoIterator>(&self, c: C) -> Option<C::Item>`, kept self borrowed and
+  not c, RT-387f), and one with no reference
   parameter was refused as an elision (RT-389, which rustc builds); `T::Out`
   under `T: Tr<i64>` was read from `Tr<i32>`'s impl (RT-86). Where no
   impl normalizes a projection (none, two, the limit), every region of
@@ -249,7 +251,12 @@ A correctness release, its branches merged as each is reviewed clean.
   elided and never an impl picked by its name. `I: Iterator<Item = (X,
   Y)>` with I a Zip of two borrows now keeps X and Y apart (the first fix
   made them one region and refused dropping the other vector, which
-  v0.30.1 and rustc build). A program's own collector, `fn f<I: Iterator, B:
+  v0.30.1 and rustc build). A reference an impl's nested obligations
+  meet is met once per signature (keyed by the trait, the type, its
+  arguments and type parameters, and the regions it is met with): two
+  bounds per level, `impl<T: Tr + Tr2> Tr for W<T>`, proved the level
+  below again and again in the places, doubling per level (RT-404's
+  places half; its front half is the obligation solver's). A program's own collector, `fn f<I: Iterator, B:
   DefaultIn<A> + Extend<I::Item>>(it: I, a: A) -> B` (and `(B,)`, `(B,
   B)`, `Pair<B>`, `Option<B>`), refused in its own body since 0.30.1
   (RT-225), builds, and its result keeps the borrow at the caller
