@@ -191,6 +191,12 @@ A correctness release, its branches merged as each is reviewed clean.
   `From` by its intrinsic impls only when the path says `From`), never
   the first `from` by its name.
 
+A qualified path takes any type before `as` (RT-93): `<<T as A>::B as
+C>::D` (rustfmt's form; 0.30.1 read the `<<` as a shift, a parser
+error, and `volec fmt` glued it to what came before), `< <S as A>::Out
+as C>::K`, `<&S as Tr>::f`, `<W<i64> as Tr>::K`, in a type and in an
+expression; 0.30.1 took only a name in an expression.
+
 How a path picks its trait, in one place
 (`front::check::calls::qualified::path_trait`): `Self::` in a trait's
 default, function or constant, is that trait's (before the bounds of

@@ -23,7 +23,7 @@ use crate::front::opaque::{assoc_in_trait, is_omega};
 use crate::front::traits::{
     bound_trait, impl_of_fn, impls_after, impls_start, trait_fn, trait_supers,
 };
-use crate::front::types::err_type;
+use crate::front::types::{TyKind, err_type};
 
 // What a path names its item through (path_trait, concrete_trait): trait
 // tr, -1 for none (the item is an inherent one, or there is none); the
@@ -159,6 +159,58 @@ pub fn agrees(have: i64, want: i64, count: i64, pcx: &Ctx<Comp>) -> bool {
 // Whether pt's arguments hold a `_` (qpath_args).
 fn has_hole(pt: PathTrait, pcx: &Ctx<Comp>) -> bool {
     pt.args >= 0 && (0..pt.nargs).any(|k| pcx.tlists[(pt.args + k) as usize] == 0)
+}
+
+// RULE: F8.4 (0.30.2, RT-234) A generic trait's function as a value
+// whose trait arguments the path leaves open (`E2::from` where a `fn(E1)
+// -> E2` is expected): each argument that one of the function's
+// parameters is, read from the expected fn type hint at that parameter
+// (`From<T>::from(x: T)` against `fn(E1) -> E2`: T = E1), as rustc
+// infers it; the call's arguments do the same for a call (convert's
+// dispatch). pt itself when hint is no fn type or decides nothing.
+pub fn args_from_fn_hint(pt: PathTrait, name: i64, hint: i64, pcx: &mut Ctx<Comp>) -> PathTrait {
+    let count = crate::front::convert::trait_param_count(pt.tr, pcx);
+    if count == 0 || hint <= 0 || pcx.types[hint as usize].kind != TyKind::Fn
+        || pt.args >= 0 && !has_hole(pt, pcx) {
+        return pt;
+    }
+    let f = crate::front::traits::trait_fn(pt.tr, name, pcx);
+    if f == 0 {
+        return pt;
+    }
+    let params = pcx.traits[pt.tr as usize].params;
+    let mark = pcx.tscratch.len() as i64;
+    for k in 0..count {
+        pcx.tscratch.push(if pt.args >= 0 && k < pt.nargs { pcx.tlists[(pt.args + k) as usize] }
+            else { 0 });
+    }
+    let mut decided = false;
+    let hl = pcx.types[hint as usize].list;
+    let hc = pcx.types[hint as usize].count;
+    for i in 0..(if pcx.nodes[f as usize].count < hc { pcx.nodes[f as usize].count } else { hc }) {
+        let ty = pcx.nodes[child(f, i, pcx) as usize].b;
+        if ty <= 0 || pcx.nodes[ty as usize].kind != NodeKind::TyName
+            || pcx.nodes[ty as usize].count != 0 || pcx.nodes[ty as usize].g != 0 {
+            continue;
+        }
+        for k in 0..count {
+            if pcx.nodes[child(params, k, pcx) as usize].a == pcx.nodes[ty as usize].a
+                && pcx.tscratch[(mark + k) as usize] == 0 {
+                pcx.tscratch[(mark + k) as usize] = pcx.tlists[(hl + i) as usize];
+                decided = true;
+            }
+        }
+    }
+    if !decided {
+        pcx.tscratch.truncate(mark as usize);
+        return pt;
+    }
+    let args = pcx.tlists.len() as i64;
+    for k in 0..count {
+        pcx.tlists.push(pcx.tscratch[(mark + k) as usize]);
+    }
+    pcx.tscratch.truncate(mark as usize);
+    PathTrait { tr: pt.tr, args: args, nargs: count, imp: -1 }
 }
 
 // Whether trait tr itself declares a function or a constant `name`.
@@ -559,6 +611,14 @@ pub fn trait_fn_of(n: i64, t: i64, pt: PathTrait, name: i64, pcx: &mut Ctx<Comp>
     // Any other trait with no impl for t is unmet, `<i64 as
     // MyFrom<i32>>::from(5)` rustc's E0277)
     if pt.imp < 0 && intrinsic_from(pt.tr, pcx) {
+        // (0.30.2, RT-234: the arguments decided, `<E2 as From<E1>>::from`,
+        // a program's impl that agrees is the function, as a value too)
+        if pt.args >= 0 && !has_hole(pt, pcx) {
+            let i = trait_impl(t, pt, pcx);
+            if i >= 0 && impl_fn(i, name, pcx) >= 0 {
+                return impl_fn(i, name, pcx);
+            }
+        }
         return -2;
     }
     let i = trait_impl(t, pt, pcx);
@@ -740,10 +800,38 @@ fn not_in_trait_error(n: i64, tr: i64, name: i64, pcx: &mut Ctx<Comp>) -> ! {
 // several impls of pt's trait are t's (several_impls_error), or none is
 // (unmet_error).
 pub fn several_impls(n: i64, t: i64, pt: PathTrait, name: i64, pcx: &mut Ctx<Comp>) -> ! {
-    if trait_impl(t, pt, pcx) == -2 {
+    // (0.30.2, RT-234: std's From, whose built-in impls are no
+    // functions: the type itself, an integer widening)
+    if intrinsic_from(pt.tr, pcx) && pt.args >= 0 && !has_hole(pt, pcx) {
+        builtin_value_error(n, t, pt, name, pcx);
+    }
+    if intrinsic_from(pt.tr, pcx) || trait_impl(t, pt, pcx) == -2 {
         several_impls_error(n, t, pt.tr, name, pcx);
     }
     unmet_error(n, t, pt.tr, pcx)
+}
+
+// error trait.builtin_fn: path n (`i64::from` as a value, decided as
+// `From<u8>`) names one of std's built-in From impls (the type itself, an
+// integer widening), which have no function to be a value. rustc's
+// std has one; vole's are the conversion itself. (0.30.2, RT-234)
+fn builtin_value_error(n: i64, t: i64, pt: PathTrait, name: i64, pcx: &mut Ctx<Comp>) -> ! {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"trait.builtin_fn";
+    err_begin(pcx.nodes[n as usize].start, pcx);
+    err_str(c"'", pcx);
+    err_type(t, pcx);
+    err_str(c"::", pcx);
+    err_sym(name, pcx);
+    err_str(c"' of '", pcx);
+    err_sym(pcx.traits[pt.tr as usize].name, pcx);
+    err_str(c"<", pcx);
+    err_type(pcx.tlists[pt.args as usize], pcx);
+    err_str(c">' is built in (the type itself or an integer widening), not a function: it is not a value", pcx);
+    err_help(c"call it in a closure: `|x| T::from(x)`", pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved_kind;
+    err_jump(pcx)
 }
 
 // RULE: F9.1 (0.30.2) The inherent function `name` of type t (of an impl
