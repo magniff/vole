@@ -196,9 +196,12 @@ A correctness release, its branches merged as each is reviewed clean.
   constant, a static's or a thread-local's pointer, a union's field, a
   C function's) unknown memory: both are refused, in the clause, its
   `old(..)` and whatever it calls, a fn value, a trait method or a
-  closure. A read through a raw pointer is allowed. `query effects F
-  --why raw_write` shows the chain (`raw_src`: where a pointer of
-  unknown provenance is made).
+  closure. A `&mut` made from a raw pointer is a write through it,
+  whatever form it takes: `&mut (*sp)[..]`, `slice::from_raw_parts_mut(p,
+  n)`, `&mut *sp` of a `*mut str`, a `&mut self` receiver `(*p).m()`, a
+  `ref mut` binding. A read through a raw pointer is allowed. `query
+  effects F --why raw_write` shows the chain (`raw_src`: where a pointer
+  of unknown provenance is made).
 - **A clause touches no thread-local static** (RT-199) and **`old(e)`
   is effect-checked** (RT-198): `ensures old(say()) == 1` with `say`
   printing was accepted.

@@ -67,29 +67,52 @@ fn deep(c: i64) -> i64 {
 // Whether a value of type t may hold a pointer: a raw one, or with refs a
 // reference too (a NonNull, a Vec's buffer; what a `&H` points to may hold
 // one), at any depth; an opaque type or one not known, yes. A fn pointer
-// holds none (what it calls is its own callee). Known answers are kept
-// (RAW_HOLDS: bit 0 refs known, 1 refs yes, 2 raw known, 3 raw yes).
+// holds none (what it calls is its own callee).
 pub fn holds_ptr(t: i64, refs: bool, pcx: &mut Ctx<Comp>) -> bool {
-    if t <= 0 {
+    let mut cyc = false;
+    holds_in(t, refs, &mut cyc, pcx)
+}
+
+// holds_ptr's walk, each type's answer kept once known (RAW_HOLDS: bit 0
+// refs known, 1 refs yes, 2 raw known, 3 raw yes; 4 and 5 the walk is in
+// it, refs and raw), so that a type met again is not walked again: an
+// enum's type arguments are its variants' fields, and before, nested
+// Options cost 2^depth (re-review 2 of g302holes: 26 deep, 6 s). A type
+// met while the walk is in it answers no for now, and an answer that
+// depended on such a no is kept only when it is yes (cyc): no is the
+// least answer, and a cycle adds no pointer of its own.
+fn holds_in(t: i64, refs: bool, cyc: &mut bool, pcx: &mut Ctx<Comp>) -> bool {
+    if t <= 0 || crate::front::opaque::is_opaque(t, pcx) {
         return true;
     }
-    if pcx.raw_holds.len() < pcx.types.len() {
-        pcx.raw_holds.resize(pcx.types.len(), 0);
+    if pcx.raw_holds.len() <= t as usize {
+        pcx.raw_holds.resize(pcx.types.len().max(t as usize + 1), 0);
     }
     let known: i64 = if refs { 1 } else { 4 };
+    let inside: i64 = if refs { 16 } else { 32 };
     let m = pcx.raw_holds[t as usize];
     if (m & known) != 0 {
         return (m & (known * 2)) != 0;
     }
-    let r = holds_in(t, refs, 0, pcx);
-    pcx.raw_holds[t as usize] = pcx.raw_holds[t as usize] | known | (if r { known * 2 } else { 0 });
+    if (m & inside) != 0 {
+        *cyc = true;
+        return false;
+    }
+    pcx.raw_holds[t as usize] = m | inside;
+    let mut below = false;
+    let r = holds_step(t, refs, &mut below, pcx);
+    let mut after = pcx.raw_holds[t as usize] & !inside;
+    if r || !below {
+        after = after | known | (if r { known * 2 } else { 0 });
+    }
+    pcx.raw_holds[t as usize] = after;
+    if below && !r {
+        *cyc = true;
+    }
     r
 }
 
-fn holds_in(t: i64, refs: bool, depth: i64, pcx: &Ctx<Comp>) -> bool {
-    if t <= 0 || depth > 64 || crate::front::opaque::is_opaque(t, pcx) {
-        return true;
-    }
+fn holds_step(t: i64, refs: bool, cyc: &mut bool, pcx: &mut Ctx<Comp>) -> bool {
     let u = undistinct(t, pcx);
     if u <= 0 {
         return true;
@@ -100,18 +123,18 @@ fn holds_in(t: i64, refs: bool, depth: i64, pcx: &Ctx<Comp>) -> bool {
     }
     if k == TyKind::Ptr {
         return refs || pcx.types[u as usize].b == 0
-            || holds_in(pcx.types[u as usize].a, refs, depth + 1, pcx);
+            || holds_in(pcx.types[u as usize].a, refs, cyc, pcx);
     }
     if k == TyKind::Slice {
         return refs || is_raw_view(u, pcx)
-            || holds_in(pcx.types[u as usize].a, refs, depth + 1, pcx);
+            || holds_in(pcx.types[u as usize].a, refs, cyc, pcx);
     }
     if k == TyKind::Array || k == TyKind::Vector || k == TyKind::Unsized {
-        return holds_in(pcx.types[u as usize].a, refs, depth + 1, pcx);
+        return holds_in(pcx.types[u as usize].a, refs, cyc, pcx);
     }
     if k == TyKind::Tuple {
         for i in 0..pcx.types[u as usize].count {
-            if holds_in(type_elem(u, i, pcx), refs, depth + 1, pcx) {
+            if holds_in(type_elem(u, i, pcx), refs, cyc, pcx) {
                 return true;
             }
         }
@@ -120,13 +143,12 @@ fn holds_in(t: i64, refs: bool, depth: i64, pcx: &Ctx<Comp>) -> bool {
     if k == TyKind::Struct {
         let st = pcx.types[u as usize].a;
         for i in 0..pcx.structs[st as usize].field_count {
-            if holds_in((struct_field(st, i, pcx)).ty, refs, depth + 1, pcx) {
+            if holds_in((struct_field(st, i, pcx)).ty, refs, cyc, pcx) {
                 return true;
             }
         }
         for i in 0..pcx.structs[st as usize].targ_count {
-            if holds_in(pcx.tlists[(pcx.structs[st as usize].targs + i) as usize], refs, depth + 1,
-                pcx) {
+            if holds_in(pcx.tlists[(pcx.structs[st as usize].targs + i) as usize], refs, cyc, pcx) {
                 return true;
             }
         }
@@ -135,15 +157,14 @@ fn holds_in(t: i64, refs: bool, depth: i64, pcx: &Ctx<Comp>) -> bool {
     if k == TyKind::Enum {
         let en = pcx.types[u as usize].a;
         for i in 0..pcx.enums[en as usize].targ_count {
-            if holds_in(pcx.tlists[(pcx.enums[en as usize].targs + i) as usize], refs, depth + 1,
-                pcx) {
+            if holds_in(pcx.tlists[(pcx.enums[en as usize].targs + i) as usize], refs, cyc, pcx) {
                 return true;
             }
         }
         for v in 0..pcx.enums[en as usize].variant_count {
             let vi = pcx.variants[enum_variant(en, v, pcx) as usize];
             for j in 0..vi.field_count {
-                if holds_in(pcx.tlists[(vi.fields + j) as usize], refs, depth + 1, pcx) {
+                if holds_in(pcx.tlists[(vi.fields + j) as usize], refs, cyc, pcx) {
                     return true;
                 }
             }
@@ -683,21 +704,25 @@ fn cls(n: i64, t: &Tab<Comp>, pcx: &mut Ctx<Comp>) -> (i64, i64) {
     (v, d)
 }
 
-// The pointer a write site writes through (infer.vl raw_write): `*p`'s p,
-// `p.f`'s and `p[i]`'s p; a raw view's Ident, itself.
+// The pointer a write site writes through (infer.vl raw_write, raw_lend):
+// `*p`'s p, `p.f`'s and `p[i]`'s p (where the place is, addr); `&mut
+// place`'s, the place's; a raw view's Ident (or the checker's copy of
+// one, typed as the view), itself.
 fn site_class(s: i64, t: &Tab<Comp>, pcx: &mut Ctx<Comp>) -> i64 {
     let k = pcx.nodes[s as usize].kind;
-    if k == NodeKind::Unary {
-        let (v, _) = cls(pcx.nodes[s as usize].b, t, pcx);
-        return v;
+    if k == NodeKind::Ident {
+        if pcx.nodes[s as usize].res == Res::Local {
+            let (v, _) = local_cls(pcx.nodes[s as usize].y, t, pcx);
+            return v;
+        }
+        return UNK;
     }
-    if k == NodeKind::FieldAccess || k == NodeKind::Index || k == NodeKind::TupleField {
-        let (v, _) = cls(pcx.nodes[s as usize].a, t, pcx);
-        return v;
+    if k == NodeKind::Unary && pcx.nodes[s as usize].op == Tok::Amp {
+        return addr(pcx.nodes[s as usize].b, t, pcx);
     }
-    if k == NodeKind::Ident && pcx.nodes[s as usize].res == Res::Local {
-        let (v, _) = local_cls(pcx.nodes[s as usize].y, t, pcx);
-        return v;
+    if k == NodeKind::Unary || k == NodeKind::FieldAccess || k == NodeKind::Index
+        || k == NodeKind::TupleField {
+        return addr(s, t, pcx);
     }
     UNK
 }
