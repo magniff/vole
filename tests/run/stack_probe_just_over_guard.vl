@@ -1,0 +1,108 @@
+// (0.30.2, RT-83) A frame just over the guard page: jump's 19.2 KB array
+// (at -O2; -O0 builds it in a temporary too), in the branch not taken,
+// against t2's 16 KiB guard page. descend goes down t2's 128 KiB stack
+// until jump is entered about 1 KiB above the guard page (where the stack
+// ends: macOS's pthread_get_stackaddr_np and _stacksize_np, only to place
+// it); thread t1, mapped just below t2's guard page, waits. v0.30.1 moved
+// sp by the whole frame at once, past the guard page, which nothing
+// touched, into t1's memory: t2 ran on (`t2: true`, then t1's lines, or a
+// hang when t1's thread record was hit). Now the frame's pages are written
+// top down first: t2 dies on its guard page, SIGBUS (exit 138), before
+// anything is printed.
+// REQUIRES: macos
+// EXIT: 138
+use std::thread;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+
+static STAGE: AtomicI64 = AtomicI64::new(0);
+static GUARD_TOP: AtomicI64 = AtomicI64::new(0);
+
+#[inline(never)]
+fn total(a: &[i64]) -> i64 {
+    let mut t = 0;
+    for x in a {
+        t += *x;
+    }
+    t
+}
+
+#[inline(never)]
+fn fill() -> i64 {
+    let mut a = [0i64; 64];
+    for i in 0..64 {
+        a[i] = 1;
+    }
+    total(&a)
+}
+
+#[inline(never)]
+fn wait() {
+    STAGE.store(1, Ordering::SeqCst);
+    while STAGE.load(Ordering::SeqCst) < 2 {
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[inline(never)]
+fn hold() -> i64 {
+    let canary = [777i64; 60000];
+    let before = total(&canary);
+    wait();
+    let after = total(&canary);
+    println("t1: canary sum before {before}, after {after}");
+    0
+}
+
+// A frame just over the 16 KiB guard page (19.2 KB at -O2).
+#[inline(never)]
+fn jump(big: bool) -> i64 {
+    if big {
+        let b = [3i64; 2400];
+        return total(&b);
+    }
+    fill()
+}
+
+// Goes down the stack until jump's frame starts about 1 KiB above the
+// guard page: each frame holds `mark`, read after the call returns.
+#[inline(never)]
+fn descend(n: i64) -> i64 {
+    let mark = [n; 4];
+    let at = &mark as *const [i64; 4] as i64;
+    if at - GUARD_TOP.load(Ordering::SeqCst) < 1536 {
+        return jump(STAGE.load(Ordering::SeqCst) > 5);
+    }
+    descend(n + 1) + total(&mark)
+}
+
+extern "C" {
+    fn pthread_self() -> usize;
+    fn pthread_get_stackaddr_np(t: usize) -> usize;
+    fn pthread_get_stacksize_np(t: usize) -> usize;
+}
+
+fn run() -> i64 {
+    // UNSAFE: macOS's C calls that say where this thread's stack is (only to
+    // place the jump: the jump itself is safe code).
+    // SAFETY: pthread_self is the running thread, live; the two calls only
+    // read its attributes.
+    let low = unsafe {
+        let t = pthread_self();
+        pthread_get_stackaddr_np(t) - pthread_get_stacksize_np(t)
+    };
+    GUARD_TOP.store(low as i64, Ordering::SeqCst);
+    descend(0)
+}
+
+fn main(gpa: Gpa) {
+    let h1 = thread::Builder::new().stack_size(2097152).spawn_in(move || hold(), gpa).unwrap();
+    while STAGE.load(Ordering::SeqCst) < 1 {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let h2 = thread::Builder::new().stack_size(131072).spawn_in(move || run(), gpa).unwrap();
+    let r2 = h2.join().unwrap();
+    println("t2: {}", r2 > 0);
+    STAGE.store(2, Ordering::SeqCst);
+    h1.join().unwrap();
+}
