@@ -191,6 +191,27 @@ A correctness release, its branches merged as each is reviewed clean.
   resolve proves nothing. An impl's bound naming `Self` (`impl<U:
   Conv<Self>> Tr<U> for W`) is read with Self the impl's type, wherever
   it is asked from.
+- **A bound is its whole trait reference, everywhere** (RT-269, RT-270,
+  RT-271, RT-272). A bound written without arguments, `Z: Tr` of `trait
+  Tr<U = i32>`, is `Z: Tr<i32>` at a call, an impl's parameter, a
+  struct's, a supertrait and an associated type's bound (v0.30.1 took an
+  impl of Tr with any arguments: E0277 accepted). An impl's `where`
+  predicates on other subjects (`where W: Conv<U>`, `where Self: ..`,
+  `where I::Item: ..`) are required where the impl is chosen and, for an
+  inherent impl, at a call of its function (v0.30.1 required them
+  nowhere). A trait parameter's default naming Self (`trait Sub<U = <Self
+  as H>::Out>`) is read for an impl with Self its type, in the trait's
+  module, and so is `Self` in an associated type's bound (`type Out:
+  Tr<Self>`; v0.30.1: unknown type 'Self'). `T: H2 + Tr<T::Out>` no longer
+  crashes the compiler: only a bound whose trait declares Out is read to
+  find T::Out, and a true cycle (`T: H<T::Out>`) is an error.
+- **The depth limit of trait searches is rustc's, 128** (RT-7, RT-53;
+  32 before, so that a type nested 34 deep did not implement its trait).
+- **No generic function is left unchecked in silence** (RT-275). One
+  whose opaque instance cannot be made gets warning generic.unchecked,
+  and one whose header does not meet its Self type's bound by its own
+  parameters' (`impl<A: Tr<i32>> G<A>` of `struct G<T: Tr<i64>>`) is
+  refused at the header (rustc E0277; v0.30.1 said nothing).
 
 ### What's new in 0.30.1
 
