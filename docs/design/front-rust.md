@@ -765,25 +765,41 @@ made where the places IR makes the copy (`RV_REPEAT`), so every
 repeat meets it whatever wrote it: a generic body (reported once, for
 the template, as the checker's errors are), a closure, a default
 method, a nested repeat (`[[d; 1]; 2]`: `[D; 1]` is not Copy). N of 1
-moves e into the one element; N of 0 drops e at once, as Rust does
-(before 0.30.2 it was never dropped). Since 0.28.0 a value that was
+moves e into the one element; N of 0 drops e as soon as it is made,
+in a scope of its own, before what follows it (an argument's next, a
+match's arm, a borrow of the array), as Rust does (before 0.30.2 it was
+never dropped). One error for a position, however many instances build
+it (a generic's, a closure's in one). Since 0.28.0 a value that was
 not Copy was copied bitwise and each copy dropped: a double free for a
 Vec, a Drop run N times. *Anchor:* `places/build.vl: expr_into,
 repeat_copy_error`. *Cases:* `rt_148_array_repeat_not_copy`,
 `rt_148_repeat_copy_refused`, `rt_148_repeat_copy_ok`.
 
 **F35.2 (a constant).** (0.30.2) The one other form Rust allows is a
-path to a constant (a free one, an inherent or a trait's associated
-one). A constant is made at each use (F34.2), so `[C; N]` of a
-constant whose type is not Copy becomes `[C, C, ..]`, N uses, each
-its own value: a constant whose value calls a function calls it once
+path to a constant (a free one, an inherent, a trait's or an Ω's
+associated one, a qualified path). Every resolver's result is marked a
+constant's use in one place, `const_use` (NODE_CONST_USE: synth_name for
+a name, synth_path for a path's member), so none has a mark to forget
+(a generic `[T::ZERO; N]` was refused when only some resolvers marked
+it). A constant is made at each use (F34.2), so `[C; N]`, N above 1, of
+a constant whose type is not Copy makes each element from the
+constant: the places IR evaluates it N times in a loop
+(`repeat_each`: the first value repeated, which makes the array a value
+for the borrow checker, then element i written with a value of its own,
+an assignment that drops nothing, the first's bits being element 0's).
+Any length: no limit (0.30.2's first form expanded the AST and refused
+more than 4096). A constant whose value calls a function calls it once
 per element, as vole's constants do at each use (rustc computes the
-constant once and copies it, which a `const fn` makes the same). At
-most 4096 elements: a longer one is `trait.repeat_copy`, never a copy.
-A Copy constant is repeated as any Copy value. *Anchor:*
-`front/check/synth_mode.vl: repeat_literal` (both modes' Repeat arms),
-`front/ast.vl: NODE_CONST_USE`. *Cases:* `rt_148_repeat_const_each`,
-`rt_148_repeat_const_limit`.
+constant once and copies it, which a `const fn` makes the same). `[C;
+0]` makes nothing from C, as rustc's; `[C; 1]` makes one. A Copy
+constant is repeated as any Copy value. A static's or a constant's data
+asks the same rule where it writes the copies (`consteval.vl
+const_write`, RT-148b): `static B: [D; 2] = [D { k: 1 }; 2];` is
+`trait.repeat_copy`. *Anchor:* `places/build.vl: repeat_needs_copy,
+repeat_each`, `front/check/names.vl: const_use`, `front/consteval.vl:
+const_write`. *Cases:* `rt_148_repeat_const_each`,
+`rt_148_repeat_const_long`, `rt_148_repeat_const_paths`,
+`rt_148_repeat_zero_drops`, `rt_148b_static_repeat_not_copy`.
 
 ## 2. Traits
 

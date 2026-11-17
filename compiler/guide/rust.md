@@ -196,8 +196,8 @@ window`), the arenas of `std::alloc`, and `embed wgsl` blocks with
 A `const` whose value calls a function is made at each use, at run
 time (rustc needs a `const fn` and computes it once). So `[C; N]` of a
 constant whose type is not Copy makes each element from the constant,
-one call per element, at most 4096 of them (else `trait.repeat_copy`);
-any other `[x; N]`, N above 1, needs x Copy, as in Rust.
+one call per element, any length; any other `[x; N]`, N above 1, needs
+x Copy, as in Rust (`trait.repeat_copy`), in a static's value too.
 
 ## Not in the language
 

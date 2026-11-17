@@ -100,20 +100,27 @@ A correctness release, its branches merged as each is reviewed clean.
 
 #### Soundness holes closed
 
-- **An array repeat of a value that is not Copy (RT-148), at every -O,
-  since 0.28.0.** `[v; 2]` of a Vec, `[D { k: 1 }; 3]` of a type with a
-  Drop impl, a generic `[t; 2]` and `[f; 2]` of an `impl FnMut` were
-  built: the value was copied bit for bit into each element and each
-  copy dropped, a double free (a use after free once one closure's Vec
-  grew) or a Drop run N times, from safe code. Neither the checker's
-  Repeat arms nor the places IR asked for Copy. Now the places IR asks
-  `rust_copy`, the one Copy test, where it makes the copies
-  (`RV_REPEAT`), so every repeat meets it: `error trait.repeat_copy`,
-  rustc's E0277 (front-rust.md F35.1). Rust's other form, a path to a
-  constant, makes each element from the constant, one use each (F35.2:
-  vole makes a constant at each use, so one whose value calls a function
-  calls it once per element), at most 4096. `[x; 0]` now drops x at once
-  (it leaked), `[x; 1]` moves it.
+- **An array repeat of a value that is not Copy (RT-148, RT-148b, RT-215), at
+  every -O, since 0.28.0.** `[v; 2]` of a Vec, `[D { k: 1 }; 3]` of a
+  type with a Drop impl, a generic `[t; 2]` and `[f; 2]` of an `impl
+  FnMut` were built: the value was copied bit for bit into each element
+  and each copy dropped, a double free (a use after free once one
+  closure's Vec grew) or a Drop run N times, from safe code; a static's
+  `[D { k: 1 }; 2]` or `[None; 2]` was written the same way. Neither the checker's
+  Repeat arms, the places IR nor the constant writer asked for Copy.
+  Now one predicate, `repeat_needs_copy` (Copy by `rust_copy`, the one
+  Copy test), is asked where the copies are made: the places IR's
+  `RV_REPEAT` for a body and `const_write` for a static's or a
+  constant's data: `error trait.repeat_copy`, rustc's E0277, once a
+  position (front-rust.md F35.1). Rust's other form, a path to a
+  constant, makes each element from the constant (F35.2): a loop of
+  the places IR evaluates it N times, any N, and vole makes a constant
+  at each use, so one whose value calls a function calls it once per
+  element. Every resolver of a constant (a name, a path to an inherent,
+  a trait's or a type parameter's associated constant) is marked in
+  one place, so `[T::ZERO; N]` in a generic body is a constant's repeat
+  too. `[x; 0]` now drops x as soon as it is made (it leaked), `[C;
+  0]` makes nothing, `[x; 1]` moves x.
 
 #### Miscompiles fixed
 
