@@ -418,6 +418,64 @@ the trait's arguments (`<T as Conv<i32>>::K`).
   for `k(&y)`, E0596/E0594 for the rest). Reads through `*&y` still
   build.
 
+- **A callable meeting an Fn bound kept no borrow of its argument
+  (RT-282, RT-297, RT-297b, RT-297c, RT-299, RT-304, RT-308, RT-309,
+  RT-310, RT-311, RT-364, RT-367, RT-368, RT-421), every -O, in v0.30.1
+  and before.** A fn item whose result
+  borrows its argument, `fn idr2<'a>(x: &'a i64) -> &'a i64`, given to
+  `v.first().map(idr2)`, `and_then`, `sort_by_key`, Iterator's `scan`,
+  `find_map`, `map_while`, `fold`, a program's `F: Fn(T) -> U` or `f:
+  fn(I::Item) -> U` parameter, or kept in a struct's field or a Vec and
+  passed on, gave a result that kept no borrow of v: `drop(v)` while it
+  lived was accepted, a use after free from safe code; a generic fn used
+  as a value whose bound's impl needs `'static` (`kb::<&i64>` with only
+  `impl Keep for &'static i64`) the same. In the instance such a value is
+  its erased `fn` type, and a call through it related its arguments to
+  its result only inside the instance, where those are the instance's
+  own substitutions. Now the signature says it: every place a callable
+  meets an Fn bound or a `fn` type (a type parameter's `Fn*` bound, a
+  `fn` type at any depth of a parameter's type, a struct's or an enum's
+  `fn` field, a `where` predicate) relates the regions its call relates,
+  assumed in the body and required at each call, read through the item's
+  own signature where a fn item is given (`fn st(x: &i64) -> &'static
+  i64` keeps no borrow, as rustc reads it), and a value whose result may
+  borrow what the bound's elided input lends for the call alone is
+  refused where it is given, `borrowck.fn_value_bound` (rustc E0308;
+  `v.iter().scan(0, bad)` with a `bad` that returns its state;
+  `dedup_by_key`, `max_by_key` and `min_by_key` with a key that borrows
+  its argument, RT-368). The callee's body is then checked by the bound,
+  not by the erased type: `entry(5).or_insert_with_key(kk)` with a `kk`
+  returning its key, and `arena_scope(&gpa, mk)` with an `mk` returning
+  a Vec on the scope, are refused at the call instead of inside std
+  (RT-378), and the same calls given a fn item that keeps no borrow
+  build (v0.30.1 refused them inside std). A local that surely holds a
+  fn item (`let p = st;`, written by that one statement) is read by that
+  item's signature too, and a parameter of the body given on is its
+  caller's value only when the body never writes it: every write counts,
+  an assignment, `&mut` (allowed of a parameter that is not `mut`), a
+  `ref mut` binding, `&raw`, a `&mut self` autoref (places/ir.vl
+  `held_value`, the one rule both readers ask). A
+  function that takes such a callable as a type parameter cannot itself
+  be used as a value (a call through the value would reach its body
+  unchecked); one taking a written `fn(..)` type can, and its callers
+  may give that parameter any `fn` value: its body calls it as R6 reads
+  the erased type, so only a type parameter's records are checked at a
+  call (`regions::bound_param`). The `'static` a bound needs only
+  through an associated-type equality, a `where` clause, an impl's
+  `where 'a: 'static`, a two-level blanket impl or the bound trait's
+  type argument (`T: KeepQ<&'static i64>`) is read from the signature
+  too (RT-364, RT-421), through std's blanket Into as well (`ki<T:
+  Into<&'static i64>>` used as a value). `&mut` of a fn pointer meets
+  FnMut and FnOnce bounds, not Fn (rustc E0277), as `&mut` of a closure.
+  One rule
+  for closures, fn items, fn pointers, method paths, generic fns with
+  their arguments and opaque `impl Fn` values (borrowck.md R6). With it,
+  a fn item or a `fn` value given to Iterator's adapters (`map`,
+  `filter_map`, `flat_map`) builds (RT-298: `&mut F` of a `fn` type meets
+  an Fn bound as F does), an opaque `impl Fn(&i64) -> &i64` value given
+  to a bound infers its result (RT-301), and `binary_search_by` and
+  `binary_search_by_key` take Rust's `F: FnMut(&'a T) -> ..` (RT-300: a
+  key that is the element's reference was refused).
 - **The results of partition_in and unzip_in kept no borrow of their
   items (RT-211, RT-261, RT-267, RT-268, RT-237b, RT-283, RT-387,
   RT-387f, RT-388, RT-99, RT-404), every -O,
