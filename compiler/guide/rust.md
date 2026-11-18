@@ -16,6 +16,7 @@ global allocator and no default `A`.
 | Rust | vole |
 |---|---|
 | `fn main()` | `fn main(gpa: Gpa)`: the program's allocator, passed down (`fn main()` when nothing allocates) |
+| `fn main()`, `-> Result<(), E>` | (0.30.2) also C's `fn main(argc: i32, argv: *mut *mut u8)` (`*const` too), `gpa: Gpa` last after them; results `()`, `i32`, `i64`, `!`, `Result<(), E: Debug>`; any other signature is `main.signature` or `main.result` (rustc E0580, E0277) |
 | `Vec<T>`, `String`, `HashMap<K, V>`, `Box<T>` | `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa, FixedState>` (the hasher is written too, `hash.default`; `FixedState` is in the prelude), `Box<T, Gpa>`; generic code writes `A: Allocator` (`use std::alloc::Allocator`). `Vec<T>` is `alloc.default` |
 | `Vec::new()`, `String::new()`, `Box::new(x)`, `Arc::new(x)` | `Vec::new_in(gpa)`, `String::new_in(gpa)`, `Box::new_in(x, gpa)`, `Arc::new_in(x, gpa)`: the allocator last. `Vec::new()` is `alloc.no_in` |
 | `x.to_string()`, `format!("{a}-{b}")`, `iter.collect()` | `x.to_string_in(gpa)`, `format_in("{a}-{b}", gpa)`, `iter.collect_in(gpa)`: what returns owned memory ends in `_in` |

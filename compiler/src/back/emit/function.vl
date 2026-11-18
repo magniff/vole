@@ -31,14 +31,14 @@ use crate::back::regalloc::prepare::{count_uses, is_emitted, tracked};
 use crate::base::{buf_append, buf_clear, buf_copy_range, buf_len, buf_truncate, die};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::base::target::get_x86;
+use crate::base::target::{frame_grow, get_x86};
 use crate::base::timer::{
     P_FRAME_LAYOUT, P_ISEL, P_REGALLOC, T_CODEGEN, T_ISEL, T_SCALAR, pass_done, timer_add,
     timer_now,
 };
 use crate::front::types::{
-    TY_BOOL, TY_F64, TY_U64, TY_U8, align_to, fn_param, int_bits, is_compound, is_integer,
-    is_vector, is_void, max_i64, scalar_type, type_align, type_size,
+    TY_BOOL, TY_F64, TY_U64, TY_U8, fn_param, int_bits, is_compound, is_integer, is_vector, is_void,
+    max_i64, scalar_type, type_align, type_size,
 };
 use crate::gen0::arm64::{a64_epilogue, a64_frame_reserve};
 use crate::gen0::gen::{fn_is_global, fn_symbol_prefix};
@@ -104,15 +104,20 @@ fn layout_frame(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
             v = (cx.insts[v as usize]).next;
         }
     }
-    let mut offset = align_to(cx.frame_out, if cx.spill_vectors { 16 } else { 8 });
+    // (0.30.2, RT-466) every growth of the frame through frame_grow,
+    // checked before it adds: past the target's limit, frame_refused
+    let unchecked = pcx.plant_limit == crate::base::target::PLANT_FRAME;
+    let mut offset = grown(fi, 0, cx.frame_out, if cx.spill_vectors { 16 } else { 8 },
+        unchecked, pcx);
     cx.spill_base = offset;
-    offset += 8 * cx.spill_count;
+    offset = grown(fi, offset, 8 * cx.spill_count, 1, unchecked, pcx);
     cx.save_base = offset;
-    offset += 8 * cx.callee_used[0..64]
+    let saves = cx.callee_used[0..64]
         .iter()
         .copied()
         .filter(|x| ({ let u = *x; u != 0 }))
         .count() as i64;
+    offset = grown(fi, offset, 8 * saves, 1, unchecked, pcx);
     if offset > 32760 {
         die(c"internal error: too many spill slots");
     }
@@ -121,17 +126,53 @@ fn layout_frame(cx: &mut FnCtx<Comp>, fi: i64, pcx: &Ctx<Comp>) {
         if (cx.slots[s as usize]).offset < 0 {
             continue;
         }
-        offset = align_to(offset, (cx.slots[s as usize]).align);
-        (cx.slots[s as usize]).offset = offset;
-        offset += (cx.slots[s as usize]).size;
+        let at = grown(fi, offset, 0, (cx.slots[s as usize]).align, unchecked, pcx);
+        (cx.slots[s as usize]).offset = at;
+        offset = grown(fi, at, (cx.slots[s as usize]).size, 1, unchecked, pcx);
         cx.frame_align = max_i64(cx.frame_align, (cx.slots[s as usize]).align);
     }
-    cx.frame_total = align_to(offset, 16);
-    // (0.30.1) x86-64 addresses the frame with 32-bit displacements (the
-    // assembler refuses a wider one): a limit, an error
-    if get_x86() && cx.frame_total > 2147483647 - 4096 {
-        die(c"a stack frame past 2 GB: x86-64 reaches its frame with 32-bit displacements (put the large value on the heap)");
+    // (0.30.1: x86-64 addresses the frame with 32-bit displacements, the
+    // assembler refuses a wider one; 0.30.2: its limit is frame_limit's)
+    cx.frame_total = grown(fi, offset, 0, 16, unchecked, pcx);
+}
+
+// (0.30.2, RT-466) layout_frame's growth of IR function fi's frame:
+// frame_grow's, or frame_refused past the target's limit.
+fn grown(fi: i64, offset: i64, size: i64, align: i64, unchecked: bool, pcx: &Ctx<Comp>) -> i64 {
+    match frame_grow(offset, size, 0, align, crate::base::target::frame_limit(), unchecked) {
+        Some(at) => at,
+        None => frame_refused(fi, pcx),
     }
+}
+
+// (0.30.2, RT-466) -O2's frame.too_big: the frame of IR function fi grew
+// to the target's limit in the code generator. Its body's locals were
+// checked where they are written (take_body's check_frame): these are
+// the slots inlining brought, or the outgoing arguments'. A task reads
+// the context only, so it stops the compiler as die does, with the
+// function's name.
+fn frame_refused(fi: i64, pcx: &Ctx<Comp>) -> ! {
+    let f = pcx.ir_fn[fi as usize];
+    let mut m: Vec<u8, Comp> = Vec::new_in(Comp {});
+    for &b in b"the stack frame of '".iter() {
+        m.push(b);
+    }
+    for &b in crate::base::sym_text(pcx.fns[f as usize].display, pcx).iter() {
+        m.push(b);
+    }
+    for &b in b"' reaches ".iter() {
+        m.push(b);
+    }
+    for &b in crate::base::target::frame_limit_text(crate::base::target::frame_limit())
+        .as_bytes()
+        .iter() {
+        m.push(b);
+    }
+    for &b in b" with the slots of its inlined callees: more than the target's stack frames hold (frame.too_big; put a large value on the heap, or #[inline(never)] on the callee)".iter() {
+        m.push(b);
+    }
+    m.push(0);
+    die(m.as_ptr())
 }
 
 // Saves (or restores) the callee-saved registers used: on AArch64 two at

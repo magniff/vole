@@ -3,11 +3,11 @@
 ## found.
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
-crate	syntax015/main.vl	6
+crate	syntax015/main.vl	7
 std	<std>	607
-$ show main
-// crate::main	syntax015/main.vl:25-31	effects: io static panic
-fn main() -> Option<i64> {
+$ show crate::run
+// crate::run	syntax015/main.vl:25-31	effects: io static panic
+fn run() -> Option<i64> {
     let x = half(8)?;
     let y = area(x, h: 2);
     let p = P { x, y };
@@ -16,11 +16,11 @@ fn main() -> Option<i64> {
 }
 $ grep 'p = {p:?}' --strings
 # syntax015/main.vl
-29:14	string	main	println("p = {p:?}, x = {x:>4}, {{y}} = {y:08x}");
+29:14	string	run	println("p = {p:?}, x = {x:>4}, {{y}} = {y:08x}");
 $ refs area
 # syntax015/main.vl
 13:4	def	fn area(w: i64, h: i64) -> i64 {
-27:13	call	main	let y = area(x, h: 2);
+27:13	call	run	let y = area(x, h: 2);
 $ type syntax015/main.vl:22:26
 i64	x
 $ def P::cmp
