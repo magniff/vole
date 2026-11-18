@@ -2862,6 +2862,71 @@ body needs `H_f` while it is being found (a recursive call's method):
 `opaque.cycle` (E0720). No `use<..>`: every input lifetime is captured.
 `-> impl Fn*(A..) -> R` is the returned-closure case (D19.8).
 
+**D21.5 (layout, drop, moves: the hidden type; what a caller may do:
+the bounds).** (0.30.2, RT-145, RT-79, RT-147) `O_f` is `H_f` for
+layout, for drop and for its own Copy. One function decides what a
+distinct type is for its kind and its glue, `front/opaque.vl
+decided_type`: its underlying type, for `O_f` the hidden type (a nested
+opaque result decided in turn), 0 while `H_f` is not known (f not
+checked yet, or being checked: a caller checked before f, functions
+that call each other). `front/kinds.vl type_kind` is the one place every
+kind and glue question passes through (`has_glue` asks it first): a
+kind that reads a 0 there is returned but not kept (`kind_unknown`), and
+neither is the kind of any type holding it (an `Option<O_f>`, an `(O_f,
+i64)`, a struct, a Vec, an array, an enum: whatever type_kind reaches
+through a field, an element, a variant or a type argument), nor its glue
+(`kind_kept`). (A type reached again while its kind is computed reads
+as plain there, through a reference only, the same before and after
+`H_f` is known: the cycle rule of every type, not an answer kept from
+before.) The places IR is built when every function is
+checked, so what it drops is decided from the hidden types: a closure
+that owns a Vec or a D, an iterator struct holding one, a tuple or an
+Option of them is dropped as rustc drops it (v0.30.1 dropped none;
+0.30.2's first try kept the Option's and the tuple's answer from before
+f was checked). decided_type does not check f to know `H_f` (a kind
+asked there would check functions in another order and meet a cycle
+rustc has not). A move is `rust_copy`'s: `O_f` is Copy only when a bound
+says `Copy`, whatever `H_f` is (a captureless closure is Copy, its
+`impl Fn` is not). `check_distinct_kinds` skips opaque types
+(distinct.kind refused every `H_f` that owns memory, RT-79); a
+projection of `O_f` (`<O_f as Iterator>::Item`) is `H_f`'s; a reference
+to `O_f` has std's impls for references through `O_f`'s bounds (`&impl
+Fn` is Fn, `&mut impl FnMut` is FnMut, `&mut impl Iterator` is an
+Iterator, RT-166), as a blanket impl over `F: Fn` covers `O_f` by its
+bound (RT-196) and `flat_map` takes `O_f` as an IntoIterator (RT-200).
+*Anchor:* `front/opaque.vl: decided_type, reveal_type, fn_bound_type`,
+`front/kinds.vl: type_kind, kind_kept`,
+`places/glue.vl: has_glue, glue_of`, `front/traits.vl: implements`.
+*Cases:* `rt_145_opaque_*`.
+
+**D21.6 (the call kind is the bound's).** (0.30.2, RT-213, RT-79c,
+RT-334) A call of a closure value has one call kind, decided in
+`synth_call`: the `Fn*` bound of the callee's type (`opaque_call_kind`,
+read after the autoderef, so for every callee shape: a local, a field,
+a tuple field, an element, a reference, a binding the value was moved
+to, a closure calling it), else a parameter's bound (`value_call_kind`);
+never the hidden closure's. `closure_call` applies it: called as
+`FnOnce`, the call consumes its callee (`CALL_CONSUMES`: moved as its
+opaque type, Copy only by its bounds, into a temporary of the call that
+its env borrows, `lower_arg`, or with no env kept as the call's callee,
+`lower_call`; a closure that is FnOnce itself is its env, moved so) and
+needs no `mut` (RT-334); called as `FnMut`, the callee must be a mutable
+place (E0596) and its env is a `&mut` borrow (`CALL_AS_FN_MUT`, E0502
+against a live shared borrow). Through a reference that its bound does
+not call through, an `impl FnOnce` (any reference, E0507) or an `impl
+FnMut` (a shared one, E0596) is refused (`through_ref_kind`), and
+neither meets a stricter bound (`fn_bound_satisfied` refuses an `impl
+FnOnce` for `F: Fn`, E0277). A callee is autoderefed through any
+references to a callable base (`callable_through_ref`: `(&&c)(1)`,
+`(&mut &mut g)()`, `&mut &&impl Fn`, RT-195), and `&&F`, `&mut &F`,
+`&mut &mut F` meet a bound as the inner reference does (std's impls for
+references; `&&mut F` is no `Fn*`). *Anchor:* `front/opaque.vl:
+opaque_call_kind`, `front/closures/fn_bounds.vl: fn_bound_satisfied,
+value_call_kind, callable_through_ref`, `front/check/calls/paths.vl:
+synth_call, through_ref_kind`, `front/closures/mod.vl: closure_call`,
+`places/build.vl: lower_call, lower_arg`. *Cases:*
+`rt_213_opaque_call_kinds`, `rt_213*`, `rt_195*`, `rt_166*`, `rt_334*`.
+
 - **L10** (0.27.2.1) One opaque type per function, at the top of its
   result; the hidden type's associated types are seen by the caller
   (`Iterator<Item = X>`'s `next` gives `H_f`'s item type, which the bound

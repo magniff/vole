@@ -59,8 +59,9 @@ fn is_variadic_arg_type(t: i64, pcx: &Ctx<Comp>) -> bool {
 }
 
 pub fn synth_call(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let callee = pcx.nodes[n as usize].a;
-    if callee == 0 && pcx.nodes[n as usize].x != 0 {
+    let mut callee = pcx.nodes[n as usize].a;
+    if (callee == 0 || (pcx.nodes[n as usize].p & crate::front::ast::CALL_CONSUMES) != 0)
+        && pcx.nodes[n as usize].x != 0 {
         // A method call, already checked (and made a call), when a rewrite
         // checks an expression again (`for x in v.items()`).
         return pcx.fns[(pcx.nodes[n as usize].x - 1) as usize].ret;
@@ -124,13 +125,56 @@ pub fn synth_call(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             pcx.nodes[callee as usize].g, pcx);
     }
     pcx.callee_pos = pcx.nodes[callee as usize].start;
-    let callee_ty0 = synth_expr(callee, pcx);
+    let mut callee_ty0 = synth_expr(callee, pcx);
+    // RULE: D19.5 (0.30.2, RT-195: a callee is autoderefed, as rustc's, to
+    // the one reference std's `Fn*` impls for references call through:
+    // `rr(2)` with `rr: &&C`, `gmm(4)` with `gmm: &mut &mut F`)
+    while callee_ty0 > 0 && pcx.types[callee_ty0 as usize].kind == TyKind::Ptr
+        && pcx.types[callee_ty0 as usize].b != 0
+        && crate::front::closures::fn_bounds::callable_through_ref(
+            pcx.types[callee_ty0 as usize].a, pcx) {
+        let inner = pcx.types[callee_ty0 as usize].a;
+        let u = new_node(NodeKind::Unary, pcx.nodes[callee as usize].start,
+            pcx.nodes[callee as usize].end, pcx);
+        pcx.nodes[u as usize].op = Tok::Star;
+        pcx.nodes[u as usize].b = callee;
+        pcx.nodes[u as usize].ty = inner;
+        pcx.nodes[u as usize].p |= crate::front::ast::NODE_CHECKED;
+        pcx.nodes[n as usize].a = u;
+        callee = u;
+        callee_ty0 = inner;
+    }
+    let own_kind = crate::front::opaque::opaque_call_kind(callee_ty0, pcx);
+    let own_ty = callee_ty0;
+    through_ref_kind(callee, callee_ty0, pcx);
     // RULE: D21.3 (an `impl Fn*` result called: its hidden closure)
     let callee_ty0 = crate::front::opaque::reveal_callee(callee, callee_ty0, pcx);
     let callee_ty = crate::front::closures::fn_through_ref(n, callee_ty0, pcx);
     if closure_of_type(callee_ty, pcx) != 0
         || crate::front::closures::closure_through_ref(callee_ty, pcx) {
-        return closure_call(n, callee_ty, pcx);
+        // RULE: D21.6 (0.30.2, RT-213) the call kind: a parameter's bound
+        // (the body was written against it: `call_once<F: FnOnce>` given an
+        // `impl FnMut` calls it once), else the bound of the callee's type,
+        // an `impl Fn*` (own_kind, read from the type after autoderef, so
+        // for every callee shape: a local, a field, an element, a
+        // reference, a binding it was moved to); never the hidden
+        // closure's (closure_call)
+        // (a parameter of a reference type is called through std's impls
+        // for references, which call what it points to by that one's own
+        // kind: its bound is the reference's, `apply<F: FnOnce>(&mut c)`)
+        let mut kind: i64 = 0;
+        if pcx.nodes[callee as usize].kind == NodeKind::Ident
+            && pcx.nodes[callee as usize].res == Res::Local && pcx.cur_fn >= 0
+            && !(callee_ty0 > 0 && pcx.types[callee_ty0 as usize].kind == TyKind::Ptr) {
+            kind = crate::front::closures::fn_bounds::value_call_kind(pcx.cur_fn,
+                pcx.nodes[callee as usize].y, pcx);
+        }
+        if kind == 0 {
+            kind = own_kind;
+        }
+        // (an opaque value moves as its type, Copy only by its bounds)
+        let move_ty = if own_kind != 0 { own_ty } else { 0 };
+        return closure_call(n, callee_ty, kind, move_ty, pcx);
     }
     if !is_fn_type(callee_ty, pcx) {
         err_begin(pcx.nodes[callee as usize].start, pcx);
@@ -164,6 +208,37 @@ pub fn synth_call(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         pcx.rust_arg = saved;
     }
     pcx.types[callee_ty as usize].a
+}
+
+// RULE: D21.6 (0.30.2, RT-213) A callee of type t, a reference to an
+// opaque type O with an `Fn*` bound that the autoderef did not call
+// through (synth_call): what the bound lets a caller do through it, as
+// std's `Fn*` impls for references, which the bound test reads too
+// (opaque.vl fn_bound_type): an `impl FnOnce` is called by value only,
+// its call moves it (rustc E0507), and an `impl FnMut` through a `&mut`
+// only, its call changes it (rustc E0596); whatever its hidden closure is.
+fn through_ref_kind(callee: i64, t: i64, pcx: &mut Ctx<Comp>) {
+    if t <= 0 || pcx.types[t as usize].kind != TyKind::Ptr || pcx.types[t as usize].b == 0 {
+        return;
+    }
+    let k = crate::front::opaque::opaque_call_kind(pcx.types[t as usize].a, pcx);
+    let shared = pcx.types[t as usize].b == crate::front::types::REF_SHARED;
+    if k == crate::front::closures::kinds::KIND_FN_ONCE {
+        err_begin(pcx.nodes[callee as usize].start, pcx);
+        err_str(c"cannot call '", pcx);
+        err_type(pcx.types[t as usize].a, pcx);
+        err_str(c"' through a reference: calling it moves it (rustc E0507)", pcx);
+        crate::base::diag::err_help(c"call the value itself, or bound the result by `Fn` (`impl Fn`) to call it through a reference", pcx);
+        err_end(pcx);
+    } else if k == crate::front::closures::kinds::KIND_FN_MUT && shared {
+        err_begin(pcx.nodes[callee as usize].start, pcx);
+        err_str(c"cannot call '", pcx);
+        err_type(pcx.types[t as usize].a, pcx);
+        err_str(c"' through a shared reference: calling it changes it (rustc E0596)", pcx);
+        crate::base::diag::err_help(
+            c"call it through a `&mut`, or bound the result by `Fn` (`impl Fn`)", pcx);
+        err_end(pcx);
+    }
 }
 
 // A direct call of function f (a template is instantiated first, with
@@ -579,11 +654,12 @@ pub fn synth_path(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             float_const_error(pcx.nodes[n as usize].start, t, member, false, pcx);
         }
     }
-    // RULE: F3.1 (0.27.2: `t::N`, an inherent constant)
+    // RULE: F3.1 (0.27.2: `t::N`, an inherent constant; 0.30.2, RT-302:
+    // each constant used is checked for exits in its value, const_use)
     if pt.tr < 0 && f < 0 {
         let r = crate::front::assoc::inherent_const_value(n, t, member, pcx);
         if r >= 0 {
-            return r;
+            return crate::front::check::names::const_use(n, r, pcx);
         }
         pt = crate::front::check::calls::qualified::concrete_trait(n, t, member, pcx);
     }
@@ -593,7 +669,7 @@ pub fn synth_path(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         pt = crate::front::check::calls::qualified::args_from_fn_hint(pt, member, hint, pcx);
         let r = crate::front::check::calls::qualified::trait_const_of(n, t, pt, member, pcx);
         if r >= 0 {
-            return r;
+            return crate::front::check::names::const_use(n, r, pcx);
         }
         f = crate::front::check::calls::qualified::trait_fn_of(n, t, pt, member, pcx);
         if f == -2 {
