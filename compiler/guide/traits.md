@@ -92,7 +92,8 @@ shape 10
 ## Associated types
 
 A trait declares `type Name;`, each impl defines it, and `T::Name`,
-`Self::Name` or `<T as Tr>::Name` is that type. A bound can fix it: `I:
+`Self::Name` or `<T as Tr>::Name` is that type (any type before `as`:
+`<&S as Tr>::f`, `<<T as A>::B as C>::D`). A bound can fix it: `I:
 Iterator<Item = i64>`. A trait can be implemented for a slice: `impl<T>
 Second for [T]`.
 

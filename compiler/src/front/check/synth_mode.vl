@@ -1012,6 +1012,7 @@ fn synth_field(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         pcx.nodes[d as usize].op = Tok::Star;
         pcx.nodes[d as usize].b = inner;
         mark_synthed(inner, pcx);
+        crate::front::check::unsafety::union_read_through(inner, pcx);
         pcx.nodes[n as usize].a = d;
         base_ty = synth_expr(d, pcx);
         depth += 1;
@@ -1076,6 +1077,7 @@ fn synth_field(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if pcx.types[base_ty as usize].kind == TyKind::Ptr
         && pcx.types[pcx.types[base_ty as usize].a as usize].kind == TyKind::Struct {
         pcx.nodes[n as usize].y = 1;
+        crate::front::check::unsafety::union_read_through(pcx.nodes[n as usize].a, pcx);
         base_ty = pcx.types[base_ty as usize].a;
         if !is_borrow(pcx.nodes[n as usize].a, pcx) {
             pcx.nodes[n as usize].p |= NODE_RAW;
@@ -1181,6 +1183,7 @@ fn synth_tuple_field(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         // (0.17) through a pointer to a tuple, as a field through a
         // pointer to a struct: `p.0` is `(*p).0`
         let base = pcx.nodes[n as usize].a;
+        crate::front::check::unsafety::union_read_through(base, pcx);
         base_ty = pcx.types[base_ty as usize].a;
         let deref = synthetic_unary(Tok::Star, base, base_ty, pcx);
         if !is_borrow(base, pcx) {
@@ -1839,6 +1842,13 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         if under_mut {
             pcx.view_deref = 0;
         }
+        // (0.30.2: the operand of a shared `&`, which marks it so, below:
+        // `&*v` of an exclusive view is the shared reborrow, `&**self` in
+        // Display for &mut T with T = str)
+        let under_shared = pcx.view_deref == -n - (1 << 40);
+        if under_shared {
+            pcx.view_deref = 0;
+        }
         let ty = synth_expr(operand, pcx);
         // (0.17, issue #1: `(*f)(10)` on a fn value, C's habit: the
         // value is called as it is)
@@ -1873,6 +1883,12 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             // (0.27.5: as a receiver, the place: synth_method)
             pcx.view_deref = n;
             return ty;
+        }
+        if under_shared && view > 0 && pcx.types[view as usize].kind == TyKind::Slice
+            && pcx.types[view as usize].b == REF_MUT {
+            copy_use(n, operand, pcx);
+            pcx.view_deref = n;
+            return crate::front::types::decay_ref(ty, pcx);
         }
         // RULE: Z4.1 (`*x` of a value is the plain error below, rustc's
         // E0614)
@@ -1920,9 +1936,11 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         || pcx.nodes[operand as usize].kind == NodeKind::MethodCall;
     if mutable && star {
         pcx.view_deref = -operand;
+    } else if star {
+        pcx.view_deref = -operand - (1 << 40);
     }
     let ty = synth_expr(operand, pcx);
-    if pcx.view_deref == -operand {
+    if pcx.view_deref == -operand || pcx.view_deref == -operand - (1 << 40) {
         pcx.view_deref = 0;
     }
     pcx.mut_place = outer_place;
@@ -1963,6 +1981,16 @@ fn synth_unary(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             copy_use(n, operand, pcx);
             return ty;
         }
+    }
+    // RULE: Z4.1 (0.30.2, RT-159) `&*s` of a shared view s (`*s` the
+    // unsized place, read as the view itself, above): the reborrow, the
+    // view, as rustc's `&*s: &str`; not a reference to the view, which
+    // `&s` is. A path call takes Self from it: `Display::fmt(&**self, f)`
+    // in Display for &T with T = str is str's, not &T's again.
+    if !mutable && star && pcx.view_deref == operand && operand > 0 {
+        pcx.view_deref = 0;
+        copy_use(n, operand, pcx);
+        return ty;
     }
     // RULE: F19.7 (0.30: a union field borrowed is unsafe, rustc E0133)
     crate::front::check::unsafety::union_borrow(operand, pcx);
