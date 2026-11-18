@@ -724,6 +724,55 @@ the trait's arguments (`<T as Conv<i32>>::K`).
   resolve proves nothing. An impl's bound naming `Self` (`impl<U:
   Conv<Self>> Tr<U> for W`) is read with Self the impl's type, wherever
   it is asked from.
+- **A bound is its whole trait reference, everywhere** (RT-269, RT-270,
+  RT-271, RT-272). A bound written without arguments, `Z: Tr` of `trait
+  Tr<U = i32>`, is `Z: Tr<i32>` at a call, an impl's parameter, a
+  struct's, a supertrait and an associated type's bound (v0.30.1 took an
+  impl of Tr with any arguments: E0277 accepted). An impl's `where`
+  predicates on other subjects (`where W: Conv<U>`, `where Self: ..`,
+  `where I::Item: ..`) are required where the impl is chosen and, for an
+  inherent impl, at a call of its function (v0.30.1 required them
+  nowhere). A trait parameter's default naming Self (`trait Sub<U = <Self
+  as H>::Out>`) is read for an impl with Self its type, in the trait's
+  module, and so is `Self` in an associated type's bound (`type Out:
+  Tr<Self>`; v0.30.1: unknown type 'Self'). `T: H2 + Tr<T::Out>` no longer
+  crashes the compiler: only a bound whose trait declares Out is read to
+  find T::Out, and a true cycle (`T: H<T::Out>`) is an error.
+- **The depth limit of trait searches is rustc's** (RT-7, RT-53): a
+  chain of impls 127 deep is proved and 128 is `trait.overflow` (E0275),
+  as is a projection's (32 before, so that a type nested 34 deep did not
+  implement its trait). Every answer about concrete types is recorded, so
+  a chain whose impls prove a bound twice per level is linear, not
+  exponential.
+- **A bound's arguments are checked against its trait** (rustc E0107:
+  `T: Tr` of `trait Tr<U>`), a default that does not resolve for the type
+  (`U = <Self as H>::Out` for a type with no H) makes the bound fail, and
+  `T::Out` names the one trait of T's bounds that declares Out (E0220
+  for none, E0221 for two; v0.30.1 took any impl of the type). An impl
+  for one type (`impl Tr for W where Bx<i64>: Conv`) has its `where`
+  clause required too, and checked at the impl (E0277). `T::Out` under a
+  bound whose supertrait declares Out, and `Self::Output` written in a
+  trait whose supertrait declares it (std's IndexMut beside a Mul impl),
+  are that trait's (RT-426: "ambiguous" before). A `where` subject may be
+  a qualified path, `<Bx<T> as H>::Item: Copy`. An impl's supertrait or
+  associated-type bound proved through more than eight blanket impls is
+  proved or refused, and past 127 refused with the overflow error
+  (RT-436: accepted before, unmet or not); that proof answers each goal
+  once per ask, so bounds shaped like a Fibonacci tree cost their count,
+  not 2^depth. `F::Output` under an `Fn() -> R` bound is the sugar's, and
+  `Self::Out` in a trait whose two supertraits declare Out is rustc's
+  E0221. A trait's `where Self: TrB` is a supertrait, as rustc reads it,
+  to every reader of the supertraits (projections took the other one's
+  Out: 8 and 200 printed where rustc gives E0221).
+- **std's HashMap and HashSet impls state `S: BuildHasher`**, the bound
+  their types declare: the impls without it (their Drop, Debug,
+  IntoIterator, DefaultIn and the plain methods) were never checked by
+  their generic instance (rustc E0277 for that header).
+- **No generic function is left unchecked in silence** (RT-275). One
+  whose opaque instance cannot be made gets warning generic.unchecked,
+  and one whose header does not meet its Self type's bound by its own
+  parameters' (`impl<A: Tr<i32>> G<A>` of `struct G<T: Tr<i64>>`) is
+  refused at the header (rustc E0277; v0.30.1 said nothing).
 - **A closure in a generic Drop impl's instance** (RT-44): `impl<T> Drop
   for W<T> { fn drop(&mut self) { thread::scope(|s| { s.spawn(|| 1i64);
   }); } }` made the compiler panic (places/regions.vl, index out of
