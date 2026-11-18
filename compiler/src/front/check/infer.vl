@@ -239,14 +239,67 @@ pub fn int_impl_pair(name: i64, tr: i64, pcx: &mut Ctx<Comp>) -> (i64, i64, i64,
 // RULE: F18.5 (0.30.2: instantiate.vl match_type) Whether types a and b
 // may be one type by an integer variable's solution: one is a free integer
 // variable, the other another or an integer type.
+// (0.30.2: through references, arrays, slices, tuples and a template's
+// arguments too, `Reverse<{integer}>` and another `Reverse<{integer}>`,
+// as unify would make them one: convert.vl takes)
 pub fn int_may_equal(a: i64, b: i64, pcx: &Ctx<Comp>) -> bool {
-    if !pcx.infer_live {
-        return false;
-    }
+    pcx.infer_live && may_equal_at(a, b, 0, pcx)
+}
+
+fn may_equal_at(a: i64, b: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
     let x = follow(a, pcx);
     let y = follow(b, pcx);
-    x == y || int_free(x, pcx) && (int_free(y, pcx) || crate::front::types::is_integer(y))
-        || int_free(y, pcx) && crate::front::types::is_integer(x)
+    if x == y {
+        return true;
+    }
+    if x <= 0 || y <= 0 || depth > 16 {
+        return false;
+    }
+    if int_free(x, pcx) {
+        return int_free(y, pcx) || crate::front::types::is_integer(y);
+    }
+    if int_free(y, pcx) {
+        return crate::front::types::is_integer(x);
+    }
+    let k = pcx.types[x as usize].kind;
+    if k != pcx.types[y as usize].kind || is_var(x, pcx) || is_var(y, pcx) {
+        return false;
+    }
+    if k == TyKind::Ptr || k == TyKind::Array || k == TyKind::Slice || k == TyKind::Unsized {
+        return pcx.types[x as usize].b == pcx.types[y as usize].b
+            && may_equal_at(pcx.types[x as usize].a, pcx.types[y as usize].a, depth + 1, pcx);
+    }
+    if k == TyKind::Tuple {
+        if pcx.types[x as usize].count != pcx.types[y as usize].count {
+            return false;
+        }
+        for i in 0..pcx.types[x as usize].count {
+            if !may_equal_at(pcx.tlists[(pcx.types[x as usize].list + i) as usize],
+                pcx.tlists[(pcx.types[y as usize].list + i) as usize], depth + 1, pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == TyKind::Struct || k == TyKind::Enum {
+        let ta = template_of(x, pcx);
+        if ta == 0 || ta != template_of(y, pcx) {
+            return false;
+        }
+        let (xa, n) = targs_of(x, pcx);
+        let (xb, m) = targs_of(y, pcx);
+        if n != m {
+            return false;
+        }
+        for i in 0..n {
+            if !may_equal_at(pcx.tlists[(xa + i) as usize], pcx.tlists[(xb + i) as usize],
+                depth + 1, pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 // RULE: F18.5 (0.30.2: synth_expr of an unsuffixed integer literal n, or
@@ -387,12 +440,19 @@ pub fn is_int_var(t: i64, pcx: &Ctx<Comp>) -> bool {
 
 // Type t, a variable's solution in its place when t is one that is solved
 // (followed through the variables it names), else t.
+// (0.30.2: through the whole chain, however long: `v == 0 .. else if v
+// == 12000` binds a variable per arm; bind's occurs check keeps a chain
+// acyclic, so it has fewer links than there are types. Every reader of a
+// variable's solution reads it here, never a chain cut at a depth: one
+// cut read a solved variable as free, distinct.mix of `{integer}` and
+// `{integer}`)
 pub fn follow(t: i64, pcx: &Ctx<Comp>) -> i64 {
     let mut r = t;
-    let mut depth: i64 = 0;
-    while depth < 64 && is_var(r, pcx) && solution(r, pcx) != 0 {
+    let mut links: i64 = 0;
+    let most = pcx.types.len() as i64;
+    while links < most && is_var(r, pcx) && solution(r, pcx) != 0 {
         r = solution(r, pcx);
-        depth += 1;
+        links += 1;
     }
     r
 }
@@ -400,12 +460,7 @@ pub fn follow(t: i64, pcx: &Ctx<Comp>) -> i64 {
 // Whether type t, with the solutions so far, is an integer variable still
 // free: a value of some integer type nothing has decided yet.
 pub fn int_free(t: i64, pcx: &Ctx<Comp>) -> bool {
-    let mut r = t;
-    let mut depth: i64 = 0;
-    while depth < 64 && is_var(r, pcx) && solution(r, pcx) != 0 {
-        r = solution(r, pcx);
-        depth += 1;
-    }
+    let r = follow(t, pcx);
     is_int_var(r, pcx) && solution(r, pcx) == 0
 }
 
@@ -420,6 +475,22 @@ pub fn coerce_vars(actual: i64, expected: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // `*const i64` unified the pointees, then failed on the pointers)
     if actual <= 0 || expected <= 0 || !mentions(actual, true, pcx) {
         return actual;
+    }
+    // (a reference where its value goes, or a value where a reference
+    // goes, `let b: i64 = r` of an `r: &{integer}`, `takes(n)` of an `n:
+    // {integer}` for `x: &i64`: the variable takes the other side's
+    // integer type, and coerce_ref says which it is, type.ref-value)
+    let a1 = follow(actual, pcx);
+    let e1 = follow(expected, pcx);
+    if pcx.types[a1 as usize].kind == TyKind::Ptr && pcx.types[e1 as usize].kind != TyKind::Ptr
+        && int_free(pcx.types[a1 as usize].a, pcx) && crate::front::types::is_integer(e1) {
+        let _ = unify(pcx.types[a1 as usize].a, e1, pcx);
+        return resolve(actual, pcx);
+    }
+    if pcx.types[e1 as usize].kind == TyKind::Ptr && pcx.types[a1 as usize].kind != TyKind::Ptr
+        && int_free(a1, pcx) && crate::front::types::is_integer(pcx.types[e1 as usize].a) {
+        let _ = unify(a1, pcx.types[e1 as usize].a, pcx);
+        return resolve(actual, pcx);
     }
     let mut a = actual;
     let mut e = expected;
@@ -505,8 +576,8 @@ fn first_int(t: i64, depth: i64, pcx: &Ctx<Comp>) -> i64 {
         return 0;
     }
     if is_var(t, pcx) {
-        let s = solution(t, pcx);
-        return if s != 0 { first_int(s, depth + 1, pcx) } else if is_int_var(t, pcx) { t }
+        let s = follow(t, pcx);
+        return if s != t { first_int(s, depth, pcx) } else if is_int_var(t, pcx) { t }
             else { 0 };
     }
     let k = pcx.types[t as usize].kind;
@@ -541,8 +612,8 @@ fn first_general(t: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
         return false;
     }
     if is_var(t, pcx) {
-        let s = solution(t, pcx);
-        return if s != 0 { first_general(s, depth + 1, pcx) } else { !is_int_var(t, pcx) };
+        let s = follow(t, pcx);
+        return if s != t { first_general(s, depth, pcx) } else { !is_int_var(t, pcx) };
     }
     let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr || k == TyKind::Array || k == TyKind::Slice || k == TyKind::Unsized
@@ -725,8 +796,8 @@ fn mentions_at(t: i64, any: bool, depth: i64, pcx: &Ctx<Comp>) -> bool {
         return false;
     }
     if is_var(t, pcx) {
-        let s = solution(t, pcx);
-        return any || s == 0 || mentions_at(s, any, depth + 1, pcx);
+        let s = follow(t, pcx);
+        return any || s == t || mentions_at(s, any, depth, pcx);
     }
     let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr || k == TyKind::Array || k == TyKind::Slice || k == TyKind::Unsized {
@@ -785,8 +856,8 @@ fn subst(t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return t;
     }
     if is_var(t, pcx) {
-        let s = solution(t, pcx);
-        return if s == 0 { t } else { subst(s, depth + 1, pcx) };
+        let s = follow(t, pcx);
+        return if s == t { t } else { subst(s, depth, pcx) };
     }
     if !mentions(t, true, pcx) {
         return t;
@@ -924,6 +995,13 @@ fn unify_at(a0: i64, b0: i64, depth: i64, pcx: &mut Ctx<Comp>) {
     if a == b || a <= 0 || b <= 0 || depth > 16 {
         return;
     }
+    // (0.30.2: of two free variables the newer takes the older, so a
+    // variable met by many, a local compared with a literal per arm, stays
+    // one link from each)
+    if is_var(a, pcx) && is_var(b, pcx) && a < b {
+        bind(b, a, pcx);
+        return;
+    }
     if is_var(a, pcx) {
         bind(a, b, pcx);
         return;
@@ -993,7 +1071,12 @@ pub fn sweep(pcx: &mut Ctx<Comp>) {
     }
     crate::front::closures::resolve_sigs(pcx.infer_closures, pcx);
     for f in pcx.infer_fns..pcx.fns.len() as i64 {
-        if pcx.fns[f as usize].tmpl != 0 {
+        // (an instance made with a variable is made again for its solution,
+        // remake_calls; 0.30.2: another, whose signature holds one through a
+        // projection of a closure's result, `Fuse<FromFn<closure() ->
+        // Option<{integer}>>>::next`, is retyped as the closures are: its
+        // body is checked after this function's end, with no variable live)
+        if pcx.fns[f as usize].tmpl != 0 && var_instance(f, pcx) {
             continue;
         }
         if mentions(pcx.fns[f as usize].ret, true, pcx) {
