@@ -90,9 +90,9 @@ true Ok(7)
   T::Err>`: `ParseIntError` (its `kind()`: `IntErrorKind::Empty`,
   `InvalidDigit`, `PosOverflow`, `NegOverflow`), `ParseFloatError`,
   `ParseBoolError`.
-- `main` returns nothing, an `i32` (its exit code) or a `Result<(), E>`
-  with `E: Debug`: an `Err(e)` prints `Error: ` and `{e:?}` on stderr,
-  and the program exits with 1.
+- `main` returns nothing, an `i32` (its exit code; an `i64`'s low half),
+  `!` or a `Result<(), E>` with `E: Debug`: an `Err(e)` prints `Error: `
+  and `{e:?}` on stderr, and the program exits with 1.
 
 ## Reading input
 

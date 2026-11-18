@@ -1736,11 +1736,19 @@ a)`, `Buf::new_in(a)`, `HashMap::new_in(a)`, `collect_in(a)`,
 malloc) is its main's parameter, passed down:
 
 ```ebnf
-main = "fn" "main" "(" [ "gpa" ":" "Gpa" ] ")" [ "->" type ] block
-     | "fn" "main" "(" "argc" ":" "i32" "," "argv" ":" "**u8" [ "," "gpa" ":" "Gpa" ] ")" [ "->" type ] block
+main = "fn" "main" "(" [ "gpa" ":" "Gpa" ] ")" [ "->" result ] block
+     | "fn" "main" "(" "argc" ":" "i32" "," "argv" ":" argv [ "," "gpa" ":" "Gpa" ] ")" [ "->" result ] block
+argv = ( "*mut" | "*const" ) ( "*mut" | "*const" ) "u8"
+result = "i32" | "i64" | "!" | "Result" "<" "()" "," type ">"
 ```
 
-(any parameter names; the `Gpa` parameter is last). `Allocator`, `Gpa`,
+(any parameter names, any alias of the types; the `Gpa` parameter is
+last; no result is `()`, exit status 0; a `Result`'s error type has
+Debug). (0.30.2) Any other signature of the program's main, `unsafe fn
+main` and `extern "C" fn main` too, is an error: `main.signature` for
+its parameters (rustc E0580), `main.result` for its result (rustc E0277).
+Before, the words C's start code passes were read as whatever main
+declared. `Allocator`, `Gpa`,
 `Arena`, `ScopedArena`, `arena_scope` and `format_in` are in the
 prelude.
 

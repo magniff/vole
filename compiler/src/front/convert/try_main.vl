@@ -7,13 +7,16 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{err_begin, err_end_soft, err_help, err_str};
 use crate::front::ast::{
-    ARM_SYNTHETIC, CLOSURE_MOVE, FN_SIG_FAILED, NodeKind, list_begin, list_end, list_push, new_node,
+    ARM_SYNTHETIC, CLOSURE_MOVE, FN_SIG_FAILED, FN_UNSAFE, NodeKind, child, list_begin, list_end,
+    list_push, new_node,
 };
 use crate::front::check::has_error_type;
 use crate::front::lexer::SUF_NONE;
 use crate::front::modules::within_std;
 use crate::front::traits::{implements, std_trait};
-use crate::front::types::{TY_I32, TY_UNIT, TyKind, buf_type, err_type};
+use crate::front::types::{
+    TY_I32, TY_I64, TY_U8, TY_UNIT, TyKind, buf_type, err_type, is_raw_ptr, is_void,
+};
 
 // The name of std's generic enum (Option, Result) that t is an instance
 // of, or 0; its type arguments in *targs (a TLISTS index).
@@ -74,10 +77,8 @@ pub fn main_result_wrapper(pcx: &mut Ctx<Comp>) {
     let main = intern_c(c"main", pcx);
     for f in 0..pcx.fns.len() as i64 {
         let node = pcx.fns[f as usize].node;
-        if pcx.fns[f as usize].name != main || pcx.nodes[node as usize].kind != NodeKind::Fn
-            || pcx.nodes[node as usize].d != 0 || pcx.nodes[node as usize].h != 0
-            || (pcx.nodes[node as usize].p & FN_SIG_FAILED) != 0
-            || pcx.fns[f as usize].generic != 0 || pcx.fns[f as usize].tmpl != 0 {
+        // (0.30.2: which function is main, one rule: is_program_main)
+        if !is_program_main(f, main, pcx) || (pcx.nodes[node as usize].p & FN_SIG_FAILED) != 0 {
             continue;
         }
         let mut targs: i64 = 0;
@@ -174,4 +175,167 @@ pub fn main_result_wrapper(pcx: &mut Ctx<Comp>) {
         pcx.nodes[node as usize].c = block;
         pcx.fns[f as usize].ret = TY_I32;
     }
+}
+
+// (0.30.2, RT-47) Whether function f is the program's entry, the `main`
+// C's start code calls: a free function (no impl's, no trait's), not
+// generic, whose symbol is `main` (sym: the interned name; the root
+// module's `fn main`, or an exported one anywhere: the symbol the back
+// ends make the entry, Ctx.main_sym). main_gpa, main_result_wrapper and
+// check_main_signature ask this one function.
+pub fn is_program_main(f: i64, sym: i64, pcx: &Ctx<Comp>) -> bool {
+    let node = pcx.fns[f as usize].node;
+    node > 0 && pcx.fns[f as usize].name == sym && pcx.nodes[node as usize].kind == NodeKind::Fn
+        && pcx.nodes[node as usize].d == 0 && pcx.nodes[node as usize].h == 0
+        && pcx.fns[f as usize].generic == 0 && pcx.fns[f as usize].tmpl == 0
+}
+
+// (0.30.2, RT-47) Whether t is std's Gpa, the allocator main may take.
+pub fn is_std_gpa(t: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let gpa = intern_c(c"Gpa", pcx);
+    t > 0 && pcx.types[t as usize].kind == TyKind::Struct
+        && pcx.structs[pcx.types[t as usize].a as usize].name == gpa
+        && within_std(pcx.structs[pcx.types[t as usize].a as usize].module, pcx)
+}
+
+// (0.30.2, RT-47) main's signature, against exactly the forms C's start
+// code calls it in (docs/grammar.md's `main`; guide language):
+// - its parameters: none, `gpa: Gpa`, `argc: i32, argv: **u8`, or
+//   those two and `gpa: Gpa` last (any names; argv's two pointers each
+//   `*mut` or `*const`, to u8: C's `char **`);
+// - its result: none, `i32`, `i64` (its low half the exit status), `!`
+//   or `Result<(), E>` (main_result_wrapper checks E);
+// - a safe vole function, not `unsafe fn` or `extern "C" fn`.
+// Any other parameter read the words the start code passes (argc, argv)
+// as its own type (a Vec, a slice, a Box, an i64 whose upper half is
+// undefined), and any other result was read as the exit status from
+// whatever main left in the register: main.signature (rustc E0580) and
+// main.result (rustc E0277). A type is what it resolves to (an alias of
+// i32 is i32). Called before main_gpa and main_result_wrapper, which
+// rewrite the main this accepts.
+pub fn check_main_signature(pcx: &mut Ctx<Comp>) {
+    if pcx.plant_limit == crate::base::target::PLANT_MAIN {
+        return;
+    }
+    let main = intern_c(c"main", pcx);
+    for f in 0..pcx.fns.len() as i64 {
+        let node = pcx.fns[f as usize].node;
+        if !is_program_main(f, main, pcx) || (pcx.nodes[node as usize].p & FN_SIG_FAILED) != 0 {
+            continue;
+        }
+        if (pcx.nodes[node as usize].p & FN_UNSAFE) != 0 || pcx.fns[f as usize].export {
+            let saved = main_error(false, pcx.nodes[node as usize].start, pcx);
+            err_str(
+                c"'main' is a safe vole function: not 'unsafe fn main' or 'extern \"C\" fn main'",
+                pcx);
+            err_help(c"write 'fn main()': its body may have unsafe blocks of its own", pcx);
+            main_error_end(saved, pcx);
+            continue;
+        }
+        let count = pcx.fns[f as usize].param_count;
+        let params = pcx.fns[f as usize].params;
+        let last = if count > 0 { pcx.tlists[(params + count - 1) as usize] } else { 0 };
+        let own = if count > 0 && is_std_gpa(last, pcx) { count - 1 } else { count };
+        // the first parameter that is not main's, and why (0: none)
+        let mut bad: i64 = -1;
+        let mut why: i64 = 0;
+        for i in 0..own {
+            if bad < 0 && is_std_gpa(pcx.tlists[(params + i) as usize], pcx) {
+                bad = i;
+                why = 1;
+            }
+        }
+        if bad < 0 && own == 1 {
+            bad = 0;
+            why = 2;
+        } else if bad < 0 && own > 2 {
+            bad = 2;
+            why = 3;
+        } else if bad < 0 && own == 2 {
+            let argc = pcx.tlists[params as usize];
+            let argv = pcx.tlists[(params + 1) as usize];
+            if argc != TY_I32 && !has_error_type(argc, pcx) {
+                bad = 0;
+                why = 4;
+            } else if !is_c_argv(argv, pcx) && !has_error_type(argv, pcx) {
+                bad = 1;
+                why = 5;
+            }
+        }
+        if bad >= 0 {
+            let t = pcx.tlists[(params + bad) as usize];
+            let saved = main_error(false,
+                pcx.nodes[child(node, bad, pcx) as usize].start, pcx);
+            if why == 1 {
+                err_str(c"'main' takes its allocator 'gpa: Gpa' last, after argc and argv", pcx);
+            } else if why == 3 {
+                err_str(c"'main' takes at most argc, argv and its allocator, not a third parameter of type '",
+                    pcx);
+                err_type(t, pcx);
+                err_str(c"'", pcx);
+            } else if why == 4 {
+                err_str(c"main's argc is C's int, 'i32', not '", pcx);
+                err_type(t, pcx);
+                err_str(c"'", pcx);
+            } else if why == 5 {
+                err_str(c"main's argv is C's 'char **', '*mut *mut u8' (or '*const'), not '", pcx);
+                err_type(t, pcx);
+                err_str(c"'", pcx);
+            } else {
+                err_str(c"'main' takes no parameter, 'gpa: Gpa', or 'argc: i32, argv: *mut *mut u8' (and 'gpa: Gpa' last), not one of type '",
+                    pcx);
+                err_type(t, pcx);
+                err_str(c"'", pcx);
+            }
+            err_help(c"the command line's arguments are std::env::args(); main's forms are in `volec guide language`",
+                pcx);
+            main_error_end(saved, pcx);
+        }
+        let r = pcx.fns[f as usize].ret;
+        let mut targs: i64 = 0;
+        if r <= 0 || is_void(r) || r == TY_I32 || r == TY_I64 || has_error_type(r, pcx)
+            || std_enum_name(r, &mut targs, pcx) == intern_c(c"Result", pcx) {
+            continue;
+        }
+        let rnode = pcx.nodes[node as usize].b;
+        let at = if rnode > 0 { pcx.nodes[rnode as usize].start }
+            else { pcx.nodes[node as usize].start };
+        let saved = main_error(true, at, pcx);
+        err_str(
+            c"'main' returns nothing, 'i32', 'i64', '!' or 'Result<(), E>' (the exit status), not '",
+            pcx);
+        err_type(r, pcx);
+        err_str(c"'", pcx);
+        err_help(
+            c"return the exit status as an i32 ('x as i32'), or 'Ok(())' from a 'Result<(), E>'",
+            pcx);
+        main_error_end(saved, pcx);
+    }
+}
+
+// Whether t is C's `char **`: a raw pointer (`*mut` or `*const`) to a raw
+// pointer to u8.
+fn is_c_argv(t: i64, pcx: &Ctx<Comp>) -> bool {
+    is_raw_ptr(t, pcx) && is_raw_ptr(pcx.types[t as usize].a, pcx)
+        && pcx.types[pcx.types[t as usize].a as usize].a == TY_U8
+}
+
+// The start of check_main_signature's error at pos, main.signature
+// (`result`: main.result): the error kind it replaces, which
+// main_error_end puts back.
+fn main_error(result: bool, pos: i64, pcx: &mut Ctx<Comp>) -> *const u8 {
+    let saved = pcx.err_kind;
+    if result {
+        pcx.err_kind = c"main.result";
+    } else {
+        pcx.err_kind = c"main.signature";
+    }
+    err_begin(pos, pcx);
+    saved
+}
+
+// The end of check_main_signature's error (main_error's), checking on.
+fn main_error_end(saved: *const u8, pcx: &mut Ctx<Comp>) {
+    err_end_soft(pcx);
+    pcx.err_kind = saved;
 }
