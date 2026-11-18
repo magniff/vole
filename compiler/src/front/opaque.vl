@@ -43,6 +43,11 @@ pub fn is_opaque_node(n: i64, pcx: &Ctx<Comp>) -> bool {
 pub fn is_opaque(t: i64, pcx: &Ctx<Comp>) -> bool {
     t > 0 && pcx.types[t as usize].kind == TyKind::Distinct
         && is_opaque_node(pcx.types[t as usize].b, pcx)
+        // (0.30.2: an integer variable, F18.5, is marked opaque as a type
+        // variable is; it stands for an integer type, neither an opaque
+        // type nor an Ω: 'static, its methods an integer type's)
+        && (pcx.nodes[pcx.types[t as usize].b as usize].p
+            & crate::front::check::infer::TY_INT_VAR) == 0
 }
 
 // RULE: D21.1 The opaque result type of function f (resolve_signature: its
@@ -89,6 +94,40 @@ fn active(f: i64, pcx: &Ctx<Comp>) -> bool {
 // needs: f's body checked first when it is not yet (check_nested); f's own
 // body being checked is opaque.cycle.
 pub fn hidden(t: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    // RULE: F18.5 (0.30.2: the result of an instance made with a type
+    // variable, `id(e)` of `id<T: Show>(t: T) -> impl Show` with e an
+    // integer literal's: that instance is never checked; the hidden type is
+    // that of the instance of the solutions, the one the call is made again
+    // to, infer.vl remake_calls; with one still free, rustc's E0282)
+    let vf = opaque_fn(t, pcx);
+    if vf >= 0 && (pcx.fns[vf as usize].attrs & crate::front::ast::FN_QUERY_ONLY) != 0
+        && pcx.fns[vf as usize].tmpl > 0 && pcx.infer_live {
+        let mark = pcx.tscratch.len() as i64;
+        for i in 0..pcx.fns[vf as usize].targ_count {
+            let a = crate::front::check::infer::resolve(
+                pcx.tlists[(pcx.fns[vf as usize].targs + i) as usize], pcx);
+            pcx.tscratch.push(a);
+        }
+        if crate::front::check::infer::targs_mention(mark, pcx)
+            || pcx.fns[vf as usize].ret != t {
+            pcx.tscratch.truncate(mark as usize);
+            err_begin(pos, pcx);
+            err_str(c"type annotations needed: the type of this '", pcx);
+            err_type(t, pcx);
+            err_str(c"' is not known here (rustc E0282)", pcx);
+            err_help(c"it is made with an integer literal whose type a later use gives: write the literal's type where it is made (`3i64`)", pcx);
+            err_end(pcx);
+        }
+        let g = crate::front::generics::instantiate::fn_instance(pcx.fns[vf as usize].tmpl - 1,
+            mark, pcx.fns[vf as usize].origin, pcx);
+        let r = pcx.fns[g as usize].ret;
+        if is_opaque(r, pcx) {
+            let h = hidden(r, pos, pcx);
+            pcx.types[t as usize].a = h;
+            return h;
+        }
+        return r;
+    }
     if pcx.types[t as usize].a != 0 {
         return pcx.types[t as usize].a;
     }
@@ -422,19 +461,22 @@ fn bound_method(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> bool {
 }
 
 // The opaque type receiver type rt is or points to, or 0.
-fn opaque_in(rt: i64, pcx: &Ctx<Comp>) -> i64 {
-    if is_opaque(rt, pcx) {
+pub fn opaque_in(rt: i64, pcx: &Ctx<Comp>) -> i64 {
+    // (0.30.2: an integer variable, F18.5, a distinct type marked opaque
+    // for what reads types, is none: its methods are calls::int_var_method's)
+    if is_opaque(rt, pcx) && !crate::front::check::infer::is_int_var(rt, pcx) {
         return rt;
     }
     if rt > 0 && pcx.types[rt as usize].kind == TyKind::Ptr && pcx.types[rt as usize].b != 0
-        && is_opaque(pcx.types[rt as usize].a, pcx) {
+        && is_opaque(pcx.types[rt as usize].a, pcx)
+        && !crate::front::check::infer::is_int_var(pcx.types[rt as usize].a, pcx) {
         return pcx.types[rt as usize].a;
     }
     0
 }
 
 // rt with opaque type o (rt itself or what it points to) made h.
-fn revealed(rt: i64, o: i64, h: i64, pcx: &mut Ctx<Comp>) -> i64 {
+pub fn revealed(rt: i64, o: i64, h: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if rt == o { h } else { ref_to(h, pcx.types[rt as usize].b, pcx) }
 }
 
@@ -889,6 +931,15 @@ pub fn virtual_fn_of(t: i64, tr: i64, b: i64, name: i64, pcx: &mut Ctx<Comp>) ->
         }
     }
     let targs = trait_args_of(tr, b, t, pcx);
+    make_virtual(t, tr, targs, name, pcx)
+}
+
+// RULE: D22.1a, F18.5 (0.30.2: virtual_fn; calls/mod.vl
+// int_virtual_method, Self an integer variable) The virtual function
+// `Tr::name⟨Self := t⟩` (tr's arguments TLISTS[targs..]), a method of t:
+// the trait's declaration without a body, its signature resolved with
+// Self = t.
+pub fn make_virtual(t: i64, tr: i64, targs: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let decl = crate::front::traits::trait_fn(tr, name, pcx);
     let item = crate::front::generics::instantiate::clone_node(decl, pcx);
     pcx.nodes[item as usize].c = 0;
@@ -1197,6 +1248,7 @@ pub fn build_opaque_instances(program: i64, pcx: &mut Ctx<Comp>) {
     pcx.opaque_phase = true;
     let mut made_fns = Vec::<i64, Comp>::new_in(Comp {});
     let mut unsure_fns = Vec::<i64, Comp>::new_in(Comp {});
+    let mut unmade_fns = Vec::<i64, Comp>::new_in(Comp {});
     for i in 0..pcx.nodes[program as usize].count {
         let item = child(program, i, pcx);
         if pcx.nodes[item as usize].kind != NodeKind::Fn || pcx.nodes[item as usize].x == 0
@@ -1259,6 +1311,8 @@ pub fn build_opaque_instances(program: i64, pcx: &mut Ctx<Comp>) {
             // (0.30.1: its `where` predicates are its Ωs' bounds,
             // assume_where_preds; one it cannot give made it unsure)
             unsure_fns.push(if pcx.opaque_unsure { 1 } else { 0 });
+        } else {
+            unmade_fns.push(f);
         }
     }
     // RULE: D22.2 (0.27.3, FL11) Each queued instance checked, as
@@ -1341,11 +1395,23 @@ pub fn build_opaque_instances(program: i64, pcx: &mut Ctx<Comp>) {
         // (not after an error: the program is fixed first, and an error in
         // the template's own text makes its check unsure too)
         if !used && pcx.error_count == 0 {
-            let tnode = pcx.fns[(tf - 1) as usize].node;
-            let at = pcx.nodes[tnode as usize].start;
-            crate::base::diag::report_warning(at, 0, c"generic.unchecked",
-                c"this generic function is not checked for every type: its generic check meets a form the opaque model does not cover (a `where` predicate on a compound type, a generic method of a generic trait called through a bound, a type whose declaration bounds a parameter the function does not), and it has no instance to check",
-                c"its errors would be found at an instance, each checked whole; call it, write the predicate on the type parameter itself, or declare the bound the type needs", pcx);
+            unchecked_warning(tf - 1, pcx);
+        }
+    }
+    // RULE: D22.2 (0.30.2, RT-275) A template whose opaque instance could not
+    // be made (a bound of its header an Ω does not meet, the model's gap
+    // where it is not the program's error, check_bounds) and that has no
+    // concrete instance is checked nowhere: the same warning, never silence.
+    for &tf in unmade_fns.as_slice() {
+        let mut used = false;
+        for g in 0..first_fn {
+            if pcx.fns[g as usize].tmpl == tf + 1 {
+                used = true;
+                break;
+            }
+        }
+        if !used && pcx.error_count == 0 {
+            unchecked_warning(tf, pcx);
         }
     }
     // (the templates whose instance checked: not one the model left out)
@@ -1355,4 +1421,12 @@ pub fn build_opaque_instances(program: i64, pcx: &mut Ctx<Comp>) {
         }
     }
     pcx.opaque_phase = false;
+}
+
+// RULE: D22.2 The warning generic.unchecked at template tf (a FUNCS index).
+fn unchecked_warning(tf: i64, pcx: &mut Ctx<Comp>) {
+    let at = pcx.nodes[pcx.fns[tf as usize].node as usize].start;
+    crate::base::diag::report_warning(at, 0, c"generic.unchecked",
+        c"this generic function is not checked for every type: its generic check meets a form the opaque model does not cover (a `where` predicate on a compound type, a generic method of a generic trait called through a bound, a type whose declaration bounds a parameter the function does not), and it has no instance to check",
+        c"its errors would be found at an instance, each checked whole; call it, write the predicate on the type parameter itself, or declare the bound the type needs", pcx);
 }

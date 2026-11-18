@@ -24,6 +24,7 @@ use crate::front::ast::{NODE_REF, NODE_REF_MUT, NodeKind, child};
 use crate::front::obligations::obligation_error;
 use crate::front::parser::rust::lifetimes_of;
 use crate::front::types::{REF_MUT, REF_RAW, REF_SHARED, TyKind, fn_param, type_elem, variant_field};
+use crate::middle::lower::ssa::HMap;
 use crate::places::front::{enum_info, fn_node, fn_param_count, fn_ret, tlist_at};
 use crate::places::ir::{
     BK_RAW, BK_RAW_MUT, Body, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, RV_REF,
@@ -460,6 +461,10 @@ fn copy_in(t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
     let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr || k == TyKind::Slice {
         return pcx.types[t as usize].b != REF_MUT;
+    }
+    // RULE: F18.5 (0.30.2: an integer variable's value is an integer)
+    if crate::front::check::infer::is_int_var(t, pcx) {
+        return true;
     }
     // RULE: D21.3 (0.27.2.1: an `impl Tr` result is Copy iff a bound says so)
     // (0.30.2, review of M1: an Ω by the front's selection, its own
@@ -3107,8 +3112,14 @@ pub struct Sig<A: Allocator> {
     pub vties: Vec<i64, A>,
     walk: Vec<i64, A>,
     // (0.30.2, RT-404) the references impl_bound_ties met in this signature,
-    // rows [key length, key.., the impl found]: each is met once
+    // rows [key length, key.., the impl found, met_at's chain]: each is met
+    // once
     met: Vec<i64, A>,
+    // (0.30.2, RT-462) a key's hash -> the last row of met with it + 1;
+    // each row then ends with the one before it with that hash + 1 (a scan
+    // of met was quadratic in the references, 2^17 of them for 16 levels of
+    // two supertrait instances each)
+    met_at: HMap,
 }
 
 pub fn sig_new() -> Sig<Comp> {
@@ -3125,6 +3136,7 @@ pub fn sig_new() -> Sig<Comp> {
         vties: Vec::new_in(Comp {}),
         walk: Vec::new_in(Comp {}),
         met: Vec::new_in(Comp {}),
+        met_at: HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 },
     }
 }
 
@@ -3223,6 +3235,8 @@ fn sig_compute(f: i64, sig: &mut Sig<Comp>, pcx: &mut Ctx<Comp>) {
     sig.strict.clear();
     sig.vties.clear();
     sig.met.clear();
+    sig.met_at.release();
+    sig.met_at = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
     let _ = add_universal(U_STATIC, 0, 0, sig);
     // (an instance's node is a clone without its generics and lifetimes:
     // its template's is read, with the instance's types)
@@ -4182,8 +4196,12 @@ fn instance_type(n: i64, f: i64, tps: i64, pcx: &mut Ctx<Comp>) -> i64 {
         pcx.self_type = pcx.fns[f as usize].self_ty;
     }
     pcx.cur_mod = crate::front::modules::module_of(n, pcx);
+    // (0.30.2: a virtual function's `Self::Out`, its trait's, as front
+    // reads the signature)
+    let sig = crate::front::check::resolve::signature_enter(f, pcx);
     let mark = crate::base::diag::errors_mark(pcx);
     let t = crate::front::check::resolve::resolve_type(n, pcx);
+    crate::front::check::resolve::signature_leave(sig, pcx);
     let failed = crate::base::diag::errors_mark(pcx) > mark;
     crate::base::diag::errors_forget(mark, pcx);
     pcx.cur_mod = saved_mod;
@@ -4439,6 +4457,17 @@ fn tie_pairs(a: &Vec<i64, Comp>, b: &Vec<i64, Comp>, tps: i64, sig: &mut Sig<Com
     true
 }
 
+// (impl_bound_ties) The hash of a met key, its index in Sig.met_at:
+// never 0.
+fn met_key(key: &Vec<i64, Comp>) -> i64 {
+    let mut h: u64 = 1469598103u64;
+    for x in key.iter() {
+        h = h.wrapping_mul(1000003u64) ^ (*x as u64);
+    }
+    let k = (h >> 1) as i64;
+    if k == 0 { 1 } else { k }
+}
+
 // RULE: L14 (0.30.2, RT-404) confirm_bound, once per reference in a
 // signature: a reference met again with the same inputs (the trait, s, its
 // arguments, its slots' entries, the bound's written arguments' universals
@@ -4467,8 +4496,9 @@ fn impl_bound_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, targs: i64, tps: i64,
     for x in wild.iter() {
         key.push(*x);
     }
-    let mut r: i64 = 0;
-    while r < sig.met.len() as i64 {
+    let h = met_key(&key);
+    let mut r = sig.met_at.get(h) - 1;
+    while r >= 0 {
         let n = sig.met[r as usize];
         if n == key.len() as i64 {
             let mut same = true;
@@ -4488,7 +4518,7 @@ fn impl_bound_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, targs: i64, tps: i64,
                 return got;
             }
         }
-        r += n + 2;
+        r = sig.met[(r + n + 2) as usize] - 1;
     }
     // (-2 while it is being met)
     let at = sig.met.len() as i64;
@@ -4497,6 +4527,8 @@ fn impl_bound_ties(s: i64, base: &Vec<i64, Comp>, tr: i64, targs: i64, tps: i64,
         sig.met.push(*x);
     }
     sig.met.push(-2);
+    sig.met.push(sig.met_at.get(h));
+    sig.met_at.put(h, at + 1);
     let found = confirm_bound(s, base, tr, targs, tps, depth, sup, pos, written, want, wild, sig,
         pcx);
     sig.met[(at + 1 + key.len() as i64) as usize] = found;
@@ -4549,7 +4581,10 @@ fn confirm_bound(s: i64, base: &Vec<i64, Comp>, tr: i64, targs: i64, tps: i64, d
     // a supertrait, sup 1: a diamond is met in linear time, RT-353)
     if sup == 0 && crate::front::traits::trait_supers(tr, pcx) > 0 {
         let mut refs = Vec::<i64, Comp>::new_in(Comp {});
-        super_refs(tr, targs, s, &mut refs, pcx);
+        let mut seen = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+        let mut chain = Vec::<i64, Comp>::new_in(Comp {});
+        super_refs(tr, targs, s, &mut refs, &mut seen, &mut chain, pcx);
+        seen.release();
         let none = Vec::<i64, Comp>::new_in(Comp {});
         let mut k: usize = 2;
         while k + 1 < refs.len() {
@@ -5047,14 +5082,21 @@ fn super_args(tr: i64, b: i64, s: i64, targs: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // arguments) pairs, each once: a reference in out already is not walked
 // again. It ends with no depth limit: the supertraits have no cycle
 // (traits::check_super_cycles), so each walk is a path of a finite graph
-// without cycles, and a diamond is walked once.
-fn super_refs(tr: i64, targs: i64, s: i64, out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+// without cycles, and a diamond is walked once. The pairs had are found
+// by their hash (obligations::pair_key, as obligations::elaborate's):
+// seen, a key -> the last pair of the key + 1, chain[pair] the one
+// before it + 1; a scan of out was quadratic in the pairs, 2^17 of them
+// for 16 levels of two supertrait instances each.
+fn super_refs(tr: i64, targs: i64, s: i64, out: &mut Vec<i64, Comp>, seen: &mut HMap,
+    chain: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
     if tr < 0 {
         return;
     }
     let n = crate::front::traits::trait_params_of(tr, pcx);
-    let mut k: usize = 0;
-    while k + 1 < out.len() {
+    let key = crate::front::obligations::pair_key(tr, targs, n, pcx);
+    let mut e = seen.get(key) - 1;
+    while e >= 0 {
+        let k = e as usize;
         let had = out[k + 1];
         let mut same = out[k] == tr && (had == targs || n > 0 && had >= 0 && targs >= 0);
         if same && had != targs {
@@ -5065,8 +5107,10 @@ fn super_refs(tr: i64, targs: i64, s: i64, out: &mut Vec<i64, Comp>, pcx: &mut C
         if same {
             return;
         }
-        k += 2;
+        e = chain[(e / 2) as usize] - 1;
     }
+    chain.push(seen.get(key));
+    seen.put(key, out.len() as i64 + 1);
     out.push(tr);
     out.push(targs);
     let supers = crate::front::traits::trait_supers(tr, pcx);
@@ -5075,7 +5119,7 @@ fn super_refs(tr: i64, targs: i64, s: i64, out: &mut Vec<i64, Comp>, pcx: &mut C
         if is_node(b, NodeKind::TyName, pcx) {
             let tr2 = crate::front::traits::bound_trait(b, pcx);
             let targs2 = super_args(tr, b, s, targs, pcx);
-            super_refs(tr2, targs2, s, out, pcx);
+            super_refs(tr2, targs2, s, out, seen, chain, pcx);
         }
     }
 }

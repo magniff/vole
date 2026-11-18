@@ -239,9 +239,9 @@ fn parse_impl(public: bool, unsafe_at: i64, pcx: &mut Ctx<Comp>) {
             c"an inherent impl is not unsafe: `unsafe impl` is an unsafe trait's impl (`unsafe impl Allocator for T`)", pcx);
     }
     pcx.where_owner = 0;
-    let wp_from = pcx.where_preds.len() as i64;
+    let wp0 = pcx.where_preds.len() as i64;
     parse_where(params, 0, pcx);
-    let wp_to = pcx.where_preds.len() as i64;
+    let wp1 = pcx.where_preds.len() as i64;
     // (0.30.1, review 4: its `where 'a: 'b`, one list with the header's bounds)
     crate::front::parser::rust::join_where_lifetimes(impl_lifetimes, pcx.lt_where, pcx);
     pcx.lt_where = 0;
@@ -325,6 +325,11 @@ fn parse_impl(public: bool, unsafe_at: i64, pcx: &mut Ctx<Comp>) {
         }
         // (a trait's methods are as visible as the trait)
         mark_public(f, item_public || trait_name != 0, pcx);
+        // RULE: F10.1 (0.30.2, RT-269: the impl's `where` predicates on
+        // other subjects, `W: Conv<U>`, `Self: Conv<U>`, are each of its
+        // functions' premises too, assumed in its body and required at a
+        // call, as the function's own)
+        own_impl_preds(wp0, wp1, f, pcx);
         list_push(f, pcx);
     }
     expect(RBrace, pcx);
@@ -338,7 +343,7 @@ fn parse_impl(public: bool, unsafe_at: i64, pcx: &mut Ctx<Comp>) {
         pcx.nodes[n as usize].c = assoc;
         // (0.30.2, RT-211 review 2: its `where` predicates on another
         // subject, `where i64: Conv<W<'a>>`, the impl's, for the places)
-        crate::front::traits::own_impl_where_preds(wp_from, wp_to, n, pcx);
+        crate::front::traits::own_impl_where_preds(wp0, wp1, n, pcx);
         // (0.30.1, review 3: the impl's lifetimes on its node too, their
         // bounds `'a: 'static` read by traits::check_impl_statics)
         if impl_lifetimes != 0 {
@@ -357,10 +362,27 @@ fn parse_impl(public: bool, unsafe_at: i64, pcx: &mut Ctx<Comp>) {
             list_push((pcx.scratch[i as usize]), pcx);
         }
         list_end(n, mark, pcx);
+        // (0.30.2, RT-269: and the impl's, required where it is chosen,
+        // traits::impl_applies)
+        own_impl_preds(wp0, wp1, n, pcx);
         list_push(n, pcx);
     }
     if dropped {
         pcx.scratch.truncate(entry as usize);
+    }
+}
+
+// (0.30.2, RT-269) The `where` predicates wp0..wp1 of an impl's header
+// (WHERE_PREDS, parsed with no owner) owned by item `to` too: the impl's
+// node or one of its functions.
+fn own_impl_preds(wp0: i64, wp1: i64, to: i64, pcx: &mut Ctx<Comp>) {
+    for k in wp0..wp1 {
+        if pcx.where_preds[k as usize].owner == 0 {
+            let p = pcx.where_preds[k as usize];
+            crate::front::traits::wp_push(crate::front::traits::WherePred {
+                owner: to, subject: p.subject, bounds: p.bounds,
+            }, pcx);
+        }
     }
 }
 
@@ -460,7 +482,13 @@ fn parse_trait(pcx: &mut Ctx<Comp>) -> i64 {
     // RULE: F10.1 (0.27.3: the trait's own predicates, not the last
     // function's: no owner is left from the item before)
     pcx.where_owner = 0;
+    let wp0 = pcx.where_preds.len() as i64;
     parse_where(pcx.nodes[n as usize].g, 0, pcx);
+    // RULE: F2.1 (0.30.2, re-review of M2: `trait Sub: TrA where Self: TrB`
+    // is `trait Sub: TrA + TrB`, as rustc reads it: the `where Self:`
+    // bounds join the supertraits, so every reader of trait_supers sees
+    // them, projections and coherence as method lookup did)
+    where_self_supers(n, wp0, pcx);
     expect(LBrace, pcx);
     let mark = list_begin(pcx);
     while !at(RBrace, pcx) && !at(Eof, pcx) {
@@ -519,6 +547,47 @@ fn parse_trait(pcx: &mut Ctx<Comp>) -> i64 {
     expect(RBrace, pcx);
     pcx.nodes[n as usize].end = prev_end(pcx);
     n
+}
+
+// (parse_trait) The bounds of the trait's `where Self: ..` predicates
+// (WHERE_PREDS from wp0) appended to its supertraits, trait node n's h.
+fn where_self_supers(n: i64, wp0: i64, pcx: &mut Ctx<Comp>) {
+    let old = pcx.nodes[n as usize].h;
+    let mut extra = false;
+    for k in wp0..pcx.where_preds.len() as i64 {
+        let s = pcx.where_preds[k as usize].subject;
+        extra = extra || is_self_subject(s, pcx);
+    }
+    if !extra {
+        return;
+    }
+    let start = if old > 0 { pcx.nodes[old as usize].start } else { pcx.nodes[n as usize].start };
+    let mark = list_begin(pcx);
+    for i in 0..(if old > 0 { pcx.nodes[old as usize].count } else { 0 }) {
+        list_push(child(old, i, pcx), pcx);
+    }
+    for k in wp0..pcx.where_preds.len() as i64 {
+        let p = pcx.where_preds[k as usize];
+        if !is_self_subject(p.subject, pcx) {
+            continue;
+        }
+        for i in 0..pcx.nodes[p.bounds as usize].count {
+            let b = child(p.bounds, i, pcx);
+            if pcx.nodes[b as usize].kind == NodeKind::TyName {
+                list_push(b, pcx);
+            }
+        }
+    }
+    let h = new_node(NodeKind::Generics, start, start, pcx);
+    list_end(h, mark, pcx);
+    pcx.nodes[n as usize].h = h;
+}
+
+// (where_self_supers) Whether type node s is `Self` itself.
+fn is_self_subject(s: i64, pcx: &Ctx<Comp>) -> bool {
+    pcx.nodes[s as usize].kind == NodeKind::TyName && pcx.nodes[s as usize].count == 0
+        && pcx.nodes[s as usize].g == 0
+        && crate::base::sym_text(pcx.nodes[s as usize].a, pcx) == b"Self"
 }
 
 // (0.27.0) The bounds (h) of each of an impl's parameters `params`.

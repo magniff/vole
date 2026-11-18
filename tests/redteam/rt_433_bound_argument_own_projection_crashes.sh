@@ -1,5 +1,5 @@
 #!/bin/sh
-# XFAIL: RT-433: a bound of T whose argument is T's projection through that same bound's trait, `fn mid<T: Tr<T::Out>>(t: T)` with `trait Tr<U> { type Out; }`, crashes the compiler (bus error, exit 138) in check and build; rustc E0391 (cycle detected when computing the bounds for type parameter `T`) (0.30.2)
+# RT-433, fixed in 0.30.2 (obligations M2, the review's fixes: a projection past the depth limit is trait.overflow, E0275, not a crash; rustc says E0391).
 # From the paused g302tparam work (its preexisting/pe6_a08). Since
 # v0.30.1 at least (the same crash). RT-272's form, where another bound
 # declares Out, passes. The supertrait form is rt_433b. It passes when

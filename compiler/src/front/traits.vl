@@ -50,8 +50,8 @@ use crate::front::check::resolve::{resolve_type, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::closures::fn_bounds::{fn_bound_error, fn_bound_satisfied};
 use crate::front::convert::{
-    bound_args, buf_bound, collect_trait_params, err_bound, impl_trait_args, implements_with,
-    same_trait_args, trait_param_count,
+    bound_args, buf_bound, collect_trait_params, err_bound, impl_trait_args, same_trait_args,
+    trait_param_count,
 };
 use crate::front::derive::derive_conflict_help;
 use crate::front::derive::intrinsic::{tuple_implements, tuple_operator};
@@ -371,11 +371,44 @@ pub fn where_preds_hold(item: i64, self_ty: i64, pos: i64, report: bool,
     ok
 }
 
+// (0.30.2, RT-269) Whether the `where` predicates of impl node `node` on
+// other subjects hold for its type t, the impl's parameters bound by the
+// caller (impl_applies, obligations::candidate): asked while an impl is
+// chosen, so quietly. A subject that does not resolve (`I::Item` for an I
+// without it) does not hold; the errors met are forgotten, and with them
+// the opaque instance's unsureness they gave (one select gave without an
+// error is kept).
+pub fn impl_preds_hold(node: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mark = crate::base::diag::errors_mark(pcx);
+    let unsure = pcx.opaque_unsure;
+    let mut ok = true;
+    let mut next = wp_start(node, pcx);
+    while ok && next >= 0 {
+        let k = next;
+        next = wp_after(k, pcx);
+        let subject = pcx.where_preds[k as usize].subject;
+        let saved_self = pcx.self_type;
+        let saved_mod = pcx.cur_mod;
+        pcx.self_type = t;
+        pcx.cur_mod = module_of(subject, pcx);
+        let resolved = crate::front::check::attempt(crate::front::check::Try::Type, subject, pcx)
+            && pcx.try_result > 0 && !has_error_type(pcx.try_result, pcx);
+        pcx.self_type = saved_self;
+        pcx.cur_mod = saved_mod;
+        ok = resolved && pred_holds(node, k, t, 0, false, pcx);
+    }
+    let erred = crate::base::diag::errors_mark(pcx) > mark;
+    crate::base::diag::errors_forget(mark, pcx);
+    if erred {
+        pcx.opaque_unsure = unsure;
+    }
+    ok
+}
+
 // Whether `where` predicate k (WHERE_PREDS) of item holds, as
 // where_preds_hold's; a subject of the error type holds (reported).
 fn pred_holds(item: i64, k: i64, self_ty: i64, pos: i64, report: bool,
     pcx: &mut Ctx<Comp>) -> bool {
-    let mut ok = true;
     let subject = pcx.where_preds[k as usize].subject;
     let bounds = pcx.where_preds[k as usize].bounds;
     let saved_self = pcx.self_type;
@@ -383,11 +416,22 @@ fn pred_holds(item: i64, k: i64, self_ty: i64, pos: i64, report: bool,
     pcx.self_type = self_ty;
     pcx.cur_mod = module_of(subject, pcx);
     let t = resolve_type_or_error(subject, pcx);
-    pcx.self_type = saved_self;
     pcx.cur_mod = saved_mod;
     if has_error_type(t, pcx) {
+        pcx.self_type = saved_self;
         return true;
     }
+    // (0.30.2: Self is self_ty in the bounds too, `where i64: Conv<Self>`)
+    let ok = pred_bounds_hold(item, k, subject, bounds, t, pos, report, pcx);
+    pcx.self_type = saved_self;
+    ok
+}
+
+// (pred_holds) Whether predicate k's bounds hold of t, its subject
+// resolved, with Self bound by the caller.
+fn pred_bounds_hold(item: i64, k: i64, subject: i64, bounds: i64, t: i64, pos: i64,
+    report: bool, pcx: &mut Ctx<Comp>) -> bool {
+    let mut ok = true;
     // RULE: F10.2, D4.5 (0.30.1: `Self: 'static`, `I::Item: 'static`, as
     // a parameter's: rustc E0310)
     if !where_outlives_hold(item, subject, t, pos, report, pcx) {
@@ -398,11 +442,7 @@ fn pred_holds(item: i64, k: i64, self_ty: i64, pos: i64, report: bool,
         let tr = bound_trait(b, pcx);
         let mut holds = if pcx.nodes[b as usize].kind
             == NodeKind::TyFn { fn_bound_satisfied(b, t, pcx) }
-            else if pcx.nodes[b as usize].g != 0 {
-                crate::front::convert::implements_with(tr, t,
-                    crate::front::convert::bound_ref(b, t, pcx), pcx)
-            }
-            else { implements(tr, t, pcx) };
+            else { crate::front::convert::bound_holds(b, t, pcx) };
         if holds && pcx.nodes[b as usize].h != 0 && !assoc_constraints_hold(b, t, pcx) {
             holds = false;
         }
@@ -859,6 +899,9 @@ pub fn collect_impls(pcx: &mut Ctx<Comp>) {
             if bounds != 0 {
                 for j in 0..pcx.nodes[bounds as usize].count {
                     bound_trait(child(bounds, j, pcx), pcx);
+                    // (0.30.2, review of M2, R2: its arguments against the
+                    // trait's parameters, rustc E0107)
+                    crate::front::convert::bound_arity(child(bounds, j, pcx), pcx);
                 }
             }
         }
@@ -1598,6 +1641,7 @@ pub fn check_impl_signatures(pcx: &mut Ctx<Comp>) {
         let ty = pcx.traits_impls[i as usize].ty;
         let tr = pcx.traits_impls[i as usize].tr;
         check_impl_statics(i, pcx);
+        check_concrete_where(i, pcx);
         crate::front::coherence::check_constrained(i, pcx);
         if ty == 0 && pcx.traits_impls[i as usize].tpl != TPL_NONE {
             crate::front::coherence::check_generic_obligations(i, pcx);
@@ -1637,10 +1681,12 @@ pub fn check_impl_signatures(pcx: &mut Ctx<Comp>) {
                 for m in 0..pcx.nodes[bounds as usize].count {
                     let b = child(bounds, m, pcx);
                     let s = bound_trait(b, pcx);
-                    let holds = if pcx.nodes[b as usize].g != 0 {
-                        crate::front::convert::implements_with(s, ta,
-                            crate::front::convert::bound_ref(b, ta, pcx), pcx)
-                    } else { implements(s, ta, pcx) };
+                    // (0.30.2, RT-271: `Self` in it, `type Out: Tr<Self>`, the
+                    // impl's type, as in the trait's other text)
+                    let saved_self = pcx.self_type;
+                    pcx.self_type = ty;
+                    let holds = s < 0 || crate::front::convert::bound_holds(b, ta, pcx);
+                    pcx.self_type = saved_self;
                     if !holds {
                         let saved_kind = pcx.err_kind;
                         pcx.err_kind = c"trait.unmet";
@@ -1666,10 +1712,7 @@ pub fn check_impl_signatures(pcx: &mut Ctx<Comp>) {
         for k in 0..(if supers == 0 { 0 } else { pcx.nodes[supers as usize].count }) {
             let b = child(supers, k, pcx);
             let s = bound_trait(b, pcx);
-            let holds = if pcx.nodes[b as usize].g != 0 {
-                crate::front::convert::implements_with(s, ty,
-                    crate::front::convert::bound_ref(b, ty, pcx), pcx)
-            } else { implements(s, ty, pcx) };
+            let holds = s < 0 || crate::front::convert::bound_holds(b, ty, pcx);
             if !holds {
                 let saved_kind = pcx.err_kind;
                 pcx.err_kind = c"trait.unmet";
@@ -2046,13 +2089,10 @@ fn impl_bounds_hold(f: i64, tr: i64, decl: i64, i: i64, trait_targs: i64, pcx: &
                     true
                 } else if crate::front::auto_traits::is_auto(btr, pcx) {
                     crate::front::auto_traits::holds_auto(btr, t, pcx)
-                } else if pcx.nodes[b as usize].g != 0 {
-                    crate::front::convert::implements_with(btr, t,
-                        crate::front::convert::bound_ref(b, t, pcx), pcx)
                 } else {
                     // (0.30.2, review of M1: an impl for every type, `impl<T> Tr for T`,
                     // is one select tries for an Ω: no rule of its own)
-                    implements(btr, t, pcx)
+                    crate::front::convert::bound_holds(b, t, pcx)
                 }
             };
             if !holds {
@@ -2420,10 +2460,17 @@ pub fn impl_bindings(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // by MAX_ASSOC_DEPTH (F0.3), as the associated types' is. RULE: F0.3, F0.4(c)
 pub fn impl_applies(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let b = impl_bindings(i, t, pcx);
-    if b < 0 || pcx.traits_impls[i as usize].ty != 0 {
+    if b < 0 {
         return b;
     }
-    if pcx.assoc_depth >= crate::front::assoc::MAX_ASSOC_DEPTH {
+    if pcx.traits_impls[i as usize].ty != 0 {
+        // (0.30.2, review of M2, R1: an impl for one type, `impl Tr for W
+        // where Bx<i64>: Conv`, has its `where` predicates required too,
+        // under the parameters its header binds when it binds them all;
+        // obligations::candidate, under the whole binding otherwise)
+        return if concrete_impl_preds_hold(i, b, t, pcx) { b } else { -1 };
+    }
+    if pcx.assoc_depth >= crate::front::assoc::MAX_IMPL_DEPTH {
         // (0.30.2: a search cut short, never recorded as a no, obligations)
         pcx.depth_cuts += 1;
         return -1;
@@ -2449,9 +2496,108 @@ pub fn impl_applies(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
             ok = false;
         }
     }
+    // RULE: F10.2 (0.30.2, RT-269: the impl's `where` predicates on other
+    // subjects, `where W: Conv<U>`, Self the type it is chosen for, as
+    // its parameters' bounds are: required where it is chosen)
+    let node = pcx.traits_impls[i as usize].node;
+    if ok && all_bound && wp_start(node, pcx) >= 0 && !impl_preds_hold(node, t, pcx) {
+        ok = false;
+    }
     env_leave(saved, pcx);
     pcx.assoc_depth -= 1;
     if ok { b } else { -1 }
+}
+
+// (0.30.2, review of M2, R1) For impl i of one type t (ImplInfo.ty set),
+// its bindings b: whether its `where` predicates on other subjects hold,
+// when it has them and its header binds every parameter (else the caller
+// checks them under the whole binding); bounded by the depth limit as
+// impl_applies' search is.
+fn concrete_impl_preds_hold(i: i64, b: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let node = pcx.traits_impls[i as usize].node;
+    if wp_start(node, pcx) < 0 {
+        return true;
+    }
+    let params = pcx.nodes[node as usize].g;
+    let count: i64 = if params > 0 { pcx.nodes[params as usize].count } else { 0 };
+    for k in 0..count {
+        if pcx.tlists[(b + k) as usize] == 0 {
+            return true;
+        }
+    }
+    if pcx.assoc_depth >= crate::front::assoc::MAX_IMPL_DEPTH {
+        pcx.depth_cuts += 1;
+        return false;
+    }
+    pcx.assoc_depth += 1;
+    let saved = env_enter(params, b, count, pcx);
+    let ok = impl_preds_hold(node, t, pcx);
+    env_leave(saved, pcx);
+    pcx.assoc_depth -= 1;
+    ok
+}
+
+// RULE: F10.2 (0.30.2, review of M2, RT-393) The `where` predicates of
+// impl i, one with no type parameters (`impl Tr for W where Bx<i64>:
+// Conv`), at the impl: each must hold of its types, as rustc's E0277 at
+// the clause (a predicate on no parameter cannot become true for some
+// use); one whose proof meets the depth limit (two such impls needing
+// each other) is trait.overflow, E0275.
+fn check_concrete_where(i: i64, pcx: &mut Ctx<Comp>) {
+    let node = pcx.traits_impls[i as usize].node;
+    let ty = pcx.traits_impls[i as usize].ty;
+    let params = pcx.nodes[node as usize].g;
+    if ty == 0 || params > 0 && pcx.nodes[params as usize].count > 0 {
+        return;
+    }
+    let mut next = wp_start(node, pcx);
+    while next >= 0 {
+        let k = next;
+        next = wp_after(k, pcx);
+        let subject = pcx.where_preds[k as usize].subject;
+        let cuts = pcx.depth_cuts;
+        if impl_preds_hold_one(node, k, ty, pcx) {
+            continue;
+        }
+        let pos = pcx.nodes[subject as usize].start;
+        let saved_self = pcx.self_type;
+        let saved_mod = pcx.cur_mod;
+        pcx.self_type = ty;
+        pcx.cur_mod = module_of(subject, pcx);
+        let t = resolve_type_or_error(subject, pcx);
+        pcx.self_type = saved_self;
+        pcx.cur_mod = saved_mod;
+        let bounds = pcx.where_preds[k as usize].bounds;
+        let b = child(bounds, 0, pcx);
+        let tr = bound_trait(b, pcx);
+        if pcx.depth_cuts != cuts && tr >= 0 {
+            crate::front::obligations::obligation_error(true, false, tr, t, pos, pcx);
+            continue;
+        }
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"trait.unmet";
+        err_begin(pos, pcx);
+        err_fmt(format_args("the impl's `where` clause '{}' does not hold: '",
+            &str::from_utf8(
+                get_src()[
+                    pcx.nodes[subject as usize].start as usize..pcx.nodes[bounds as usize].end as usize]).unwrap()), pcx);
+        err_type(t, pcx);
+        err_str(c"' does not implement it", pcx);
+        err_help(
+            c"rustc E0277: a predicate on no type parameter of the impl must hold of its types",
+            pcx);
+        err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
+    }
+}
+
+// Whether where predicate k of impl node `node` holds for its type ty,
+// quietly (impl_preds_hold's, for one).
+fn impl_preds_hold_one(node: i64, k: i64, ty: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mark = crate::base::diag::errors_mark(pcx);
+    let ok = pred_holds(node, k, ty, 0, false, pcx);
+    crate::base::diag::errors_forget(mark, pcx);
+    ok
 }
 
 // Whether parameter node p has a bound with type arguments or
@@ -3411,6 +3557,22 @@ pub fn implements(tr: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
         return has_error_type(t, pcx) || t == TY_NEVER
             || crate::front::auto_traits::holds_auto(tr, t, pcx);
     }
+    // RULE: F18.5 (0.30.2: an integer variable still free implements a
+    // trait some integer type implements, as rustc's obligation on it waits:
+    // `impl<A: Step> Iterator for Range<A>` is Range<{integer}>'s, its Item
+    // the variable; the type it takes is decided at the function's end, and
+    // an instance made with it checks its bounds again then)
+    if crate::front::check::infer::int_free(t, pcx) {
+        return tr < 0 || crate::front::check::infer::int_some_impl(tr, pcx);
+    }
+    // (one solved: its solution's, a variable being a distinct type marked
+    // opaque, below)
+    if crate::front::check::infer::is_int_var(t, pcx) {
+        let s = crate::front::check::infer::follow(t, pcx);
+        if s != t {
+            return implements(tr, s, pcx);
+        }
+    }
     // RULE: D21.3 (an `impl Tr` result: its bounds' traits, and, 0.30.2,
     // RT-196, RT-200, what an impl gives every type its bounds meet,
     // `impl<I: Iterator> IntoIterator for I`, `impl<F: Fn(i64) -> i64>
@@ -3437,10 +3599,8 @@ pub fn satisfies(p: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
     for i in 0..pcx.nodes[bounds as usize].count {
         let b = child(bounds, i, pcx);
         // (0.15: `From<U>`, a generic trait's bound)
-        if pcx.nodes[b as usize].g != 0
-            && !implements_with(bound_trait(b, pcx), t, crate::front::convert::bound_ref(b, t, pcx),
-                pcx)
-            || pcx.nodes[b as usize].g == 0 && !implements(bound_trait(b, pcx), t, pcx) {
+        // (0.30.2, RT-270: its whole reference, the defaults too)
+        if !crate::front::convert::bound_holds(b, t, pcx) {
             return false;
         }
         // (0.14: `Fn(A) -> R`, and constraints `Iterator<Item = A>`)
@@ -3465,6 +3625,55 @@ pub fn check_later_bounds(pcx: &mut Ctx<Comp>) {
         i += 5;
     }
     pcx.bounds_later.clear();
+}
+
+// RULE: F18.5 (0.30.2: infer.vl int_fallback) The type arguments of
+// instance f of template tf, made with a type variable (its bounds are
+// checked when it is made again with the solutions): each that holds an integer variable still free takes the one
+// integer type its bounds admit, and so does each such variable that is
+// the trait argument of one of its bounds (`S: Sum<{integer}>`), as
+// check_bounds does where the types are known: before the fallback.
+pub fn int_bound_vars(f: i64, tf: i64, pcx: &mut Ctx<Comp>) {
+    let params = pcx.nodes[pcx.fns[tf as usize].node as usize].g;
+    if params == 0 {
+        return;
+    }
+    let targs = pcx.fns[f as usize].targs;
+    let count = pcx.fns[f as usize].targ_count;
+    // (in the instance's module, its Self the one it was made with, as
+    // fn_instance checks its bounds: `S: Sum<Self::Item>`)
+    let (saved_mod, saved_self, saved_impl) = (pcx.cur_mod, pcx.self_type, pcx.self_impl);
+    pcx.cur_mod = pcx.fns[f as usize].module;
+    pcx.self_type = pcx.fns[f as usize].self_ty;
+    pcx.self_impl = impl_of_fn(tf, pcx);
+    let saved = env_enter(params, targs, count, pcx);
+    for k in 0..count {
+        let p = child(params, k, pcx);
+        let bounds = pcx.nodes[p as usize].h;
+        if bounds == 0 {
+            continue;
+        }
+        let t = pcx.tlists[(targs + k) as usize];
+        if crate::front::check::infer::int_open(t, pcx) {
+            crate::front::check::infer::int_bounds(t, p, true, pcx);
+        }
+        if crate::front::check::infer::int_open(t, pcx) {
+            continue;
+        }
+        let rt = crate::front::check::infer::resolve(t, pcx);
+        for i in 0..pcx.nodes[bounds as usize].count {
+            let b = child(bounds, i, pcx);
+            let tr = bound_trait(b, pcx);
+            if tr >= 0 && pcx.nodes[b as usize].g != 0 {
+                let bargs = crate::front::convert::bound_ref(b, rt, pcx);
+                crate::front::check::infer::int_trait_args(tr, rt, bargs, pcx);
+            }
+        }
+    }
+    env_leave(saved, pcx);
+    pcx.cur_mod = saved_mod;
+    pcx.self_type = saved_self;
+    pcx.self_impl = saved_impl;
 }
 
 // The type arguments TLISTS[targs..] of generic item `what` (its name),
@@ -3499,9 +3708,29 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
         if bounds == 0 {
             continue;
         }
-        let t = (pcx.tlists[(targs + k) as usize]);
+        let mut t = (pcx.tlists[(targs + k) as usize]);
         if t == pcx.ty_error && pcx.check_unchecked {
             continue;
+        }
+        // (with the solutions so far: a variable solved, `T = {integer}`
+        // that a later use made i64, is its type here, not itself)
+        if pcx.infer_live {
+            t = crate::front::check::infer::resolve(t, pcx);
+        }
+        // RULE: F18.5 (0.30.2: a type that is or holds an integer variable,
+        // `T = {integer}`, `I = Range<{integer}>`: the one integer type that
+        // satisfies the bounds there is the variable's; one several satisfy
+        // is checked when the instance is made again with its type)
+        // (an instance's body checked with one, `-> impl Show` of `id(3)`:
+        // checked when it is made again, as the variable's function's end)
+        if crate::front::check::infer::int_open(t, pcx) {
+            if pcx.infer_live {
+                crate::front::check::infer::int_bounds(t, p, true, pcx);
+            }
+            if crate::front::check::infer::int_open(t, pcx) {
+                continue;
+            }
+            t = crate::front::check::infer::resolve(t, pcx);
         }
         // RULE: F18.6 (g) (a free variable, `Vec::<u8, _>::new_in(gpa)`'s
         // `_`, is checked when it is solved: its instance is made again)
@@ -3536,20 +3765,47 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
             let tr = bound_trait(b, pcx);
             // RULE: AT3 (`T: Send`: sync.not_send, with the failing part)
             if crate::front::auto_traits::is_auto(tr, pcx) {
-                crate::front::auto_traits::check_bound(tr, t, p, what, pos, pcx);
+                // (0.30.2, review of M2, RT-401: an auto trait's bound of the
+                // header, `struct G<T: Send>` of `impl<A> G<A>`, as any other's)
+                let sure = pcx.opaque_sure;
+                let own = header_sure(t, pcx);
+                if own {
+                    pcx.opaque_sure = true;
+                }
+                crate::front::auto_traits::check_bound(tr, t, p, what, pos, own, pcx);
+                pcx.opaque_sure = sure;
                 continue;
             }
             // (0.15: `From<U>`, a generic trait's bound)
             let bargs: i64 = if pcx.nodes[b as usize].g
                 != 0 { crate::front::convert::bound_ref(b, t, pcx) } else { -1 };
+            // RULE: F18.5 (0.30.2: a trait argument that is an integer
+            // variable, `S: Sum<{integer}>` of `(1..4).sum()` into an i64:
+            // the one integer type an impl gives it, else checked when the
+            // instance is made again with its type)
+            if bargs >= 0 && pcx.infer_live
+                && !crate::front::check::infer::int_trait_args(tr, t, bargs, pcx)
+                && (0..count).any(|i| crate::front::check::infer::mentions(
+                    pcx.tlists[(targs + i) as usize], true, pcx)) {
+                continue;
+            }
             let cuts = pcx.depth_cuts;
-            let holds = if bargs >= 0 { implements_with(tr, t, bargs, pcx) }
-                else { implements(tr, t, pcx) };
+            let holds = crate::front::convert::bound_holds(b, t, pcx);
             // RULE: O-M1 (0.30.2) a search the depth limit cut short is
             // trait.overflow, never "not implemented" (rustc E0275)
             if !holds && pcx.depth_cuts != cuts {
                 crate::front::obligations::obligation_error(true, true, tr, t, pos, pcx);
             } else if !holds {
+                // RULE: D22.2 (0.30.2, RT-275: an Ω of the template's own
+                // parameter, while its opaque instance is made, that does
+                // not meet its header's bound, `impl<A: Tr<i32>> G<A>` of
+                // `struct G<T: Tr<i64>>`: its bounds are all it has when the
+                // template has no other predicate, and select said no
+                // without a cut or an unread bound: the program's error,
+                // recorded, never the model's, forgotten)
+                if header_sure(t, pcx) {
+                    pcx.opaque_sure = true;
+                }
                 err_begin(pos, pcx);
                 err_str(c"the trait '", pcx);
                 if bargs >= 0 {
@@ -3579,6 +3835,17 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
         }
     }
     env_leave(saved, pcx);
+}
+
+// RULE: D22.2 (0.30.2, RT-275, RT-401) Whether a bound of a template's
+// header that t does not meet is the program's error, not the model's:
+// while its opaque instance is made, t an Ω of the template's own
+// parameter, the template with no other predicate, and select's no
+// without a cut or an unread bound.
+fn header_sure(t: i64, pcx: &Ctx<Comp>) -> bool {
+    pcx.opaque_assume && pcx.opaque_header_sure && !pcx.opaque_unsure
+        && crate::front::opaque::is_omega(t, pcx)
+        && pcx.nodes[pcx.types[t as usize].b as usize].x == 0
 }
 
 // RULE: D4.5, F10.2 (0.30.1, rustc E0310) Type parameter p's bounds

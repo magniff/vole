@@ -638,6 +638,46 @@ the trait's arguments (`<T as Conv<i32>>::K`).
 
 #### Bugs fixed
 
+- **Integer literals are typed as rustc types them** (F18.5). An
+  unsuffixed integer literal that nothing types where it is written is an
+  integer variable, rustc's `{integer}`, unified through the whole
+  function and `i32` only if nothing types it by the function's end
+  (`infer.vl: int_fallback`, the one place that decides it). A later use
+  types it through a closure (its body, its captures, its result), an
+  `Option` or a `Result`, a generic call, a struct's field, a container,
+  a branch, an array, a labelled `break`, a destructuring `let`, a
+  pattern, or a trait method called on it (`m.max(5)`, `a.cmp(&b)`):
+  `let a = 2000000000; let s = Some(a).map(|x| x + x).unwrap(); take(s)`
+  with `take(x: i64)` computes `x + x` in i64 and prints 4000000000,
+  where 0.30.1 computed it in i32 and widened the overflowed value
+  (-294967296 at -O2, a panic at -O0: RT-C301-1, RT-C301-10). Forms
+  0.30.1 refused are accepted, as rustc accepts them: `|| 3000000000`
+  where `FnMut() -> i64` goes, `v.iter().fold(0, |s, x| s + x)` of
+  `&i64` items, `Some(4).and_then(half)` of a `half(x: i64)`,
+  `(1..4).sum()` into an `i64`, `v.push(1)` then `let b: u8 = v[0]`,
+  `f(5)` of an `f<T: Tr>` with `impl Tr for i64` alone (and so `id(3)`
+  of an `id<T: Show>(t: T) -> impl Show`, its instance the one type's),
+  `s.get(1)` (`I::Output` of the usize `SliceIndex` selects), `&[1, 2,
+  250]` where `&[u8]` goes, `&n` where `*const i64` goes, `x.hash(&mut
+  h)` before `take(x)` (it hashes the i64), a `match` on a literal's
+  value whose arms are of the type a later use gives it.
+- A trait's method called on a literal's value, the trait implemented by
+  several integer types, is the impl of the type a later use gives it:
+  `e.show()` then `take(e)` of `take(x: i64)` called i32's `show` in
+  0.30.1 (another output, no error); i64's now, as rustc. When the type
+  taken has no impl of the trait, rustc's E0277.
+- A literal's value in a `format_args` hole or an `assert!` message was
+  typed i32 there (`format_args("{}", a + a)` then `let b: i64 = a`
+  overflowed: -294967296, RT-410), and a turbofish method of a trait
+  implemented for i32 and i64 called i32's (RT-411): both now wait for
+  the type the variable takes. Accepted as rustc accepts them:
+  `i64::from(a + 1)`, `take(a.into())`, `x.cmp(&best)` and `x.clone()`
+  of an `x: &{integer}`, `Add2::add2(a, b)` with `b: i64`, `.sum()` of
+  mapped or iterated literals into an i64 (RT-412, RT-415, RT-417).
+- A lazy build (0.27.4) makes every integer type's builtin impls: the
+  integer variables' decisions read them all, and one it lacked typed a
+  literal another way than `volec check` did (`x.hash(&mut h)` hashed an
+  i32 where `let y: i64 = x` followed; found while making this release).
 - **`#[derive(Clone)]` of a generic struct with a reference for T
   (RT-212, its derive form).** `Rep { v: &w }.clone()` was refused in
   the derived body, whose `Clone::clone(&self.v)` took the method
@@ -721,6 +761,55 @@ the trait's arguments (`<T as Conv<i32>>::K`).
   resolve proves nothing. An impl's bound naming `Self` (`impl<U:
   Conv<Self>> Tr<U> for W`) is read with Self the impl's type, wherever
   it is asked from.
+- **A bound is its whole trait reference, everywhere** (RT-269, RT-270,
+  RT-271, RT-272). A bound written without arguments, `Z: Tr` of `trait
+  Tr<U = i32>`, is `Z: Tr<i32>` at a call, an impl's parameter, a
+  struct's, a supertrait and an associated type's bound (v0.30.1 took an
+  impl of Tr with any arguments: E0277 accepted). An impl's `where`
+  predicates on other subjects (`where W: Conv<U>`, `where Self: ..`,
+  `where I::Item: ..`) are required where the impl is chosen and, for an
+  inherent impl, at a call of its function (v0.30.1 required them
+  nowhere). A trait parameter's default naming Self (`trait Sub<U = <Self
+  as H>::Out>`) is read for an impl with Self its type, in the trait's
+  module, and so is `Self` in an associated type's bound (`type Out:
+  Tr<Self>`; v0.30.1: unknown type 'Self'). `T: H2 + Tr<T::Out>` no longer
+  crashes the compiler: only a bound whose trait declares Out is read to
+  find T::Out, and a true cycle (`T: H<T::Out>`) is an error.
+- **The depth limit of trait searches is rustc's** (RT-7, RT-53): a
+  chain of impls 127 deep is proved and 128 is `trait.overflow` (E0275),
+  as is a projection's (32 before, so that a type nested 34 deep did not
+  implement its trait). Every answer about concrete types is recorded, so
+  a chain whose impls prove a bound twice per level is linear, not
+  exponential.
+- **A bound's arguments are checked against its trait** (rustc E0107:
+  `T: Tr` of `trait Tr<U>`), a default that does not resolve for the type
+  (`U = <Self as H>::Out` for a type with no H) makes the bound fail, and
+  `T::Out` names the one trait of T's bounds that declares Out (E0220
+  for none, E0221 for two; v0.30.1 took any impl of the type). An impl
+  for one type (`impl Tr for W where Bx<i64>: Conv`) has its `where`
+  clause required too, and checked at the impl (E0277). `T::Out` under a
+  bound whose supertrait declares Out, and `Self::Output` written in a
+  trait whose supertrait declares it (std's IndexMut beside a Mul impl),
+  are that trait's (RT-426: "ambiguous" before). A `where` subject may be
+  a qualified path, `<Bx<T> as H>::Item: Copy`. An impl's supertrait or
+  associated-type bound proved through more than eight blanket impls is
+  proved or refused, and past 127 refused with the overflow error
+  (RT-436: accepted before, unmet or not); that proof answers each goal
+  once per ask, so bounds shaped like a Fibonacci tree cost their count,
+  not 2^depth. `F::Output` under an `Fn() -> R` bound is the sugar's, and
+  `Self::Out` in a trait whose two supertraits declare Out is rustc's
+  E0221. A trait's `where Self: TrB` is a supertrait, as rustc reads it,
+  to every reader of the supertraits (projections took the other one's
+  Out: 8 and 200 printed where rustc gives E0221).
+- **std's HashMap and HashSet impls state `S: BuildHasher`**, the bound
+  their types declare: the impls without it (their Drop, Debug,
+  IntoIterator, DefaultIn and the plain methods) were never checked by
+  their generic instance (rustc E0277 for that header).
+- **No generic function is left unchecked in silence** (RT-275). One
+  whose opaque instance cannot be made gets warning generic.unchecked,
+  and one whose header does not meet its Self type's bound by its own
+  parameters' (`impl<A: Tr<i32>> G<A>` of `struct G<T: Tr<i64>>`) is
+  refused at the header (rustc E0277; v0.30.1 said nothing).
 - **A closure in a generic Drop impl's instance** (RT-44): `impl<T> Drop
   for W<T> { fn drop(&mut self) { thread::scope(|s| { s.spawn(|| 1i64);
   }); } }` made the compiler panic (places/regions.vl, index out of
@@ -743,6 +832,23 @@ the trait's arguments (`<T as Conv<i32>>::K`).
 
 #### What the checkers now refuse
 
+- A literal that does not fit the type a later use gives it, wherever
+  that use is (`let a = 300; take_u8(a)`: `integer literal 300 does not
+  fit in type 'u8'`), a negation a later use types unsigned (rustc
+  E0600), and one variable met by two integer types that do not widen to
+  one another (E0308): each was typed `i32` before, and passed or failed
+  elsewhere.
+- A trait's method whose impls' signatures differ between the integer
+  types (a `&mut self` one, a generic one naming `Self` in another
+  parameter or its result) is the trait's declaration with Self the
+  variable, its impl the type's it takes at the end, as rustc's
+  (0.30.1 called i32's and computed in i32); `x.into()` with nothing at
+  the call saying what it converts to leaves both types to the end, its
+  From checked there (0.30.1 refused it). A generic trait's method whose
+  impls differ beyond Self is refused (`type.infer`), never i32's.
+- A method of two traits that integer types implement, called on such a
+  value (`a.m()` with `impl A for i32` and `impl B for i64`, or a
+  blanket `impl<T> B for T`), is rustc's E0034 (0.30.1 called one).
 - **A `&'static` field set from a borrow that does not last (RT-383,
   RT-422), unsound since 0.27.1.** A struct, union or variant field
   typed `&'static T` (or holding one: `Option<&'static T>`, `[&'static
