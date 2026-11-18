@@ -674,6 +674,18 @@ the trait's arguments (`<T as Conv<i32>>::K`).
   `i64::from(a + 1)`, `take(a.into())`, `x.cmp(&best)` and `x.clone()`
   of an `x: &{integer}`, `Add2::add2(a, b)` with `b: i64`, `.sum()` of
   mapped or iterated literals into an i64 (RT-412, RT-415, RT-417).
+- A candidate impl the selection weighs and rejects binds no integer
+  variable: headers are matched and arguments tried in a snapshot
+  (`infer.vl: probe_begin`), undone at the probe's end, and the chosen
+  candidate's call makes the receiver and its `self` one type. An earlier
+  build of this release left a rejected impl's binding behind:
+  `(Some(a), Some(7u8), 9i64).go()` of an `impl<T> Tr for (T, T, u8)`
+  beside the impl taken made `a` a u8, and `a - 10` printed 251.
+- An assignment's value and a struct field's are checked as a `let`'s
+  with its written type (R5): a reference where its value goes (`s = r`
+  of an `r: &i64`, `p.x = r`, `P { x: r }`) or a value where a reference
+  goes (`S { p: n }` of a `p: &i64`) is `type.ref-value`, rustc's E0308;
+  0.30.1 read through the reference or lent the place unasked.
 - A lazy build (0.27.4) makes every integer type's builtin impls: the
   integer variables' decisions read them all, and one it lacked typed a
   literal another way than `volec check` did (`x.hash(&mut h)` hashed an
