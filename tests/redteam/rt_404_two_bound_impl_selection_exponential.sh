@@ -1,5 +1,5 @@
 #!/bin/sh
-# XFAIL: RT-404: selection is exponential in the nesting depth when an impl has two bounds per level, `impl<T: Tr + Tr2> Tr for W<T>` and the same for Tr2: `check` of `go(&w)` with w a W nested 26 deep does not end within 20 s (about 2x per level: 0.9 s at 20, 3.4 s at 22, 14 s at 24); rustc is instant (0.30.2)
+# RT-404 (closed in 0.30.2, was XFAIL): selection is exponential in the nesting depth when an impl has two bounds per level, `impl<T: Tr + Tr2> Tr for W<T>` and the same for Tr2: `check` of `go(&w)` with w a W nested 26 deep does not end within 20 s (about 2x per level: 0.9 s at 20, 3.4 s at 22, 14 s at 24); rustc is instant (0.30.2)
 # From the review of g302oblig-m2 (forms fexp_16, fexp_20, fexp_22).
 # Since v0.30.1 at least (v0.30.1: 1.9 s at 16, 25 s at 20); the release
 # build is faster but still doubles per level. The growth fits two proofs
