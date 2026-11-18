@@ -22,7 +22,9 @@ use crate::front::check::Res;
 use crate::front::contracts::checks::{CHK_ENSURES, CHK_INVARIANT, CHK_REQUIRES};
 use crate::front::contracts::diag::{CONTRACT_EFFECT, CONTRACT_OLD, end_with_code};
 use crate::front::contracts::expand::subtree;
-use crate::front::effects::{EFF_ALLOC_EXTERN, EFF_GLOBAL, EFF_IO, EFF_UNKNOWN, Effects, fn_effects};
+use crate::front::effects::{
+    EFF_ALLOC_EXTERN, EFF_GLOBAL, EFF_IO, EFF_TLS, EFF_UNKNOWN, Effects, fn_effects,
+};
 use crate::front::effects::infer::expr_effects;
 use crate::front::kinds::{is_owned_type, is_view_type};
 use crate::front::types::err_type;
@@ -98,7 +100,10 @@ pub fn test_kind(item: i64, pcx: &Ctx<Comp>) -> i64 {
 // effects. (0.18, with 0.17's values) An ensures reads no moved
 // parameter and keeps no view in an old(..) (contract.old). (The
 // conditions' types and names were checked with the functions expand.vl
-// made of them.)
+// made of them.) RULE: C3.4 (0.30.2, RT-198) A clause is its condition
+// and the `old(..)` it reads, which expand.vl made lets before the call:
+// both checked alike. (RT-38g) It writes through no pointer but what it
+// made, clause_raw.
 pub fn check_contracts(pcx: &mut Ctx<Comp>) {
     if pcx.check_calls.len() as i64 == 0 {
         return;
@@ -118,11 +123,81 @@ pub fn check_contracts(pcx: &mut Ctx<Comp>) {
         if kind != CHK_REQUIRES && kind != CHK_ENSURES && kind != CHK_INVARIANT {
             continue;
         }
-        if pcx.fn_effects_count != 0
-            && (impure(child(call, 0, pcx), check, pcx)
-                || impure_whole(child(call, 0, pcx), check, pcx)) {
+        if pcx.fn_effects_count == 0 {
+            continue;
+        }
+        let cond = child(call, 0, pcx);
+        let mut parts: Vec<i64, Comp> = Vec::new_in(Comp {});
+        parts.push(cond);
+        olds_of(cond, &mut parts, pcx);
+        let mut bad = false;
+        for p in parts.iter().copied() {
+            if impure(p, check, pcx) || impure_whole(p, check, pcx) {
+                bad = true;
+                break;
+            }
+        }
+        let g = if i < pcx.check_call_fns.len() as i64 { pcx.check_call_fns[i as usize] }
+            else { -1 };
+        if bad || writes_raw(&parts, g, check, pcx) {
             seen.push(check);
         }
+    }
+}
+
+// RULE: C3.4 (0.30.2, RT-198) The `old(..)` lets condition n reads (a
+// local `?oldN` of expand.vl replace_olds, by resolution), their values
+// into out.
+fn olds_of(n: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    if n <= 0 {
+        return;
+    }
+    if pcx.nodes[n as usize].kind == NodeKind::Ident && pcx.nodes[n as usize].res == Res::Local {
+        let y = pcx.nodes[n as usize].y;
+        let name = sym_text(pcx.locals[y as usize].name, pcx);
+        let v = pcx.locals[y as usize].value;
+        if name.len() > 4 && name[0..4] == b"?old" && v > 0 && !out.contains(&v) {
+            out.push(v);
+        }
+        return;
+    }
+    let mut ks: Vec<i64, Comp> = Vec::new_in(Comp {});
+    crate::front::effects::provenance::kids(n, &mut ks, pcx);
+    for e in ks.iter().copied() {
+        olds_of(e, out, pcx);
+    }
+}
+
+// RULE: C3.4 (0.30.2, RT-38g) Whether the clause made of parts (in
+// function g) writes through a pointer it did not make: one of g's
+// parameters' (the caller's memory) or of unknown provenance, itself or
+// in what it calls (effects/provenance.vl clause_raw); reported once.
+fn writes_raw(parts: &Vec<i64, Comp>, g: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mut inside: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for p in parts.iter().copied() {
+        nodes_in(p, &mut inside, pcx);
+    }
+    inside.sort();
+    let (n, callee) = crate::front::effects::provenance::clause_raw(g, &inside, pcx);
+    if n <= 0 {
+        return false;
+    }
+    effect_error(n, check, if callee == -1 { -5 } else { callee },
+        crate::front::effects::EFF_RAW_WRITE, pcx);
+    true
+}
+
+// The nodes of the tree at n into out (those the effects walk goes into:
+// a `for`'s body, a lowered `?`, effects/provenance.vl kids).
+fn nodes_in(n: i64, out: &mut Vec<i64, Comp>, pcx: &Ctx<Comp>) {
+    if n <= 0 {
+        return;
+    }
+    out.push(n);
+    let mut ks: Vec<i64, Comp> = Vec::new_in(Comp {});
+    crate::front::effects::provenance::kids(n, &mut ks, pcx);
+    for e in ks.iter().copied() {
+        nodes_in(e, out, pcx);
     }
 }
 
@@ -158,7 +233,16 @@ fn ensures_values(n: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
     }
     if pcx.nodes[n as usize].kind == NodeKind::Ident
         && pcx.nodes[n as usize].res == Res::Local {
-        let l = pcx.nodes[n as usize].y;
+        let mut l = pcx.nodes[n as usize].y;
+        // (0.30.2, RT-38f: a clause's view of a parameter, `let p = p;`
+        // that expand.vl push_view writes, is read as the parameter)
+        let v = pcx.locals[l as usize].value;
+        if !pcx.locals[l as usize].is_param && v > 0
+            && pcx.nodes[v as usize].kind == NodeKind::Ident
+            && (pcx.nodes[v as usize].p & crate::front::byref::CLAUSE_VIEW) != 0
+            && pcx.nodes[v as usize].res == Res::Local {
+            l = pcx.nodes[v as usize].y;
+        }
         let name = sym_text(pcx.locals[l as usize].name, pcx);
         let ty = pcx.locals[l as usize].ty;
         let owner = sym_text(pcx.nodes[(pcx.check_owner[check as usize]) as usize].a,
@@ -278,7 +362,9 @@ fn impure_whole(n: i64, check: i64, pcx: &mut Ctx<Comp>) -> bool {
 }
 
 // (0.25) What makes effects e impure in a condition: -4 unknown
-// (conservatively), -2 alloc, EFF_IO, EFF_GLOBAL, or 0.
+// (conservatively), -2 alloc, EFF_IO, EFF_GLOBAL, EFF_TLS (0.30.2,
+// RT-199: a thread-local's state, as a static's), EFF_INTERIOR, or 0. (A
+// write through a pointer: writes_raw, by where the pointer comes from.)
 fn impure_bit(e: Effects) -> i64 {
     if (e.bits & EFF_UNKNOWN) != 0 {
         return -4;
@@ -294,8 +380,15 @@ fn impure_bit(e: Effects) -> i64 {
     }
     // (0.26.1: a write through a shared reference, a cell: the bit cannot
     // tell a read from a write)
-    if (e.bits & crate::front::effects::EFF_INTERIOR) != 0 { crate::front::effects::EFF_INTERIOR }
-    else { 0 }
+    if (e.bits & crate::front::effects::EFF_INTERIOR) != 0 {
+        return crate::front::effects::EFF_INTERIOR;
+    }
+    // RULE: C3.4 (0.30.2, RT-199: a thread-local read or written: its
+    // state changes what the program does as a static's)
+    if (e.bits & EFF_TLS) != 0 {
+        return EFF_TLS;
+    }
+    0
 }
 
 // contract.effect at node n, a call of f (-1: a static read; -3: a call
@@ -306,7 +399,9 @@ fn effect_error(n: i64, check: i64, f: i64, bit: i64, pcx: &mut Ctx<Comp>) {
         else if bit == -4 { c"has effects that are not known" }
         else if bit == crate::front::effects::EFF_INTERIOR {
             c"writes through a shared reference (a cell)"
-        } else { c"touches a static" };
+        } else if bit == crate::front::effects::EFF_RAW_WRITE {
+            c"writes through a raw pointer what it did not make"
+        } else if bit == EFF_TLS { c"touches a thread-local static" } else { c"touches a static" };
     let word = if (pcx.check_kind[check as usize]) == CHK_REQUIRES { c"requires" }
         else if (pcx.check_kind[check as usize]) == CHK_ENSURES { c"ensures" }
         else { c"invariant" };
@@ -334,11 +429,13 @@ fn effect_error(n: i64, check: i64, f: i64, bit: i64, pcx: &mut Ctx<Comp>) {
             str::from_utf8(sym_text(pcx.nodes[n as usize].a, pcx)).unwrap()), pcx);
     }
     err_str(
-        c": a condition may not do io, allocate, touch statics or write through a shared reference", pcx);
+        c": a condition may not do io, allocate, touch statics or write through a shared reference or a raw pointer", pcx);
     err_help(c"a check that passes must not change what the program does: compute the value in the body, or check it with assert there", pcx);
     if f >= 0 && bit != -4 {
         let effect = if bit == -2 { "alloc" } else if bit == EFF_IO { "io" }
-            else if bit == crate::front::effects::EFF_INTERIOR { "interior" } else { "global" };
+            else if bit == crate::front::effects::EFF_INTERIOR { "interior" }
+            else if bit == crate::front::effects::EFF_RAW_WRITE { "raw_write" }
+            else if bit == EFF_TLS { "tls" } else { "global" };
         let t = buf_new();
         buf_fmt(t,
             format_args("query effects {} --why {effect}",

@@ -1,5 +1,5 @@
 #!/bin/sh
-# XFAIL: RT-462: `check` of 16 levels of supertraits with two instances each, `trait T1<X>: T0<(X, u8)> + T0<(X, u16)> {}` .. `T16`, and `fn k<X: T16<u8>>(x: &X) -> i64 { 0 }`, does not end within 10 s on the release build (33 s at a load of 22, 17-27 s in the review); v0.30.1 checks it in 1.7 s and rustc builds it in 1.7 s (0.30.2)
+# RT-462 (fixed in 0.30.2, the solver's lookups by hash): `check` of 16 levels of supertraits with two instances each, `trait T1<X>: T0<(X, u8)> + T0<(X, u16)> {}` .. `T16`, and `fn k<X: T16<u8>>(x: &X) -> i64 { 0 }`, does not end within 10 s on the release build (33 s at a load of 22, 17-27 s in the review); v0.30.1 checks it in 1.7 s and rustc builds it in 1.7 s (0.30.2)
 # From the second re-review of g302qual (its form x_pairs_exp_nobody_d16).
 # A regression since the obligations work: the review traced it to
 # obligations::elaborate's dedup, a linear scan over 2^16 elaborated

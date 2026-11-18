@@ -62,7 +62,10 @@ Vole adds two things to a signature, both checked.
 - **Contracts**: `requires COND else "code: message"` and `ensures
   COND` (with `result`) after the signature. A caller that breaks a
   `requires` stops at its own line with the message, exit 101 (`guide
-  contracts`).
+  contracts`). A clause writes nothing it did not make: it reads the
+  parameters and `result` as through `&`, whatever their types are
+  written as, and writes through no cell, nor a raw pointer that may
+  point to what it did not make (0.30.2).
 
 ```vole
 fn half(x: i64) -> i64
@@ -162,6 +165,11 @@ fn main() {
   &'static i64` keeps no borrow of v; one whose result borrows an
   argument the bound lends for the call alone (`sort_by_key(idr)`) is
   `borrowck.fn_value_bound`, as rustc's E0308.
+- A union's field is Copy, a reference or a `std::mem::ManuallyDrop<T>`,
+  as in Rust (E0740, 0.30.2; a generic `T` needs `T: Copy`). One
+  difference: `u.m.k = v` through a ManuallyDrop field's `DerefMut`,
+  which rustc refuses, is allowed in `unsafe`, and drops the old `k` as
+  rustc's `(*u.m).k = v` does.
 - A borrowed literal is not promoted to a static: `&7` lives in the
   function that makes it, so `let r: &'static u64 = &7;` and a
   `&'static` field set to `&7` (or to a const's `&[1, 2]`) are refused;
