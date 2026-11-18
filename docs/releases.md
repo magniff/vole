@@ -295,6 +295,62 @@ the trait's arguments (`<T as Conv<i32>>::K`).
   first release that builds the case) to 0.30.1; `--no-vectorize` was
   the workaround.
 
+#### What the checkers now refuse
+
+- **A union's field needs no drop** (RT-43; rustc E0740, `union.field`).
+  A union's field is Copy, a reference (`&mut T` too), std's
+  `ManuallyDrop<T>`, or a tuple or an array of those. Before, a field of
+  any type was accepted, and `u.x = 5; u.p.d = D { v: 3 };`, with no
+  `unsafe`, dropped the old `d` read from the bytes `u.x` wrote (with an
+  owning field, a free of a garbage pointer). A generic union is checked
+  by its opaque instance too: `union U<T> { t: T }` needs `T: Copy`
+  whatever its uses. The fix is the field's type in `ManuallyDrop<..>`,
+  whose value `ManuallyDrop::drop` or `into_inner` takes where the
+  program knows the field holds it. Independently of the declarations, no
+  drop reads a union's field: an assignment's old value under one is
+  never dropped.
+- **An assignment through a union's field reads it** (RT-43, E0133). A
+  place is written without being read only up to its first deref: `u.r.k
+  = v` with `r: &mut P` (also through a Copy struct's reference, a
+  `&mut` tuple, a `&mut &mut P`, `&raw mut u.r.k`) and `u.m.k = v`
+  through a ManuallyDrop's DerefMut read the union's field, and need
+  `unsafe`. They were accepted in safe code: a write through a pointer
+  made of another field's bytes.
+- **A contract's clause writes nothing it did not make, whatever the
+  types are written as** (RT-38f). Every parameter a clause mentions is
+  read through a view, before the body and after it: a parameter whose
+  `&mut` is hidden in an alias (`type R<'a> = &'a mut i64`), an
+  associated type or `self` of `impl Bump for &mut i64` had none after
+  the body, so `ensures { *p = 9; true }` wrote the caller's value (with
+  a `debug ensures`, the output changed with `--debug-contracts`).
+  A view is made only when a name of the clause resolves to the
+  parameter: `ensures { let s = 3; s > 0 }`, a closure's parameter or a
+  match binding named as a by-value parameter the body took read
+  nothing of it.
+- **A clause writes nothing it did not make through a raw pointer**
+  (RT-38g, `contract.effect`), judged by where the pointer comes from.
+  A pointer made of a `&mut` of the clause's own local is a `&mut`
+  write, which the borrow checker and the views police: std's `take`,
+  `swap`, `sort`, `iter_mut`, `mem::replace` on a clause's locals, and
+  `o.iter().all(..)` on an `Option`, are accepted. A pointer from a
+  parameter (`poke(p)`, `a.as_ptr() as *mut i64`, a struct, a Vec, a
+  Box, a HashMap holding one) writes the caller's memory, and one of
+  unknown provenance (`addr as *mut i64` of an integer that is not a
+  constant, a static's or a thread-local's pointer, a union's field, a
+  C function's) unknown memory: both are refused, in the clause, its
+  `old(..)` and whatever it calls, a fn value, a trait method or a
+  closure. A `&mut` made from a raw pointer is a write through it,
+  whatever form it takes: `&mut (*sp)[..]`, `&mut (*p).0[..]`,
+  `slice::from_raw_parts_mut(p, n)`, `&mut *sp` of a `*mut str`, a
+  `&mut self` receiver `(*p).m()`, a `ref mut` binding. A read through
+  a raw pointer is allowed, and so is C given a `*const` source:
+  `ptr::copy_nonoverlapping(p, &raw mut own, n)` writes only its
+  destination. `query effects F --why raw_write` shows the chain
+  (`raw_src`: where a pointer of unknown provenance is made).
+- **A clause touches no thread-local static** (RT-199) and **`old(e)`
+  is effect-checked** (RT-198): `ensures old(say()) == 1` with `say`
+  printing was accepted.
+
 #### Soundness holes closed
 
 - **A frame larger than the guard page stepped over it** (RT-83, every
@@ -367,6 +423,25 @@ the trait's arguments (`<T as Conv<i32>>::K`).
   resolve proves nothing. An impl's bound naming `Self` (`impl<U:
   Conv<Self>> Tr<U> for W`) is read with Self the impl's type, wherever
   it is asked from.
+- **A closure in a generic Drop impl's instance** (RT-44): `impl<T> Drop
+  for W<T> { fn drop(&mut self) { thread::scope(|s| { s.spawn(|| 1i64);
+  }); } }` made the compiler panic (places/regions.vl, index out of
+  bounds), and so did such a closure in what only that `drop` calls (a
+  generic function, a trait's default method, a generic trait's impl
+  method). The instance is made while the bodies are built, after every
+  closure's kind and signature slots were decided, and its closures had
+  none; one whose body moved a capture kept it borrowed and dropped the
+  value twice. They now get both, and their bodies are built before the
+  bodies that make them.
+- **A closure whose result holds another closure** (RT-91):
+  `w.iter().flat_map(|y| v.iter().map(move |x| x * y))`, a closure
+  returning an Option, a tuple or a struct holding a `map` or `filter`
+  closure, made the compiler panic (places/regions.vl, index out of
+  bounds). A closure type's region slots include its signature's, which
+  were made in the closures' order, the outer before the inner one it
+  holds; each closure's slots are now made on demand, after those of
+  every closure its signature and type hold (visited once, at any
+  depth: a closure in 15 nested one-tuples, RT-91c).
 
 #### What the checkers now refuse
 
