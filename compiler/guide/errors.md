@@ -291,7 +291,7 @@ let n = 3;
 for x in n { }
 ```
 ```err
-error[type error] no method 'into_iter' on type 'i32'
+error[type error] no method 'into_iter' on type '{integer}'
 ```
 `for x in 0..n`. A `for` takes an `IntoIterator`: a range, `&v`,
 `v.iter()`, a `HashMap`; a type of yours with `impl Iterator for T`
