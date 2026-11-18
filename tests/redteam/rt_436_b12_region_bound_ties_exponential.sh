@@ -3,8 +3,9 @@
 # regions pass's impl_bound_ties walked an instance's bound `T: P0` through
 # bounds shaped like a Fibonacci tree (`impl<X: P1 + Q1> P0 for X`,
 # `impl<X: P1> Q0 for X`) by every path, 2^depth of them: past 60 s at
-# depth 40 and at 127. Each (substitution, trait reference, base) is walked
-# once per bound now (Sig.ties_seen). It passes when the program, 127
+# depth 40 and at 127. Each reference with the same inputs is met
+# once per signature now (Sig.met, the regions memo of RT-404, which
+# closes this form as well). It passes when the program, 127
 # levels deep, builds and prints 4 within 10 s.
 V=${1:-volec}
 case "$V" in */*) V=$(cd "$(dirname "$V")" && pwd)/$(basename "$V") ;; esac
