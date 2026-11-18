@@ -100,6 +100,43 @@ A correctness release, its branches merged as each is reviewed clean.
 
 #### Soundness holes closed
 
+- **A stack frame whose size wrapped (RT-466, RT-466b, RT-466c), every
+  -O, since 0.30.1 at least.** A frame's size was summed with no check:
+  one local of 2^63 bytes, two of 2^63 or three of 2^62 (in a branch
+  not taken) made a frame of a small or negative size, with no reserve
+  and its slots above sp (SIGBUS at -O2, an internal assembler error or
+  a panic at -O0). Every growth of a frame now goes through one checked
+  function, `base::target::frame_grow`, which checks each bound before
+  it adds: the sum of a body's locals and temporaries, where both code
+  generators take the body (take_body's `check_frame`, so a frame is
+  refused at the same local at every level), gen0's own slots
+  (`alloc_slot`) and -O2's layout (`layout_frame`, the slots inlining
+  brings). Past the target's limit it is `error frame.too_big` at the
+  local that takes the frame there: on AArch64 a frame's locals reach
+  2^62 bytes (the code generators' own frames 2^63 - 2^32), on x86-64 2
+  GiB less a page, the existing limit of its 32-bit displacements (an
+  internal assembler error at -O0 before). A frame under the limit is
+  built as before, its probes faulting as it is entered.
+- **main's signature was not checked (RT-47, three forms), every -O,
+  since 0.16.** `fn main(v: Vec<i64, Gpa>)`, `fn main(args: &[&str])`,
+  `fn main(b: Box<i64, Gpa>)` were built with C's argc and argv read as
+  the parameter (a Vec freeing argv, a slice whose length was argv's
+  address), and `fn main() -> String<Gpa>` returned its pointer as the
+  exit status. main is now checked where it is identified
+  (`front::convert::is_program_main`, which main_gpa and
+  main_result_wrapper ask too) against exactly its documented forms: no
+  parameter, `gpa: Gpa`, `argc: i32, argv: *mut *mut u8` (each pointer
+  `*mut` or `*const`), or those and `gpa: Gpa` last; results `()`,
+  `i32`, `i64`, `!`, `Result<(), E>`; a safe vole fn. Anything else is
+  `error main.signature` (rustc E0580) at the parameter, or `error
+  main.result` (rustc E0277) at the result: an i64 argc (its upper half
+  undefined), the allocator first, argc alone, a third pointer,
+  `&&u8` for argv, `unsafe fn main`, `extern "C" fn main`, a `u8`, a
+  tuple, an `Option` or an `f64` result. A module's `fn main` and a
+  method named main are ordinary functions. Four cases and a fixture
+  used `argc: i64` or the allocator first, and are written with the
+  form now.
+
 - **An array repeat of a value that is not Copy (RT-148, RT-148b,
   RT-215, RT-302), at every -O, since 0.28.0.** `[v; 2]` of a Vec, `[D { k: 1 }; 3]` of a
   type with a Drop impl, a generic `[t; 2]` and `[f; 2]` of an `impl
