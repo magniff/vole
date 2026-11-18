@@ -59,11 +59,12 @@ error: VOLE_PLANT_RT_CG_7 is x17, temp, insn, frame or scratch
 ## builds it, through movz/movk and a register
 % printf 'fn main() {\n    let mut a = [0u8; 3000000000usize];\n    a[2999999999] = 7;\n    println("{}", a[2999999999]);\n}\n' > big.vl
 % VOLE_CACHE=off volec big.vl -O2 --target x86_64-macos -o big.o
-error: a stack frame past 2 GB: x86-64 reaches its frame with 32-bit displacements (put the large value on the heap)
+big.vl:2:9: error[frame.too_big] the stack frame of 'main' reaches 2 GiB less a page (x86-64 reaches a frame's slots with 32-bit displacements) with this value of type '[u8; 3000000000]': more than the target's stack frames hold | help: put a value this large on the heap (Box::new_in, Vec::with_capacity_in), or make it smaller
 [exit 1]
 % VOLE_CACHE=off volec big.vl -O2 --target aarch64-macos -o big.o
 ok: wrote big.o
-## at -O0 too (its own frame; the assembler refuses the subq)
+## at -O0 too (0.30.2: the same error at the same local, where it was
+## the assembler's refusal of the subq, an internal error)
 % VOLE_CACHE=off volec big.vl -O0 --target x86_64-macos -o big.o
-internal error: cannot assemble: an immediate a 64-bit operation cannot sign-extend from 32 bits: subq $6000000656, %rsp
+big.vl:2:9: error[frame.too_big] the stack frame of 'main' reaches 2 GiB less a page (x86-64 reaches a frame's slots with 32-bit displacements) with this value of type '[u8; 3000000000]': more than the target's stack frames hold | help: put a value this large on the heap (Box::new_in, Vec::with_capacity_in), or make it smaller
 [exit 1]
