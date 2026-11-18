@@ -353,6 +353,139 @@ the trait's arguments (`<T as Conv<i32>>::K`).
 
 #### Soundness holes closed
 
+- **A `&mut` behind a `&` cast to a raw pointer or a `&mut` (RT-197),
+  every -O, since 0.28.0.** `h.r as *mut i64` with `h: &H` and `r: &'a
+  mut i64` was accepted, and a write through the pointer changed `x`
+  behind a shared reference; `h.r as &mut i64` made a second `&mut` in
+  safe code, and a mutable view coerced or cast to a raw one (`let p:
+  *mut [i64] = h.s;`, `h.s as *mut [i64]`) was the same. The coercion
+  `let p: *mut i64 = h.r` was refused: it was lowered as rustc's `&raw
+  mut (*h.r)`, whose borrow is asked, while a cast read its operand by
+  copying the reference, which only the loan check knew for a write.
+  Now one function (places/build.vl `exclusive_read`) decides what
+  every read of an exclusive reference as another pointer is, a
+  coercion's and a cast's alike: its reborrow of the kind the target
+  asks, `&raw mut`, `&raw const`, `&` or `&mut` (a view's `slice
+  Q[..]`), each refused as its borrow is (rustc E0596) through a field,
+  a tuple field, an index, a Box, a Deref, a closure's capture and a
+  `&&mut`. The checker of the places IR (`--verify-places`) no longer
+  lets a copy of a `&mut` into a raw pointer pass, and the loan
+  check's second rule for it is gone. The position does not matter: a
+  block's tail, an if's arms, a match arm, a closure's result, an array
+  element, `Some`, a tuple, a `*mut [i64]` argument, `*r as *mut i64` of
+  an `r: &&mut i64`, an index of a `&[&mut [i64]]` (RT-284), an array
+  repeat `[h.r; 2]` and a closure's `return h.r` (RT-314), a loop's
+  `break h.r`, a closure's match arm and `a[0] = h.r` (RT-366) are each the
+  operand the coercion reads, so each is its reborrow.
+- **A `&mut` behind a `&` was usable as the `&mut` through `*&` (RT-321),
+  every -O, since v0.30.1 at least.** `k(&y)` with `y: &mut S` and `fn
+  k(x: &mut S)` mutated through the shared borrow, and so did `k(*&y)`,
+  `let w: &mut S = *&y` and `(*&y).k += 1`. The place of `*&x` was
+  folded to x for any borrow, so the `&` was lost; now only `&mut x` and
+  `&raw` are folded, and `*&y` is a place behind a `&`: the checker's
+  `*` of `&y` (where `&mut S` goes) and each written form is refused,
+  `borrowck.borrow_immutable` or `borrowck.assign_immutable` (rustc E0308
+  for `k(&y)`, E0596/E0594 for the rest). Reads through `*&y` still
+  build.
+
+- **The results of partition_in and unzip_in kept no borrow of their
+  items (RT-211, RT-261, RT-267, RT-268, RT-237b, RT-283, RT-387,
+  RT-387f, RT-388, RT-99, RT-404), every -O,
+  since 0.28.0.** `let (a, b): (Vec<&i64, Gpa>, ..) =
+  v.iter().partition_in(.., gpa); drop(v);` and then reading a was a
+  use after free from safe code; `unzip_in` the same, and so a program's
+  collector called with `&v` (`fn f<C: IntoIterator, B: From<C::Item>>`,
+  `Extend<C::Item>`, `FromIteratorIn<C::Item, A>`, `<C::IntoIter as
+  Iterator>::Item`), a result tied to its argument only by std's blanket
+  `impl<T, U: From<T>> Into<U> for T`, and an impl's own bound proved by
+  an impl whose trait argument is `'static` (`impl<'a, T: Conv<W<'a>>>
+  Tr for H<'a, T>` with `impl Conv<W<'static>> for i64`: 'a was never
+  'static). A call's result regions are tied to its arguments by the
+  callee's predicates, read through the impl that proves each, and three
+  readings tied nothing: a `where` predicate on a subject other than a
+  type parameter (unzip_in's `Self: Iterator<Item = (X, Y)>`) was never
+  read; a projection `C::Item` was normalized only through a direct impl
+  or one blanket impl, never a pattern impl (`impl<'a, T, A> IntoIterator
+  for &'a Vec<T, A>`), so it read as elided; and an impl's trait
+  arguments and its nested obligations were not related to the bound's,
+  so a slot only the impl names (`'static`, or a parameter the header
+  does not bind, `U` of the Into blanket) was lost. Now every predicate
+  of the signature, on a parameter, `Self`, a projection or any type, is
+  read by one function (places/regions.vl `subject_ties`), through the
+  impl `front::obligations::select` chose for its whole reference, the
+  one chooser; that
+  impl's trait arguments are the bound's slot by slot, and its nested
+  obligations are met the same way, recursively, as rustc's confirmation
+  (`impl_bound_ties`, `arg_ties`). A lifetime of the impl its header does
+  not name (`impl<'a, T: Copy> Extend<&'a T> for Vec<T>`) is bound to the
+  bound's slot for the impl's own predicates and relates to nothing else
+  (so `impl<'a: 'static> From<W<'a>> for i64`, met through the Into
+  blanket, makes `go<T: Into<i64>>(W { r: &v })`'s borrow 'static:
+  refused, RT-99, accepted since v0.30.1; 0.30.2's first fix tied it to all, refusing `words.iter()
+  .partition_in(..)` of `Vec<&'static str>` and a dropped `words`, which
+  v0.30.1 and rustc build); one neither the header nor the trait
+  arguments name (`'a` of std's `impl<'a, T: Copy + 'a, I: Iterator<Item
+  = &'a T>> Iterator for Copied<I>`) is one region of its own that the
+  impl's nested obligations relate. Its associated-type equalities are
+  met too (`impl<'a, T: Get<Out = W<'a>>> Tr for H<'a, T>` with only
+  `type Out = W<'static>`: 'a is 'static, RT-388, a use after free
+  before), and so are its `where` predicates on a subject that is no
+  parameter of it (`where i64: Conv<W<'a>>`, `where T::K: ..`: kept on
+  the impl by the parser, never read before). Every projection of a
+  signature, `C::Item`, `Self::Item`, a qualified `<C as
+  IntoIterator>::Item` or `<C::IntoIter as Iterator>::Item`, is
+  normalized before the walk through the impl `select` chose for its
+  whole reference (`warm_projections`, `norm_proj`), and the impl's own
+  projections again the same way (Zip's `type Item = (A::Item,
+  B::Item)`, Enumerate's `(usize, I::Item)`: `norm_nested`). Before, a
+  qualified projection, a projection inside an impl's value and one no
+  impl was found for by its name were read as elided: the result was
+  given to the only reference parameter, `fn nth<I: Iterator>(i: I, k:
+  &usize) -> Option<<I as Iterator>::Item>` kept k borrowed and not
+  `v.iter()` (RT-387, a use after free; a method's, `fn first<C:
+  IntoIterator>(&self, c: C) -> Option<C::Item>`, kept self borrowed and
+  not c, RT-387f), and one with no reference
+  parameter was refused as an elision (RT-389, which rustc builds); `T::Out`
+  under `T: Tr<i64>` was read from `Tr<i32>`'s impl (RT-86). Where no
+  impl normalizes a projection (none, two, the limit), every region of
+  its base is one region and the projection's slot that one, never
+  elided and never an impl picked by its name. `I: Iterator<Item = (X,
+  Y)>` with I a Zip of two borrows now keeps X and Y apart (the first fix
+  made them one region and refused dropping the other vector, which
+  v0.30.1 and rustc build). A reference an impl's nested obligations
+  meet is met once per signature (keyed by the trait, the type, its
+  arguments and type parameters, and the regions it is met with): two
+  bounds per level, `impl<T: Tr + Tr2> Tr for W<T>`, proved the level
+  below again and again in the places, doubling per level (RT-404's
+  places half; its front half is the obligation solver's). A program's own collector, `fn f<I: Iterator, B:
+  DefaultIn<A> + Extend<I::Item>>(it: I, a: A) -> B` (and `(B,)`, `(B,
+  B)`, `Pair<B>`, `Option<B>`), refused in its own body since 0.30.1
+  (RT-225), builds, and its result keeps the borrow at the caller
+  (RT-225b); so does a default method with a `where Self:` predicate, a
+  fn that returns what partition_in or unzip_in made (RT-237, RT-237b),
+  and a fn whose result is a projection, `-> Option<C::Item>` (RT-265,
+  refused before as an elision). A `where` predicate on a compound type
+  met by an impl with lifetime bounds (`where V<T>: Sup`, `where X<'a>:
+  Sup` with `impl<'a: 'static> Sup for X<'a>`) is assumed in the fn's
+  body and proven at the call, as rustc does (RT-C301-11's compound
+  form; 0.30.1 refused the body). An impl parameter bound only by
+  another's Fn bound's output, B of `impl<B, I: Iterator, F:
+  FnMut(I::Item) -> B> Iterator for Map<I, F>`, is read as rustc's
+  `<C as FnOnce>::Output`, through the closure C's own signature
+  (`fn_output_slot`): the closure's capture is in B only when its result
+  borrows it (`.map(|_x| &w[0])` keeps w borrowed, a use after free in
+  0.30.1), so `first(v.iter().map(|x| { w.len(); x }))` (and FilterMap,
+  MapWhile, Scan, an enumerate after it) keeps v borrowed and not w, as
+  rustc; this release's first fix took every region of the Map and
+  refused dropping w. An F that is an fn item or an fn pointer is read
+  by its type's elision, as a call through an fn value is (a vole fn
+  type carries no regions): B is the bound's only input region, or
+  'static with none (`MyMap { i: v.iter(), f: id }` keeps v borrowed,
+  a use after free in 0.30.1, and not another borrow the adapter holds);
+  an fn item that returns `&'static` from a reference input is still
+  read as borrowing it, as a direct call through the fn value is (since
+  0.30.1, rustc builds both). A for loop over a program's adapter of an adapter
+  whose item holds a reference builds (RT-106, refused since 0.28.0).
 - **A frame larger than the guard page stepped over it** (RT-83, every
   release before, every level, both arches). The prologue moved sp by
   the whole frame at once and touched none of the pages in between, so
