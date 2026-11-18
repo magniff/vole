@@ -842,6 +842,14 @@ the trait's arguments (`<T as Conv<i32>>::K`).
   holds; each closure's slots are now made on demand, after those of
   every closure its signature and type hold (visited once, at any
   depth: a closure in 15 nested one-tuples, RT-91c).
+- **`check` answered from the tools' cache counts the shaders**: its
+  `ok: 0 errors in main.vl (N files, M shaders)` said `0 shaders` for a
+  program whose shaders are `embed wgsl` blocks, and counted only the
+  `.wgsl` files of one that also has blocks (0.29 to 0.30.1). The
+  shaders were counted from the front end's blocks, nodes the cache does
+  not keep; the cache now keeps the two counts as the front end made
+  them (`read_counts`, the one place that counts them), its format's
+  version 12 (tests/refactor/cache_shaders0302.t).
 
 #### What the checkers now refuse
 
