@@ -129,6 +129,7 @@ borrowck.unused_param
 borrowck.static_mut_ref
 borrowck.param_outlives
 borrowck.fn_value_static
+borrowck.fn_value_bound
 borrowck.mut_twice
 borrowck.conflict
 borrowck.use_borrowed
