@@ -1,5 +1,5 @@
 #!/bin/sh
-# XFAIL: RT-409: `volec fmt` lays out a qualified path whose self type has nested generics, `type Out = <W<W<T>> as H>::Out;`, as `< W<W<T>> as H >::Out` (0.30.2)
+# RT-409 (closed in 0.30.2, was XFAIL): `volec fmt` lays out a qualified path whose self type has nested generics, `type Out = <W<W<T>> as H>::Out;`, as `< W<W<T>> as H >::Out` (0.30.2)
 # rustfmt keeps `<W<W<T>> as H>::Out`. Seen when the edit hook formatted rt_400.
 V=${1:-volec}
 case "$V" in */*) V=$(cd "$(dirname "$V")" && pwd)/$(basename "$V") ;; esac
