@@ -1,31 +1,41 @@
 #!/bin/sh
-# XFAIL: RT-138g: integer literals in a shared tuple type 3 wide and 20 deep: check runs past 30 s (infer::subst and mentions_at walk it as a tree, 3^16 nodes); v0.30.1 took about 5 s (0.30.3)
-# (from RT-138's fix) `let a1 = (a0, a0, a0); ...` 20 levels of a tuple of
-# integer literals. 0.30.2's integer variables (F18.5) leave the literals
-# free until the function's end, so infer.vl's walks over the type, each
-# bounded by depth 16 but a tree walk of a shared type (subst,
-# mentions_at; first_int, first_general, holds_at, may_equal_at the same
-# way), meet 3^16 nodes per call. It passes when `volec check` ends
-# within 10 s.
+# (0.30.2, from RT-138's fix) Integer literals in a tuple type whose parts
+# are shared, 20 levels 3 wide and 4 wide (`let a1 = (a0, a0, a0); ...`),
+# read as an i64. 0.30.2's integer variables (F18.5) leave the literals
+# free until the function's end, so infer.vl's walks of the type, each to
+# depth 16 (subst, mentions_at; occurs, first_int, first_general,
+# holds_at, may_equal_at the same way), met 3^16 or 4^16 parts per call
+# as a tree: the release's check ran 51 s for the 3-wide form and past a
+# minute for the 4-wide one (v0.30.1: 5 s and past a minute, in its
+# widening checks). Each walk answers a (part, depth) once now (infer.vl's
+# Walk). The function has a second error, so its body is not placed: the
+# value itself holds 2 * 3^20 integers. It passes when `volec check` of
+# each ends within 10 s with that error.
 V=${1:-volec}
 case "$V" in */*) V=$(cd "$(dirname "$V")" && pwd)/$(basename "$V") ;; esac
 w=$(mktemp -d)
 trap 'rm -rf "$w"' EXIT
-{
-  echo 'fn main() {'
-  echo '    let a0 = (1, 2);'
-  i=1
-  while [ $i -le 20 ]; do
-    p=a$((i - 1))
-    echo "    let a$i = ($p, $p, $p);"
-    i=$((i + 1))
-  done
-  echo '    let x: i64 = (a20.0).0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0;'
-  echo '    println("{}", x);'
-  echo '}'
-} > "$w/main.vl"
-cd "$w" || exit 1
-VOLE_CACHE=off perl -e 'alarm 10; exec @ARGV' "$V" check main.vl > out.txt 2>&1
-rc=$?
-if [ $rc -ne 0 ] && [ $rc -ne 1 ]; then echo "check did not end within 10 s (rc $rc)"; tail -3 out.txt; exit 1; fi
+for wide in 3 4; do
+  {
+    echo 'fn main() {'
+    echo '    let a0 = (1, 2);'
+    i=1
+    while [ $i -le 20 ]; do
+      p=a$((i - 1))
+      parts=$p
+      k=1
+      while [ $k -lt $wide ]; do parts="$parts, $p"; k=$((k + 1)); done
+      echo "    let a$i = ($parts);"
+      i=$((i + 1))
+    done
+    echo '    let x: i64 = (a20.0).0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0 .0;'
+    echo '    println("{}", x);'
+    echo '    let z: bool = 1u8;'
+    echo '}'
+  } > "$w/main$wide.vl"
+  (cd "$w" && VOLE_CACHE=off perl -e 'alarm 10; exec @ARGV' "$V" check "main$wide.vl" > "out$wide.txt" 2>&1)
+  rc=$?
+  if [ $rc -ne 1 ]; then echo "$wide wide: check did not end within 10 s with an error (rc $rc)"; tail -3 "$w/out$wide.txt"; exit 1; fi
+  if ! grep -q "expected 'bool', got 'u8'" "$w/out$wide.txt"; then echo "$wide wide: not the bool error:"; tail -3 "$w/out$wide.txt"; exit 1; fi
+done
 exit 0
