@@ -98,6 +98,36 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 A correctness release, its branches merged as each is reviewed clean.
 
+#### Soundness holes closed
+
+- **An array repeat of a value that is not Copy (RT-148, RT-148b,
+  RT-215, RT-302), at every -O, since 0.28.0.** `[v; 2]` of a Vec, `[D { k: 1 }; 3]` of a
+  type with a Drop impl, a generic `[t; 2]` and `[f; 2]` of an `impl
+  FnMut` were built: the value was copied bit for bit into each element
+  and each copy dropped, a double free (a use after free once one
+  closure's Vec grew) or a Drop run N times, from safe code; a static's
+  `[D { k: 1 }; 2]` or `[None; 2]` was written the same way. Neither the checker's
+  Repeat arms, the places IR nor the constant writer asked for Copy.
+  Now one predicate, `repeat_needs_copy` (Copy by `rust_copy`, the one
+  Copy test), is asked where the copies are made: the places IR's
+  `RV_REPEAT` for a body and `const_write` for a static's or a
+  constant's data: `error trait.repeat_copy`, rustc's E0277, once a
+  position (front-rust.md F35.1). Rust's other form, a path to a
+  constant, makes each element from the constant (F35.2): a loop of
+  the places IR evaluates it N times, any N, and vole makes a constant
+  at each use, so one whose value calls a function calls it once per
+  element. Every resolver of a constant (a name, a path to an inherent,
+  a trait's or a type parameter's associated constant) is marked in
+  one place, so `[T::ZERO; N]` in a generic body is a constant's repeat
+  too. `[x; 0]` now drops x as soon as it is made (it leaked), `[C;
+  0]` makes nothing, `[x; 1]` moves x. A constant's value is a body of
+  its own (RT-302, RT-279c, RT-407): a `return`, `?`, `break` or
+  `continue` that would leave it, which left the function that read the
+  constant, is refused where the value is written, used or not, in a
+  constant, a static, an associated constant, an array length or a
+  discriminant (`const.exit`, rustc E0572, E0268); `[C; N]` builds into a
+  temporary moved into its destination once made.
+
 #### Miscompiles fixed
 
 - **A qualified path to a trait's item (RT-C301-8), at every level, in
@@ -388,6 +418,64 @@ the trait's arguments (`<T as Conv<i32>>::K`).
   for `k(&y)`, E0596/E0594 for the rest). Reads through `*&y` still
   build.
 
+- **A callable meeting an Fn bound kept no borrow of its argument
+  (RT-282, RT-297, RT-297b, RT-297c, RT-299, RT-304, RT-308, RT-309,
+  RT-310, RT-311, RT-364, RT-367, RT-368, RT-421), every -O, in v0.30.1
+  and before.** A fn item whose result
+  borrows its argument, `fn idr2<'a>(x: &'a i64) -> &'a i64`, given to
+  `v.first().map(idr2)`, `and_then`, `sort_by_key`, Iterator's `scan`,
+  `find_map`, `map_while`, `fold`, a program's `F: Fn(T) -> U` or `f:
+  fn(I::Item) -> U` parameter, or kept in a struct's field or a Vec and
+  passed on, gave a result that kept no borrow of v: `drop(v)` while it
+  lived was accepted, a use after free from safe code; a generic fn used
+  as a value whose bound's impl needs `'static` (`kb::<&i64>` with only
+  `impl Keep for &'static i64`) the same. In the instance such a value is
+  its erased `fn` type, and a call through it related its arguments to
+  its result only inside the instance, where those are the instance's
+  own substitutions. Now the signature says it: every place a callable
+  meets an Fn bound or a `fn` type (a type parameter's `Fn*` bound, a
+  `fn` type at any depth of a parameter's type, a struct's or an enum's
+  `fn` field, a `where` predicate) relates the regions its call relates,
+  assumed in the body and required at each call, read through the item's
+  own signature where a fn item is given (`fn st(x: &i64) -> &'static
+  i64` keeps no borrow, as rustc reads it), and a value whose result may
+  borrow what the bound's elided input lends for the call alone is
+  refused where it is given, `borrowck.fn_value_bound` (rustc E0308;
+  `v.iter().scan(0, bad)` with a `bad` that returns its state;
+  `dedup_by_key`, `max_by_key` and `min_by_key` with a key that borrows
+  its argument, RT-368). The callee's body is then checked by the bound,
+  not by the erased type: `entry(5).or_insert_with_key(kk)` with a `kk`
+  returning its key, and `arena_scope(&gpa, mk)` with an `mk` returning
+  a Vec on the scope, are refused at the call instead of inside std
+  (RT-378), and the same calls given a fn item that keeps no borrow
+  build (v0.30.1 refused them inside std). A local that surely holds a
+  fn item (`let p = st;`, written by that one statement) is read by that
+  item's signature too, and a parameter of the body given on is its
+  caller's value only when the body never writes it: every write counts,
+  an assignment, `&mut` (allowed of a parameter that is not `mut`), a
+  `ref mut` binding, `&raw`, a `&mut self` autoref (places/ir.vl
+  `held_value`, the one rule both readers ask). A
+  function that takes such a callable as a type parameter cannot itself
+  be used as a value (a call through the value would reach its body
+  unchecked); one taking a written `fn(..)` type can, and its callers
+  may give that parameter any `fn` value: its body calls it as R6 reads
+  the erased type, so only a type parameter's records are checked at a
+  call (`regions::bound_param`). The `'static` a bound needs only
+  through an associated-type equality, a `where` clause, an impl's
+  `where 'a: 'static`, a two-level blanket impl or the bound trait's
+  type argument (`T: KeepQ<&'static i64>`) is read from the signature
+  too (RT-364, RT-421), through std's blanket Into as well (`ki<T:
+  Into<&'static i64>>` used as a value). `&mut` of a fn pointer meets
+  FnMut and FnOnce bounds, not Fn (rustc E0277), as `&mut` of a closure.
+  One rule
+  for closures, fn items, fn pointers, method paths, generic fns with
+  their arguments and opaque `impl Fn` values (borrowck.md R6). With it,
+  a fn item or a `fn` value given to Iterator's adapters (`map`,
+  `filter_map`, `flat_map`) builds (RT-298: `&mut F` of a `fn` type meets
+  an Fn bound as F does), an opaque `impl Fn(&i64) -> &i64` value given
+  to a bound infers its result (RT-301), and `binary_search_by` and
+  `binary_search_by_key` take Rust's `F: FnMut(&'a T) -> ..` (RT-300: a
+  key that is the element's reference was refused).
 - **The results of partition_in and unzip_in kept no borrow of their
   items (RT-211, RT-261, RT-267, RT-268, RT-237b, RT-283, RT-387,
   RT-387f, RT-388, RT-99, RT-404), every -O,
@@ -518,7 +606,47 @@ the trait's arguments (`<T as Conv<i32>>::K`).
   the derived body, whose `Clone::clone(&self.v)` took the method
   probe's auto-deref and called W's clone for a `&W` field; the path
   call now takes Self from its argument as written (RT-159), `&W`.
-
+- **An `impl Trait` value is its hidden type for drop and layout, its
+  bounds for what a caller may do (RT-145, RT-79, RT-147, since 0.27.2.1).**
+  A value returned as `impl Trait` was never dropped: a closure's
+  captured String or Vec and an iterator struct's Vec were leaked, at
+  every -O. A function returning one whose hidden type has a Drop impl
+  or owns memory was refused (`distinct.kind` at line 1, column 1), and
+  one returning another function's `impl Trait` had no methods. Now the
+  opaque type's kind and glue are its hidden type's, decided at one
+  place (`decided_type`, through `type_kind`), and nothing that holds
+  one (an Option, a tuple, a struct) is decided before the hidden type
+  is known: a caller checked before the function, or functions that
+  call each other, drop each value once. It moves as its hidden type
+  and is Copy only when a bound says so (borrowck.md D21.5).
+- **A reference to an `impl Trait` value has std's impls for references
+  (RT-166, RT-196, RT-200).** `&impl Fn` was not Fn, `&mut impl FnMut`
+  not FnMut, `&mut impl Iterator` failed in std's projection; a blanket
+  `impl<F: Fn(i64) -> i64> Apply for F` did not cover an `impl Fn`, and
+  `flat_map` over an opaque iterator said IntoIterator is not
+  implemented. The bound test and the impl search see an opaque value
+  through its bounds (D21.5).
+- **An `impl Fn*` value is called as its bound says (RT-213, RT-79c).**
+  An `impl FnOnce` whose closure is Fn passed an `F: Fn` bound and could
+  be called twice; one capturing a Drop value got `distinct.kind` and
+  false use_moved errors; a call that a bound makes FnOnce asked for a
+  `mut` binding. The call kind is now the bound's (`opaque_call_kind`,
+  D21.6), for every callee shape (a local, a field, an element, a tuple
+  field, a binding it moved to, a closure calling it): an `impl FnOnce`
+  is called once and needs no `mut` (RT-334), an `impl FnMut` needs a
+  `mut` place and a `&mut` borrow; through a reference an `impl FnOnce`
+  is refused (E0507), an `impl FnMut` through a shared one (E0596). Three
+  cases whose `fn call<F: FnMut() -> i64>(f: F) { f() }` rustc refuses
+  (E0596) now say `mut f`.
+- **A call through two references (RT-195).** `(&&c)(1)` and `(&mut
+  &mut g)()` were "cannot call non-function type": a callee is now
+  autoderefed through every reference to a callable, as rustc's (D21.6).
+- **An array constant is a value at each use (RT-214).** `let a = A;`
+  of `const A: [Option<D>; 2]` was refused as a move out of a static;
+  one whose type is not Copy is now made at each use, moved, borrowed
+  and dropped as rustc's temporary (front-rust.md F34.3); a shared
+  borrow of one with no drop glue and no interior mutability is of its
+  static, as rustc promotes it (`&A` returned as `'static`).
 - **An impl is chosen by its whole trait reference** (the trait
   obligation engine's selection, docs/design/obligations.md, M1). Where
   the region checker met an instance's bound `T: Tr<A>`, it chose the

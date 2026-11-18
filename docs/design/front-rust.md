@@ -754,6 +754,126 @@ const_value, eval_array_len`, `front/assoc.vl: inherent_const_value`,
 `front/check/mod.vl: lookup_local`. *Cases:* `rust_f_f34_const_values`,
 `rust_f_f34_const_len_err`, `rust_f_f34_const_hygiene`.
 
+
+**F34.3 (an array constant is a constant).** (0.30.2, RT-214) An array
+constant is held in an immutable static (0.9, `collect_name`), and one
+whose type is Copy is read in place there. One whose type is not Copy
+is made at each use, as F34.2's constants (`inline_array_const`, from
+its value as written, the static item's `x`): each use is a value of
+its own that its user moves, borrows (`C.len()`, `&C[0]`, its
+temporary dropped at the statement's end) and drops, as rustc's
+temporary, never a move out of the static (v0.30.1: `let a = A;` was
+`borrowck.move_out`, "a static"). `C[0]` by value stays E0508. Its
+slice's methods take it as a temporary (`array_const_use`). A shared
+borrow whose place is based on such a use (`&C`, `&C[0]`, `&C[1].k`)
+is of the static when the type has no drop glue and no interior
+mutability, as rustc promotes it to a `'static` (`places/build.vl
+shared_place, promoted_base`; 0.30.2's first try refused `fn r() ->
+&'static [N; 2] { &C }` as a local's, which v0.30.1 accepted). RT-317's
+struct literal and RT-117's literals need a static made for the value,
+not this one. *Anchor:*
+`front/check/names.vl: inline_array_const`, `places/build.vl:
+promoted_const`. *Cases:* `rt_214_const_array_each_use`,
+`rt_214_const_array_index_refused`, `rt_214_const_array_borrow_promoted`.
+
+**F34.4 (a constant's value is a body of its own).** (0.30.2, RT-302,
+RT-279c, RT-407) A `return`, `?`, `break` or `continue` that would leave
+a constant's value is refused, error `const.exit` (rustc E0572, E0268):
+the value of a `const` or `static` item, of an associated constant (an
+impl's, an inherent one, a trait's default), of a local constant, an
+array length or a repeat count, an enum discriminant. It is checked once,
+where the value is written, used or not (`check_const_bodies`, before
+any function is checked, and consteval's own entry points,
+`check_const_expr`, `eval_array_len`, `eval_discriminant`): by the
+value's tree as written (`const_body_exits`, which walks the fields
+`clone_node` copies), so no use, which is a copy of that tree, can bring
+an exit along, and a constant made at each use never leaves the using
+function half way through (a `[C; N]` part built, F35.2). A closure in
+the value is a body of its own (the checker's closure rules); an array
+length or a repeat count in it is one too, out of reach of the value's
+loops; a loop of the value's own may be left by its `break`. a5eefbcae
+refused an exit only where a constant was used, so an unused constant's
+and a value consteval folded past the exit (`true || return`) were
+accepted. Every check of a constant's value goes through
+`check_const_value` (the copies at a use: inline_const,
+inline_array_const, assoc_const_value, inherent_const_value; consteval's
+bodies): the using function's loops are out of reach (`loop_base`), and
+a `return` or `?` of the value, refused already, says nothing more there
+(`const_value`). A function's check is a body of its own wherever it is
+asked from (`check_function`, called inside a value by check_nested for
+a hidden type): it starts with no constant's value, no constant
+expression, every local of its own in reach and no caller's argument
+around it (`const_value`, `const_context`, `env_floor`, `rust_arg`;
+a5eefbcae reset only `loop_base`, and refused mk's own `return` when
+mk's hidden type was asked inside a constant's value). A use of a value
+whose exit is refused gives the exit no target (`find_loop` 0, no loop
+of the using function takes its `break`), and with no error recorded it
+is an internal error (`const_exit_seen`); the walk reaches a loop as the
+checker does (a `loop`'s, a `while`'s and a `for`'s body; a `while`'s
+condition and a `for`'s iterator are outside it, rustc E0590, E0268). *Anchor:*
+`front/check/names.vl: const_body_exits, check_const_bodies,
+check_const_value, const_exit_error`, `front/check/body.vl:
+check_function`. *Cases:* `rt_302_*`, `rt_279c*`, `rt_407*`,
+`rt_148_repeat_const_exit_*`.
+
+### F35 Array repeat
+
+**F35.1 (the value is Copy).** (0.30.2, RT-148) An array repeat `[e;
+N]` with N above 1 copies the value of e into each element, so its type
+must be Copy (`places/regions.vl: rust_copy`, the one Copy test; an
+`impl Trait` is Copy when a bound says so, a type parameter when its
+bounds do): else `error trait.repeat_copy`, rustc's E0277. The test is
+made where the places IR makes the copy (`RV_REPEAT`), so every
+repeat meets it whatever wrote it: a generic body (reported once, for
+the template, as the checker's errors are), a closure, a default
+method, a nested repeat (`[[d; 1]; 2]`: `[D; 1]` is not Copy). N of 1
+moves e into the one element; N of 0 drops e as soon as it is made,
+in a scope of its own, before what follows it (an argument's next, a
+match's arm, a borrow of the array), as Rust does (before 0.30.2 it was
+never dropped). One error for a position, however many instances build
+it (a generic's, a closure's in one). Since 0.28.0 a value that was
+not Copy was copied bitwise and each copy dropped: a double free for a
+Vec, a Drop run N times. *Anchor:* `places/build.vl: expr_into,
+repeat_copy_error`. *Cases:* `rt_148_array_repeat_not_copy`,
+`rt_148_repeat_copy_refused`, `rt_148_repeat_copy_ok`.
+
+**F35.2 (a constant).** (0.30.2) The one other form Rust allows is a
+path to a constant (a free one, an inherent, a trait's or an Ω's
+associated one, a qualified path). Every resolver's result is marked a
+constant's use in one place, `const_use` (NODE_CONST_USE: synth_name for
+a name, synth_path for a path's member), so none has a mark to forget
+(a generic `[T::ZERO; N]` was refused when only some resolvers marked
+it). A constant is made at each use (F34.2), so `[C; N]`, N above 1, of
+a constant whose type is not Copy makes each element from the
+constant: the places IR evaluates it N times in a loop
+(`repeat_each`), into a temporary moved into the destination whole once
+it is made: the first value repeated, which makes the temporary a value
+for the borrow checker, then element i written with a value of its own
+(an assignment that drops nothing, the first's bits being element 0's).
+While the loop runs a guard scope (`EN_GUARD`, `emit_guard`) holds the
+temporary: no exit can reach it, as F34.4 refuses every exit from a
+constant's value where the value is, and one that did would be an
+internal error, never a drop of what may or may not have been made.
+10d65043a filled the destination itself and an exit dropped the first's
+copies (a triple drop, a double free). Without an exit the temporary
+and the destination built in place give the same output (an assignment
+evaluates its value into a temporary first, and the destination is not
+seen meanwhile: `rt_148_repeat_const_dest_seen`), so the construction is
+pinned by the places IR (`rt_148_repeat_const_into_temp`). A panic ends the
+program, no unwinding. Any length: no limit (0.30.2's first form expanded the AST and refused
+more than 4096). A constant whose value calls a function calls it once
+per element, as vole's constants do at each use (rustc computes the
+constant once and copies it, which a `const fn` makes the same). `[C;
+0]` makes nothing from C, as rustc's; `[C; 1]` makes one. A Copy
+constant is repeated as any Copy value. A static's or a constant's data
+asks the same rule where it writes the copies (`consteval.vl
+const_write`, RT-148b): `static B: [D; 2] = [D { k: 1 }; 2];` is
+`trait.repeat_copy`. *Anchor:* `places/build.vl: repeat_needs_copy,
+repeat_each`, `front/check/names.vl: const_use`, `front/consteval.vl:
+const_write`. *Cases:* `rt_148_repeat_const_each`,
+`rt_148_repeat_const_long`, `rt_148_repeat_const_paths`,
+`rt_148_repeat_zero_drops`, `rt_148b_static_repeat_not_copy`.
+
 ## 2. Traits
 
 ### F2 Supertraits
@@ -2423,6 +2543,7 @@ where a `try:` is named, a case in `tests/borrowck-try`'s shape under
 | `trait.overlap` | F4.2 | E0119 | none; the message gives the witness types |
 | `trait.unconstrained` | F14.1 | E0207 | none; names the parameter |
 | `trait.unmet` | F2.3, F10.2, F11.1, F13.2 (none applies), F16.2, F20.4, F22.1 | E0277 | the missing impl's header, or `use` of the trait when an impl exists in a module not in scope |
+| `trait.repeat_copy` | F35.1, F35.2 (0.30.2) | E0277 | none: the help names a constant, the elements, a Vec |
 | `trait.impl_lifetimes` | F5.5 (0.30.1) | E0308, E0195 | none: the trait's lifetimes, written in the impl's signature |
 | `trait.impl_generics` | F5.5 (0.30.1) | E0049, E0276, E0308 | none: the trait's type parameters and bounds, written in the impl |
 | `trait.sealed` | F5.6 (0.30.1) | E0658 (Pattern, Step), a sealed trait | none: one of std's impls |
