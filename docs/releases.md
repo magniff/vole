@@ -100,6 +100,20 @@ A correctness release, its branches merged as each is reviewed clean.
 
 #### Miscompiles fixed
 
+- **A qualified path to a trait's item (RT-C301-8), at every level, in
+  0.30.0 and 0.30.1.** When a type implements two traits that each have
+  a function or an associated constant of one name, a path that names
+  one trait took the other's: `let f = <S as B>::m;` ran `A::m`, and
+  `<S as A>::K` was `B::K`; so did `T::K` and `T::mk()` in an instance
+  of `fn f<T: A>()` whose type also implements B, and `Self::K` in a
+  trait's default function. The checker read the path's trait for a
+  call with a receiver only, and found the value's or the constant's
+  item by its name on the type. Now one function decides the trait of
+  every path's item, from what the path says (`<X as Tr>`, a type
+  parameter's bound, a trait default's own trait), and the item is
+  found in that trait's impl only, with the trait's arguments as
+  written (`<S as Conv<i64>>::c`), for a call, a value and a constant
+  alike (front-rust.md F8.3, F8.4; `front/check/calls/qualified.vl`).
 - **A raw slice parameter taken for a `&[T]` (RT-46), at -O1 and -O2,
   since 0.28.0.** A function's `*const [T]`, `*mut [T]` or `*const
   str` parameter was given the facts of a shared reference: the
@@ -122,6 +136,135 @@ A correctness release, its branches merged as each is reviewed clean.
   and `&mut [T]` parameters keep their facts: the compiler's source
   built at -O2 by 0.30.1 and by 0.30.2 gives the same assembly, byte
   for byte. `--no-noalias` was the workaround.
+- **A path call adjusted its first argument as a method receiver
+  (RT-159), since 0.28.0, unsound from safe code.** `Tr::m(arg)` was
+  made the method call `arg.m()`, whose probe adds and removes
+  references and takes a `&` for a `&mut`: `T0::g(&s)` of a `g(&mut
+  self)` mutated s through a shared reference, `T0::h(s)` of an
+  `h(&self)` borrowed s instead of moving it, and `T0::f(&s)` of an
+  `f(self)` ran S's impl, not `&S`'s. Now a path call is never a method
+  call: Self is the first argument's type as written (the parameter
+  holding Self read against it, `&Self` against a `&S` gives S), and the
+  arguments are checked as any call's, with only the coercions any
+  argument has (`&mut S` where `&S` goes). `&*v` of a view (`&str`,
+  `&[T]`) is the view, as rustc's, so `Show::show(&**self)` in an impl
+  for `&T` calls T's. rustc's errors for the rest: E0277 (`&S: T0`
+  unmet), E0308 (the argument not of the parameter's shape).
+- **A path took another trait's item by its name (RT-C301-8), in safe
+  code.** `Self::K` in a trait's default constant read another trait's
+  or the inherent `K` (0.30.1 printed 200 for rustc's 10), `Self::K` in
+  a default copied into `impl<T: Base> A for T` read Base's, and
+  `<i64 as MyFrom<i32>>::from(x)` or `T::from(x)` under `T: MyFrom<u8>`
+  called std's `From` (an integer widening) instead of the program's
+  trait, and `let b: S = Mk2::mk()`, Self from the expected type, ran
+  Mk's `mk` (RT-325). The trait a path names is decided once, by `path_trait`, and
+  every later step (the item, the impl, the dispatch of a generic
+  trait's call) takes that trait and its arguments; none picks again
+  by the name.
+- **Refused where rustc accepts, fixed with it (RT-C301-9, RT-87):**
+  `<T as B>::m` as a value in a generic function, `<S as Conv<i64>>::c`
+  of a generic trait with two impls for S, `T::mk()` under `T: Tr<i64>`
+  for a type with impls of `Tr<i32>` and `Tr<i64>`, and `<T as B>::Out`
+  beside `<T as A>::Out` in a generic body (one opaque type for both
+  before); `<T as Tr<i64>>::get(t)` under `T: Sub` with `trait Sub:
+  Tr<i64>` (RT-392), and `T::Out` under `T: Sub` read by Sub's
+  supertrait in an instance whose type has another trait's `Out` too
+  (RT-426b). `T::Out` with two bounds declaring `Out` is now E0221
+  (RT-399).
+
+#### What the checkers now refuse
+
+- A path `S::m`, `S::K` or `Self::K` naming a function or constant two
+  traits give S (none inherent, both in scope), and `T::m` or `T::K`
+  of a parameter two of whose bounds declare it: error
+  `method.ambiguous` (rustc E0034), with a `try: <S as A>::m` per
+  trait. 0.30.1 took one of them silently.
+- `T::Out` through two bounds that both declare `Out`: error
+  `type.ambiguous` (rustc E0221); 0.30.1 took the first bound's.
+- `<S as Tr>::f(args)` calls Tr's function with its arguments as
+  written, with no autoref (rustc's); `<S as B>::m` where B declares no
+  `m` is `trait.no_item` (E0576), and one where S has no impl of B is
+  `trait.unmet` (E0277).
+- A qualified path's self type is a type, a name too, read where a
+  type is read: `<W as Conv<bool>>::c(x)`, `<W>::mk()`, `<W as Mk>::C`
+  and `<E as Mk>::f` with W or E generic and written without its
+  arguments are refused as `let x: W` is ("'W' is generic: write its
+  type arguments", rustc E0107), in a generic function's body too,
+  whether or not it is called. v0.30.1 inferred W's arguments for a
+  call (`let x: W<u8> = <W as Mk>::mk()` printed); the branch's first
+  cut chose the impl by the path's trait. `<W<_> as Mk>::mk()`,
+  `<Self as Mk>`, a parameter's `<T as Mk>`, and `<D as Mk>::C` with
+  D's parameters defaulted (D's default instance, refused by 0.30.1)
+  are taken.
+- A supertrait cycle (`trait A: B`, `trait B: A`): error `trait.cycle`
+  (rustc E0391) at the trait's declaration, whether or not a path walks
+  it, and the checking stops there, as rustc's does. A cycle whose
+  arguments grow at each step (`trait A<T>: B<Option<T>>`, `trait B<T>:
+  A<Option<T>>`) made the branch's first cut run without end, a walk
+  keyed by trait and arguments never meeting the same pair twice; the
+  bound that closes a cycle now names no trait after its error, so no
+  walk, in the checker or in a tool that goes on after an error, meets
+  a cycle. A path through supertraits has no depth limit any more (the
+  first cut refused a chain deeper than 8).
+- **No walk of the supertraits has a depth limit, and each meets a
+  trait once (RT-360, RT-353).** `Y::top(y)` under `Y: T33` with
+  `top` declared 34 supertraits down was refused (a cut at 32 read as
+  "no function in the bounds"), and so were a method call, `Y::K` and
+  `Y::Out` 40 down, a bound `Z: T0` proved from `Y: T11` 12 down (a cut
+  at 8), and an impl's bound giving T0's method through 12. Through a
+  supertrait diamond (`trait T_i: T_{i-1} + T_{i-2}`) the time grew
+  exponentially (v0.30.1: 59 s at depth 32; refused from depth 18).
+  One walk, `front::traits::super_closure`, gives a trait's supertraits
+  each once; every walk by trait alone is it (the bounds' functions,
+  `opaque::entails`, `coherence::trait_implies`, the `'static` bounds,
+  an associated type through supertraits), and those that carry the
+  trait's arguments (`qualified::reached_all`, `obligations::elaborate`,
+  the region checker's `super_refs`) meet each (trait, arguments) once.
+  They end because the graph has no cycle: depth 40 of the diamond
+  checks in 0.05 s.
+- `<i64 as MyFrom<i32>>::from(x)` with no `impl MyFrom<i32>`, and
+  `i64::from(x)` where a program's trait gives i64 a `from` beside
+  std's `From`: `trait.unmet` (E0277) and `method.ambiguous` (E0034);
+  a path whose trait is decided calls that trait's function (std's
+  `From` by its intrinsic impls only when the path says `From`), never
+  the first `from` by its name.
+
+A qualified path takes any type before `as` (RT-93): `<<T as A>::B as
+C>::D` (rustfmt's form; 0.30.1 read the `<<` as a shift, a parser
+error, and `volec fmt` glued it to what came before), `< <S as A>::Out
+as C>::K`, `<&S as Tr>::f`, `<W<i64> as Tr>::K`, in a type and in an
+expression; 0.30.1 took only a name in an expression. A `<` or `<<`
+starts a qualified path wherever a type, type arguments or an
+expression can start, decided in three places the parser asks
+(`types::opens_args`, `types::starts_type`, `exprs::starts_expr`): a
+turbofish (`f::<<T as Tr>::A>()`, `M.m::<<<S as A>::B as C>::E>()`,
+`<S as G>::g::<<S as A>::Out>()`), a bound's arguments (`U:
+G<<T as A>::Out>`, `trait A: B<<Self as A>::X>`), a `where` predicate
+(`where <T as A>::Out: B`, RT-356; `where <Self as H>::Out: Conv` on an
+impl, RT-403; `Option<<T as A>::Out>: Default`),
+`return` and `break` values and a range's end (`return <<S as A>::Out as
+B>::D`, `break 'a <S as A>::C`, `0..<S as A>::C`). The same list gives
+`return ..` its value (a RangeFull, as rustc's; it was an empty return).
+`volec fmt` prints each qualified path as written: `<&S as T1>::h`,
+`<[i64] as Z>::z` and `<W<i64> as Conv<bool>>::c` were spaced as
+comparisons (`< W<i64> as Conv<bool >>::c`, and every later line of the
+block indented 4 more), and `id::<<<S as A>::Out as B>::E>` became
+`id::<< <S`. A `<` after a `}` is read by Rust's rule
+(`tools::fmt::layout::statement_braces`): after a block-like
+expression that is an operand (`let c = unsafe { a } < b as i64`, a
+`match`, an `if .. else`) it compares, after one that is a whole
+statement (`if t { .. } <S as A>::g();`, an item) it opens a qualified
+path; a comment before the `<` changes nothing.
+
+How a path picks its trait, in one place
+(`front::check::calls::qualified::path_trait`): `Self::` in a trait's
+default, function or constant, is that trait's (before the bounds of
+an `impl<T: Base> A for T`); a supertrait carries its arguments
+(`trait Sub: Conv<i64>` gives `T: Sub` the items of `Conv<i64>`); `_`
+in a qualified path's trait arguments (`<S as Conv<_>>::mk(x)`,
+`<u8 as TryFrom<_>>::try_from(v)`) is filled from the impls; and a
+`try:` line of `method.ambiguous` is a path that can be pasted, with
+the trait's arguments (`<T as Conv<i32>>::K`).
 
 - **A scan vectorized as a reduction (RT-61), at -O2, in safe code.** A
   value carried from one iteration of a loop to the next and also read
@@ -152,8 +295,197 @@ A correctness release, its branches merged as each is reviewed clean.
   first release that builds the case) to 0.30.1; `--no-vectorize` was
   the workaround.
 
+#### What the checkers now refuse
+
+- **A union's field needs no drop** (RT-43; rustc E0740, `union.field`).
+  A union's field is Copy, a reference (`&mut T` too), std's
+  `ManuallyDrop<T>`, or a tuple or an array of those. Before, a field of
+  any type was accepted, and `u.x = 5; u.p.d = D { v: 3 };`, with no
+  `unsafe`, dropped the old `d` read from the bytes `u.x` wrote (with an
+  owning field, a free of a garbage pointer). A generic union is checked
+  by its opaque instance too: `union U<T> { t: T }` needs `T: Copy`
+  whatever its uses. The fix is the field's type in `ManuallyDrop<..>`,
+  whose value `ManuallyDrop::drop` or `into_inner` takes where the
+  program knows the field holds it. Independently of the declarations, no
+  drop reads a union's field: an assignment's old value under one is
+  never dropped.
+- **An assignment through a union's field reads it** (RT-43, E0133). A
+  place is written without being read only up to its first deref: `u.r.k
+  = v` with `r: &mut P` (also through a Copy struct's reference, a
+  `&mut` tuple, a `&mut &mut P`, `&raw mut u.r.k`) and `u.m.k = v`
+  through a ManuallyDrop's DerefMut read the union's field, and need
+  `unsafe`. They were accepted in safe code: a write through a pointer
+  made of another field's bytes.
+- **A contract's clause writes nothing it did not make, whatever the
+  types are written as** (RT-38f). Every parameter a clause mentions is
+  read through a view, before the body and after it: a parameter whose
+  `&mut` is hidden in an alias (`type R<'a> = &'a mut i64`), an
+  associated type or `self` of `impl Bump for &mut i64` had none after
+  the body, so `ensures { *p = 9; true }` wrote the caller's value (with
+  a `debug ensures`, the output changed with `--debug-contracts`).
+  A view is made only when a name of the clause resolves to the
+  parameter: `ensures { let s = 3; s > 0 }`, a closure's parameter or a
+  match binding named as a by-value parameter the body took read
+  nothing of it.
+- **A clause writes nothing it did not make through a raw pointer**
+  (RT-38g, `contract.effect`), judged by where the pointer comes from.
+  A pointer made of a `&mut` of the clause's own local is a `&mut`
+  write, which the borrow checker and the views police: std's `take`,
+  `swap`, `sort`, `iter_mut`, `mem::replace` on a clause's locals, and
+  `o.iter().all(..)` on an `Option`, are accepted. A pointer from a
+  parameter (`poke(p)`, `a.as_ptr() as *mut i64`, a struct, a Vec, a
+  Box, a HashMap holding one) writes the caller's memory, and one of
+  unknown provenance (`addr as *mut i64` of an integer that is not a
+  constant, a static's or a thread-local's pointer, a union's field, a
+  C function's) unknown memory: both are refused, in the clause, its
+  `old(..)` and whatever it calls, a fn value, a trait method or a
+  closure. A `&mut` made from a raw pointer is a write through it,
+  whatever form it takes: `&mut (*sp)[..]`, `&mut (*p).0[..]`,
+  `slice::from_raw_parts_mut(p, n)`, `&mut *sp` of a `*mut str`, a
+  `&mut self` receiver `(*p).m()`, a `ref mut` binding. A read through
+  a raw pointer is allowed, and so is C given a `*const` source:
+  `ptr::copy_nonoverlapping(p, &raw mut own, n)` writes only its
+  destination. `query effects F --why raw_write` shows the chain
+  (`raw_src`: where a pointer of unknown provenance is made).
+- **A clause touches no thread-local static** (RT-199) and **`old(e)`
+  is effect-checked** (RT-198): `ensures old(say()) == 1` with `say`
+  printing was accepted.
+
 #### Soundness holes closed
 
+- **A `&mut` behind a `&` cast to a raw pointer or a `&mut` (RT-197),
+  every -O, since 0.28.0.** `h.r as *mut i64` with `h: &H` and `r: &'a
+  mut i64` was accepted, and a write through the pointer changed `x`
+  behind a shared reference; `h.r as &mut i64` made a second `&mut` in
+  safe code, and a mutable view coerced or cast to a raw one (`let p:
+  *mut [i64] = h.s;`, `h.s as *mut [i64]`) was the same. The coercion
+  `let p: *mut i64 = h.r` was refused: it was lowered as rustc's `&raw
+  mut (*h.r)`, whose borrow is asked, while a cast read its operand by
+  copying the reference, which only the loan check knew for a write.
+  Now one function (places/build.vl `exclusive_read`) decides what
+  every read of an exclusive reference as another pointer is, a
+  coercion's and a cast's alike: its reborrow of the kind the target
+  asks, `&raw mut`, `&raw const`, `&` or `&mut` (a view's `slice
+  Q[..]`), each refused as its borrow is (rustc E0596) through a field,
+  a tuple field, an index, a Box, a Deref, a closure's capture and a
+  `&&mut`. The checker of the places IR (`--verify-places`) no longer
+  lets a copy of a `&mut` into a raw pointer pass, and the loan
+  check's second rule for it is gone. The position does not matter: a
+  block's tail, an if's arms, a match arm, a closure's result, an array
+  element, `Some`, a tuple, a `*mut [i64]` argument, `*r as *mut i64` of
+  an `r: &&mut i64`, an index of a `&[&mut [i64]]` (RT-284), an array
+  repeat `[h.r; 2]` and a closure's `return h.r` (RT-314), a loop's
+  `break h.r`, a closure's match arm and `a[0] = h.r` (RT-366) are each the
+  operand the coercion reads, so each is its reborrow.
+- **A `&mut` behind a `&` was usable as the `&mut` through `*&` (RT-321),
+  every -O, since v0.30.1 at least.** `k(&y)` with `y: &mut S` and `fn
+  k(x: &mut S)` mutated through the shared borrow, and so did `k(*&y)`,
+  `let w: &mut S = *&y` and `(*&y).k += 1`. The place of `*&x` was
+  folded to x for any borrow, so the `&` was lost; now only `&mut x` and
+  `&raw` are folded, and `*&y` is a place behind a `&`: the checker's
+  `*` of `&y` (where `&mut S` goes) and each written form is refused,
+  `borrowck.borrow_immutable` or `borrowck.assign_immutable` (rustc E0308
+  for `k(&y)`, E0596/E0594 for the rest). Reads through `*&y` still
+  build.
+
+- **The results of partition_in and unzip_in kept no borrow of their
+  items (RT-211, RT-261, RT-267, RT-268, RT-237b, RT-283, RT-387,
+  RT-387f, RT-388, RT-99, RT-404), every -O,
+  since 0.28.0.** `let (a, b): (Vec<&i64, Gpa>, ..) =
+  v.iter().partition_in(.., gpa); drop(v);` and then reading a was a
+  use after free from safe code; `unzip_in` the same, and so a program's
+  collector called with `&v` (`fn f<C: IntoIterator, B: From<C::Item>>`,
+  `Extend<C::Item>`, `FromIteratorIn<C::Item, A>`, `<C::IntoIter as
+  Iterator>::Item`), a result tied to its argument only by std's blanket
+  `impl<T, U: From<T>> Into<U> for T`, and an impl's own bound proved by
+  an impl whose trait argument is `'static` (`impl<'a, T: Conv<W<'a>>>
+  Tr for H<'a, T>` with `impl Conv<W<'static>> for i64`: 'a was never
+  'static). A call's result regions are tied to its arguments by the
+  callee's predicates, read through the impl that proves each, and three
+  readings tied nothing: a `where` predicate on a subject other than a
+  type parameter (unzip_in's `Self: Iterator<Item = (X, Y)>`) was never
+  read; a projection `C::Item` was normalized only through a direct impl
+  or one blanket impl, never a pattern impl (`impl<'a, T, A> IntoIterator
+  for &'a Vec<T, A>`), so it read as elided; and an impl's trait
+  arguments and its nested obligations were not related to the bound's,
+  so a slot only the impl names (`'static`, or a parameter the header
+  does not bind, `U` of the Into blanket) was lost. Now every predicate
+  of the signature, on a parameter, `Self`, a projection or any type, is
+  read by one function (places/regions.vl `subject_ties`), through the
+  impl `front::obligations::select` chose for its whole reference, the
+  one chooser; that
+  impl's trait arguments are the bound's slot by slot, and its nested
+  obligations are met the same way, recursively, as rustc's confirmation
+  (`impl_bound_ties`, `arg_ties`). A lifetime of the impl its header does
+  not name (`impl<'a, T: Copy> Extend<&'a T> for Vec<T>`) is bound to the
+  bound's slot for the impl's own predicates and relates to nothing else
+  (so `impl<'a: 'static> From<W<'a>> for i64`, met through the Into
+  blanket, makes `go<T: Into<i64>>(W { r: &v })`'s borrow 'static:
+  refused, RT-99, accepted since v0.30.1; 0.30.2's first fix tied it to all, refusing `words.iter()
+  .partition_in(..)` of `Vec<&'static str>` and a dropped `words`, which
+  v0.30.1 and rustc build); one neither the header nor the trait
+  arguments name (`'a` of std's `impl<'a, T: Copy + 'a, I: Iterator<Item
+  = &'a T>> Iterator for Copied<I>`) is one region of its own that the
+  impl's nested obligations relate. Its associated-type equalities are
+  met too (`impl<'a, T: Get<Out = W<'a>>> Tr for H<'a, T>` with only
+  `type Out = W<'static>`: 'a is 'static, RT-388, a use after free
+  before), and so are its `where` predicates on a subject that is no
+  parameter of it (`where i64: Conv<W<'a>>`, `where T::K: ..`: kept on
+  the impl by the parser, never read before). Every projection of a
+  signature, `C::Item`, `Self::Item`, a qualified `<C as
+  IntoIterator>::Item` or `<C::IntoIter as Iterator>::Item`, is
+  normalized before the walk through the impl `select` chose for its
+  whole reference (`warm_projections`, `norm_proj`), and the impl's own
+  projections again the same way (Zip's `type Item = (A::Item,
+  B::Item)`, Enumerate's `(usize, I::Item)`: `norm_nested`). Before, a
+  qualified projection, a projection inside an impl's value and one no
+  impl was found for by its name were read as elided: the result was
+  given to the only reference parameter, `fn nth<I: Iterator>(i: I, k:
+  &usize) -> Option<<I as Iterator>::Item>` kept k borrowed and not
+  `v.iter()` (RT-387, a use after free; a method's, `fn first<C:
+  IntoIterator>(&self, c: C) -> Option<C::Item>`, kept self borrowed and
+  not c, RT-387f), and one with no reference
+  parameter was refused as an elision (RT-389, which rustc builds); `T::Out`
+  under `T: Tr<i64>` was read from `Tr<i32>`'s impl (RT-86). Where no
+  impl normalizes a projection (none, two, the limit), every region of
+  its base is one region and the projection's slot that one, never
+  elided and never an impl picked by its name. `I: Iterator<Item = (X,
+  Y)>` with I a Zip of two borrows now keeps X and Y apart (the first fix
+  made them one region and refused dropping the other vector, which
+  v0.30.1 and rustc build). A reference an impl's nested obligations
+  meet is met once per signature (keyed by the trait, the type, its
+  arguments and type parameters, and the regions it is met with): two
+  bounds per level, `impl<T: Tr + Tr2> Tr for W<T>`, proved the level
+  below again and again in the places, doubling per level (RT-404's
+  places half; its front half is the obligation solver's). A program's own collector, `fn f<I: Iterator, B:
+  DefaultIn<A> + Extend<I::Item>>(it: I, a: A) -> B` (and `(B,)`, `(B,
+  B)`, `Pair<B>`, `Option<B>`), refused in its own body since 0.30.1
+  (RT-225), builds, and its result keeps the borrow at the caller
+  (RT-225b); so does a default method with a `where Self:` predicate, a
+  fn that returns what partition_in or unzip_in made (RT-237, RT-237b),
+  and a fn whose result is a projection, `-> Option<C::Item>` (RT-265,
+  refused before as an elision). A `where` predicate on a compound type
+  met by an impl with lifetime bounds (`where V<T>: Sup`, `where X<'a>:
+  Sup` with `impl<'a: 'static> Sup for X<'a>`) is assumed in the fn's
+  body and proven at the call, as rustc does (RT-C301-11's compound
+  form; 0.30.1 refused the body). An impl parameter bound only by
+  another's Fn bound's output, B of `impl<B, I: Iterator, F:
+  FnMut(I::Item) -> B> Iterator for Map<I, F>`, is read as rustc's
+  `<C as FnOnce>::Output`, through the closure C's own signature
+  (`fn_output_slot`): the closure's capture is in B only when its result
+  borrows it (`.map(|_x| &w[0])` keeps w borrowed, a use after free in
+  0.30.1), so `first(v.iter().map(|x| { w.len(); x }))` (and FilterMap,
+  MapWhile, Scan, an enumerate after it) keeps v borrowed and not w, as
+  rustc; this release's first fix took every region of the Map and
+  refused dropping w. An F that is an fn item or an fn pointer is read
+  by its type's elision, as a call through an fn value is (a vole fn
+  type carries no regions): B is the bound's only input region, or
+  'static with none (`MyMap { i: v.iter(), f: id }` keeps v borrowed,
+  a use after free in 0.30.1, and not another borrow the adapter holds);
+  an fn item that returns `&'static` from a reference input is still
+  read as borrowing it, as a direct call through the fn value is (since
+  0.30.1, rustc builds both). A for loop over a program's adapter of an adapter
+  whose item holds a reference builds (RT-106, refused since 0.28.0).
 - **A frame larger than the guard page stepped over it** (RT-83, every
   release before, every level, both arches). The prologue moved sp by
   the whole frame at once and touched none of the pages in between, so
@@ -221,6 +553,11 @@ A correctness release, its branches merged as each is reviewed clean.
   integer variables' decisions read them all, and one it lacked typed a
   literal another way than `volec check` did (`x.hash(&mut h)` hashed an
   i32 where `let y: i64 = x` followed; found while making this release).
+- **`#[derive(Clone)]` of a generic struct with a reference for T
+  (RT-212, its derive form).** `Rep { v: &w }.clone()` was refused in
+  the derived body, whose `Clone::clone(&self.v)` took the method
+  probe's auto-deref and called W's clone for a `&W` field; the path
+  call now takes Self from its argument as written (RT-159), `&W`.
 
 - **An impl is chosen by its whole trait reference** (the trait
   obligation engine's selection, docs/design/obligations.md, M1). Where
@@ -259,6 +596,25 @@ A correctness release, its branches merged as each is reviewed clean.
   resolve proves nothing. An impl's bound naming `Self` (`impl<U:
   Conv<Self>> Tr<U> for W`) is read with Self the impl's type, wherever
   it is asked from.
+- **A closure in a generic Drop impl's instance** (RT-44): `impl<T> Drop
+  for W<T> { fn drop(&mut self) { thread::scope(|s| { s.spawn(|| 1i64);
+  }); } }` made the compiler panic (places/regions.vl, index out of
+  bounds), and so did such a closure in what only that `drop` calls (a
+  generic function, a trait's default method, a generic trait's impl
+  method). The instance is made while the bodies are built, after every
+  closure's kind and signature slots were decided, and its closures had
+  none; one whose body moved a capture kept it borrowed and dropped the
+  value twice. They now get both, and their bodies are built before the
+  bodies that make them.
+- **A closure whose result holds another closure** (RT-91):
+  `w.iter().flat_map(|y| v.iter().map(move |x| x * y))`, a closure
+  returning an Option, a tuple or a struct holding a `map` or `filter`
+  closure, made the compiler panic (places/regions.vl, index out of
+  bounds). A closure type's region slots include its signature's, which
+  were made in the closures' order, the outer before the inner one it
+  holds; each closure's slots are now made on demand, after those of
+  every closure its signature and type hold (visited once, at any
+  depth: a closure in 15 nested one-tuples, RT-91c).
 
 #### What the checkers now refuse
 
@@ -786,6 +1142,7 @@ none at 0.30.0's tag; the census's own cases went from 712 to 705).
   same name, a qualified path used as a value takes one trait's for
   both: `let f = <S as B>::m;` runs `A::m`, and `<S as A>::K` is `B::K`.
   A call through the path, `<S as B>::m(&s)` or `B::m(&s)`, is right.
+  Fixed in 0.30.2 ("What's new in 0.30.2", Miscompiles fixed).
 - **Unsound in safe code:**
   - indexing a raw slice pointer (`*mut [T]`, `*const [T]`) needs no
     `unsafe` (RT-39);

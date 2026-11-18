@@ -732,7 +732,7 @@ shared one goes and no call takes it, a `let` with a type, an
 assignment, a struct's or a variant's field, an array element, a result
 (`let b: &[T] = s;`, `b = s;`, `H { b: s }`, `let u: &str = t;`, `let
 k: &i64 = r;`), is its shared reborrow, `_t = &(*Q)` or `_t = slice
-Q[..]` (build.vl operand, shared_coercion). Before, the place was copied
+Q[..]` (build.vl operand, exclusive_read). Before, the place was copied
 with no loan, Copy as its shared type is: a write through `s` while `b`
 lived was accepted (a use after free; a live `&str` changed by
 `make_ascii_uppercase`). A `let` with a type whose initializer is a place
@@ -1858,10 +1858,15 @@ closure the region is instantiated fresh (D3.6, D4.3), as it should be.
   being a reborrow of the other, and the reborrow's region is bounded
   by the outer reference's (`'q : 'new`). (0.30.1) Nor a whole mutable
   view, with no exception: given to a call, into a shared view or
-  `&T` (shared_coercion, the hidden binding of a format hole, a typed
-  `let`), it is reborrowed; only a copy into a raw pointer (R1, a cast
-  or a coercion, an access of the reference's kind) and a `requires`
-  companion's read (C3.2) are no reborrow. verify_mut_copies asserts
+  `&T` (exclusive_read, the hidden binding of a format hole, a typed
+  `let`), it is reborrowed; only a `requires` companion's read (C3.2)
+  is no reborrow. (0.30.2, RT-197) Into a raw pointer too, by a cast or
+  a coercion: `w as *mut W` is `&raw mut (*w)`, `as *const W` `&raw
+  const (*w)`, a mutable view `slice Q[..]` marked `&mut`, and `r as
+  &mut T` `&mut (*r)`, each asked as its borrow is (E0596 behind a
+  `&`); before, a cast copied the reference and only the loan check
+  knew it for a write, so `h.r as *mut i64` of an `h: &H` wrote behind
+  a shared reference. verify_mut_copies asserts
   it of every body the runner builds (`--verify-places`); the
   exemptions it had for views (a call's argument, an intrinsic's, a
   shared destination) hid `f(s, s)`, `let b: &[T] = s;` with a write
@@ -2676,6 +2681,25 @@ decided by where `'a` and `'v` are:
    bounds (D4.5: a capture field `&'cₖ τₖ` gives `'t ⊒ 'cₖ` over the
    universals of `F`'s substitution), and D19.5's call rule includes
    them in the callee's order.
+
+(0.30.2, RT-44) The closures a body made while the bodies are built
+(the `drop` instance of a generic Drop impl, made where a value of its
+type is dropped, places/shim.vl drop_fn, with what it calls: a generic
+function, a trait's default method, a generic trait's impl method, a
+const's initializer) get D19.1-D19.6 as every closure does, and their
+bodies are built before the bodies that make them, innermost first:
+`places/mod.vl: place_late_closures`, after every body run_places
+builds. Before, they had no `X_C` (a closure's signature indexed
+`CSLOTS` past its type's slots: a compiler panic) and no D19.2 (a
+capture its body moved stayed a borrow: a double drop). Cases
+`rt_044_*`.
+(0.30.2, RT-91) A closure type's slots are its env's and its `X_C`
+(`slot_count`), so a closure's `X_C` is made after the `X_C` of every
+closure its signature or its env holds (`front/closures/kinds.vl:
+sig_slots_ordered`, depth first over the types). Before, they were made
+in the closures' order, and an outer closure made before the inner one
+its result holds (`flat_map(|y| v.iter().map(|x| ..))`) counted the
+inner type's slots without them. Cases `rt_091_*`.
 
 *Soundness.* No position of `slots(Env(C))` is contravariant (a `fn`
 type has no slot, R6); `X_C`'s have `fn` variance. Every later value
