@@ -1,5 +1,5 @@
 #!/bin/sh
-# XFAIL: RT-493: `check` time doubles with each level of a supertrait diamond with a type argument (`trait T_i<X>: T_{i-1}<X> + U_{i-1}<X>`, `trait U_i<X>: T_{i-1}<X> + U_{i-1}<X>`) when `fn k<X: T26<u8>>(x: &X)` calls `need(x)` under `U: T0<u8>` (impl_bound_ties, exponential): 26 levels take about 15 s of CPU on the release build, 24 levels 3.4 s; v0.30.1 refuses it ("the trait 'T0<u8>' is not implemented for 'X'"); rustc builds it in 0.13 s (0.30.2)
+# RT-493 (closed in 0.30.2, was XFAIL): `check` time doubles with each level of a supertrait diamond with a type argument (`trait T_i<X>: T_{i-1}<X> + U_{i-1}<X>`, `trait U_i<X>: T_{i-1}<X> + U_{i-1}<X>`) when `fn k<X: T26<u8>>(x: &X)` calls `need(x)` under `U: T0<u8>` (impl_bound_ties, exponential): 26 levels take about 15 s of CPU on the release build, 24 levels 3.4 s; v0.30.1 refuses it ("the trait 'T0<u8>' is not implemented for 'X'"); rustc builds it in 0.13 s (0.30.2)
 # From the review of g302elab (its gen/diam.py, mode args). RT-353 is a
 # diamond without type arguments and a method call (front::obligations).
 # Measured in CPU time (user + system), so that the machine's load does not
