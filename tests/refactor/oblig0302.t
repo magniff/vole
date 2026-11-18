@@ -13,7 +13,7 @@ ok: built d
 ## depth: the places' limit lowered to 2; the same chain is trait.overflow
 ## there:
 % VOLE_PLANT_OBLIG=depth VOLE_CACHE=off volec check depth.vl 2>&1 | cut -c1-120
-depth.vl:14:19: error[trait.overflow] 'R: Tr' is not proved: the impls that would prove it need it again, deeper than 32
+depth.vl:14:19: error[trait.overflow] 'R: Tr' is not proved: the impls that would prove it need it again, deeper than 12
 ## Two impls of Tr for W<'a> are refused by coherence:
 % VOLE_CACHE=off volec check overlap.vl 2>&1 | cut -c1-120
 overlap.vl:9:1: error[trait.overlap] conflicting impls of trait 'Tr': this impl and an earlier one apply to the same typ
