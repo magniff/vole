@@ -15,7 +15,6 @@ use crate::front::check::check_mode::{check_expr, check_shift_amount};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::mark_no_read;
 use crate::front::check::vectors::vector_operator_ok;
-use crate::front::check::widen::takes_context;
 use crate::front::closures::note_local_write;
 use crate::front::distinct::strip_distinct;
 use crate::front::lexer::Tok;
@@ -103,34 +102,14 @@ pub fn check_assign(n: i64, pcx: &mut Ctx<Comp>) {
             None => {}
         }
     }
-    // RULE: F18.5 (c) (an open local assigned: by an untyped literal it
-    // stays open, by a value of a definite type it takes that type)
-    let mut open: i64 = -1;
-    if pcx.open_lets.len() as i64 > 0 && op != Tok::ShlEq && op != Tok::ShrEq
-        && pcx.nodes[target as usize].kind == Ident {
-        // (an open tuple or array takes a value of a definite type too,
-        // `kv = e.remove_entry()`; only an integer one a literal)
-        // (0.28.0: so does a tree of literals and open locals, `s += x`,
-        // one variable with them: open_group)
-        let lit = crate::front::check::literals::open_value(value, pcx);
-        open = if lit { crate::front::check::literals::open_scalar(target, pcx) }
-            else { crate::front::check::literals::open_local(target, pcx) };
-        // (`s += f()?` too: a `?` takes no type from its target)
-        if open >= 0 && !lit
-            && pcx.nodes[value as usize].kind != NodeKind::Try && takes_context(value, pcx) {
-            open = -1;
-        }
-    }
     let outer = pcx.assigning;
     pcx.assigning = n;
     let outer_place = pcx.mut_place;
     pcx.mut_place = target;
-    pcx.open_keep = open >= 0;
     let target_ty = synth_expr(target, pcx);
     // RULE: D2.7 (0.30.1: each slicing on the target's path a mutable one,
     // `a[1..][0][0] = 9`, rust::mut_slicing)
     crate::front::check::rust::mut_slicing(target, pcx);
-    pcx.open_keep = false;
     pcx.mut_place = outer_place;
     pcx.assigning = outer;
     crate::front::check::rust::const_write(target, false, pcx);
@@ -149,46 +128,6 @@ pub fn check_assign(n: i64, pcx: &mut Ctx<Comp>) {
         type_error(target, c"invalid assignment target", pcx);
     }
     check_mutable_place(target, pcx);
-    if open >= 0 && crate::front::check::literals::open_value(value, pcx)
-        && !crate::front::check::literals::open_literal(value, pcx) {
-        // (the tree checked, its open locals kept, and typed with the local;
-        // its literals checked to fit when it is: `i += 1 << 31`)
-        let saved_init = pcx.open_init;
-        pcx.open_init = value;
-        pcx.open_keep = true;
-        synth_expr(value, pcx);
-        pcx.open_keep = false;
-        pcx.open_init = saved_init;
-        crate::front::check::literals::open_record(
-            crate::front::check::literals::open_local(target, pcx), value, pcx);
-        return;
-    } else if open >= 0 && crate::front::check::literals::open_literal(value, pcx) {
-        // (the literal typed with the local)
-        crate::front::check::literals::open_record(
-            crate::front::check::literals::open_local(target, pcx), value, pcx);
-    } else if open >= 0 {
-        let vt = synth_expr(value, pcx);
-        // (`s += x` of an `x: &i64` reads through it, as the operator does)
-        let through = if vt > 0 && pcx.types[vt as usize].kind == TyKind::Ptr
-            && pcx.types[vt as usize].b != 0
-            && is_integer(pcx.types[vt as usize].a) { pcx.types[vt as usize].a } else { vt };
-        let tt = crate::front::check::literals::open_settle(target, through, pcx);
-        if op != Tok::Eq && !is_numeric(tt) {
-            type_error_got(n, c"compound assignment requires numeric type", tt, pcx);
-        }
-        let kind = pcx.nodes[value as usize].kind;
-        if kind == Ident || kind == NodeKind::FieldAccess || kind == NodeKind::TupleField
-            || kind == NodeKind::Index || kind == NodeKind::Call || kind == NodeKind::MethodCall
-            || kind == NodeKind::Path || kind == NodeKind::Cast {
-            // (the value checked as check_expr would, from its type)
-            pcx.nodes[value as usize].p |= NODE_CHECKED;
-            check_expr(value, tt, pcx);
-        } else if vt != tt && vt != TY_NEVER && vt != pcx.ty_error && tt != pcx.ty_error
-            && !crate::front::check::widen::try_widen(value, vt, tt, pcx) {
-            crate::front::check::mismatch_error(value, tt, vt, pcx);
-        }
-        return;
-    }
     if op == Tok::Eq {
         // RULE: D3.6a (0.27.7: a place declared `*mut T` takes no `&T`)
         let saved_raw = pcx.raw_mut_at;
@@ -201,12 +140,38 @@ pub fn check_assign(n: i64, pcx: &mut Ctx<Comp>) {
     // RULE: F26.1, F26.2 (0.27.2: `a += b` of a non-number is
     // `AddAssign::add_assign(&mut a, b)`, every `op=` alike)
     if !is_numeric(strip_distinct(target_ty, pcx))
-        && !is_vector(target_ty, pcx) {
+        && !is_vector(target_ty, pcx) && !crate::front::check::infer::int_free(target_ty, pcx) {
         crate::front::check::synth_mode::require_op_bound(n, target, op, true, pcx);
         if crate::front::traits::rust_op_trait(op, target_ty, true, pcx) >= 0 {
             op_assign_call(n, pcx);
             return;
         }
+    }
+    // RULE: F18.5 (0.30.2: a place of an integer variable's type: the
+    // value's integer type and the variable are unified, `s += x`; `s += r`
+    // of an `r: &i64` reads through it, as the operator does)
+    if crate::front::check::infer::int_free(target_ty, pcx) {
+        if op == Tok::ShlEq || op == Tok::ShrEq {
+            check_shift_amount(value, pcx);
+            return;
+        }
+        let vt = synth_expr(value, pcx);
+        let through = if vt > 0 && pcx.types[vt as usize].kind == TyKind::Ptr
+            && pcx.types[vt as usize].b != 0
+            && crate::front::check::infer::int_like(pcx.types[vt as usize].a, pcx) {
+            pcx.types[vt as usize].a } else { vt };
+        if vt == TY_NEVER || vt == pcx.ty_error {
+            return;
+        }
+        if !crate::front::check::infer::int_like(through, pcx)
+            || !crate::front::check::infer::unify(target_ty, through, pcx) {
+            crate::front::check::mismatch_error(value, target_ty, vt, pcx);
+        }
+        if through != vt {
+            pcx.nodes[value as usize].p |= NODE_CHECKED;
+            check_expr(value, crate::front::check::infer::resolve(target_ty, pcx), pcx);
+        }
+        return;
     }
     if op == Tok::ShlEq || op == Tok::ShrEq {
         // (0.18: a distinct type as its underlying type)
