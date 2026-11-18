@@ -112,6 +112,7 @@ map_code() {
         E0510) echo guard_write ;;
         E0796|static_mut) echo static_mut_ref ;;
         E0793) echo packed_ref ;;  # (0.30.1, D2.10)
+        general) echo fn_value_bound ;;  # (0.30.2, R6: "implementation of `Fn*` is not general enough", a callable whose result borrows the bound's elided input)
         *) echo "?$1" ;;
     esac
 }
@@ -174,6 +175,7 @@ for case_ in "$@"; do
         first=$(awk '/^error\[E0277\]: .* between threads safely/ { print "auto"; exit }
             /^error\[E[0-9]+\]/ { print substr($0, 7, 5); exit }
             /^error: lifetime may not live long enough/ { print "lifetime"; exit }
+            /^error: implementation of `(Fn|FnMut|FnOnce)` is not general enough/ { print "general"; exit }
             /^error: captured variable cannot escape/ { print "captured"; exit }
             /^error: creating a (shared|mutable) reference to mutable static/ { print "static_mut"; exit }
             /^error: / && !/^error: aborting/ { print "other"; exit }' "$WORK/out")
@@ -192,9 +194,19 @@ for case_ in "$@"; do
             gotcode=opaque.mismatch
         fi
         # (0.30.1, D4.7: E0308, "one type is more general than the
-        # other", where a function needing a 'static parameter is a value)
-        if [ "$want" = fn_value_static ] && [ "$first" = E0308 ]; then
+        # other", where a function needing a 'static parameter is a value;
+        # 0.30.2: E0597 where rustc carries that 'static to the argument
+        # the value is called with, which vole cannot through the erased
+        # `fn` type and refuses at the value: borrowck.md D4.7)
+        if [ "$want" = fn_value_static ] && { [ "$first" = E0308 ] || [ "$first" = E0597 ]; }; then
             gotcode=fn_value_static
+        fi
+        # (0.30.2, R6: E0308, "one type is more general than the other",
+        # a fn item whose result borrows the bound's elided input given for
+        # it, as rustc's type check reports it)
+        if [ "$want" = fn_value_bound ] && [ "$first" = E0308 ] \
+            && grep -q 'one type is more general than the other' "$WORK/out"; then
+            gotcode=fn_value_bound
         fi
     fi
     msg=$(awk '/^error/ && !/^error: aborting/ { print; exit }' "$WORK/out" | cut -c1-120)
