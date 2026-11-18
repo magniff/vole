@@ -1,4 +1,3 @@
-## XFAIL: RT-TL-7: checking a function takes cubic time in its number of lets (open)
 ## main.vl: one function of 3000 `let x = x + 1;` (57 KB). `volec check`:
 ## 1000 lets 0.74 s, 2000 8.9 s, 3000 20.1 s, 5000 more than 60 s, all
 ## in the `check` phase (--time-passes); distinct names (`let xI = I;`)
