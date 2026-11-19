@@ -1705,9 +1705,29 @@ fn remake_calls(pcx: &mut Ctx<Comp>) {
 }
 
 // RULE: F18.6 (a method call or a field on a bare variable) The type is not
-// known: the `type.infer` of the call that made variable v.
+// known: the `type.infer` of the call that made variable v. (0.30.2: a
+// variable whose record reports nothing, one standing for a projection
+// that waits for an integer variable, `f(2) as i32` or `f(2) == 1i32` of
+// `f<T: Tr>(t: T) -> T::Out`, which has its integer's record: rustc's
+// E0282 at the call that made it; never the jump with nothing said, which
+// left the statement out of the program. A projection settled with no
+// type, `i64::Out` with no impl of Tr for i64, said so: no second error.)
 pub fn unknown_error(v: i64, pcx: &mut Ctx<Comp>) -> ! {
-    report_rec(pcx.nodes[pcx.types[v as usize].b as usize].x - 1, pcx);
+    let r = pcx.nodes[pcx.types[v as usize].b as usize].x - 1;
+    // (VOLE_PLANT_OBLIG=unknown, tests only: the jump with nothing said)
+    if (r < 0 || !report_rec(r, pcx)) && pcx.plant_oblig != 7 {
+        let k = dep_record(v, pcx);
+        if k < 0 || pcx.infer_deps[k as usize] > 0 || pcx.error_count == 0 {
+            let saved = pcx.err_kind;
+            pcx.err_kind = c"type.infer";
+            crate::base::diag::err_begin(if k >= 0 { pcx.infer_deps[(k + 3) as usize] }
+                else if r >= 0 { pcx.infer_recs[(r + 1) as usize] } else { 0 }, pcx);
+            crate::base::diag::err_str(c"type annotations needed: this value's type is not known where it is used (rustc E0282)", pcx);
+            crate::base::diag::err_help(c"its type waits for an integer literal's, which no use has given yet: write the literal's type, `2u8`, or the value's, `let r: i64 = f(2);`", pcx);
+            crate::base::diag::err_end_soft(pcx);
+            pcx.err_kind = saved;
+        }
+    }
     crate::base::diag::err_jump(pcx)
 }
 
@@ -1902,8 +1922,42 @@ pub fn dependent(v: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
     d
 }
 
-// Each variable standing for a projection whose variable is solved to a
-// type with no free one takes the projection's type.
+// (fn_instance) The mark of the projections that wait made from here on.
+pub fn deps_mark(pcx: &Ctx<Comp>) -> i64 {
+    pcx.infer_deps.len() as i64
+}
+
+// RULE: F18.6 (0.30.2) The projections that wait made since mark, those of
+// the signature of an instance made with a variable, `-> T::Out` of `f(2)`,
+// are the call's: settled, and reported (settle_dep, rustc's E0271), at
+// the call's position pos, never at the signature's text.
+pub fn deps_at(mark: i64, pos: i64, pcx: &mut Ctx<Comp>) {
+    let mut i = if mark > pcx.infer_dbase { mark } else { pcx.infer_dbase };
+    while i + 3 < pcx.infer_deps.len() as i64 {
+        pcx.infer_deps[(i + 3) as usize] = pos;
+        i += 4;
+    }
+}
+
+// (unknown_error) The record of the projection that variable d stands for
+// (dependent), its index in INFER_DEPS, -1 when d stands for none.
+fn dep_record(d: i64, pcx: &Ctx<Comp>) -> i64 {
+    let mut i = pcx.infer_dbase;
+    while i + 3 < pcx.infer_deps.len() as i64 {
+        if pcx.infer_deps[i as usize] == d || pcx.infer_deps[i as usize] == -d {
+            return i;
+        }
+        i += 4;
+    }
+    -1
+}
+
+// RULE: F18.6 (0.30.2) Each variable d standing for a projection
+// `v::name` whose variable v is solved to a type with no free one is the
+// projection's type: unified with it (settle_dep), whether d is still free
+// or a use gave it a type first (`let s: i32 = r`). A record settles once:
+// its variable's slot is negated before its projection is read, so a
+// unification that reading makes, which settles again, passes over it.
 fn settle_deps(pcx: &mut Ctx<Comp>) {
     let mut changed = true;
     while changed {
@@ -1912,14 +1966,63 @@ fn settle_deps(pcx: &mut Ctx<Comp>) {
         while i + 3 < pcx.infer_deps.len() as i64 {
             let d = pcx.infer_deps[i as usize];
             let base = resolve(pcx.infer_deps[(i + 1) as usize], pcx);
-            if is_free_var(d, pcx) && !mentions(base, false, pcx) {
-                let t = crate::front::assoc::projection(base, pcx.infer_deps[(i + 2) as usize],
-                    pcx.infer_deps[(i + 3) as usize], pcx);
-                if t > 0 && t != pcx.ty_error && bind(d, t, pcx) {
+            if d > 0 && !mentions(base, false, pcx) {
+                pcx.infer_deps[i as usize] = -d;
+                let name = pcx.infer_deps[(i + 2) as usize];
+                let pos = pcx.infer_deps[(i + 3) as usize];
+                let t = crate::front::assoc::projection(base, name, pos, pcx);
+                // (VOLE_PLANT_OBLIG=settle, tests only: a variable a use gave
+                // its type is passed over, the rule before 0.30.2's fix)
+                if t > 0 && t != pcx.ty_error
+                    && (pcx.plant_oblig != 6 || is_free_var(d, pcx)) {
+                    settle_dep(d, t, base, name, pos, pcx);
                     changed = true;
                 }
             }
             i += 4;
         }
     }
+}
+
+// RULE: F18.6 (0.30.2, the re-review of the obligations, y01/y02) The
+// variable d standing for `base::name` meets the projection's type t:
+// unified with it. A use that gave d its type before base was known, `let
+// s: i32 = r` of `r = f(2)`, gave it the projection's type or a mismatch:
+// rustc's E0271 at the projection, never d's type kept with the impl's
+// value of another (an i64 read as an i32, a u64 as a &str). d still a
+// type variable after (t one it cannot take, `!`, which no value has) is
+// left as before.
+fn settle_dep(d: i64, t: i64, base: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) {
+    unify_at(d, t, 0, pcx);
+    let have = resolve(d, pcx);
+    let want = resolve(t, pcx);
+    // (a type an error made, `Option<{error}>`: reported where it was)
+    if have == want || is_free_var(have, pcx) && !is_int_var(have, pcx)
+        || crate::front::check::has_error_type(have, pcx) {
+        return;
+    }
+    let (tr, def) = crate::front::assoc::projection_source(base, name, pcx);
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"type error";
+    crate::base::diag::err_begin(pos, pcx);
+    crate::base::diag::err_str(c"type mismatch resolving '<", pcx);
+    crate::front::types::err_type(base, pcx);
+    if tr >= 0 {
+        crate::base::diag::err_str(c" as ", pcx);
+        crate::base::diag::err_sym(pcx.traits[tr as usize].name, pcx);
+    }
+    crate::base::diag::err_str(c">::", pcx);
+    crate::base::diag::err_sym(name, pcx);
+    crate::base::diag::err_str(c" == ", pcx);
+    crate::front::types::err_type(have, pcx);
+    crate::base::diag::err_str(c"': the impl's type is '", pcx);
+    crate::front::types::err_type(want, pcx);
+    crate::base::diag::err_str(c"' (rustc E0271)", pcx);
+    crate::base::diag::err_help(c"the impl was chosen by the argument's type, known only after this value was used as another type (an integer literal is i32 when no use gives its type): write the argument's type, `2u8`, or use the value as the impl's type", pcx);
+    if def > 0 {
+        crate::base::diag::err_note_at(pcx.nodes[def as usize].start,
+            b"the impl's type", pcx);
+    }
+    crate::base::diag::err_end_soft(pcx);
+    pcx.err_kind = saved;
 }
