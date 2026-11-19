@@ -629,60 +629,123 @@ fn candidate(i: i64, t: i64, targs: i64, n: i64, pcx: &mut Ctx<Comp>) -> bool {
 
 // Whether type t holds nothing a later step may change: no inference
 // variable, Ω, opaque or error type, no closure (a closure of an opaque
-// instance is one of its Ωs').
+// instance is one of its Ωs'). (0.30.2) Linear in the types t reaches:
+// asking has_error_type at each level, as before, was quadratic in t's
+// depth (a 4096-deep `W<W<..>>`, which the nesting limit allows, ran for
+// minutes), and a type's parts are shared (`(a, a)`), so a walk of it as
+// a tree is exponential in its depth. A small type is walked as a tree
+// (CONCRETE_TREE_NODES at most, no allocation); past that, as a graph,
+// each type once.
 fn concrete(t: i64, pcx: &Ctx<Comp>) -> bool {
-    if t <= 0 || t == pcx.ty_error || has_error_type(t, pcx) {
-        return false;
+    let mut left: i64 = CONCRETE_TREE_NODES;
+    let r = concrete_tree(t, &mut left, pcx);
+    if r >= 0 {
+        return r == 1;
     }
+    let mut seen = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+    let mut work: Vec<i64, Comp> = Vec::new_in(Comp {});
+    seen.put(t + 1, 1);
+    work.push(t);
+    let mut ok = true;
+    while ok && work.len() > 0 {
+        let u = work[work.len() - 1];
+        work.truncate(work.len() - 1);
+        if not_concrete_node(u, pcx) {
+            ok = false;
+        } else {
+            for i in 0..concrete_child_count(u, pcx) {
+                let c = concrete_child(u, i, pcx);
+                if seen.get(c + 1) == 0 {
+                    seen.put(c + 1, 1);
+                    work.push(c);
+                }
+            }
+        }
+    }
+    seen.release();
+    ok
+}
+
+// The nodes concrete walks as a tree before it walks the graph.
+const CONCRETE_TREE_NODES: i64 = 256;
+
+// concrete's walk as a tree: 1 concrete, 0 not, -1 more than `left` nodes.
+fn concrete_tree(t: i64, left: &mut i64, pcx: &Ctx<Comp>) -> i64 {
+    if not_concrete_node(t, pcx) {
+        return 0;
+    }
+    *left -= 1;
+    if *left < 0 {
+        return -1;
+    }
+    for i in 0..concrete_child_count(t, pcx) {
+        let r = concrete_tree(concrete_child(t, i, pcx), left, pcx);
+        if r != 1 {
+            return r;
+        }
+    }
+    1
+}
+
+// Whether type t itself, apart from its parts, makes a type that holds it
+// not concrete: none (t <= 0), the error type, a closure, a variable, an
+// opaque type.
+fn not_concrete_node(t: i64, pcx: &Ctx<Comp>) -> bool {
+    if t <= 0 || t == pcx.ty_error {
+        return true;
+    }
+    let k = pcx.types[t as usize].kind;
+    if k == TyKind::Struct {
+        return pcx.structs[pcx.types[t as usize].a as usize].closure != 0;
+    }
+    k == TyKind::Distinct
+        && (crate::front::check::infer::is_var(t, pcx) || crate::front::opaque::is_opaque(t, pcx))
+}
+
+// The parts of t concrete looks into: a pointer's, array's, slice's,
+// unsized or vector type's element; a tuple's elements; a function's or a
+// distinct type's elements, then its `a` (its result, its base) when it
+// has one; a struct's or enum's type arguments. (A distinct type's
+// elements: has_error_type, which concrete asked before, looked into
+// them.)
+fn concrete_child_count(t: i64, pcx: &Ctx<Comp>) -> i64 {
     let k = pcx.types[t as usize].kind;
     if k == TyKind::Ptr || k == TyKind::Array || k == TyKind::Slice || k == TyKind::Unsized
         || k == TyKind::Vector {
-        return concrete(pcx.types[t as usize].a, pcx);
+        return 1;
     }
     if k == TyKind::Tuple {
-        for e in 0..pcx.types[t as usize].count {
-            if !concrete(type_elem(t, e, pcx), pcx) {
-                return false;
-            }
-        }
-        return true;
+        return pcx.types[t as usize].count;
     }
-    if k == TyKind::Fn {
-        for e in 0..pcx.types[t as usize].count {
-            if !concrete(type_elem(t, e, pcx), pcx) {
-                return false;
-            }
-        }
-        return pcx.types[t as usize].a <= 0 || concrete(pcx.types[t as usize].a, pcx);
+    if k == TyKind::Fn || k == TyKind::Distinct {
+        return pcx.types[t as usize].count + (if pcx.types[t as usize].a > 0 { 1 } else { 0 });
+    }
+    if k == TyKind::Struct {
+        return pcx.structs[pcx.types[t as usize].a as usize].targ_count;
+    }
+    if k == TyKind::Enum {
+        return pcx.enums[pcx.types[t as usize].a as usize].targ_count;
+    }
+    0
+}
+
+// The i-th of concrete_child_count's parts of t.
+fn concrete_child(t: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
+    let k = pcx.types[t as usize].kind;
+    if k == TyKind::Ptr || k == TyKind::Array || k == TyKind::Slice || k == TyKind::Unsized
+        || k == TyKind::Vector {
+        return pcx.types[t as usize].a;
+    }
+    if k == TyKind::Tuple || k == TyKind::Fn || k == TyKind::Distinct {
+        return if i < pcx.types[t as usize].count { type_elem(t, i, pcx) }
+            else { pcx.types[t as usize].a };
     }
     if k == TyKind::Struct {
         let s = pcx.types[t as usize].a;
-        if pcx.structs[s as usize].closure != 0 {
-            return false;
-        }
-        for e in 0..pcx.structs[s as usize].targ_count {
-            if !concrete(pcx.tlists[(pcx.structs[s as usize].targs + e) as usize], pcx) {
-                return false;
-            }
-        }
-        return true;
+        return pcx.tlists[(pcx.structs[s as usize].targs + i) as usize];
     }
-    if k == TyKind::Enum {
-        let en = pcx.types[t as usize].a;
-        for e in 0..pcx.enums[en as usize].targ_count {
-            if !concrete(pcx.tlists[(pcx.enums[en as usize].targs + e) as usize], pcx) {
-                return false;
-            }
-        }
-        return true;
-    }
-    if k == TyKind::Distinct {
-        if crate::front::check::infer::is_var(t, pcx) || crate::front::opaque::is_opaque(t, pcx) {
-            return false;
-        }
-        return pcx.types[t as usize].a <= 0 || concrete(pcx.types[t as usize].a, pcx);
-    }
-    true
+    let en = pcx.types[t as usize].a;
+    pcx.tlists[(pcx.enums[en as usize].targs + i) as usize]
 }
 
 fn args_concrete(targs: i64, n: i64, pcx: &Ctx<Comp>) -> bool {

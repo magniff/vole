@@ -111,6 +111,7 @@ use crate::front::embed::wgsl::WgslCx;
 use crate::front::features::ctx::features_cx_new;
 use crate::front::lexer::Tok;
 use crate::front::threads::threads_cx_new;
+use crate::middle::lower::ssa::HMap;
 use crate::places::ir::body_new;
 
 // What an identifier names.
@@ -1219,6 +1220,9 @@ fn simple_targ(p: i64, gpa: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // jumps out of one leaves raised: each later search cut short sooner)
     assoc_depth: i64,
     const_value: i64,
+    // (0.30.2, RT-138: the constants being made, which an error that jumps
+    // out of one would leave marked: a later use of it read as a cycle)
+    const_stack: i64,
 }
 
 fn save_check_state(pcx: &Ctx<Comp>) -> CheckState {
@@ -1237,6 +1241,7 @@ fn save_check_state(pcx: &Ctx<Comp>) -> CheckState {
         closures: pcx.closure_stack.len() as i64,
         assoc_depth: pcx.assoc_depth,
         const_value: pcx.const_value,
+        const_stack: pcx.const_stack.len() as i64,
     }
 }
 
@@ -1260,6 +1265,7 @@ fn restore_check_state(s: CheckState, pcx: &mut Ctx<Comp>) {
     pcx.wrap_node = s.wrap;
     pcx.loop_base = s.loop_base;
     pcx.const_value = s.const_value;
+    cut_back(&mut pcx.const_stack, s.const_stack);
     pcx.cur_fn = s.cur_fn;
     cut_back(&mut pcx.closure_stack, s.closures);
     pcx.assoc_depth = s.assoc_depth;
@@ -1366,48 +1372,110 @@ pub fn resolve_type_or_error(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
 }
 
 // Whether type t is or holds the error type (a type that failed).
+// (0.30.2) Linear in the types t reaches: a type is a graph whose nodes
+// are shared (`(a, a)` names one type twice), so a walk of it as a tree
+// is exponential in its depth (40 nested pairs, 2^40 nodes). A small type
+// is walked as a tree (ERROR_TREE_NODES at most, the common case, no
+// allocation); past that, as a graph, each type once (error_in_graph).
 pub fn has_error_type(t: i64, pcx: &Ctx<Comp>) -> bool {
-    if t == pcx.ty_error {
-        return true;
+    let mut left: i64 = ERROR_TREE_NODES;
+    let r = error_in_tree(t, &mut left, pcx);
+    if r >= 0 {
+        return r == 1;
     }
+    error_in_graph(t, pcx)
+}
+
+// The nodes a tree walk of has_error_type visits before it walks the graph.
+const ERROR_TREE_NODES: i64 = 256;
+
+// has_error_type's walk as a tree: 1 an error found, 0 none, -1 more
+// than `left` nodes.
+fn error_in_tree(t: i64, left: &mut i64, pcx: &Ctx<Comp>) -> i64 {
+    if t == pcx.ty_error {
+        return 1;
+    }
+    *left -= 1;
+    if *left < 0 {
+        return -1;
+    }
+    for i in 0..error_child_count(t, pcx) {
+        let r = error_in_tree(error_child(t, i, pcx), left, pcx);
+        if r != 0 {
+            return r;
+        }
+    }
+    0
+}
+
+// has_error_type's walk as a graph: each type reached once.
+fn error_in_graph(t: i64, pcx: &Ctx<Comp>) -> bool {
+    let mut seen = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+    let mut work: Vec<i64, Comp> = Vec::new_in(Comp {});
+    seen.put(t + 1, 1);
+    work.push(t);
+    let mut found = false;
+    while !found && work.len() > 0 {
+        let u = work[work.len() - 1];
+        work.truncate(work.len() - 1);
+        if u == pcx.ty_error {
+            found = true;
+        } else {
+            for i in 0..error_child_count(u, pcx) {
+                let c = error_child(u, i, pcx);
+                if seen.get(c + 1) == 0 {
+                    seen.put(c + 1, 1);
+                    work.push(c);
+                }
+            }
+        }
+    }
+    seen.release();
+    found
+}
+
+// The types has_error_type looks into from t: a pointer's, slice's or
+// array's element; a distinct type's or a function's `a` (its base, its
+// result), then its elements; a tuple's elements; a generic struct's or
+// enum's type arguments.
+fn error_child_count(t: i64, pcx: &Ctx<Comp>) -> i64 {
     let kind = pcx.types[t as usize].kind;
     if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
-        return has_error_type(pcx.types[t as usize].a, pcx);
+        return 1;
     }
-    if kind == TyKind::Distinct && has_error_type(pcx.types[t as usize].a, pcx) {
-        return true;
+    if kind == TyKind::Distinct || kind == TyKind::Fn {
+        return 1 + pcx.types[t as usize].count;
     }
-    if kind == TyKind::Fn && has_error_type(pcx.types[t as usize].a, pcx) {
-        return true;
+    if kind == TyKind::Tuple {
+        return pcx.types[t as usize].count;
     }
-    // (0.14: `Option<{error}>`, from an associated type an impl lacks)
     if kind == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].tmpl != 0 {
+        return pcx.structs[pcx.types[t as usize].a as usize].targ_count;
+    }
+    if kind == TyKind::Enum && pcx.enums[pcx.types[t as usize].a as usize].tmpl != 0 {
+        return pcx.enums[pcx.types[t as usize].a as usize].targ_count;
+    }
+    0
+}
+
+// The i-th of error_child_count's types of t.
+fn error_child(t: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
+    let kind = pcx.types[t as usize].kind;
+    if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
+        return pcx.types[t as usize].a;
+    }
+    if kind == TyKind::Distinct || kind == TyKind::Fn {
+        return if i == 0 { pcx.types[t as usize].a } else { type_elem(t, i - 1, pcx) };
+    }
+    if kind == TyKind::Tuple {
+        return type_elem(t, i, pcx);
+    }
+    if kind == TyKind::Struct {
         let s = pcx.types[t as usize].a;
-        for i in 0..pcx.structs[s as usize].targ_count {
-            if has_error_type(
-                (pcx.tlists[(pcx.structs[s as usize].targs + i) as usize]), pcx) {
-                return true;
-            }
-        }
+        return pcx.tlists[(pcx.structs[s as usize].targs + i) as usize];
     }
-    if kind == TyKind::Enum && (pcx.enums[pcx.types[t as usize].a as usize]).tmpl != 0 {
-        let e = pcx.types[t as usize].a;
-        for i in 0..(pcx.enums[e as usize]).targ_count {
-            if has_error_type(
-                (pcx.tlists[((pcx.enums[e as usize]).targs + i) as usize]),
-                pcx) {
-                return true;
-            }
-        }
-    }
-    if kind == TyKind::Tuple || kind == TyKind::Fn || kind == TyKind::Distinct {
-        for i in 0..pcx.types[t as usize].count {
-            if has_error_type(type_elem(t, i, pcx), pcx) {
-                return true;
-            }
-        }
-    }
-    false
+    let e = pcx.types[t as usize].a;
+    pcx.tlists[(pcx.enums[e as usize].targs + i) as usize]
 }
 
 // After an error in statement `stmt`: the names its `let` binds stand for
