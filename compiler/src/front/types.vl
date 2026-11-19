@@ -4,6 +4,8 @@
 // A type is an index in TYPES. Types are interned, so two types are equal
 // exactly when their ids are. The primitive types have fixed ids.
 
+use std::alloc::Allocator;
+
 use crate::base::{
     buf_byte, buf_int, buf_new, buf_str, die, intern_buf, intern_c, sym_name, sym_table,
     sym_table_len,
@@ -1114,7 +1116,7 @@ pub fn variant_field_offset(v: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
         let t = find_type(Enum, e, 0, pcx);
         let payload = if t >= 0
             && pcx.types[t as usize].size >= 0 { (pcx.enums[e as usize]).payload }
-            else { enum_layout(e, pcx).payload };
+            else { let mut m = layout_memo(); enum_layout(e, &mut m, pcx).payload };
         return payload + tuple_offset(pcx.variants[v as usize].shape, i, pcx);
     }
     tuple_offset(pcx.variants[v as usize].shape, i + 1, pcx)
@@ -1200,21 +1202,117 @@ fn size_align_to(x: i64, align: i64) -> i64 {
 // the main thread: every type's after checking (lay_out_types) and before
 // each phase of the code generator's tasks (middle::parallel's
 // prepare_layouts), which only read it. A type not laid out yet (the
-// front end's, or one made since) is laid out here and not kept.
+// front end's, or one made since) is laid out here and not kept (each of
+// its parts once: LayoutMemo).
 pub fn type_size(t: i64, pcx: &Ctx<Comp>) -> i64 {
     if pcx.types[t as usize].size >= 0 {
         return pcx.types[t as usize].size;
     }
-    let mut none: Vec<i64, Comp> = Vec::new_in(Comp {});
-    layout_of(t, none.as_mut_slice(), pcx).size
+    layout_fresh(t, pcx).size
 }
 
 pub fn type_align(t: i64, pcx: &Ctx<Comp>) -> i64 {
     if pcx.types[t as usize].size >= 0 {
         return pcx.types[t as usize].align;
     }
+    layout_fresh(t, pcx).align
+}
+
+// The layout of type t, not laid out yet: one question (LayoutMemo). Out
+// of line, so that type_size and type_align, asked everywhere of types
+// laid out, stay a read.
+#[inline(never)]
+fn layout_fresh(t: i64, pcx: &Ctx<Comp>) -> Layout {
     let mut none: Vec<i64, Comp> = Vec::new_in(Comp {});
-    layout_of(t, none.as_mut_slice(), pcx).align
+    let mut m = layout_memo();
+    layout_of(t, none.as_mut_slice(), &mut m, pcx)
+}
+
+// (0.30.2) The layouts of the parts of a type not laid out yet,
+// made for one question (type_size, type_align, field_offset,
+// variant_field_offset, compute_layout's layout_of). A type's parts are
+// shared: `(a, a)` names one type twice and `struct N0 { a: N1, b: N1 }`
+// one struct twice, so laid out as a tree (each part again for each path
+// to it) a layout is exponential in the depth: 30 nested pairs are 2^30
+// parts, and check::too_big_begin asks the size of every tuple, array,
+// struct and enum the checker makes (41 s for 30 levels). A part's layout
+// depends on its type alone, so the first LAYOUT_TREE_NODES parts are
+// laid out as a tree (no allocation, for the small types most questions
+// are about), and after that each part's layout is made once and
+// recorded: the work is linear in the distinct types the question
+// reaches, and the answers are the tree's. Nothing is kept past the
+// question (a type of the front end may not be final: its integer
+// variables, its parameters, a struct whose fields are not all
+// resolved), so the next question lays it out again, as before.
+struct LayoutMemo<A: Allocator> {
+    // (parts laid out as a tree before parts are recorded)
+    left: i64,
+    // an open-addressed table: keys[i] is a part's type + 1 (0: a free
+    // slot), rows[i] its layout; empty, or a power of two long and at most
+    // half full
+    keys: Vec<i64, A>,
+    rows: Vec<Layout, A>,
+    count: i64,
+}
+
+const LAYOUT_TREE_NODES: i64 = 64;
+
+fn layout_memo() -> LayoutMemo<Comp> {
+    LayoutMemo {
+        left: LAYOUT_TREE_NODES,
+        keys: Vec::new_in(Comp {}),
+        rows: Vec::new_in(Comp {}),
+        count: 0,
+    }
+}
+
+// The slot of key in m's table (m's keys not empty): its own, or the free
+// one it would take. The loop ends: the table is at most half full.
+fn memo_slot(m: &LayoutMemo<Comp>, key: i64) -> usize {
+    let mask = m.keys.len() - 1;
+    let mut slot = (((key as u64).wrapping_mul(11400714819323198485u64) >> 32) as usize) & mask;
+    while m.keys[slot] != 0 && m.keys[slot] != key {
+        slot = (slot + 1) & mask;
+    }
+    slot
+}
+
+// The layout recorded for type t, if any.
+fn memo_get(m: &LayoutMemo<Comp>, t: i64) -> Option<Layout> {
+    if m.count == 0 {
+        return Option::None;
+    }
+    let slot = memo_slot(m, t + 1);
+    if m.keys[slot] == t + 1 { Option::Some(m.rows[slot]) } else { Option::None }
+}
+
+// Records type t's layout l (t not recorded yet).
+fn memo_put(m: &mut LayoutMemo<Comp>, t: i64, l: Layout) {
+    if (m.count + 1) * 2 > m.keys.len() as i64 {
+        let mut keys: Vec<i64, Comp> = Vec::new_in(Comp {});
+        let mut rows: Vec<Layout, Comp> = Vec::new_in(Comp {});
+        let mut size = m.keys.len() * 2;
+        if size < 64 {
+            size = 64;
+        }
+        keys.resize(size, 0);
+        rows.resize(size, Layout { size: 0, align: 1, payload: -1 });
+        let old_keys = std::mem::replace(&mut m.keys, keys);
+        let old_rows = std::mem::replace(&mut m.rows, rows);
+        for i in 0..old_keys.len() {
+            if old_keys[i] != 0 {
+                let slot = memo_slot(m, old_keys[i]);
+                m.keys[slot] = old_keys[i];
+                m.rows[slot] = old_rows[i];
+            }
+        }
+    }
+    let slot = memo_slot(m, t + 1);
+    if m.keys[slot] == 0 {
+        m.count += 1;
+    }
+    m.keys[slot] = t + 1;
+    m.rows[slot] = l;
 }
 
 // Makes type t's layout and keeps it, the layouts of the types it holds
@@ -1253,7 +1351,9 @@ pub fn compute_layout(t: i64, pcx: &mut Ctx<Comp>) {
         let n = pcx.structs[pcx.types[t as usize].a as usize].field_count + 1;
         offsets.resize(n as usize, 0);
     }
-    let l = layout_of(t, offsets.as_mut_slice(), pcx);
+    // (its parts are kept by now, but for a niche enum's, not laid out)
+    let mut m = layout_memo();
+    let l = layout_of(t, offsets.as_mut_slice(), &mut m, pcx);
     if kind == Struct {
         let s = pcx.types[t as usize].a;
         for i in 0..pcx.structs[s as usize].field_count {
@@ -1277,20 +1377,28 @@ pub fn compute_layout(t: i64, pcx: &mut Ctx<Comp>) {
 // the alignment again for the fields' order), so a struct of structs was
 // laid out four times a level deep: `size_of::<T>()` in std's generic
 // code, checked for every instance, was 4% of `volec check` of the
-// compiler.
-fn size_align(t: i64, pcx: &Ctx<Comp>) -> (i64, i64) {
+// compiler. (0.30.2) Of a part of the type a question is about: kept,
+// recorded in m, or laid out (and recorded once m records: LayoutMemo).
+fn size_align(t: i64, m: &mut LayoutMemo<Comp>, pcx: &Ctx<Comp>) -> (i64, i64) {
     if pcx.types[t as usize].size >= 0 {
         return (pcx.types[t as usize].size, pcx.types[t as usize].align);
     }
+    if let Option::Some(l) = memo_get(m, t) {
+        return (l.size, l.align);
+    }
     let mut none: Vec<i64, Comp> = Vec::new_in(Comp {});
-    let l = layout_of(t, none.as_mut_slice(), pcx);
+    let l = layout_of(t, none.as_mut_slice(), m, pcx);
+    if m.left > 0 {
+        m.left -= 1;
+    } else {
+        memo_put(m, t, l);
+    }
     (l.size, l.align)
 }
 
-// The layout of type t from its parts' (type_size and type_align), kept
-// nowhere; a struct's fields' offsets go to offsets[i] when offsets is not
-// empty.
-fn layout_of(t: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
+// The layout of type t from its parts' (size_align, in m), kept nowhere;
+// a struct's fields' offsets go to offsets[i] when offsets is not empty.
+fn layout_of(t: i64, offsets: &mut [i64], m: &mut LayoutMemo<Comp>, pcx: &Ctx<Comp>) -> Layout {
     let kind = pcx.types[t as usize].kind;
     let mut size: i64 = 0;
     let mut align: i64 = 1;
@@ -1309,10 +1417,10 @@ fn layout_of(t: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
         align = 8;
     } else if kind == Vector {
         // (0.19: 8, 16 or 32 bytes, aligned to their size)
-        size = pcx.types[t as usize].b * type_size(pcx.types[t as usize].a, pcx);
+        size = pcx.types[t as usize].b * size_align(pcx.types[t as usize].a, m, pcx).0;
         align = size;
     } else if kind == TyKind::Distinct {
-        let (s, a) = size_align(pcx.types[t as usize].a, pcx);
+        let (s, a) = size_align(pcx.types[t as usize].a, m, pcx);
         size = s;
         align = a;
     } else if kind == Enum && crate::front::distinct::enum_niche(pcx.types[t as usize].a, pcx) {
@@ -1320,25 +1428,25 @@ fn layout_of(t: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
         size = 8;
         align = 8;
     } else if kind == Enum {
-        let l = enum_layout(pcx.types[t as usize].a, pcx);
+        let l = enum_layout(pcx.types[t as usize].a, m, pcx);
         size = l.size;
         align = l.align;
         payload = l.payload;
     } else if kind == Array {
-        let (s, a) = size_align(pcx.types[t as usize].a, pcx);
+        let (s, a) = size_align(pcx.types[t as usize].a, m, pcx);
         size = size_mul(s, pcx.types[t as usize].b);
         align = a;
     } else if kind == Tuple {
         let mut offset: i64 = 0;
         for i in 0..pcx.types[t as usize].count {
             let elem = type_elem(t, i, pcx);
-            let (s, a) = size_align(elem, pcx);
+            let (s, a) = size_align(elem, m, pcx);
             align = max_i64(align, a);
             offset = size_add(size_align_to(offset, a), s);
         }
         size = size_align_to(offset, align);
     } else if kind == Struct {
-        let l = struct_layout(pcx.types[t as usize].a, offsets, pcx);
+        let l = struct_layout(pcx.types[t as usize].a, offsets, m, pcx);
         size = l.size;
         align = l.align;
     }
@@ -1350,8 +1458,8 @@ fn layout_of(t: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
 }
 
 // The layout of enum e without a niche: its tag, then the largest variant.
-fn enum_layout(e: i64, pcx: &Ctx<Comp>) -> Layout {
-    let mut size = type_size((pcx.enums[e as usize]).tag, pcx);
+fn enum_layout(e: i64, m: &mut LayoutMemo<Comp>, pcx: &Ctx<Comp>) -> Layout {
+    let mut size = size_align((pcx.enums[e as usize]).tag, m, pcx).0;
     let mut align = size;
     let mut payload: i64 = -1;
     let mut largest: i64 = 0;
@@ -1359,7 +1467,7 @@ fn enum_layout(e: i64, pcx: &Ctx<Comp>) -> Layout {
     for i in 0..(pcx.enums[e as usize]).variant_count {
         let shape = pcx.variants[enum_variant(e, i, pcx) as usize].shape;
         if shape != 0 {
-            let (s, a) = size_align(shape, pcx);
+            let (s, a) = size_align(shape, m, pcx);
             largest = max_i64(largest, s);
             widest = max_i64(widest, a);
         }
@@ -1378,7 +1486,7 @@ fn enum_layout(e: i64, pcx: &Ctx<Comp>) -> Layout {
 
 // The layout of struct s, its fields' offsets in offsets[i] when offsets
 // is not empty.
-fn struct_layout(s: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
+fn struct_layout(s: i64, offsets: &mut [i64], m: &mut LayoutMemo<Comp>, pcx: &Ctx<Comp>) -> Layout {
     let mut align: i64 = 1;
     let repr = pcx.structs[s as usize].repr;
     let n = pcx.structs[s as usize].field_count;
@@ -1394,7 +1502,7 @@ fn struct_layout(s: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
     let mut aligns: Vec<i64, Comp> = Vec::new_in(Comp {});
     for i in 0..n {
         (order[i as usize]) = i;
-        let (fs, fa) = size_align((struct_field(s, i, pcx)).ty, pcx);
+        let (fs, fa) = size_align((struct_field(s, i, pcx)).ty, m, pcx);
         sizes.push(fs);
         aligns.push(fa);
     }
@@ -1415,7 +1523,7 @@ fn struct_layout(s: i64, offsets: &mut [i64], pcx: &Ctx<Comp>) -> Layout {
     for k in 0..n {
         let field_ty = (struct_field(s, (order[k as usize]), pcx)).ty;
         // Packed: aligned to at most the packing (`align` holds it).
-        let natural = if wgsl { wgsl_align(field_ty, pcx) }
+        let natural = if wgsl { wgsl_align(field_ty, m, pcx) }
             else { aligns[(order[k as usize]) as usize] };
         let field_align = if (repr & REPR_PACKED) != 0
             && natural > pcx.structs[s as usize].align {
@@ -1478,7 +1586,7 @@ pub fn lay_out_types(pcx: &mut Ctx<Comp>) {
 // layout). The sizes are the host's: a vec3's 12, an array's stride its
 // element's size (front/embed/made.vl refuses an array of 3-element
 // arrays, whose WGSL stride is 16).
-fn wgsl_align(t: i64, pcx: &Ctx<Comp>) -> i64 {
+fn wgsl_align(t: i64, m: &mut LayoutMemo<Comp>, pcx: &Ctx<Comp>) -> i64 {
     if pcx.types[t as usize].kind == Array {
         let e = pcx.types[t as usize].a;
         if e == TY_I32 || e == TY_U32 || e == TY_F32 {
@@ -1490,10 +1598,10 @@ fn wgsl_align(t: i64, pcx: &Ctx<Comp>) -> i64 {
             }
         }
         if pcx.types[e as usize].kind == Array {
-            return wgsl_align(e, pcx);
+            return wgsl_align(e, m, pcx);
         }
     }
-    type_align(t, pcx)
+    size_align(t, m, pcx).1
 }
 
 pub fn max_i64(a: i64, b: i64) -> i64 {
@@ -1523,7 +1631,8 @@ pub fn field_offset(s: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
     let mut offsets_room: Vec<i64, Comp> = Vec::new_in(Comp {});
     offsets_room.resize((pcx.structs[s as usize].field_count + 1) as usize, 0);
     let offsets = offsets_room.as_mut_slice();
-    struct_layout(s, offsets, pcx);
+    let mut m = layout_memo();
+    struct_layout(s, offsets, &mut m, pcx);
     let offset = (offsets[i as usize]);
     offset
 }

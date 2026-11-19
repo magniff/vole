@@ -679,6 +679,21 @@ the trait's arguments (`<T as Conv<i32>>::K`).
   the same text), and a constant made at each use whose use failed is
   no longer read as its own cycle at its next use.
 
+- **A type's size was exponential in its shared parts (RT-138c,
+  RT-138g, RT-38k forms), since RT-M2-9's fix in 0.30.2.** The checker
+  asks the size of every tuple, array, struct, enum and generic
+  instance it makes (to refuse one of 2^61 bytes or more), and a type
+  not laid out yet was laid out as a tree, each part again for each path
+  to it: `let a1 = (a0, a0); ... let a30 = (a29, a29);` was 2^30 parts,
+  41 s of `check` (0.1 s before), and 40 levels of `struct Ni { a: Ni+1,
+  b: Ni+1 }` never ended. Each part is laid out once per question now
+  (`types.vl: LayoutMemo`, threaded through every walk of a layout:
+  tuples, arrays, structs, enums, distinct types, a #[repr(wgsl)]
+  field's alignment), so the work is linear in the distinct types a
+  question reaches; nothing is kept past it, and every size, alignment
+  and offset is the same as before (the compiler's output is
+  byte-identical over the examples and tests/run).
+
 - **Integer literals are typed as rustc types them** (F18.5). An
   unsuffixed integer literal that nothing types where it is written is an
   integer variable, rustc's `{integer}`, unified through the whole
