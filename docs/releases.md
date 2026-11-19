@@ -639,6 +639,23 @@ the trait's arguments (`<T as Conv<i32>>::K`).
 
 #### Bugs fixed
 
+- **Constants defined by each other crashed the compiler (RT-138),
+  in 0.30.1 and before.** `impl S { const A: i64 = Self::B; const B: i64 =
+  Self::A; }`, a trait impl's or a trait's default constants so, a
+  generic impl's at an instance, three in a ring, or a cycle through an
+  array length (`const A: [i64; Self::N]` with N A's length) ran `check`
+  and the build out of stack (SIGBUS): an associated constant is made at
+  each use from a copy of its value, and nothing marked the one being
+  made. Now every constant, free or associated, is made under one mark
+  (`consteval.vl: const_enter`, F34.5): the constant (its declaration,
+  the type it is made for and the impl) met again while it is made is
+  `error const.cycle` (rustc E0391) at its declaration, naming the
+  cycle (`S::A -> S::B -> S::A`). One declaration at another type is
+  another constant (`N::V + 1` of `Succ<N>`), as rustc's instances. A
+  free constant's cycle is `const.cycle` too (it was a `type error` of
+  the same text), and a constant made at each use whose use failed is
+  no longer read as its own cycle at its next use.
+
 - **Integer literals are typed as rustc types them** (F18.5). An
   unsuffixed integer literal that nothing types where it is written is an
   integer variable, rustc's `{integer}`, unified through the whole

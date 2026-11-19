@@ -1,11 +1,11 @@
 ## 0.30.2, RT-466 and RT-47: a limit is an error, never a yes. A stack
-## frame's size grows through one checked function (frame_grow): three
-## locals of 2^62 bytes, whose sum wrapped, are refused at the first that
-## reaches the limit, at every level.
+## frame's size grows through one checked function (frame_grow): five
+## locals of 2^61 - 8 bytes (each a type that fits), whose sum wrapped, are
+## refused at the first that reaches the limit, at every level.
 % VOLE_CACHE=off volec wrap.vl -O0 -o w 2>&1 | cut -c1-100
-wrap.vl:5:13: error[frame.too_big] the stack frame of 'three' reaches 2^62 bytes with this value of 
+wrap.vl:9:13: error[frame.too_big] the stack frame of 'five' reaches 2^62 bytes with this value of t
 % VOLE_CACHE=off volec wrap.vl -O2 -o w 2>&1 | cut -c1-100
-wrap.vl:5:13: error[frame.too_big] the stack frame of 'three' reaches 2^62 bytes with this value of 
+wrap.vl:9:13: error[frame.too_big] the stack frame of 'five' reaches 2^62 bytes with this value of t
 ## A frame under the limit is built:
 % VOLE_CACHE=off volec fits.vl -o f && ./f
 ok
