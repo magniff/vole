@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.30.2 (vole 0.30.2)
+
+- No change to the grammar: the version follows the compiler's. The
+  release is one of the checkers (integer literals, places, regions,
+  obligations, frame and type sizes); none changes how a file is
+  highlighted.
+
 ## 0.30.1 (vole 0.30.1)
 
 - No change to the grammar: the version follows the compiler's. The
