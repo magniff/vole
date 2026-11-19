@@ -101,6 +101,29 @@ A correctness release, its branches merged as each is reviewed clean.
 
 #### Soundness holes closed
 
+- **An integer literal's projection took the type a use gave it, every
+  -O, since 0.30.2's integer variables (F18.5, F18.6).** `f(2)` of `fn
+  f<T: Tr>(t: T) -> T::Out`, with impls of Tr for u8 and i32, is a
+  variable standing for `<{integer} as Tr>::Out`, settled when the
+  integer's type is known (`infer::settle_deps`). It took its impl's
+  type only while no use had given it one: after `let s: i32 = r` the
+  impl chosen, i32's with `Out = i64`, was never compared, and the i64
+  was read as an i32 (1705032704 for 6000000000), a u64 as a `&str`
+  (SIGSEGV), `f(2) + 1` panicked at -O0 and wrapped at -O2. v0.30.1
+  refused these. Each such variable now settles once (`settle_dep`):
+  unified with the projection's type, whatever gave it a type before (a
+  `let`, an argument, a result, a field, an `if` branch, a variable it
+  took first, `o = Some(f(2))`), and a type that differs is `error[type
+  error] type mismatch resolving '<i32 as Tr>::Out == i32'` (rustc
+  E0271) at the call, rustc's position (`infer::deps_at`: an instance's
+  signature, or a trait method's on the literal, `2.o()`, is the
+  call's). A use that needs the variable's type before the integer's is
+  known, `f(2) == 1i32` or `f(2).count_ones()`, is `error type.infer`
+  (rustc E0282) at the call: `unknown_error` jumped with nothing said
+  for it, which left the statement out of the program (a `println`
+  printed nothing) or ended in `places.not_built`. 37 cases,
+  `int_var_projection_*`; tests/refactor/settle0302.t plants each check
+  away (`VOLE_PLANT_OBLIG=settle`, `unknown`) and shows the fault.
 - **A stack frame whose size wrapped (RT-466, RT-466b, RT-466c), every
   -O, since 0.30.1 at least.** A frame's size was summed with no check:
   one local of 2^63 bytes, two of 2^63 or three of 2^62 (in a branch
