@@ -1249,7 +1249,14 @@ AST nodes; a `fn` type or a bound inside one is not looked into (its
 references are what the item gives). It is stricter than rustc where
 the value's type itself says `'static` (`let f: fn(&'static T) =
 item`), which the erased type cannot say; rustc's E0308 ("one type is
-more general than the other") covers the rest. A result's lifetimes
+more general than the other") covers the rest. Where the value is
+given straight to a bound (`v.first().map(kf::<&i64>)` with `fn kf<T>(x:
+T) -> &'static i64 where &'static i64: From<T>`), rustc carries the
+`'static` the function needs to the argument it is called with and
+reports that borrow, E0597 (`v` does not live long enough); vole cannot
+carry it through the erased type and refuses the value: the same
+program refused at another place (the borrowck twin reads E0597 as this
+code for such a case). A result's lifetimes
 need nothing: a call through the value ties its result to every
 argument (R6). `error borrowck.fn_value_static`, at the value.
 *Anchor:* `places/fn_values.vl: check_fn_value`, `places/build.vl:
@@ -2144,7 +2151,12 @@ outside the holes named below.
   read when the callee does not store it. Sound (the callee's real
   signature relates at most these regions); ends with `for<'a>` `fn`
   types (0.29). Case `rust_b_err_fn_value_arg_flow_strict`
-  (`// RUSTC: accepts L13`).
+  (`// RUSTC: accepts L13`). (0.30.2) So a `fn` value given for a bound
+  whose input is the call's own region is refused (R6's strict records,
+  `borrowck.fn_value_bound`) though its type names the lifetime its
+  result borrows: `g: fn(&mut i64, &'b i64) -> Option<&'b i64>` given to
+  scan, whose result would borrow the state's `&mut` too, case
+  `rust_b_err_fn_value_r6_via_erased`.
 - L14 (0.27.2.1) An instance's type argument whose trait impl has an
   equality bound is not read with it (D4.6 (d) reads the bounds of the
   function's own parameters only): in `Copied<Chain<Iter<'x, T>,
@@ -2273,7 +2285,8 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.return_local` | D6.2.2 | E0515 | none; the help suggests returning an owned value |
 | `borrowck.outlives` | D6.2.1; D19.10 case 1 | E0621, E0623, E0521 | "add `'a: 'b`", or "name the lifetime `'a` on `x`" when the blame path ends at two parameters of elided regions (E2 failed): `fix --suggested` writes `<'a>` on both |
 | `borrowck.param_outlives` | D4.5 (0.30.1) | E0310 | none mechanical; the help says to add `T: 'static` |
-| `borrowck.fn_value_static` | D4.7 (0.30.1) | E0308 | none mechanical; the help says to call it by name, or take `&T` |
+| `borrowck.fn_value_static` | D4.7 (0.30.1) | E0308; E0597 where rustc carries the `'static` to the argument (0.30.2) | none mechanical; the help says to call it by name, or take `&T` |
+| `borrowck.fn_value_bound` | R6 (0.30.2) | E0308 ("one type is more general than the other"); "implementation of `Fn*` is not general enough" | none mechanical; the help says to pass a closure that does not borrow the argument, or the function by its name |
 | `borrowck.elision` | E4 at the signature (ir271) | E0106 | writes `<'a>` and `&'a` on the only reference parameter when there is one |
 | `borrowck.unused_param` | D5.3 (ir271) | E0392 | adds a `PhantomData<&'a ()>` field |
 | `borrowck.use_moved` | M1, M5 | E0382 | `.clone()` when `Clone` (as `own.moved`'s) |
