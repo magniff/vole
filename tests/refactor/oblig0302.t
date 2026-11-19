@@ -46,4 +46,4 @@ zipuaf.vl:14:10: error[borrowck.move_borrowed] cannot move out of 'v' because it
 ok: 0 errors in zipuaf.vl (1 file, 0 shaders)
 ## Any other value is refused.
 % VOLE_PLANT_OBLIG=x VOLE_CACHE=off volec check depth.vl 2>&1 | cut -c1-120
-error: VOLE_PLANT_OBLIG is depth, overlap, nonest or untied
+error: VOLE_PLANT_OBLIG is depth, overlap, nonest, untied, settle or unknown
