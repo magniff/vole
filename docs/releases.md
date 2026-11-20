@@ -98,6 +98,27 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 ### What's new in 0.30.2
 
 A correctness release, its branches merged as each is reviewed clean.
+Built and tested on aarch64-macos only; no Linux row ran. The release
+gate, three runs. The first (2026-11-18) passed 44 of 48 rows (the
+suites 7238 cases at each level, none failed); four failed on what the
+release had added or found: borrowck-twin (seven fn-value cases gave
+other codes than rustc's), e18-loans (a cycle of associated constants
+crashed the check), cachediff (a check answered from the cache counted
+no shaders after a rename of an embedded item) and chain-diverse (a
+type's size wrapped, RT-M2-9); each was fixed and passed alone on the
+fixed tree. A review then found an integer literal's projection settled
+by the wrong impl (fixed: settle), and the whole gate ran again
+(2026-11-19): 47 of 48. redteam-cases failed: the RT-M2-9 size check
+asked a type's size of every type the checker makes and laid out each
+shared part again on every path to it, exponential in the depth of
+sharing (three red-team cases timed out). Its cause was first taken for
+the machine's load, then shown alone on an idle machine; the fix lays
+out each part once per question (layout_shared_parts). The whole gate
+on that tree (2026-11-19/20): 48 of 48 rows passed, the suites 8037
+cases at each level, none failed, chain-diverse 160 minutes,
+chain-fresh 54 releases rebuilt from the seed with the recorded bytes.
+The bench row alone, the machine near idle: 1.006 against cc -O2 at
+-O2 (0.30.1: 1.003), iterchain 1.010 times iterloop.
 
 #### Soundness holes closed
 
