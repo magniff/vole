@@ -14,10 +14,10 @@ use crate::base::ctx::Ctx;
 use crate::front::types::{REF_MUT, REF_RAW, REF_SHARED, TyKind, type_elem};
 use crate::places::borrowck::{Bck, MODE_MUT, MODE_RAW, MODE_SHARED, edge};
 use crate::places::ir::{
-    AK_CLOSURE, AK_VARIANT, BK_MUT, BK_MUT2, BK_RAW, BK_RAW_MUT, BK_SHARED, Body, PJ_CONST,
+    AK_CLOSURE, AK_VARIANT, BK_MUT, BK_MUT2, BK_RAW, BK_RAW_MUT, BK_SHARED, Body, OK_FN, PJ_CONST,
     PJ_DEREF, PJ_INDEX, RV_AGG, RV_CAST, RV_REF, RV_REPEAT, RV_SLICE, RV_USE, SK_ASSIGN, SK_CALL,
-    TK_RETURN, full_place_type, local_ty, op_a, op_b, op_is_place, op_kind, proj_kind, proj_parent,
-    proj_val, step_type, undistinct,
+    TK_RETURN, full_place_type, held_value, local_ty, op_a, op_b, op_is_place, op_kind, proj_kind,
+    proj_parent, proj_val, step_type, undistinct,
 };
 use crate::places::regions::{
     RO_UNIVERSAL, U_NAMED, U_OUTER, V_CO, V_CONTRA, V_INV, field_map, place_regions, region_count,
@@ -376,15 +376,20 @@ fn assign(loc: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>
         for i in 0..bck.regs.len() as i64 {
             bck.regs_b.push(bck.regs[i as usize]);
         }
-        if bck.regs_b.len() == 0 {
-            return;
-        }
+        // RULE: D3.6 (0.30.2, RT-383) a destination with no slots of its own
+        // still has its fields' written regions: a field typed `&'static T`
+        // (field_map's MAP_STATIC) makes its part outlive 'static, whether
+        // or not the aggregate's type has a lifetime or a type argument
         let variant: i64 = if st.d == AK_VARIANT { st.e } else { -1 };
         for i in 0..st.nops {
             if !op_is_place(op_kind(st.ops, i, pbody)) {
                 continue;
             }
             walk_place(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), bck, pbody, pcx);
+            if bck.regs.len() == 0 {
+                // (a part with no region: nothing to relate)
+                continue;
+            }
             keep_regs(bck);
             let o_type = bck.w_type;
             bck.fmap.clear();
@@ -495,6 +500,25 @@ fn call(loc: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) 
             bck);
         k += 2;
     }
+    // RULE: R6 (0.30.2) the relations a call through a callable the callee
+    // reads makes (regions::callable_ties), at its call regions: each, but
+    // where the value given for its parameter is a fn item whose own
+    // signature keeps the two positions apart (`fn st(x: &i64) -> &'static
+    // i64` for `F: FnOnce(T) -> U`: U borrows nothing of T)
+    k = 0;
+    while k + 7 <= bck.sig.vties.len() as i64 {
+        let p = bck.sig.vties[k as usize];
+        let mut need = true;
+        if p >= 0 && p < st.nops && op_kind(st.ops, p, pbody) == OK_FN {
+            need = crate::places::fn_values::relates(op_a(st.ops, p, pbody), &bck.sig.vties, k,
+                pcx);
+        }
+        if need {
+            edge(cvar(bck.sig.vties[(k + 1) as usize], e), cvar(bck.sig.vties[(k + 2) as usize], e),
+                loc, bck);
+        }
+        k += 7;
+    }
     // RULE: D4.6 (f) (an Ω's projection's region named by its bound: the
     // caller's universal of that name, both ways)
     for u in 1..universal_count(&bck.sig) {
@@ -533,8 +557,24 @@ fn outer_region(sym: i64, pbody: &Body<Comp>) -> i64 {
 // (`fn store<'a>(x: &mut &'a T, y: &'a T)` as `fn(&mut &T, &T)`), which
 // the erased type cannot say; stricter than rustc, which keeps the
 // elided regions apart (L13).
+// RULE: R6, D20.1 (0.30.2) But a relation the body's signature keeps as a
+// strict record of the parameter called (regions::callable_ties: a call's
+// own region, the bound's elided input, outliving another position) is
+// not made: every caller gave there a fn item whose signature keeps them
+// apart, or was refused (fn_values::check_callables), as rustc checks the
+// body against the bound (`F: FnOnce(&K) -> V`: V does not borrow the
+// key). The callee is the parameter itself, unprojected.
 fn indirect_call(loc: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
     let st = pbody.stmts[loc as usize];
+    let mut strict = Vec::<i64, Comp>::new_in(Comp {});
+    let mut sp: i64 = -1;
+    if st.nops > 0 && op_is_place(op_kind(st.ops, 0, pbody)) && op_b(st.ops, 0, pbody) <= 0 {
+        let p = param_copied(op_a(st.ops, 0, pbody), pbody);
+        if p >= 0 && crate::places::regions::bound_param(pbody.fn_, p, pcx) {
+            crate::places::regions::strict_records(pbody.fn_, &mut strict, pcx);
+            sp = p;
+        }
+    }
     if st.a >= 0 {
         walk_place(st.a, st.b, bck, pbody, pcx);
         bck.regs_b.clear();
@@ -548,7 +588,9 @@ fn indirect_call(loc: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ct
             walk_place(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), bck, pbody, pcx);
             for a in 0..bck.regs.len() as i64 {
                 for d in 0..bck.regs_b.len() as i64 {
-                    edge(bck.regs[a as usize], bck.regs_b[d as usize], loc, bck);
+                    if !strict_pair(&strict, sp, i - 1, a, -1, d) {
+                        edge(bck.regs[a as usize], bck.regs_b[d as usize], loc, bck);
+                    }
                 }
             }
         }
@@ -562,19 +604,28 @@ fn indirect_call(loc: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ct
         bck.vars.clear();
         slot_variances(bck.w_type, V_CO, &mut bck.vars, pcx);
         bck.regs_a.clear();
+        let mut ks = Vec::<i64, Comp>::new_in(Comp {});
         for k in 0..bck.regs.len() as i64 {
             if k < bck.vars.len() as i64 && bck.vars[k as usize] == V_INV {
                 bck.regs_a.push(bck.regs[k as usize]);
+                ks.push(k);
             }
         }
+        let oj = if j == st.nops { -1 } else { j - 1 };
         for i in 1..(if bck.regs_a.len() > 0 { st.nops + 1 } else { 0 }) {
             if i == j || !indirect_operand(i, loc, bck, pbody, pcx) {
                 continue;
             }
+            let oi = if i == st.nops { -1 } else { i - 1 };
             for a in 0..bck.regs.len() as i64 {
                 for d in 0..bck.regs_a.len() as i64 {
-                    edge(bck.regs[a as usize], bck.regs_a[d as usize], loc, bck);
-                    edge(bck.regs_a[d as usize], bck.regs[a as usize], loc, bck);
+                    let k = ks[d as usize];
+                    if !strict_pair(&strict, sp, oi, a, oj, k) {
+                        edge(bck.regs[a as usize], bck.regs_a[d as usize], loc, bck);
+                    }
+                    if !strict_pair(&strict, sp, oj, k, oi, a) {
+                        edge(bck.regs_a[d as usize], bck.regs[a as usize], loc, bck);
+                    }
                 }
             }
         }
@@ -610,4 +661,34 @@ fn ret(loc: i64, bck: &mut Bck<Comp>, pbody: &Body<Comp>, pcx: &mut Ctx<Comp>) {
         bck.regs.push(pbody.ret_var[j as usize]);
     }
     sub(0, 0, t, V_CO, loc, bck, pcx);
+}
+
+// Whether strict (regions::Sig.strict's records) holds one of parameter p
+// that position (o, s) outlive position (o2, s2) (an operand of the call
+// through it, -1 its result; s a slot).
+fn strict_pair(strict: &Vec<i64, Comp>, p: i64, o: i64, s: i64, o2: i64, s2: i64) -> bool {
+    if p < 0 {
+        return false;
+    }
+    let mut r: usize = 0;
+    while r + 5 <= strict.len() {
+        if strict[r] == p && strict[r + 1] == o && strict[r + 2] == s && strict[r + 3] == o2
+            && strict[r + 4] == s2 {
+            return true;
+        }
+        r += 5;
+    }
+    false
+}
+
+// The parameter (its index) local l is, unprojected: itself, never
+// written in the body (what the caller gave, which check_callables
+// checked), or a local written once, by a copy or a move of one that is
+// (the temporary a call by value `f(x)` moves the parameter into); -1
+// else. ir::held_value decides it, counting every write (a borrow that
+// may write, through a closure's capture or a `ref mut` too); the rule
+// build::held_callable reads too. A `mut` parameter only called, as an
+// FnMut is, holds its caller's.
+fn param_copied(l: i64, pbody: &Body<Comp>) -> i64 {
+    held_value(l, pbody).1
 }

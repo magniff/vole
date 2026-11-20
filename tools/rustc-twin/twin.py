@@ -360,17 +360,17 @@ def rust_edition(src):
     return m.group(1) if m else "2021"
 
 
-def rustc_build(rustc, rs, exe, edition="2021", overflow=False, alloc_api=False):
+def rustc_build(rustc, rs, exe, edition="2021", overflow=False, alloc_api=False, opt=1):
     """None, or the first error line of rustc's. overflow: Rust's overflow
     checks, vole's at -O0 (0.26.3: on at -O0, off at -O1 and -O2).
     alloc_api: rustc as nightly (RUSTC_BOOTSTRAP=1) with
-    feature(allocator_api), for prelude_alloc.rs."""
+    feature(allocator_api), for prelude_alloc.rs. opt: rustc's opt-level."""
     env = dict(os.environ)
     extra = []
     if alloc_api:
         env["RUSTC_BOOTSTRAP"] = "1"
         extra = ["-Zcrate-attr=feature(allocator_api)"]
-    r = subprocess.run([rustc, "--edition", edition, "-A", "warnings", "-C", "opt-level=1",
+    r = subprocess.run([rustc, "--edition", edition, "-A", "warnings", "-C", f"opt-level={opt}",
                         "-C", "overflow-checks=" + ("on" if overflow else "off")] + extra + ["-o", exe, rs],
                        capture_output=True, text=True, env=env)
     if r.returncode == 0:

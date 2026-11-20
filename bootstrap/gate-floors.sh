@@ -255,6 +255,12 @@ case "$STEP" in
     # (four measures: hello, std, check, regions)
     compile-cost)
         judge "$(lines 'M instructions, was ')" 4 "programs measured" ;;
+    # (0.30.2: its canary, a planted finding it must report; 95 findings
+    # at 0.30.2's start)
+    redteam-cases)
+        [ "$(lines 'redteam-cases: the canary caught')" -ge 1 ] \
+            || refuse "no canary line in its log: the audit ran without its fault shown caught"
+        judge "$(count 'redteam-cases: ')" 90 "red-team findings held to their cases" ;;
     # (0.30.1: the audit's canary, planted sites it must find)
     unsafe-audit)
         judge "$(lines 'the canary caught \(4 unjustified, 1 unneeded\)')" 1 "canaries caught" ;;

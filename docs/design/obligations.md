@@ -1,6 +1,8 @@
 # Trait obligations: one place proves `T: Trait<Args>` (design, 0.30.2)
 
-Status: design, no code. It is the root fix for the class of soundness
+Status: **M1 in** (0.30.2, the selection table; §11 says where the code
+differs from this text), M2 next; M3 onwards in a later round. It is the
+root fix for the class of soundness
 findings reviews 3–5 of 0.30.1 kept finding (an impl's predicate assumed
 in its body and required nowhere). Each 0.30.1 fix closed one path
 through which an obligation was discharged. This design removes the
@@ -319,3 +321,224 @@ A test suite (`tests/run/rust_o_*`) states each invariant with must-fail
 cases, one per path of §1. A canary in the gate counts the callers of
 `select` against the callers of `match_type` on impls (0 outside
 `select`).
+
+## 11. Status and where the code differs (0.30.2)
+
+**M1, the selection table: in.** `front/obligations.vl`'s `select(tr, t,
+targs)` is the one function that chooses an impl for a trait reference.
+It tries every impl of `tr` (its chain, `impls_start`) and keeps each
+whose header matches `t` and whose bounds hold (`impl_applies`), whose
+trait arguments are `targs` (`impl_targs`, or completed from them,
+`complete_impl_targs_by`), and, for a parameter only the trait arguments
+bind, whose bounds hold for the whole binding (`U: From<T>` of
+`impl<T, U: From<T>> Into<U> for T`, which `impl_applies` leaves
+unchecked). One is the choice; two are `SEL_AMBIG`; none after a depth
+limit cut a search short is `SEL_LIMIT` (never a no). For an Ω (a
+template's parameter in its opaque instance) the first candidate is its
+own predicates, the Param candidate (below): `SEL_PARAM`, which wins over
+every impl, as rustc's `ParamCandidate` does. The front's `has_impl`,
+`implements` and `implements_with` ask it (their own builtins, `Into` by
+`From`, the intrinsics, are unchanged, after an Ω's ask). The
+places' `impl_bound_ties` (`places/regions.vl`) takes the impl from it for
+an instance's bound, for each supertrait (its arguments read with the
+bound's and `Self`, `super_args`) and for each bound of the chosen impl's
+parameters (read with the impl's bindings), and `trait_arg_ties` too;
+`impl_class`, `may_apply` and `param_bound_predicates` are deleted, and
+with them the class order and the "every candidate's predicates"
+stopgap of 0.30.1's round 6.
+
+Where the code differs from §3:
+
+- **The table's key is the trait reference** (trait, self type, the
+  trait arguments; `select` reads every impl's `Self` as the self type,
+  never the asker's), not (use node or instance,
+  bound index): an instance's types are concrete, so its reference is
+  what the use determines, and uses that share one share the choice
+  (`Ctx.sel_map`, `Ctx.sel_rows`). A choice is recorded only when made at
+  the top of a search (`assoc_depth` 0, every impl known), with no depth
+  limit met inside it (`Ctx.depth_cuts`, counted at each limit of the
+  front's searches) and of types with no inference variable, Ω, opaque,
+  error or closure type in them; a new impl empties the table. Every
+  later ask of the same reference, the front's and the places', reads it.
+- **The Param candidate** (review of M1). An Ω's bounds, its
+  parameter's and the `where` clauses' that add to them, are read whole,
+  once per bound list (`param_preds`, `Ctx.param_rows`): each bound's
+  trait and arguments, the written ones resolved in the scope the bound
+  is written in (the Ω's home, `set_home`: the opaque instance's
+  parameters bound to its Ωs and its `Self`; for an impl function's
+  bounds held against its trait's, `impl_bounds_hold`, the trait
+  function's parameters and the trait's; an associated type's Ω, its
+  declaration's bounds with `Self` the parent Ω), so a parameter `P` is
+  the template's Ω, never a `struct P` of the module; the missing ones
+  the trait's defaults with `Self` the Ω (`T: Tr` of `trait Tr<U = i64>`
+  is `T: Tr<i64>`, `complete_args`); and each supertrait's, its
+  arguments substituted (`elaborate`: `T: Sub<i64>` of `trait Sub<Q>:
+  Tr<Q>` gives `T: Tr<i64>`, never Tr with any arguments). A reference
+  is proved by the Param candidate when one of them is it exactly. One
+  whose arguments do not resolve proves nothing: when nothing else does,
+  the instance is unsure (D22.2: its errors are forgotten, its concrete
+  instances checked whole), never a yes. This replaces
+  `opaque::implements_with` (deleted: a supertrait proved its trait with
+  any arguments, an argument it could not resolve held, a bound without
+  arguments held for any, a bound's argument was resolved by name in the
+  module), the Ω shortcut of `has_impl`, and `traits::blanket_all` (an
+  impl for every type is one of the impls `select` tries for an Ω).
+  Without the 0.30.1 stopgap that required every candidate's predicates,
+  the front's lax reading let programs the places had refused build and
+  read freed memory (the review's f42-f47); they are refused here, as
+  rustc refuses them (E0277): `rust_o_m1_param_*`, RT-96.
+- **The places' code is in `places/regions.vl`** (`impl_bound_ties`,
+  `chosen`), not yet `places/obligations.vl`: M2 moves it there with the
+  confirmation walk.
+- **A bound whose arguments the places cannot read** (one naming what
+  does not resolve with the instance's types and `Self`, the instance's
+  impl type) is asked with no arguments (`targs` -1): one impl is the
+  choice; several are each required, their predicates and their
+  parameters' bounds', the 0.30.1 stopgap kept for this case alone. A
+  bound written without arguments on a trait that has some (`T:
+  PartialEq`) is asked with the trait's defaults (`PartialEq<T>`), and
+  with none when no impl proves those (the front reads such a bound as
+  "any arguments").
+- **`trait.ambiguous`** (two impls for a reference whose arguments are
+  known) and **`trait.overflow`** (a chain of nested bounds deeper than
+  `MAX_ASSOC_DEPTH`) are reported at the call that made the instance,
+  by one helper (`obligations::obligation_error`). The front reports
+  `trait.overflow` itself where a bound's search met the depth limit
+  (`check_bounds`, by `Ctx.depth_cuts`), never "not implemented": a
+  chain of 140 impls (`tests/refactor/oblig0302.t`). Coherence leaves one
+  impl per reference and the front meets the depth limit first, so the
+  places' two guards are reached only under a planted fault
+  (`VOLE_PLANT_OBLIG`, test-only, read when the context is made, in the
+  code cache's key): `depth` lowers the places' limit to 2, and a
+  three-impl chain the front proves is `trait.overflow` there;
+  `overlap` leaves coherence's `trait.overlap` unreported, and two
+  impls for one type are `trait.ambiguous` (the same transcript). The
+  front's own verdict for an Ambiguous reference is a yes (the places
+  refuse it).
+- **Not yet through `select`** (each decides an impl for a type and a
+  trait, or a name, by its own rule; each is a form of the bug until it
+  asks `select`):
+  - the places' projections, `proj_walk`, `direct_impl`, `proj_again`,
+    `proj_bound` (`places/regions.vl`), and `param_proj` through the
+    front's `found_impl`: `T::Out` under `T: Tr<i64>` is read from the
+    first impl for the type that defines a type named `Out`, of any trait
+    and any trait arguments. With `Tr<i32>`'s `Out = &'static str` beside
+    `Tr<i64>`'s `Out = &'a str`, a short borrow is returned as
+    `'static`, accepted in v0.30.1 and here (rustc E0597): M4;
+  - the front's associated types and constants (`assoc::find_assoc`,
+    `assoc_value_with`, `assoc_const_value`, `declared_for`): M4;
+  - the front's calls of a generic trait's functions in an instance
+    (`convert::dispatch`, `has_generic_trait_fn`, `one_generic_trait_fn`,
+    `covers_member`, `place_takes`, `template_trait_call`): `T::mk()`
+    under `T: Tr<i64>` for a type with Tr<i32> and Tr<i64> is refused as
+    ambiguous (rustc takes the bound's); RT-52, a method on `&W` through
+    impls for `&'a W<'b>`, is not found. Not in §8's milestones: it
+    belongs with M3 (the env's `Param` candidates name the bound's impl);
+  - the front's dispatch through a bound (`convert::by_param_bound`,
+    `takes`, `by_expected`, `ambiguous_call`, and `opaque::trait_args_of`,
+    the trait arguments of a bound's method read by name in the module):
+    a method through a bound with trait arguments, of a type with two
+    impls told apart by them, is refused as ambiguous (RT-98, five
+    forms): M3;
+  - the front's projections through bounds (`assoc::projection_by_bounds`,
+    `trait_projection_with`, `opaque::omega_projection`): `T::Out` is
+    read from the first bound whose trait declares `Out`, its arguments
+    as written (only that bound's arguments are read, RT-272: `T: H2 +
+    Tr<T::Out>` read Tr's first and recursed to a crash): M4;
+  - `opaque::implements`, for an `impl Tr` result (not an Ω): one of its
+    bounds entails the trait, with any arguments; asked with arguments,
+    an `impl Tr<..>` result proves nothing (`implements_with` asks
+    `select`, which has no candidate for it): M3;
+  - `impl_regions::super_impls` and `check_super_predicates`: M5;
+  - `auto_traits::vouched`, `alloc_rules::struct_implements`,
+    `kinds::has_drop_impl`, `checkalloc::of_allocator_type`,
+    `borrowck::diag::overloaded_call`, `effects::check::effects_declared`:
+    traits without arguments, one impl per type by coherence; M6 routes
+    them;
+  - coherence (`check_overlap`, `could_hold`, `entails`) decides whether
+    two impls can meet, not which one does: it stays its own.
+- **The depth limit** (`MAX_ASSOC_DEPTH`) is rustc's, 128 (32 before:
+  RT-7, RT-53). `select` says SEL_LIMIT there, and the front reports
+  `trait.overflow`. An error that jumps out of a search restores the
+  depth (`CheckState`), so that later searches are not cut sooner.
+- **A bound is its whole reference at every ask** (RT-270; the review
+  of M2, R2): a parameter left out with no default is E0107 at the bound
+  (`convert::bound_arity`, once, in collect_impls), a default that does
+  not resolve for the subject (`U = <Self as H>::Out`, no H) makes the
+  bound not hold, and the associated-type constraints
+  (`assoc_constraints_hold`, `constraint_error`: `constraint_got`) and
+  `projection_by_bounds` read the bound's whole reference too.
+  `T::Out` is the Out of the one trait of T's bounds, or their
+  supertraits, that declares it: none is E0220, two E0221
+  (`assoc_declarers`; C3). Every answer `select` gives about concrete
+  types is recorded, a nested one too, unless the depth limit cut it
+  (C1: the where check had made a chain exponential). An impl for one
+  type has its `where` predicates required as a generic one's
+  (`concrete_impl_preds_hold`, R1). The impl search's limit counts the
+  asked obligation as rustc does (`MAX_IMPL_DEPTH`, 127 proved, 128
+  E0275; C2), and a projection's limit is `trait.overflow` (R3).
+  An impl with no type parameters has each `where` predicate checked
+  at the impl too (`check_concrete_where`, RT-393: E0277 at the clause,
+  `trait.overflow` for two that need each other). A header's auto-trait
+  bound of the template's own parameter is answered by its bounds
+  (`header_sure`, RT-401). A projection's trait is the one its bound or
+  its text names, then that trait's supertraits: `T::Out` under `T: Sub`
+  of `trait Sub: Tr` is Tr's, and `Self::Output` written in `trait Get:
+  Index<usize>` is Index's (`enclosing_trait`, `super_projection`,
+  RT-426), never another trait's of the type by the name. Coherence's
+  generic proof (`coherence::entails`, an impl's supertraits and its
+  associated types' declared bounds) stops at the impl search's limit
+  with a cut reported as `trait.overflow` (E0275), never a yes (RT-436;
+  it said yes past 8).
+  Earlier text of this item:
+  `convert::bound_ref` reads one written without arguments with the
+  trait's defaults, and `bound_holds` is the one test of a trait bound
+  (check_bounds, pred_holds, satisfies, int_meets_bounds,
+  impl_bounds_hold, the supertraits and associated-type bounds of
+  check_impl_signatures). An impl's trait arguments left out are its
+  trait's defaults read by `complete_args` (`convert::header_targs`:
+  Self the impl's type, the trait's module; RT-271).
+- **An impl's predicates on other subjects** (`where W: Conv<U>`,
+  `where Self: ..`, `where I::Item: ..`) are owned by the impl's node
+  and by each of its functions (`parser::items::own_impl_preds`; 0.30.1
+  parsed them with no owner and required them nowhere, RT-269):
+  `impl_applies` and `candidate` require them where the impl is chosen,
+  a call of an inherent impl's function requires them, and a function's
+  opaque instance assumes them as its own (D22.1: one on a compound
+  subject not proved of the Ωs makes it unsure, as before).
+- **A template whose opaque instance is not made** (RT-275) and has no
+  concrete instance gets `generic.unchecked`; when the failure is a
+  header bound the template's own parameter's Ω does not meet and the
+  template has no other `where` predicate, it is the program's error,
+  recorded at the impl's Self type (`opaque_header_sure`, check_bounds).
+  The form whose bound only a compound `where` proves (`where i64:
+  From<A>` for `A: Into<i64>`) stays a warning until M3 puts compound
+  predicates in the env (rt_275 keeps its XFAIL for that).
+
+M1's cases: `tests/run/rt_c301_015_*` (review 5's m01, m03, m04, m13),
+`tests/run/rust_o_m1_*` (the A4 forms m05, m10, m11; trait arguments
+told apart by a nested type, a blanket impl beside a concrete one, a
+supertrait's arguments, an impl parameter's bound with arguments three
+levels down, impls told apart only by a region or `&'a T` beside
+`&'static T`, which coherence refuses); the Param candidate's,
+`tests/run/rt_096*` and `rust_o_m1_param_*` (the review's f42-f47: a
+shadowed parameter, through a `where`, declared after its bound, a
+default, a parameter as the argument, a supertrait's arguments, a
+generic supertrait's) and `rust_o_m1_impl_*self*` (an impl's bound
+naming `Self`, s01, s05, s06), `rust_o_m1_param_impl_*` (an impl's
+parameter beside a struct of its name, f34), `rust_o_m1_param_checked_*`
+(a Drop impl, a method and a `where` whose Self type's declaration bounds
+one parameter by another: each now checked as a template, where 0.30.1
+warned `generic.unchecked`; the Ωs get their home before the Self type
+is read, `set_home_self`); the guards', `tests/refactor/oblig0302.t`.
+
+M2's front cases: `tests/run/rust_o_m2_bound_noargs_*` (RT-270: a
+`where`, an impl's parameter, a struct's, a supertrait, an associated
+type's bound, a `Self` default, a parameter's bound), `rust_o_m2_impl_where_*`
+(RT-269: a compound subject, an inherent impl, a projection, a method on
+the concrete type, a parameter only the trait arguments fix),
+`rust_o_m2_bound_own_projection_*` (RT-272: the `where` form, the
+order, nested, an impl's, a cycle, an unmet one), `rust_o_m2_default_self_*`
+and `rust_o_m2_assoc_bound_self_*` (RT-271), `rust_o_m2_unmade_*`
+(RT-275), `rust_o_m2_depth_*` (RT-7) and, from the review of M2,
+`rust_o_m2_r1_*`, `_r2_*`, `_r3_*`, `_c1_*`, `_c2_*`, `_c3_*`.

@@ -22,7 +22,7 @@ use crate::front::closures::{closure_of_type, closure_sig};
 use crate::front::generics::{env_enter, env_leave, env_lookup};
 use crate::front::generics::instantiate::unify;
 use crate::front::modules::{is_within, module_of, within_std};
-use crate::front::traits::{bound_trait, implements};
+use crate::front::traits::bound_trait;
 use crate::front::types::{TyKind, err_type};
 
 // The AssocType node named `name` in holder h (0: none), or 0.
@@ -220,7 +220,16 @@ fn find_assoc(tr: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
     found
 }
 
-pub const MAX_ASSOC_DEPTH: i64 = 32;
+// (0.30.2, RT-7, RT-53: rustc's recursion limit, 128, so that a program
+// rustc builds is not cut short here; 32 before: a type nested 34 deep was
+// reported as not implementing its trait)
+pub const MAX_ASSOC_DEPTH: i64 = 128;
+
+// (0.30.2, review of M2, C2) The depth of nested impl searches: rustc's
+// limit counts the obligation asked as its first level, so a chain of
+// impls 127 deep is its last proof, 128 its overflow (E0275); a
+// projection's levels are counted from its own.
+pub const MAX_IMPL_DEPTH: i64 = MAX_ASSOC_DEPTH - 1;
 
 // The type definition c (an AssocType node) of impl i gives type t.
 fn assoc_value(i: i64, c: i64, t: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
@@ -237,12 +246,22 @@ fn assoc_value_with(i: i64, c: i64, t: i64, pos: i64, binds: i64, pcx: &mut Ctx<
         return pcx.nodes[c as usize].ty;
     }
     if pcx.assoc_depth >= MAX_ASSOC_DEPTH {
+        // RULE: O-M1 (0.30.2, review of M2: the limit is an overflow, rustc
+        // E0275, as select's is: a chain deeper than it, or a cycle)
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"trait.overflow";
         err_begin(pos, pcx);
         err_fmt(format_args("the associated type '{}' of '",
             str::from_utf8(sym_text(pcx.nodes[c as usize].a, pcx)).unwrap()), pcx);
         err_type(t, pcx);
-        err_str(c"' is defined in terms of itself", pcx);
-        err_end(pcx);
+        err_fmt(
+            format_args("' is not resolved: its definition needs it again, deeper than {} steps",
+                MAX_ASSOC_DEPTH), pcx);
+        err_help(
+            c"rustc E0275, overflow evaluating the requirement: a projection must not need itself", pcx);
+        crate::base::diag::err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
+        crate::base::diag::err_jump(pcx);
     }
     pcx.assoc_depth += 1;
     let saved_mod = pcx.cur_mod;
@@ -270,28 +289,15 @@ fn assoc_value_with(i: i64, c: i64, t: i64, pos: i64, binds: i64, pcx: &mut Ctx<
     ty
 }
 
-// (0.27.2) Path n is `t::name` with `name` an associated constant of t
-// (defined in an impl for t, else a trait's default): n becomes a copy
-// of the constant's value expression, checked against its type in the
-// impl's scope (Self = t, the impl's parameters bound); its type. -1
-// when t has no such constant. RULE: F3.2
-pub fn assoc_const_value(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let mut c: i64 = 0;
-    let mut i: i64 = -1;
-    for k in 0..pcx.traits_impls.len() as i64 {
-        let own = assoc_in(pcx.nodes[pcx.traits_impls[k as usize].node as usize].c, name, pcx);
-        let decl = assoc_in(
-            pcx.nodes[pcx.traits[pcx.traits_impls[k as usize].tr as usize].node as usize].b, name,
-            pcx);
-        let d = if own != 0 { own } else { decl };
-        if d == 0 || (pcx.nodes[d as usize].p & NODE_ASSOC_CONST) == 0
-            || pcx.nodes[d as usize].c == 0
-            || !impl_covers(k, t, pcx) {
-            continue;
-        }
-        c = d;
-        i = k;
-    }
+// (0.27.2; 0.30.2: of impl i, which qualified::path_trait or
+// concrete_trait chose, never one found by the name alone) Path n is
+// `t::name` with `name` the associated constant impl i gives t (its own,
+// else its trait's default): n becomes a copy of the constant's value
+// expression, checked against its type in the impl's scope (Self = t,
+// the impl's parameters bound); its type. -1 when impl i gives no such
+// constant. RULE: F3.2
+pub fn impl_const_value(n: i64, t: i64, i: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let c = crate::front::check::calls::qualified::impl_const_decl(i, name, pcx);
     if c == 0 {
         return -1;
     }
@@ -304,14 +310,18 @@ pub fn assoc_const_value(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 
     pcx.cur_mod = module_of(c, pcx);
     pcx.self_type = t;
     pcx.self_impl = i;
+    // RULE: F34.5 (0.30.2, RT-138: met again while it is made, a cycle;
+    // its type too, an array length naming a constant)
+    crate::front::consteval::const_enter(c, t, i, pcx);
     let saved = if generic {
         env_enter(params, crate::front::traits::impl_bindings(i, t, pcx),
             pcx.nodes[params as usize].count, pcx)
     } else { env_enter(0, 0, 0, pcx) };
     let ty = resolve_type_or_error(pcx.nodes[c as usize].b, pcx);
     let e = crate::front::generics::instantiate::clone_node(pcx.nodes[c as usize].c, pcx);
-    crate::front::check::check_mode::check_expr(e, ty, pcx);
+    crate::front::check::names::check_const_value(e, ty, pcx);
     env_leave(saved, pcx);
+    crate::front::consteval::const_leave(pcx);
     pcx.cur_mod = saved_mod;
     pcx.self_type = saved_self;
     pcx.self_impl = saved_impl;
@@ -377,6 +387,9 @@ pub fn inherent_const_value(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i
     let saved_self = pcx.self_type;
     pcx.cur_mod = module_of(c, pcx);
     pcx.self_type = t;
+    // RULE: F34.5 (0.30.2, RT-138: met again while it is made, a cycle;
+    // its type too, an array length naming a constant)
+    crate::front::consteval::const_enter(c, t, -1, pcx);
     // (the parameters bound for the constant's type and value)
     let targs = pcx.tlists.len() as i64;
     for i in mark..pcx.tscratch.len() as i64 {
@@ -391,9 +404,10 @@ pub fn inherent_const_value(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i
     pcx.env_floor = pcx.env.len() as i64;
     let ty = resolve_type_or_error(pcx.nodes[c as usize].b, pcx);
     let e = crate::front::generics::instantiate::clone_node(pcx.nodes[c as usize].c, pcx);
-    crate::front::check::check_mode::check_expr(e, ty, pcx);
+    crate::front::check::names::check_const_value(e, ty, pcx);
     pcx.env_floor = saved_floor;
     env_leave(env, pcx);
+    crate::front::consteval::const_leave(pcx);
     pcx.cur_mod = saved_mod;
     pcx.self_type = saved_self;
     let start = pcx.nodes[n as usize].start;
@@ -451,9 +465,18 @@ pub fn projection(t: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
     }
     // RULE: D22.1 (`Ω::Item`: its bound's equality)
     if crate::front::opaque::is_omega(t, pcx) {
-        let r = crate::front::opaque::omega_projection(t, name, pcx);
+        let r = crate::front::opaque::omega_projection(t, name, pos, pcx);
         if r != 0 {
             return r;
+        }
+    }
+    // RULE: D21.5 (0.30.2, RT-166: `O::Item` of an opaque result type O,
+    // `<&mut O as Iterator>::Item` in std's impl for references: its
+    // hidden type's, which its bounds' equalities are, D21.2)
+    if crate::front::opaque::is_opaque(t, pcx) && !crate::front::opaque::is_omega(t, pcx) {
+        let h = crate::front::opaque::reveal_type(t, pcx);
+        if h > 0 && h != pcx.ty_error {
+            return projection(h, name, pos, pcx);
         }
     }
     let c = find_assoc(-1, t, name, pcx);
@@ -487,12 +510,24 @@ pub fn projection(t: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
     assoc_value(pcx.found_impl, c, t, pos, pcx)
 }
 
+// (0.30.2, infer::settle_dep's message) The trait whose impl defines
+// `t::name` as projection reads it, and the type node of that definition,
+// `type Out = i64`'s `i64`: (-1, 0) when there is none.
+pub fn projection_source(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> (i64, i64) {
+    let c = find_assoc(-1, t, name, pcx);
+    if c == 0 || pcx.found_impl < 0 {
+        return (-1, 0);
+    }
+    (pcx.traits_impls[pcx.found_impl as usize].tr, pcx.nodes[c as usize].b)
+}
+
 // The associated type `name` trait tr gives type t, or 0 when t has no
 // impl of tr defining it (no error).
 pub fn trait_projection(tr: i64, t: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    // RULE: D22.1 (`<Ω as Tr>::Item`: its bound's equality, or none)
+    // RULE: D22.1, F8.1 (`<Ω as Tr>::Item`: its bound's equality, or a
+    // fresh Ω; 0.30.2: Tr's, not the first bound's of the name)
     if crate::front::opaque::is_omega(t, pcx) {
-        return crate::front::opaque::omega_projection(t, name, pcx);
+        return crate::front::opaque::omega_projection_of(t, tr, name, pos, pcx);
     }
     let c = find_assoc(tr, t, name, pcx);
     if c == 0 {
@@ -530,6 +565,20 @@ pub fn resolve_projection_node(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let first = pcx.nodes[child(n, 0, pcx) as usize].a;
     let param = env_lookup(first, pcx);
     let base = if param != 0 { param } else { pcx.self_type };
+    // RULE: D22.1, F8.1 (0.30.2: `Self::Out` in trait Tr's declaration
+    // read for an Ω, opaque::virtual_fn_of: `<Self as Tr>::Out`, Tr's or
+    // its supertrait's, not another bound's of the name)
+    if param == 0 && pcx.assoc_trait >= 0 && crate::front::opaque::is_omega(base, pcx) {
+        let tr = crate::front::check::calls::qualified::trait_type_declaring(pcx.assoc_trait,
+            pcx.nodes[n as usize].a, pcx.nodes[n as usize].start, pcx);
+        if tr >= 0 {
+            let r = crate::front::opaque::omega_projection_of(base, tr, pcx.nodes[n as usize].a,
+                pcx.nodes[n as usize].start, pcx);
+            if r != 0 {
+                return r;
+            }
+        }
+    }
     // RULE: F11.3 (0.27.2: `I::Output` under `I: SliceIndex<[T]>` is `<I as
     // SliceIndex<[T]>>::Output`, though usize has Add's Output too)
     if param != 0 && !has_error_type(base, pcx) {
@@ -538,51 +587,168 @@ pub fn resolve_projection_node(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             return r;
         }
     }
+    // RULE: F11.3 (0.30.2, RT-426: `Self::Output` written in a trait's text
+    // is that trait's, or its supertraits', `trait Get: Index<usize>`, std's
+    // IndexMut: never another trait's of the type by the name, Mul's)
+    if param == 0 && base > 0 && !has_error_type(base, pcx)
+        && !crate::front::opaque::is_omega(base, pcx) {
+        let et = enclosing_trait(pcx.nodes[n as usize].start, pcx);
+        if et >= 0 {
+            // (re-review of M2, C2: two supertraits that declare it, `trait
+            // Sub: TrA + TrB`, are rustc's E0221, never the first found)
+            let mut found = Vec::<i64, Comp>::new_in(Comp {});
+            declarers_of(et, pcx.nodes[n as usize].a, &mut found, 0, pcx);
+            if found.len() > 1 {
+                err_begin(pcx.nodes[n as usize].start, pcx);
+                err_fmt(
+                    format_args(
+                        "'Self::{}' is ambiguous: more than one supertrait of '{}' declares it",
+                        str::from_utf8(sym_text(pcx.nodes[n as usize].a, pcx)).unwrap(),
+                        str::from_utf8(sym_text(pcx.traits[et as usize].name, pcx)).unwrap()), pcx);
+                err_help(c"rustc E0221: name the trait, `<Self as Tr>::Out`", pcx);
+                err_end(pcx);
+            }
+            let r = super_projection(et, base, pcx.nodes[n as usize].a, pcx.nodes[n as usize].start,
+                pcx);
+            if r != 0 {
+                return r;
+            }
+        }
+    }
     projection(base, pcx.nodes[n as usize].a, pcx.nodes[n as usize].start, pcx)
 }
 
+// (0.30.2, RT-426) The trait whose declaration holds position pos (a
+// TRAITS index), or -1: `Self::Output` written in `trait Get:
+// Index<usize>` is Get's, or its supertraits'.
+fn enclosing_trait(pos: i64, pcx: &Ctx<Comp>) -> i64 {
+    for tr in 0..pcx.traits.len() as i64 {
+        let node = pcx.traits[tr as usize].node;
+        if node > 0 && pcx.nodes[node as usize].start <= pos && pos < pcx.nodes[node as usize].end {
+            return tr;
+        }
+    }
+    -1
+}
+
 // (0.27.2) `P::name` for the type parameter P (bound to t) through the
-// traits of P's bounds: the definition of the first bound trait's impl for
-// t, read with the bound's arguments (an impl parameter only they fix,
-// `impl<T> SliceIndex<[T]> for usize`, completed from them); 0 when no
-// bound gives one. RULE: F11.3, F14.1
-fn projection_by_bounds(first: i64, t: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
+// traits of P's bounds: the definition of that trait's impl for t, read
+// with the bound's arguments (an impl parameter only they fix, `impl<T>
+// SliceIndex<[T]> for usize`, completed from them); 0 when no bound
+// gives one. (0.30.2: of the one trait of the bounds, or their
+// supertraits, that declares name, E0221 for two: qualified::
+// bound_assoc_trait; 0.27.2 took the first bound's impl that had it.)
+// RULE: F11.3, F14.1, F9.3
+fn projection_by_bounds(first: i64, t0: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let p = crate::front::generics::env_param_node(first, pcx);
     if p <= 0 || pcx.nodes[p as usize].h == 0 {
         return 0;
     }
+    // RULE: F18.5 (0.30.2: P bound to an integer variable, `s.get(1)`: the
+    // one integer type P's bounds admit, as rustc selects the one impl
+    // before it normalizes `I::Output`; when several do, the projection
+    // waits for the variable, infer::dependent)
+    let mut t = t0;
+    if pcx.infer_live && crate::front::check::infer::int_open(t, pcx) {
+        crate::front::check::infer::int_bounds(t, p, true, pcx);
+        t = crate::front::check::infer::resolve(t, pcx);
+        if crate::front::check::infer::int_open(t, pcx) {
+            return 0;
+        }
+    }
     let name = pcx.nodes[n as usize].a;
     let bounds = pcx.nodes[p as usize].h;
+    let tr = crate::front::check::calls::qualified::bound_assoc_trait(first, bounds, name,
+        pcx.nodes[n as usize].start, pcx);
+    if tr < 0 {
+        // (re-review of M2, C1: `F::Output` under `F: Fn() -> i64` is the
+        // sugar's FnOnce Output, which no trait bound declares: read by
+        // projection, as before)
+        if name == intern_c(c"Output", pcx)
+            && (0..pcx.nodes[bounds as usize].count).any(
+                |k| pcx.nodes[child(bounds, k, pcx) as usize].kind == NodeKind::TyFn) {
+            return 0;
+        }
+        // (review of M2, C3: none declares it, rustc E0220; v0.30.1 took
+        // any impl of the type that defines a type of the name)
+        err_begin(pcx.nodes[n as usize].start, pcx);
+        err_fmt(format_args("no bound of '{}' declares an associated type '{}'",
+            str::from_utf8(sym_text(first, pcx)).unwrap(),
+            str::from_utf8(sym_text(name, pcx)).unwrap()), pcx);
+        err_help(c"rustc E0220: bound the parameter by the trait that declares it", pcx);
+        err_end(pcx);
+    }
+    // (the arguments of the bound naming tr itself, its whole reference,
+    // the defaults too: `T: Tr` of `trait Tr<U = i32>` reads Tr<i32>'s Out,
+    // review of M2, R2; a supertrait's: none)
+    let mut bargs: i64 = -1;
+    for k in 0..pcx.nodes[bounds as usize].count {
+        let b = child(bounds, k, pcx);
+        if pcx.nodes[b as usize].kind == NodeKind::TyName
+            && crate::front::traits::bound_trait(b, pcx) == tr {
+            // (RT-272: its arguments may name this projection, `T: H<T::Out>`,
+            // a cycle: cut at the depth limit, an error, never a crash)
+            if pcx.assoc_depth >= MAX_ASSOC_DEPTH {
+                pcx.depth_cuts += 1;
+                return 0;
+            }
+            pcx.assoc_depth += 1;
+            bargs = crate::front::convert::bound_ref(b, t, pcx);
+            pcx.assoc_depth -= 1;
+            break;
+        }
+    }
+    let saved_tr = pcx.assoc_trait;
+    let saved_args = pcx.assoc_targs;
+    pcx.assoc_trait = tr;
+    pcx.assoc_targs = bargs;
+    let c = find_assoc(tr, t, name, pcx);
+    pcx.assoc_trait = saved_tr;
+    pcx.assoc_targs = saved_args;
+    if c == 0 {
+        return 0;
+    }
+    let i = pcx.found_impl;
+    let mut binds: i64 = -1;
+    if bargs >= 0 && crate::front::convert::impl_targs(i, t, pcx) < 0 {
+        binds = crate::front::convert::complete_impl_bindings(i, t, bargs, pcx);
+    }
+    assoc_value_with(i, c, t, pcx.nodes[n as usize].start, binds, pcx)
+}
+
+// (0.30.2, review of M2, C3) The traits of bounds (a Generics holder) and
+// their supertraits that declare the associated type `name`: the first in
+// `first`, the count of distinct ones returned (rustc: `T::Out` names the
+// one trait of T's bounds that declares Out; none is E0220, two E0221).
+fn assoc_declarers(bounds: i64, name: i64, first: &mut i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut found = Vec::<i64, Comp>::new_in(Comp {});
     for k in 0..pcx.nodes[bounds as usize].count {
         let b = child(bounds, k, pcx);
         if pcx.nodes[b as usize].kind != NodeKind::TyName {
             continue;
         }
-        let tr = crate::front::traits::bound_trait(b, pcx);
-        if tr < 0 {
-            continue;
-        }
-        let bargs: i64 = if pcx.nodes[b as usize].g
-            != 0 { crate::front::convert::bound_args(b, pcx) }
-            else { -1 };
-        let saved_tr = pcx.assoc_trait;
-        let saved_args = pcx.assoc_targs;
-        pcx.assoc_trait = tr;
-        pcx.assoc_targs = bargs;
-        let c = find_assoc(tr, t, name, pcx);
-        pcx.assoc_trait = saved_tr;
-        pcx.assoc_targs = saved_args;
-        if c == 0 {
-            continue;
-        }
-        let i = pcx.found_impl;
-        let mut binds: i64 = -1;
-        if bargs >= 0 && crate::front::convert::impl_targs(i, t, pcx) < 0 {
-            binds = crate::front::convert::complete_impl_bindings(i, t, bargs, pcx);
-        }
-        return assoc_value_with(i, c, t, pcx.nodes[n as usize].start, binds, pcx);
+        declarers_of(bound_trait(b, pcx), name, &mut found, 0, pcx);
     }
-    0
+    *first = if found.len() > 0 { found[0] } else { -1 };
+    found.len() as i64
+}
+
+// Trait tr and its supertraits that declare associated type `name`, each
+// once, pushed onto found.
+fn declarers_of(tr: i64, name: i64, found: &mut Vec<i64, Comp>, depth: i64, pcx: &mut Ctx<Comp>) {
+    if tr < 0 || depth > MAX_ASSOC_DEPTH {
+        return;
+    }
+    if assoc_in(pcx.nodes[pcx.traits[tr as usize].node as usize].b, name, pcx) != 0 {
+        if !found.contains(&tr) {
+            found.push(tr);
+        }
+        return;
+    }
+    let supers = crate::front::traits::trait_supers(tr, pcx);
+    for i in 0..(if supers > 0 { pcx.nodes[supers as usize].count } else { 0 }) {
+        declarers_of(bound_trait(child(supers, i, pcx), pcx), name, found, depth + 1, pcx);
+    }
 }
 
 // Whether type node n is a projection, `T::Item` or `Self::Item` (not a
@@ -616,20 +782,35 @@ fn constraint_type(c: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // implement the bound's trait meets them: that is the bound's error.)
 pub fn assoc_constraints_hold(bound: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
     let tr = bound_trait(bound, pcx);
-    if tr < 0 || has_error_type(t, pcx) || !implements(tr, t, pcx) {
+    // (0.30.2, review of M2, R2: the bound's whole reference, `Tr<Out =
+    // i64>` of `trait Tr<U = i64>` is Tr<i64>'s Out, never any impl's)
+    if tr < 0 || has_error_type(t, pcx) || !crate::front::convert::bound_holds(bound, t, pcx) {
         return true;
     }
     let holder = pcx.nodes[bound as usize].h;
     for i in 0..pcx.nodes[holder as usize].count {
         let c = child(holder, i, pcx);
         let want = constraint_type(c, pcx);
-        let got = trait_projection(tr, t, pcx.nodes[c as usize].a, pcx.nodes[c as usize].start,
-            pcx);
+        let got = constraint_got(tr, bound, t, c, pcx);
         if got != 0 && !has_error_type(got, pcx) && !has_error_type(want, pcx) && got != want {
             return false;
         }
     }
     true
+}
+
+// (0.30.2, review of M2, R2) The type constraint c (an AssocType node of
+// bound `bound`, of trait tr) names for t: the projection by the bound's
+// whole reference (its arguments and the defaults), `Tr<Out = i64>` of
+// `trait Tr<U = i64>` is Tr<i64>'s Out; an Ω's by its bounds.
+fn constraint_got(tr: i64, bound: i64, t: i64, c: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let bargs = crate::front::convert::bound_ref(bound, t, pcx);
+    if bargs >= 0 && !crate::front::opaque::is_omega(t, pcx) {
+        trait_projection_with(tr, t, bargs, pcx.nodes[c as usize].a, pcx.nodes[c as usize].start,
+            pcx)
+    } else {
+        trait_projection(tr, t, pcx.nodes[c as usize].a, pcx.nodes[c as usize].start, pcx)
+    }
 }
 
 // The error for the first constraint of `bound` type t does not meet:
@@ -644,7 +825,7 @@ pub fn constraint_error(bound: i64, t: i64, param: i64, what: i64, pos: i64, pcx
     for i in 0..pcx.nodes[holder as usize].count {
         c = child(holder, i, pcx);
         want = constraint_type(c, pcx);
-        got = trait_projection(tr, t, pcx.nodes[c as usize].a, pcx.nodes[c as usize].start, pcx);
+        got = constraint_got(tr, bound, t, c, pcx);
         if got != 0 && got != want {
             break;
         }
@@ -667,28 +848,30 @@ pub fn constraint_error(bound: i64, t: i64, param: i64, what: i64, pos: i64, pcx
     err_end(pcx)
 }
 
-// (0.27.2.1) trait_projection, else through tr's supertraits (to
-// MAX_ASSOC_DEPTH): `I: DoubleEndedIterator<Item = &T>` names Iterator's
-// Item. RULE: F2.2, F11.2
+// (0.27.2.1) trait_projection, else through tr's supertraits:
+// `I: DoubleEndedIterator<Item = &T>` names Iterator's Item; the first of
+// traits::super_closure's order that has it (0.30.2: to every depth, a
+// chain deeper than MAX_ASSOC_DEPTH was a no; assoc_depth counts the
+// projections nested in each other, not the supertraits). RULE: F2.2,
+// F11.2
 pub fn super_projection(tr: i64, t: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let got = trait_projection(tr, t, name, pos, pcx);
-    if got != 0 || pcx.assoc_depth >= MAX_ASSOC_DEPTH {
+    if got != 0 {
         return got;
     }
-    let supers = crate::front::traits::trait_supers(tr, pcx);
-    if supers == 0 {
-        return 0;
+    if pcx.assoc_depth >= MAX_ASSOC_DEPTH {
+        // (0.30.2: a search cut short, never recorded as a no, obligations)
+        pcx.depth_cuts += 1;
+        return got;
     }
+    let mut reached: Vec<i64, Comp> = Vec::new_in(Comp {});
+    crate::front::traits::super_closure(tr, &mut reached, pcx);
     pcx.assoc_depth += 1;
     let mut r: i64 = 0;
-    for i in 0..pcx.nodes[supers as usize].count {
-        let saved_mod = pcx.cur_mod;
-        pcx.cur_mod = pcx.traits[tr as usize].module;
-        let s = bound_trait(child(supers, i, pcx), pcx);
-        pcx.cur_mod = saved_mod;
-        if r == 0 && s >= 0 {
-            r = super_projection(s, t, name, pos, pcx);
-        }
+    let mut k: usize = 1;
+    while r == 0 && k < reached.len() {
+        r = trait_projection(reached[k], t, name, pos, pcx);
+        k += 1;
     }
     pcx.assoc_depth -= 1;
     r

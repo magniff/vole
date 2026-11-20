@@ -44,7 +44,10 @@ use crate::front::types::{
 };
 use crate::middle::lower::ssa::HMap;
 
-pub use try_main::{main_result_wrapper, std_enum_name, std_variant_pattern};
+pub use try_main::{
+    check_main_signature, is_program_main, is_std_gpa, main_result_wrapper, std_enum_name,
+    std_variant_pattern,
+};
 
 // ---- Generic traits ----
 
@@ -172,8 +175,7 @@ pub fn impl_trait_args(i: i64, pcx: &mut Ctx<Comp>) {
     if pcx.traits_impls[i as usize].tpl != TPL_NONE {
         return;
     }
-    pcx.traits_impls[i as usize].targs = resolve_args(written,
-        pcx.traits_impls[i as usize].module, pcx);
+    pcx.traits_impls[i as usize].targs = header_targs(i, pcx.traits_impls[i as usize].ty, pcx);
     let from = std_trait(c"From", pcx);
     if tr == from
         && (pcx.tlists[pcx.traits_impls[i as usize].targs as usize])
@@ -245,7 +247,7 @@ pub fn impl_fn_symbol(sym: i64, i: i64, pcx: &mut Ctx<Comp>) -> i64 {
 
 // Whether impl i is for type t (for a generic impl: t is an instance of
 // its type, and the arguments satisfy the impl's bounds).
-fn impl_covers(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
+pub fn impl_covers(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
     // RULE: F0.3 (0.27.2: through impl_applies, a pattern impl too)
     crate::front::traits::impl_applies(i, t, pcx) >= 0
 }
@@ -268,12 +270,63 @@ pub fn impl_targs(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
             return -1;
         }
     }
+    impl_targs_with(i, t, b, pcx)
+}
+
+// (0.30.2) The trait arguments of generic impl i with its parameters
+// bound to TLISTS[b..] (impl_bindings', or complete_impl_bindings'): a
+// TLISTS index (t: the impl's type, Self of the trait's defaults).
+pub fn impl_targs_with(i: i64, t: i64, b: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let params = pcx.nodes[pcx.traits_impls[i as usize].node as usize].g;
     let saved = env_enter(params, b, pcx.nodes[params as usize].count, pcx);
-    let r = resolve_args(
-        pcx.nodes[pcx.nodes[pcx.traits_impls[i as usize].node as usize].a as usize].g,
-        pcx.traits_impls[i as usize].module, pcx);
+    let r = header_targs(i, t, pcx);
     env_leave(saved, pcx);
     r
+}
+
+// (0.30.2, RT-271) The trait arguments of impl i for its type s, as
+// written in its header with the trait's defaults for those it leaves out
+// (default_trait_args spliced them into the header's node): the written
+// ones resolved here, in the impl's scope (its parameters bound by the
+// caller), the defaults by complete_args, in the trait's module with Self
+// s and the parameters before bound (`trait Sub<U = <Self as H>::Out>`:
+// v0.30.1 read the default in the impl's scope, where `Self` is unknown).
+// A TLISTS index; -1 when they do not resolve.
+fn header_targs(i: i64, s: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let tr = pcx.traits_impls[i as usize].tr;
+    let node = pcx.traits_impls[i as usize].node;
+    let g = pcx.nodes[pcx.nodes[node as usize].a as usize].g;
+    let module = pcx.traits_impls[i as usize].module;
+    let tp = pcx.traits[tr as usize].params;
+    let count: i64 = if g > 0 { pcx.nodes[g as usize].count } else { 0 };
+    let mut w = count;
+    for j in 0..count {
+        let c = child(g, j, pcx);
+        let d = if tp > 0
+            && j < pcx.nodes[tp as usize].count { pcx.nodes[child(tp, j, pcx) as usize].b }
+            else { 0 };
+        if d > 0 && (c == d || c == pcx.nodes[node as usize].b
+            && pcx.nodes[d as usize].kind == NodeKind::TyName && pcx.nodes[d as usize].list == 0
+            && pcx.nodes[d as usize].g == 0 && sym_text(pcx.nodes[d as usize].a, pcx) == b"Self") {
+            w = j;
+            break;
+        }
+    }
+    if w == count || s <= 0 {
+        return resolve_args(g, module, pcx);
+    }
+    let written = new_node(NodeKind::Generics, pcx.nodes[g as usize].start,
+        pcx.nodes[g as usize].end, pcx);
+    let mark = list_begin(pcx);
+    for j in 0..w {
+        list_push(child(g, j, pcx), pcx);
+    }
+    list_end(written, mark, pcx);
+    let r: i64 = if w > 0 { resolve_args(written, module, pcx) } else { -1 };
+    if w > 0 && r < 0 {
+        return -1;
+    }
+    crate::front::obligations::complete_args(tr, r, w, s, pcx)
 }
 
 // (0.27.2) impl_targs for a pattern impl whose header leaves a parameter
@@ -388,7 +441,16 @@ pub fn unify_recv_bound(i: i64, n: i64, params: i64, bound: &mut [i64], pcx: &mu
 // arguments a bound asks for (targs, a TLISTS index): the parameters the
 // self type t leaves are completed from them; a TLISTS index, -1 when one
 // stays unbound. RULE: F14.1
+// RULE: F18.5 (0.30.2) A probe: what its matching binds is undone at its
+// end (infer::probe_begin), whichever candidate it accepts or rejects.
 pub fn complete_impl_bindings(i: i64, t: i64, targs: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mark = crate::front::check::infer::probe_begin(pcx);
+    let r = complete_impl_bindings_in(i, t, targs, pcx);
+    crate::front::check::infer::probe_end(mark, pcx);
+    r
+}
+
+fn complete_impl_bindings_in(i: i64, t: i64, targs: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if pcx.traits_impls[i as usize].tpl == TPL_NONE {
         return -1;
     }
@@ -453,6 +515,119 @@ pub fn bound_args(b: i64, pcx: &mut Ctx<Comp>) -> i64 {
     resolve_args(pcx.nodes[b as usize].g, module_of(b, pcx), pcx)
 }
 
+// (0.30.2, obligations) The whole trait reference of bound b for subject
+// s: its written arguments (bound_args), the others the trait's defaults
+// with Self s (`T: Tr<i32>` of `trait Tr<A, B = A>` is `Tr<i32, i32>`,
+// front::obligations::complete_args), so that every reader of it reads
+// as many as the trait has (0.30.1 read past the written ones). One with
+// no default is the error type: an argument missing (rustc E0107), which
+// holds, as one that does not resolve does. A TLISTS index.
+pub fn bound_ref(b: i64, s: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let g = pcx.nodes[b as usize].g;
+    // (0.30.2, RT-270: none written, the defaults, `Z: Tr` of `trait Tr<U
+    // = i32>` is `Z: Tr<i32>`, never Tr with any arguments; -1 when the
+    // trait has no parameters or one has no default)
+    if g <= 0 {
+        return crate::front::obligations::complete_args(crate::front::traits::bound_trait(b, pcx),
+            -1, 0, s, pcx);
+    }
+    let a = bound_args(b, pcx);
+    let w: i64 = if g > 0 { pcx.nodes[g as usize].count } else { 0 };
+    let tr = crate::front::traits::bound_trait(b, pcx);
+    let n = trait_param_count(tr, pcx);
+    if a < 0 || w >= n {
+        return a;
+    }
+    let full = crate::front::obligations::complete_args(tr, a, w, s, pcx);
+    if full >= 0 || !lacks_default(b, tr, pcx) {
+        return full;
+    }
+    let r = pcx.tlists.len() as i64;
+    for k in 0..w {
+        pcx.tlists.push(pcx.tlists[(a + k) as usize]);
+    }
+    for _ in w..n {
+        pcx.tlists.push(pcx.ty_error);
+    }
+    r
+}
+
+// (0.30.2, RT-270) Whether t meets bound b, a trait bound: by its whole
+// trait reference (bound_ref: its written arguments and the defaults) when
+// it has one, else (a trait without parameters; one whose parameter has no
+// default and none written) by the trait alone.
+pub fn bound_holds(b: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let tr = crate::front::traits::bound_trait(b, pcx);
+    if tr < 0 {
+        return true;
+    }
+    // (0.30.2, review of M2, R2: a parameter with no default left out is
+    // rustc's E0107, reported at the bound, bound_arity: it holds here, no
+    // second error; a default that does not resolve for t, `U = <Self as
+    // H>::Out` for a t with no H, does not hold, rustc E0277: never the
+    // trait with any arguments)
+    if lacks_default(b, tr, pcx) {
+        return true;
+    }
+    let r = bound_ref(b, t, pcx);
+    // RULE: F18.5 (0.30.2: a bound written without arguments whose
+    // reference holds an integer variable, `{integer}: PartialEq<{integer}>`
+    // of `(1, 2) == (1, 2)`, is the trait alone until the variable has its
+    // type, as the release's integer variables read it; the instance made
+    // again with that type checks the whole reference, check_bounds)
+    let n = trait_param_count(tr, pcx);
+    if r >= 0 && pcx.nodes[b as usize].g == 0 && pcx.infer_live
+        && (crate::front::check::infer::mentions(t, true, pcx)
+            || (0..n).any(|k| crate::front::check::infer::mentions(pcx.tlists[(r + k) as usize],
+                true, pcx))) {
+        return crate::front::traits::implements(tr, t, pcx);
+    }
+    if r >= 0 { implements_with(tr, t, r, pcx) }
+    else if trait_param_count(tr, pcx) == 0 { crate::front::traits::implements(tr, t, pcx) }
+    else { false }
+}
+
+// (0.30.2, review of M2, R2) Whether bound b of trait tr leaves out a
+// parameter that has no default (`Z: Tr` of `trait Tr<U>`, rustc E0107).
+pub fn lacks_default(b: i64, tr: i64, pcx: &Ctx<Comp>) -> bool {
+    let g = pcx.nodes[b as usize].g;
+    let w: i64 = if g > 0 { pcx.nodes[g as usize].count } else { 0 };
+    let tp = pcx.traits[tr as usize].params;
+    if tp <= 0 {
+        return false;
+    }
+    for j in w..pcx.nodes[tp as usize].count {
+        if pcx.nodes[child(tp, j, pcx) as usize].b <= 0 {
+            return true;
+        }
+    }
+    false
+}
+
+// (0.30.2, review of M2, R2) Bound b's arguments against its trait's
+// parameters, once, where the bound is declared (traits::collect_impls):
+// one with no default left out, or more than the trait takes, is rustc's
+// E0107, an error at the bound.
+pub fn bound_arity(b: i64, pcx: &mut Ctx<Comp>) {
+    let tr = crate::front::traits::bound_trait(b, pcx);
+    if tr < 0 || pcx.nodes[b as usize].kind != NodeKind::TyName {
+        return;
+    }
+    let g = pcx.nodes[b as usize].g;
+    let w: i64 = if g > 0 { pcx.nodes[g as usize].count } else { 0 };
+    let n = trait_param_count(tr, pcx);
+    if w <= n && !lacks_default(b, tr, pcx) {
+        return;
+    }
+    err_begin(pcx.nodes[b as usize].start, pcx);
+    err_fmt(format_args("trait '{}' takes ",
+        str::from_utf8(sym_text(pcx.traits[tr as usize].name, pcx)).unwrap()), pcx);
+    err_int_words(n, c" type argument", c" type arguments", pcx);
+    err_fmt(format_args(", got {w}"), pcx);
+    err_help(c"rustc E0107: write the ones that have no default, `Tr<T>`", pcx);
+    crate::base::diag::err_end_soft(pcx);
+}
+
 // From's intrinsic impls: every type from itself, an integer type from
 // the ones that widen to it.
 fn intrinsic_from(from: i64, to: i64) -> bool {
@@ -472,11 +647,33 @@ pub fn implements_with(tr: i64, t: i64, targs: i64, pcx: &mut Ctx<Comp>) -> bool
     if count == 0 {
         return implements(tr, t, pcx);
     }
+    // RULE: F18.6 (0.30.2: a variable that is solved is its solution, in
+    // the type and in the arguments: `S: Sum<{integer}>` of an iterator of
+    // literals once its items took i64 is `i64: Sum<i64>`; the retyping of
+    // the function so far waits for its end)
+    if pcx.infer_live {
+        let rt = crate::front::check::infer::resolve(t, pcx);
+        let mut changed = rt != t;
+        let ra = pcx.tlists.len() as i64;
+        for k in 0..count {
+            let a = pcx.tlists[(targs + k) as usize];
+            let r = crate::front::check::infer::resolve(a, pcx);
+            changed = changed || r != a;
+            pcx.tlists.push(r);
+        }
+        if changed {
+            return implements_with(tr, rt, ra, pcx);
+        }
+        pcx.tlists.truncate(ra as usize);
+    }
     // RULE: D22.1 (0.27.3: an Ω, by its bounds, FL11)
     // (0.28.0: or by an impl that covers every type, as any type: std's
     // `impl<T> Borrow<T> for T` for `K: Borrow<K>` of HashMap::get)
-    if crate::front::opaque::is_opaque(t, pcx) && crate::front::opaque::is_omega(t, pcx)
-        && crate::front::opaque::implements_with(tr, t, targs, pcx) {
+    // (0.30.2, review of M1: both by select, the Param candidate first,
+    // its bounds read whole, as the places read them; before Into's and
+    // From's own rules, which an Ω's bound `T: Into<U>` meets)
+    if crate::front::opaque::is_omega(t, pcx)
+        && crate::front::obligations::holds(crate::front::obligations::select(tr, t, targs, pcx)) {
         return true;
     }
     for k in 0..count {
@@ -493,23 +690,10 @@ pub fn implements_with(tr: i64, t: i64, targs: i64, pcx: &mut Ctx<Comp>) -> bool
     if tr == from && intrinsic_from((pcx.tlists[targs as usize]), t) {
         return true;
     }
-    // (0.27.2.1: the impls of tr only, by its chain)
-    let mut next_impl = crate::front::traits::impls_start(tr, pcx);
-    while next_impl >= 0 {
-        let i = next_impl;
-        next_impl = crate::front::traits::impls_after(i, pcx);
-        if pcx.traits_impls[i as usize].tr != tr || !impl_covers(i, t, pcx) {
-            continue;
-        }
-        let mut a = impl_targs(i, t, pcx);
-        if a < 0 {
-            a = complete_impl_targs_by(i, t, targs, pcx);
-        }
-        if a >= 0 && same_list(a, targs, count, pcx) {
-            return true;
-        }
-    }
-    false
+    // (0.30.2, obligations M1: the impl select chooses by the whole trait
+    // reference, the one function every caller asks)
+    !crate::front::opaque::is_omega(t, pcx)
+        && crate::front::obligations::holds(crate::front::obligations::select(tr, t, targs, pcx))
 }
 
 // Bound b's trait with its arguments, for messages: `From<i64>`.
@@ -545,7 +729,7 @@ pub fn err_bound(tr: i64, targs: i64, pcx: &mut Ctx<Comp>) {
 // ---- Calls of a generic trait's functions ----
 
 // The function `member` of impl i (an FNS index), -1 when it has none.
-fn impl_fn(i: i64, member: i64, pcx: &Ctx<Comp>) -> i64 {
+pub fn impl_fn(i: i64, member: i64, pcx: &Ctx<Comp>) -> i64 {
     let node = pcx.traits_impls[i as usize].node;
     for k in 0..pcx.nodes[node as usize].count {
         let f = child(node, k, pcx);
@@ -700,7 +884,10 @@ fn own_bound_misses(tr: i64, decl: i64, targs: i64, t: i64, k: i64, a: i64,
                     continue;
                 }
                 let want = decl_type(tr, decl, targs, t, pcx.nodes[c as usize].b, pcx);
-                if want != got && !has_error_type(want, pcx) {
+                // (0.30.2: `v.extend(2..5)` of a `Vec<{integer}>`: two
+                // integer variables may be one, as the call makes them)
+                if want != got && !has_error_type(want, pcx)
+                    && !crate::front::check::infer::int_may_equal(want, got, pcx) {
                     return true;
                 }
             }
@@ -713,7 +900,17 @@ fn own_bound_misses(tr: i64, decl: i64, targs: i64, t: i64, k: i64, a: i64,
 // Whether candidate c (an index of CANDS, a pair) takes the arguments of
 // call n, of types tys[..] (0 for a literal, kinds[..] its kind); `skip`
 // is 1 for a method call (its receiver is the decl's self).
+// RULE: F18.5 (0.30.2) A probe: what its matching binds is undone at its
+// end (infer::probe_begin), whichever candidate it accepts or rejects.
 fn takes(c: i64, n: i64, t: i64, tys: &mut [i64], kinds: &mut [i64], skip: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mark = crate::front::check::infer::probe_begin(pcx);
+    let r = takes_in(c, n, t, tys, kinds, skip, pcx);
+    crate::front::check::infer::probe_end(mark, pcx);
+    r
+}
+
+fn takes_in(c: i64, n: i64, t: i64, tys: &mut [i64], kinds: &mut [i64], skip: i64,
+    pcx: &mut Ctx<Comp>) -> bool {
     let i = (pcx.cands[c as usize]);
     let tr = pcx.traits_impls[i as usize].tr;
     let decl = trait_fn(tr,
@@ -750,7 +947,11 @@ fn takes(c: i64, n: i64, t: i64, tys: &mut [i64], kinds: &mut [i64], skip: i64, 
                 && !literal_tuple_fits(child(n, k, pcx), p, pcx) {
                 return false;
             }
-        } else if a != p && a != TY_NEVER && !has_error_type(p, pcx) {
+        } else if a != p && a != TY_NEVER && !has_error_type(p, pcx)
+            // RULE: F18.5 (0.30.2: `r == Reverse(3)`, each literal its own
+            // integer variable: one type once unified, as the call's check
+            // makes them)
+            && !crate::front::check::infer::int_may_equal(a, p, pcx) {
             return false;
         } else if a != TY_NEVER && own_bound_misses(tr, decl, targs, t, k + skip, a, pcx) {
             return false;
@@ -765,7 +966,45 @@ fn takes(c: i64, n: i64, t: i64, tys: &mut [i64], kinds: &mut [i64], skip: i64, 
 // x = f + 1, as synth_method makes); its type. -1 when t has no
 // generic-trait impl with a function `member` (the caller reports it).
 pub fn generic_trait_call(n: i64, t: i64, member: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    dispatch(n, t, member, 0, pcx)
+    dispatch(n, t, member, 0, -1, -1, 0, pcx)
+}
+
+// RULE: F8.4 (0.30.2) generic_trait_call of trait want only, with the
+// arguments wargs the path writes (wn; -1 none): `<S as Conv<i64>>::c(x)`
+// and `T::from(x)` under `T: From<u8>` choose among that trait's impls by
+// the arguments, never another trait's of the name.
+pub fn trait_call(n: i64, t: i64, member: i64, want: i64, wargs: i64, wn: i64,
+    pcx: &mut Ctx<Comp>) -> i64 {
+    dispatch(n, t, member, 0, want, wargs, wn, pcx)
+}
+
+// RULE: F18.5 (0.30.2: calls/mod.vl int_trait_fn) The function `member` of
+// the one generic-trait impl that covers type t and has one (`eq` of
+// `impl PartialEq<i32> for i32`), as dispatch's candidates are; -1 when
+// none or several do (dispatch then chooses by the arguments' types).
+pub fn sole_impl_fn(t: i64, member: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let impls_now = pcx.traits_impls.len() as i64;
+    let mut found: i64 = -1;
+    let mut c = impl_naming(member, pcx);
+    while c >= 0 {
+        let i = pcx.name_cells[c as usize];
+        c = impl_naming_after(c, pcx);
+        if i >= impls_now {
+            break;
+        }
+        if trait_param_count(pcx.traits_impls[i as usize].tr, pcx) == 0
+            || !impl_covers(i, t, pcx) {
+            continue;
+        }
+        let f = impl_fn(i, member, pcx);
+        if f >= 0 {
+            if found >= 0 {
+                return -1;
+            }
+            found = f;
+        }
+    }
+    found
 }
 
 // (0.27.0) Whether t has a generic-trait impl with a function `member`
@@ -803,10 +1042,13 @@ pub fn one_generic_trait_fn(t: i64, member: i64, pcx: &mut Ctx<Comp>) -> bool {
 // `W::from(x)` with W a generic type written without its arguments (n a
 // Call, tpl W's template): a generic-trait call on the instance expected
 // there; its type. -1 when tpl has no generic-trait impl with a function
-// `member` (the caller reports it).
-pub fn template_trait_call(n: i64, tpl: i64, member: i64, pcx: &mut Ctx<Comp>) -> i64 {
+// `member` (the caller reports it). Of trait want's only when want >= 0
+// (dispatch).
+pub fn template_trait_call(n: i64, tpl: i64, member: i64, want: i64, wargs: i64, wn: i64,
+    pcx: &mut Ctx<Comp>) -> i64 {
     let found = (0i64..pcx.traits_impls.len() as i64).any(|i| pcx.traits_impls[i as usize].tpl
         == tpl
+        && (want < 0 || pcx.traits_impls[i as usize].tr == want)
         && trait_param_count(pcx.traits_impls[i as usize].tr, pcx) != 0
         && impl_fn(i, member, pcx) >= 0);
     if !found {
@@ -828,7 +1070,7 @@ pub fn template_trait_call(n: i64, tpl: i64, member: i64, pcx: &mut Ctx<Comp>) -
                 str::from_utf8(sym_text(template_name(tpl, pcx), pcx)).unwrap()), pcx);
         err_end(pcx);
     }
-    dispatch(n, hint, member, 0, pcx)
+    dispatch(n, hint, member, 0, want, wargs, wn, pcx)
 }
 
 // Among the candidates of call n that take its arguments, the one whose
@@ -1005,7 +1247,7 @@ fn place_takes(n: i64, place: i64, member: i64, tys: &mut [i64], kinds: &mut [i6
 // those impl_fn finds it in (their own functions and the trait defaults
 // copied into them, whatever their flags), made again when an impl or a
 // copy was added since.
-fn impl_naming(member: i64, pcx: &mut Ctx<Comp>) -> i64 {
+pub fn impl_naming(member: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if pcx.name_impls != pcx.traits_impls.len() as i64
         || pcx.name_extra != pcx.impl_extra.len() as i64 {
         index_impl_names(pcx);
@@ -1015,7 +1257,7 @@ fn impl_naming(member: i64, pcx: &mut Ctx<Comp>) -> i64 {
 
 // The cell after cell c (impl_naming's), -1 at the end; its impl:
 // pcx.name_cells.get(c).
-fn impl_naming_after(c: i64, pcx: &Ctx<Comp>) -> i64 {
+pub fn impl_naming_after(c: i64, pcx: &Ctx<Comp>) -> i64 {
     pcx.name_cells[(c + 1) as usize] - 1
 }
 
@@ -1107,14 +1349,26 @@ fn into_bound_target(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if count == 1 { found } else { 0 }
 }
 
-// generic_trait_call, the first `pre` arguments synthesized already.
-fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
+// generic_trait_call, the first `pre` arguments synthesized already; of
+// trait want's impls only when want >= 0 (0.30.2: a path call whose trait
+// qualified::path_trait decided, trait_call), with its arguments wargs
+// (wn of them; -1 not written; a 0 among them a `_`), From's intrinsic
+// impls (the type itself, a narrower integer) counting only when want is
+// From or none.
+fn dispatch(n: i64, t: i64, member: i64, pre: i64, want: i64, wargs: i64, wn: i64,
+    pcx: &mut Ctx<Comp>) -> i64 {
     if t < 0 || has_error_type(t, pcx) {
         return -1;
     }
     let method = pcx.nodes[n as usize].kind == NodeKind::MethodCall;
     let from = std_trait(c"From", pcx);
-    let is_from = !method && from >= 0 && member == intern_c(c"from", pcx);
+    let is_from = !method && from >= 0 && member == intern_c(c"from", pcx)
+        && (want < 0 || want == from);
+    // (`<T as From<X>>::from(x)`: From<X>'s intrinsic impl only, X itself
+    // or narrower than T; 0 for none written or a `_`)
+    let from_arg: i64 = if is_from && want == from && wargs >= 0 && wn == 1 {
+        pcx.tlists[wargs as usize]
+    } else { 0 };
     if method && member == intern_c(c"into", pcx) && pcx.nodes[n as usize].count == 0
         && std_trait(c"Into", pcx) >= 0 {
         let to = into_bound_target(n, pcx);
@@ -1145,8 +1399,17 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
             break;
         }
         if trait_param_count(pcx.traits_impls[i as usize].tr, pcx) == 0
+            || want >= 0 && pcx.traits_impls[i as usize].tr != want
             || !impl_covers(i, t, pcx) {
             continue;
+        }
+        // (the arguments the path writes, `_` any: an impl's own that
+        // differ, or a pattern impl's none, leave it out)
+        if want >= 0 && wargs >= 0 && wn > 0 {
+            let have = impl_targs(i, t, pcx);
+            if have >= 0 && !crate::front::check::calls::qualified::agrees(have, wargs, wn, pcx) {
+                continue;
+            }
         }
         let f = impl_fn(i, member, pcx);
         if f >= 0 {
@@ -1166,7 +1429,7 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
             };
             let place = crate::front::types::place_of_view(vt, pcx);
             if place > 0 && place != t && covers_member(place, member, pcx) {
-                return dispatch(n, place, member, pre, pcx);
+                return dispatch(n, place, member, pre, want, wargs, wn, pcx);
             }
         }
         return -1;
@@ -1214,13 +1477,7 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
         let param_local = recv > 0 && pcx.nodes[recv as usize].kind == NodeKind::Ident
             && pcx.nodes[recv as usize].res == Res::Local && pcx.nodes[recv as usize].y >= 0
             && pcx.locals[pcx.nodes[recv as usize].y as usize].tparam != 0;
-        // (0.28.0: `Tr::m(x)` with x a reference to the view, `<K as
-        // Borrow<Q>>::borrow(k)` of `k: &K`, K = &str: Self is the view)
-        let via_ref = recv > 0 && pcx.nodes[recv as usize].ty > 0
-            && pcx.nodes[recv as usize].ty != t
-            && pcx.types[pcx.nodes[recv as usize].ty as usize].kind == TyKind::Ptr
-            && pcx.types[pcx.nodes[recv as usize].ty as usize].a == t;
-        let place_first = pcx.via_node == n && !via_ref || pcx.place_recv == n
+        let place_first = pcx.place_recv == n
             // (0.28.0: `x: &P` with P the place, the view x itself; not `k:
             // &K` with K = &str, a reference to the view: K's own impl,
             // `<&str as Borrow<&str>>` by the bound `K: Borrow<K>`)
@@ -1231,7 +1488,7 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
                 else { pcx.cur_fn < 0 || pcx.fns[pcx.cur_fn as usize].tmpl == 0 });
         if place > 0 && place_first && place_takes(n, place, member, tys, kinds, pcx) {
             pcx.cands.truncate(mark as usize);
-            return dispatch(n, place, member, count, pcx);
+            return dispatch(n, place, member, count, want, wargs, wn, pcx);
         }
     }
     let skip: i64 = if method { 1 } else { 0 };
@@ -1285,7 +1542,29 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return if method { method_call(n, t, f, pcx) } else { path_call(n, t, f, pcx) };
     }
     // From's intrinsic impls: the type itself, a narrower integer.
-    if is_from && count == 1 {
+    if is_from && count == 1 && from_arg != 0 {
+        // (From<X> for t is intrinsic when X is t or widens to it; the
+        // argument then is an X, a narrower integer widened to it as any
+        // argument is)
+        if from_arg == t || widens(from_arg, t) {
+            let a = child(n, 0, pcx);
+            let mut at = (tys[0]);
+            if at == 0 {
+                check_expr(a, from_arg, pcx);
+                at = from_arg;
+            }
+            if at == from_arg || widens(at, from_arg) {
+                pcx.cands.truncate(mark as usize);
+                if at == t {
+                    become_value(n, a, t, pcx);
+                } else {
+                    become_cast(n, a, t, pcx);
+                }
+                return t;
+            }
+        }
+    }
+    if is_from && count == 1 && from_arg == 0 {
         let a = child(n, 0, pcx);
         let at = (tys[0]);
         if at == 0
@@ -1301,6 +1580,17 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
         if at != 0 && widens(at, t) {
             pcx.cands.truncate(mark as usize);
             become_cast(n, a, t, pcx);
+            return t;
+        }
+        // RULE: F18.5 (0.30.2: an argument of an integer variable's type,
+        // `i64::from(a + 1)`, `a.into()`: From<{integer}> waits for the
+        // variable, its impl checked with the type it takes at the
+        // function's end, infer::int_from; the conversion is the cast)
+        if at != 0 && crate::front::check::infer::int_free(at, pcx)
+            && (is_integer(t) || is_float(t)) {
+            pcx.cands.truncate(mark as usize);
+            become_cast(n, a, t, pcx);
+            crate::front::check::infer::int_from(n, at, pcx);
             return t;
         }
     }
@@ -1319,7 +1609,7 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
         let place = crate::front::types::place_of_view(vt, pcx);
         if place > 0 && place != t && covers_member(place, member, pcx) {
             pcx.cands.truncate(mark as usize);
-            return dispatch(n, place, member, count, pcx);
+            return dispatch(n, place, member, count, want, wargs, wn, pcx);
         }
     }
     // RULE: F6.2 (0.28.0: in an instance a receiver `*a` of `a: &T` is a
@@ -1333,7 +1623,7 @@ fn dispatch(n: i64, t: i64, member: i64, pre: i64, pcx: &mut Ctx<Comp>) -> i64 {
             && pcx.types[rt as usize].b == crate::front::types::REF_SHARED
             && pcx.types[rt as usize].a == t && has_generic_trait_fn(rt, member, pcx) {
             pcx.cands.truncate(mark as usize);
-            return dispatch(n, rt, member, count, pcx);
+            return dispatch(n, rt, member, count, want, wargs, wn, pcx);
         }
     }
     no_impl_error(n, t, member, mark, tys, kinds, is_from, from, pcx);
@@ -1356,7 +1646,10 @@ fn path_call(n: i64, t: i64, f0: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // Method call n (`x.m(args)`, x of type t or a pointer to one) of
 // generic-trait function f: a Call with the receiver (borrowed or
 // dereferenced as f's self takes it) first, checked.
-fn method_call(n: i64, t: i64, f0: i64, pcx: &mut Ctx<Comp>) -> i64 {
+fn method_call(n: i64, t0: i64, f0: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    // RULE: F18.5 (0.30.2: the receiver's type and self's with the
+    // solutions so far)
+    let mut t = if pcx.infer_live { crate::front::check::infer::resolve(t0, pcx) } else { t0 };
     let mut f = f0;
     if pcx.fns[f as usize].generic > 0 {
         f = instantiate_call(f, n, 1, t, pcx.nodes[n as usize].g, pcx);
@@ -1386,8 +1679,26 @@ fn method_call(n: i64, t: i64, f0: i64, pcx: &mut Ctx<Comp>) -> i64 {
         check_call_safety(n, f, 1, pcx);
         return pcx.fns[f as usize].ret;
     }
-    let through = pcx.nodes[receiver as usize].ty != t;
-    let self_ty = fn_param(f, 0, pcx);
+    // RULE: F18.5 (0.30.2: the chosen impl's self and the receiver made one
+    // type here, at the call: `(7, 8)` of `impl<T> Pair<T> for (T, T)`,
+    // whose header matched with the two variables apart, matching binding
+    // nothing, instantiate.vl match_type)
+    if pcx.infer_live {
+        let s0 = fn_param(f, 0, pcx);
+        let inner = if pcx.types[s0 as usize].kind == TyKind::Ptr { pcx.types[s0 as usize].a }
+            else { s0 };
+        if crate::front::check::infer::resolve(inner, pcx) != t
+            && crate::front::check::infer::int_may_equal(inner, t, pcx) {
+            crate::front::check::infer::unify(inner, t, pcx);
+            t = crate::front::check::infer::resolve(t, pcx);
+        }
+    }
+    let through = if pcx.infer_live {
+        crate::front::check::infer::resolve(rt, pcx) != t
+    } else { rt != t };
+    let self_ty = if pcx.infer_live {
+        crate::front::check::infer::resolve(fn_param(f, 0, pcx), pcx)
+    } else { fn_param(f, 0, pcx) };
     let mut arg = receiver;
     if through && !is_borrow(receiver, pcx)
         && !(pcx.types[self_ty as usize].kind == TyKind::Ptr && pcx.types[self_ty as usize].b == 0) {
@@ -1442,8 +1753,10 @@ pub fn become_value(n: i64, a: i64, t: i64, pcx: &mut Ctx<Comp>) {
     pcx.nodes[n as usize].ty = t;
 }
 
-// Call n becomes `a as t` (a checked, of an integer type that widens to t).
-fn become_cast(n: i64, a: i64, t: i64, pcx: &mut Ctx<Comp>) {
+// Call n becomes `a as t` (a checked, of an integer type that widens to t;
+// 0.30.2: of an integer variable's type, t one of the conversion's types,
+// infer::int_from).
+pub fn become_cast(n: i64, a: i64, t: i64, pcx: &mut Ctx<Comp>) {
     let (start, end) = (pcx.nodes[n as usize].start, pcx.nodes[n as usize].end);
     let ty = new_node(NodeKind::TyName, start, end, pcx);
     pcx.nodes[ty as usize].a = intern_c(primitive_name(t), pcx);
@@ -1655,7 +1968,7 @@ pub fn into_call(n: i64, expected: i64, pcx: &mut Ctx<Comp>) -> i64 {
     pcx.nodes[n as usize].kind = NodeKind::Call;
     pcx.nodes[n as usize].a = callee;
     pcx.nodes[n as usize].b = 0;
-    let r = dispatch(n, expected, intern_c(c"from", pcx), 1, pcx);
+    let r = dispatch(n, expected, intern_c(c"from", pcx), 1, -1, -1, 0, pcx);
     if r < 0 { expected } else { r }
 }
 
@@ -1694,7 +2007,7 @@ pub fn try_into_call(n: i64, expected: i64, pcx: &mut Ctx<Comp>) -> i64 {
     pcx.nodes[n as usize].kind = NodeKind::Call;
     pcx.nodes[n as usize].a = callee;
     pcx.nodes[n as usize].b = 0;
-    let r = dispatch(n, to, intern_c(c"try_from", pcx), 1, pcx);
+    let r = dispatch(n, to, intern_c(c"try_from", pcx), 1, -1, -1, 0, pcx);
     if r < 0 { expected } else { r }
 }
 
@@ -1714,6 +2027,21 @@ pub fn error_conversion(value: i64, from: i64, to: i64, pos: i64, pcx: &mut Ctx<
         pcx.nodes[ty as usize].ty = to;
         pcx.nodes[c as usize].a = value;
         pcx.nodes[c as usize].b = ty;
+        return c;
+    }
+    // RULE: F18.5 (0.30.2: an error of an integer variable's type, `Err(0)?`
+    // in a function whose error type is i64: rustc's `i64: From<{integer}>`
+    // waits for the variable; the cast, its From checked at the function's
+    // end with the type the variable took, infer::int_from, as `T::from(x)`)
+    if crate::front::check::infer::int_free(from, pcx) && (is_integer(to) || is_float(to)) {
+        let c = new_node(NodeKind::Cast, start, end, pcx);
+        let ty = new_node(NodeKind::TyName, start, end, pcx);
+        pcx.nodes[ty as usize].a = intern_c(primitive_name(to), pcx);
+        pcx.nodes[ty as usize].ty = to;
+        pcx.nodes[c as usize].a = value;
+        pcx.nodes[c as usize].b = ty;
+        pcx.nodes[c as usize].ty = to;
+        crate::front::check::infer::int_from(c, from, pcx);
         return c;
     }
     let tr = std_trait(c"From", pcx);

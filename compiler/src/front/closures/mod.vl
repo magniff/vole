@@ -38,8 +38,8 @@ use crate::base::diag::{
     err_try_fmt, file_line_col,
 };
 use crate::front::ast::{
-    CLOSURE_MOVE, FN_CLOSURE, NODE_CAPTURE, NODE_IMPLICIT, NodeKind, child, list_begin, list_end,
-    list_push, new_node,
+    CALL_AS_FN_MUT, CALL_CONSUMES, CLOSURE_MOVE, FN_CLOSURE, NODE_CAPTURE, NODE_IMPLICIT, NodeKind,
+    child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::check::{
     Res, check_block, define_local, mismatch_error, pop_scope, push_scope, type_error,
@@ -86,11 +86,14 @@ use crate::front::types::{
     // (0.27.2, D20.3) the expected bound (a TyFn node; 0: none) and the
     // generics node its types are written in (0: none); the closure's
     // external signature regions X_C: how many, and their variances in
-    // CAPTURE_LIST from xc_at (places/regions.vl, closure_sig_slots)
+    // CAPTURE_LIST from xc_at (places/regions.vl, closure_sig_slots), and
+    // whether they are made (0.30.2, RT-91: a type holding the closure
+    // counts its slots only then, kinds.vl make_xc)
     pub exp_node: i64,
     pub exp_tps: i64,
     pub xc_at: i64,
     pub xc_n: i64,
+    pub xc_made: bool,
     // (D19.10) its requirements, once its body is solved: req_n pairs (i,
     // j) in CAPTURE_LIST from req_at, slot i of its type outlives slot j
     // (-1: 'static)
@@ -189,6 +192,11 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64, pcx: &mut Ctx<Comp>) -> i6
         let mut t = wanted;
         if pcx.nodes[param as usize].b != 0 {
             t = resolve_type(pcx.nodes[param as usize].b, pcx);
+            // RULE: F18.5 (0.30.2: the bound's type, an integer variable,
+            // `fold(0, |s: i64, x| ..)`, takes the type written)
+            let wanted = if wanted > 0 && t > 0 && wanted != t && pcx.infer_live
+                && crate::front::check::infer::int_free(wanted, pcx)
+                && crate::front::check::infer::unify(wanted, t, pcx) { t } else { wanted };
             if wanted > 0 && t > 0 && wanted != t && pcx.types[t as usize].kind == TyKind::Ptr
                 && pcx.types[t as usize].a == wanted
                 && pcx.types[wanted as usize].kind != TyKind::Ptr {
@@ -235,7 +243,9 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64, pcx: &mut Ctx<Comp>) -> i6
     let mut result = ret;
     if pcx.nodes[n as usize].b != 0 {
         let written = resolve_type(pcx.nodes[n as usize].b, pcx);
-        if ret != 0 && ret != written && ret != pcx.ty_error && written != pcx.ty_error {
+        if ret != 0 && ret != written && ret != pcx.ty_error && written != pcx.ty_error
+            && !(pcx.infer_live && crate::front::check::infer::int_free(ret, pcx)
+                && crate::front::check::infer::unify(ret, written, pcx)) {
             mismatch_error(pcx.nodes[n as usize].b, ret, written, pcx);
         }
         result = written;
@@ -352,6 +362,13 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64, pcx: &mut Ctx<Comp>) -> i6
         list_end(fn_body, lets, pcx);
     }
     let body_ty = check_block(fn_body, result, pcx);
+    // RULE: F18.6 (a) (0.30.2: a result of a variable's type, an integer
+    // one from a literal argument, `fold(0, |s, x| s + x)`, is the body's)
+    if result != 0 && pcx.infer_live && body_ty != result && body_ty != TY_NEVER
+        && body_ty != pcx.ty_error
+        && crate::front::check::infer::unify(body_ty, result, pcx) {
+        result = crate::front::check::infer::resolve(result, pcx);
+    }
     if result == 0 {
         result = if body_ty == TY_NEVER { TY_UNIT } else { body_ty };
     } else if body_ty != result && body_ty != TY_NEVER && body_ty != pcx.ty_error
@@ -363,10 +380,6 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64, pcx: &mut Ctx<Comp>) -> i6
         err_type(result, pcx);
         err_str(c"'", pcx);
         err_end(pcx);
-    }
-    // RULE: F18.5 (an open local it captures takes its type now)
-    if pcx.open_lets.len() as i64 > 0 {
-        crate::front::check::literals::open_captured(pcx.closures[id as usize].caps, pcx);
     }
     // RULE: F18.6 (a type variable a capture holds is not known)
     if pcx.infer_live {
@@ -468,7 +481,8 @@ fn new_closure(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         caps: pcx.caps.len() as i64, ty: 0, sig: 0, kind: 0, expected: 0, bound_kind: 0,
         bound_node: 0,
         use_at: 0,
-        use_count: 0, exp_node: 0, exp_tps: 0, xc_at: 0, xc_n: 0, req_at: 0, req_n: 0,
+        use_count: 0, exp_node: 0, exp_tps: 0, xc_at: 0, xc_n: 0, xc_made: false, req_at: 0,
+        req_n: 0,
     });
     id
 }
@@ -1012,8 +1026,10 @@ pub fn closure_sig(c: i64, pcx: &Ctx<Comp>) -> i64 {
 
 // Call n of a value of closure type `ty` (synth_call): a direct call of
 // the closure's function, with `&callee` first when it captures; its
-// result type.
-pub fn closure_call(n: i64, ty0: i64, pcx: &mut Ctx<Comp>) -> i64 {
+// result type. as_kind: the call kind its callee's type or parameter
+// bound gives (KIND_FN..), 0 none; move_ty: the type the callee moves as
+// when the call consumes it (an opaque type), 0 its closure's.
+pub fn closure_call(n: i64, ty0: i64, as_kind: i64, move_ty: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // RULE: D19.5 (a call through `&F` or `&mut F` of a closure, the rust
     // edition's `compare(a, b)` with `compare: &mut F`: rustc's blanket
     // impls, the call of `*compare`, its env `&*compare`)
@@ -1040,12 +1056,35 @@ pub fn closure_call(n: i64, ty0: i64, pcx: &mut Ctx<Comp>) -> i64 {
         pcx.nodes[u as usize].ty = ty;
         callee = u;
     }
-    if (pcx.nodes[pcx.closures[c as usize].node as usize].c & CLOSURE_MOVE) != 0
-        && pcx.closures[c as usize].writes {
-        // (0.25) a sink closure that changes what it owns (FnMut): a
-        // call changes the closure, which must be mutable: a var, an
-        // inout or sink parameter, not a let binding or a let access
+    // RULE: D19.5, D21.6 (0.30.2, RT-213) The call is of the kind as_kind
+    // says, its closure's own or not: called as FnOnce, it consumes the
+    // callee (CALL_CONSUMES: moved into a temporary of the call, which the
+    // env borrows; a closure that is FnOnce itself is its own env, moved;
+    // either moved as the opaque type it is, never copied as a closure
+    // that is Copy), and needs no `mut`; called as FnMut (as_kind, or a sink
+    // closure that changes what it owns), the callee must be a mutable
+    // place (E0596), and its env is a `&mut` borrow (CALL_AS_FN_MUT).
+    let once = as_kind == crate::front::closures::kinds::KIND_FN_ONCE;
+    // (the borrow checker asks for the `mut` through the env's `&mut`
+    // borrow; a closure that captures nothing has no env, so it is asked
+    // here, as is a sink closure's, 0.25)
+    let fnmut = !once && (as_kind == crate::front::closures::kinds::KIND_FN_MUT
+        && pcx.closures[c as usize].capture_count == 0
+        || (pcx.nodes[pcx.closures[c as usize].node as usize].c & CLOSURE_MOVE) != 0
+        && pcx.closures[c as usize].writes);
+    if fnmut {
+        // (0.25) a call that changes the closure: a var, an inout or sink
+        // parameter, not a let binding or a let access
         crate::front::check::assign::check_closure_call_place(callee, n, pcx);
+    }
+    if once {
+        pcx.nodes[n as usize].p |= CALL_CONSUMES;
+        if move_ty != 0 {
+            pcx.nodes[callee as usize].ty = move_ty;
+        }
+    }
+    if as_kind == crate::front::closures::kinds::KIND_FN_MUT {
+        pcx.nodes[n as usize].p |= CALL_AS_FN_MUT;
     }
     let mark = list_begin(pcx);
     if pcx.closures[c as usize].capture_count > 0 {
@@ -1068,7 +1107,9 @@ pub fn closure_call(n: i64, ty0: i64, pcx: &mut Ctx<Comp>) -> i64 {
         list_push(arg, pcx);
     }
     list_end(n, mark, pcx);
-    pcx.nodes[n as usize].a = 0;
+    // (a consumed callee with no env stays the call's `a`, moved there)
+    pcx.nodes[n as usize].a = if (pcx.nodes[n as usize].p & CALL_CONSUMES) != 0
+        && pcx.closures[c as usize].capture_count == 0 { callee } else { 0 };
     pcx.nodes[n as usize].x = f + 1;
     pcx.types[sig as usize].a
 }
@@ -1100,6 +1141,18 @@ pub fn resolve_sigs(from: i64, pcx: &mut Ctx<Comp>) {
         let s = pcx.closures[c as usize].sig;
         if s > 0 {
             pcx.closures[c as usize].sig = crate::front::check::infer::resolve(s, pcx);
+        }
+        // (0.30.2: its env's fields, the captures' types: an integer
+        // variable's, F18.5, solved after the closure was checked)
+        let st = pcx.closures[c as usize].env_struct;
+        if st >= 0 {
+            let at = pcx.structs[st as usize].fields;
+            for j in 0..pcx.structs[st as usize].field_count {
+                let ft = pcx.fields[(at + j) as usize].ty;
+                if crate::front::check::infer::mentions(ft, true, pcx) {
+                    pcx.fields[(at + j) as usize].ty = crate::front::check::infer::resolve(ft, pcx);
+                }
+            }
         }
     }
 }

@@ -34,7 +34,10 @@ hello
 
 `main` returns the exit status (`fn main()` with no result is 0).
 `fn main(gpa: Gpa)` takes the program's allocator (below); the
-arguments are `std::env::args()`. Several files on the command line
+arguments are `std::env::args()`. main's forms (0.30.2, others are
+`main.signature`, `main.result`): no parameter, `gpa: Gpa`, C's `argc:
+i32, argv: *mut *mut u8`, or those and `gpa: Gpa` last; it returns
+nothing, `i32`, `i64`, `!` or `Result<(), E>`. Several files on the command line
 make one program; `mod name;` loads `name.vl`.
 
 ## Where it is not Rust

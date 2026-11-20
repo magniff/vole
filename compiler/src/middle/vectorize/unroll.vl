@@ -45,6 +45,7 @@ use crate::middle::vectorize::checks::{
     record_ovf,
 };
 use crate::middle::vectorize::legality::{coef, is_unreachable_exit, loads_in, set_class};
+use crate::middle::vectorize::reduction::{in_set, reduction_set};
 
 const UNROLL_RT_SIZE: i64 = 64;
 
@@ -219,132 +220,38 @@ fn runtime_factor(cx: &mut FnCtx<Comp>, l: i64, pcx: &Ctx<Comp>) -> i64 {
     if u < 2 { 0 } else { u }
 }
 
-// (0.15) Whether v is one of the set's values.
-fn in_set(set: &[i64], v: i64) -> bool {
-    for i in 0..set.len() as i64 {
-        if ((set[i as usize])) == v {
-            return true;
-        }
-    }
-    false
-}
-
 // (0.15) Whether header phi r of loop l (next value nx) is a reduction the
-// copies may each keep apart, combined after the unrolled loop: an
-// accumulator only ever combined with values that do not depend on it, by
-// one associative and commutative operation (+ and -, ^, |, &, *, of
-// integers), through phis and selects of such values; or a minimum or
-// maximum, `k ? x : r` with k comparing x and r (an integer order). Only
-// nx may be used outside the loop (outs: the exit block's values). Returns
-// the operation (as i64; ADD for + and -), -1 for a minimum or maximum (its
-// select nx), or 0. (0.26.2, a prototype) When `spec`, a sum whose steps
-// are each overflow-checked is one too: its steps and addends into `steps`.
+// copies may each keep apart, combined after the unrolled loop
+// (reduction_set, the vectorizer's rule too: its running value read by
+// nothing but its own steps, and after the loop as nx alone; outs: the
+// exit block's values). Returns the operation (as i64; ADD for + and -),
+// -1 for a minimum or maximum (its select nx), or 0. (0.26.2, a
+// prototype) When `spec`, a sum whose steps are each overflow-checked is
+// one too: its steps and addends into `steps`.
 fn split_reduction(cx: &mut FnCtx<Comp>, l: i64, r: i64, nx: i64, outs: &[i64], spec: bool,
     steps: &mut Vec<i64, Comp>) -> i64 {
-    let ty = (cx.insts[r as usize]).ty;
-    if !is_integer(ty) || r == cx.v_iv || nx == r || (cx.insts[nx as usize]).block == 0
-        || !loop_contains(cx, l, (cx.insts[nx as usize]).block) {
+    let mut set: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let mut checks: Vec<i64, Comp> = Vec::new_in(Comp {});
+    let kind = reduction_set(cx, l, r, nx, outs, &mut set, &mut checks);
+    if kind == 0 || checks.len() as i64 == 0 {
+        return kind;
+    }
+    // (0.26.2) Checked steps (each a recorded check, see checked_steps):
+    // split when spec, the loop redone from its start when the sums may
+    // overflow (unroll_runtime).
+    if !spec || kind != Add as i64 {
         return 0;
     }
-    let h = loop_header(cx, l);
-    let mut set: Vec<i64, Comp> = Vec::new_in(Comp {});
-    set.push(r);
-    let mut family: i64 = 0;
-    let mut minmax = false;
-    let k = (cx.insts[nx as usize]).a;
-    if (cx.insts[nx as usize]).op == Op::Sel && (cx.insts[k as usize]).op == Cmp
-        && is_integer((cx.insts[k as usize]).imm2)
-        && (cx.insts[k as usize]).cond != Cond::Eq
-        && (cx.insts[k as usize]).cond != Cond::Ne
-        && ((cx.insts[k as usize]).a == r) != ((cx.insts[k as usize]).b == r) {
-        let z = if (cx.insts[k as usize]).a == r { (cx.insts[k as usize]).b }
-            else { (cx.insts[k as usize]).a };
-        if ((cx.insts[nx as usize]).b == r && (cx.insts[nx as usize]).c == z)
-            || ((cx.insts[nx as usize]).b == z && (cx.insts[nx as usize]).c == r) {
-            minmax = true;
-            set.push(k);
-            set.push(nx);
+    for i in 0..checks.len() as i64 {
+        if ovf_index(cx, (checks[i as usize])) < 0 {
+            return 0;
         }
     }
-    let mut ok = true;
-    let mut grew = true;
-    let mut checks: Vec<i64, Comp> = Vec::new_in(Comp {});
-    while ok && grew && !minmax {
-        grew = false;
-        for i in 0..loop_size(cx, l) {
-            let mut w = { let at_ix = loop_block(cx, l, i) as usize; cx.blocks[at_ix].first };
-            while w != 0 && ok {
-                if w != r && !in_set(&set, w) && uses_set(cx, w, &set) {
-                    let op = (cx.insts[w as usize]).op;
-                    let mut member = true;
-                    if op == Phi {
-                        ok = (cx.insts[w as usize]).block != h;
-                        for a in 0..(cx.insts[w as usize]).nargs {
-                            ok = ok && in_set(&set, ir_val(cx, ir_arg(cx, w, a)));
-                        }
-                    } else if op == Op::Sel {
-                        ok = !in_set(&set, (cx.insts[w as usize]).a)
-                            && in_set(&set, (cx.insts[w as usize]).b)
-                            && in_set(&set, (cx.insts[w as usize]).c);
-                    } else if (op == Add || op == Sub || op == Op::Xor || op == Op::Or
-                        || op == And || op == Op::Mul) && (cx.insts[w as usize]).ty == ty {
-                        let f = if op == Sub { Add as i64 } else { op as i64 };
-                        ok = in_set(&set, (cx.insts[w as usize]).a)
-                            != in_set(&set, (cx.insts[w as usize]).b)
-                            && (op != Sub || in_set(&set, (cx.insts[w as usize]).a))
-                            && (family == 0 || family == f);
-                        family = f;
-                    } else if op == Op::Ovf && spec && ovf_index(cx, w) >= 0 {
-                        // (0.26.2) A step's overflow check (see
-                        // checked_steps): not one of the set.
-                        if !in_set(checks.as_slice(), w) {
-                            checks.push(w);
-                        }
-                        member = false;
-                    } else {
-                        ok = false;
-                    }
-                    if ok && member {
-                        set.push(w);
-                        grew = true;
-                    }
-                }
-                w = (cx.insts[w as usize]).next;
-            }
-        }
+    let ty = (cx.insts[r as usize]).ty;
+    if !checked_steps(cx, set.as_slice(), checks.as_slice(), ty, steps) {
+        return 0;
     }
-    // Nothing else uses the set inside the loop (a minimum's compare
-    // and select only each other and r), nor outside but nx, nor a
-    // terminator.
-    for i in 0..loop_size(cx, l) {
-        let b = loop_block(cx, l, i);
-        if (cx.blocks[b as usize]).term != Term::Jump
-            && in_set(&set, ir_val(cx, (cx.blocks[b as usize]).cond)) {
-            ok = false;
-        }
-        if minmax {
-            let mut w = (cx.blocks[b as usize]).first;
-            while w != 0 && ok {
-                if w != r && w != k && w != nx && uses_set(cx, w, &set) {
-                    ok = false;
-                }
-                w = (cx.insts[w as usize]).next;
-            }
-        }
-    }
-    ok = ok && in_set(&set, nx) && (minmax || family != 0);
-    for i in 0..outs.len() as i64 {
-        let x = (outs[i as usize]);
-        if x != nx && in_set(&set, x) {
-            ok = false;
-        }
-    }
-    // (0.26.2) Checked steps: split when spec, the loop redone from its
-    // start when the sums may overflow (unroll_runtime).
-    if ok && checks.len() as i64 > 0 {
-        ok = !minmax && family == Add as i64 && checked_steps(cx, &set, &checks, ty, steps);
-    }
-    if !ok { 0 } else if minmax { -1 } else { family }
+    kind
 }
 
 // (0.26.2, a prototype) Whether `checks`, overflow checks on values of
@@ -427,16 +334,6 @@ fn mark_step_check(cx: &mut FnCtx<Comp>, w: i64) {
             (cx.v_ovfs[(3 * k + 1) as usize]) = OVK_STEP;
         }
     }
-}
-
-fn uses_set(cx: &mut FnCtx<Comp>, w: i64, set: &[i64]) -> bool {
-    for i in 0..ir_operand_count(cx, w) {
-        let x = ir_operand(cx, w, i);
-        if x != 0 && in_set(set, ir_val(cx, x)) {
-            return true;
-        }
-    }
-    false
 }
 
 // (0.15) The identity of reduction operation `kind` at type ty.

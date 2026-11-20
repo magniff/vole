@@ -732,7 +732,7 @@ shared one goes and no call takes it, a `let` with a type, an
 assignment, a struct's or a variant's field, an array element, a result
 (`let b: &[T] = s;`, `b = s;`, `H { b: s }`, `let u: &str = t;`, `let
 k: &i64 = r;`), is its shared reborrow, `_t = &(*Q)` or `_t = slice
-Q[..]` (build.vl operand, shared_coercion). Before, the place was copied
+Q[..]` (build.vl operand, exclusive_read). Before, the place was copied
 with no loan, Copy as its shared type is: a write through `s` while `b`
 lived was accepted (a use after free; a live `&str` changed by
 `make_ascii_uppercase`). A `let` with a type whose initializer is a place
@@ -1249,7 +1249,14 @@ AST nodes; a `fn` type or a bound inside one is not looked into (its
 references are what the item gives). It is stricter than rustc where
 the value's type itself says `'static` (`let f: fn(&'static T) =
 item`), which the erased type cannot say; rustc's E0308 ("one type is
-more general than the other") covers the rest. A result's lifetimes
+more general than the other") covers the rest. Where the value is
+given straight to a bound (`v.first().map(kf::<&i64>)` with `fn kf<T>(x:
+T) -> &'static i64 where &'static i64: From<T>`), rustc carries the
+`'static` the function needs to the argument it is called with and
+reports that borrow, E0597 (`v` does not live long enough); vole cannot
+carry it through the erased type and refuses the value: the same
+program refused at another place (the borrowck twin reads E0597 as this
+code for such a case). A result's lifetimes
 need nothing: a call through the value ties its result to every
 argument (R6). `error borrowck.fn_value_static`, at the value.
 *Anchor:* `places/fn_values.vl: check_fn_value`, `places/build.vl:
@@ -1858,10 +1865,15 @@ closure the region is instantiated fresh (D3.6, D4.3), as it should be.
   being a reborrow of the other, and the reborrow's region is bounded
   by the outer reference's (`'q : 'new`). (0.30.1) Nor a whole mutable
   view, with no exception: given to a call, into a shared view or
-  `&T` (shared_coercion, the hidden binding of a format hole, a typed
-  `let`), it is reborrowed; only a copy into a raw pointer (R1, a cast
-  or a coercion, an access of the reference's kind) and a `requires`
-  companion's read (C3.2) are no reborrow. verify_mut_copies asserts
+  `&T` (exclusive_read, the hidden binding of a format hole, a typed
+  `let`), it is reborrowed; only a `requires` companion's read (C3.2)
+  is no reborrow. (0.30.2, RT-197) Into a raw pointer too, by a cast or
+  a coercion: `w as *mut W` is `&raw mut (*w)`, `as *const W` `&raw
+  const (*w)`, a mutable view `slice Q[..]` marked `&mut`, and `r as
+  &mut T` `&mut (*r)`, each asked as its borrow is (E0596 behind a
+  `&`); before, a cast copied the reference and only the loan check
+  knew it for a write, so `h.r as *mut i64` of an `h: &H` wrote behind
+  a shared reference. verify_mut_copies asserts
   it of every body the runner builds (`--verify-places`); the
   exemptions it had for views (a call's argument, an intrinsic's, a
   shared destination) hid `f(s, s)`, `let b: &[T] = s;` with a write
@@ -1954,6 +1966,85 @@ outside the holes named below.
   the result outlive the argument (case `rust_b_err_fn_item_bound_result`).
   Stricter than rustc for a fn item whose result is `'static` (the erased
   type says every argument region outlives every result region).
+  *(0.30.2, RT-282, RT-297..301, RT-304, RT-308..311, RT-364, RT-367,
+  RT-368, RT-378, RT-421) One rule where a
+  callable meets an Fn bound or a `fn` type.* A call through such a
+  callable in a signature's body relates the regions of its parts as
+  `indirect_call` reads the erased type (every argument region outlives
+  every result region; one in an invariant position equals every other
+  one's), and the signature says so: `regions::callable_ties` (in
+  `sig_compute`) reads every `Fn*` bound of a type parameter whose
+  substitution is a `fn` type, a `fn` item or an opaque `impl Fn` (and
+  the bound's of a closure that has its own bound regions, checked
+  against another bound before: `closure_group_ties`), every `fn` type
+  written in a parameter's type at any depth (behind `&`, in an array, a
+  tuple, a struct's or an enum's type argument), and every `where`
+  predicate on another subject, in the signature's universals. Each
+  relation is `Sig.vties`: assumed in the body (`assign_regions`) and
+  required at each call (`constraints::call`), except where the value
+  given for that parameter is a fn item whose own signature keeps the two
+  positions apart (`fn st(x: &i64) -> &'static i64` for `F: Fn(T) -> U`:
+  `fn_values::relates`), as rustc reads the item's own type. A relation
+  whose first region is the call's own (an elided lifetime of the
+  bound's input, `F: FnMut(&T) -> K`) is no universal's: it is a strict
+  record (`Sig.strict`), checked where the value is given
+  (`fn_values::check_callables`, from `build.vl lower_call`), when the
+  callee's body reads it, of a parameter typed by a type parameter
+  (`regions::bound_param`, as `indirect_call` asks it): a fn item
+  whose signature relates them, a `fn` value, or a parameter forwarded
+  from a body that has no such record is `borrowck.fn_value_bound`
+  (rustc E0308). What a value is, is read from the call's lowered
+  operands (`build::held_callable`): a fn item (any path naming it), a
+  local written once, by one or by a copy of a local that holds one
+  (`let p = st;`, `let k: fn(&i64) -> &'static i64 = st;`: its item's
+  signature decides), or a parameter of the body that the body never
+  writes and is typed by a type parameter (forwarded: the body's own
+  record, checked by its callers, holds it). Whether a local is written
+  after its definition is one rule (`ir::held_value`), which
+  `indirect_call` asks too: every write counts, whatever the local's
+  flags say (a parameter that is not `mut` may be borrowed mutably): an
+  assignment or a call into it or a part of it, and a borrow of it or a
+  part that is not shared (`&mut`, a `ref mut` binding in any pattern, a
+  `&mut self` autoref, `&raw mut`, `&raw const`, a closure's unique
+  capture, a match's fake borrow). Since every caller is checked by them, the callee's body is
+  checked by the bound, not by the erased type, for a parameter typed by
+  a type parameter (`f: F`, `regions::bound_param`): a call through that
+  parameter (or the temporary a call by value moves it into), when the
+  body never writes it (`ir::held_value`), makes no edge a strict
+  record names (`constraints::indirect_call`, `strict_pair`). So std's
+  `or_insert_with_key` and `arena_scope` given a fn item that keeps no
+  borrow build, and one that does is refused at the call, not inside std
+  (RT-378). A value of type F can reach such a body only through a
+  checked call: a function with such records used as a value is
+  `borrowck.fn_value_bound`. A `fn(..)` type written for a parameter
+  asks nothing of the body (its calls are read as R6 reads that type, as
+  before), so such a function is a value as any other (`pick<'a>(d: &'a
+  i64, k: fn(&i64) -> &'a i64)`), and its callers may give it any `fn`
+  value (a forwarded `fn(..)` parameter, an array's element), at the top
+  of the parameter's type or below it (`&[fn(..)]`). A struct or an enum whose field is a `fn` type
+  (`struct H<A, B> { f: fn(A) -> B }`) has the same relations as its
+  declaration's requirements (`regions::fn_field_reqs`, through
+  `adt_reqs`), its parameters' regions standing for every slot of what
+  they are given. Before, a fn item's call in the instance related
+  nothing at the caller: `v.first().map(idr2)`, `ap(&v[0], idr2)`,
+  `v.iter().scan(0, sc)`, a `fn` value kept in a field or a Vec and
+  passed on each kept no borrow of v, a use after free from safe code.
+  Whether a function's parameter needs `'static` is one rule,
+  `fn_values::static_param`, for its use as a value (`check_fn_value`,
+  `borrowck.fn_value_static`) and where a bound reads it
+  (`check_callables`): its written text (D4.7: a `'static`, an alias's,
+  a lifetime bounded by it), and what its bounds bring as the signature
+  reads them, through the impl select chose and that impl's nested
+  obligations (`impl_bound_ties`: `T: Keep` with only `impl Keep for
+  &'static i64`, `T: Into<&'static i64>` through std's blanket Into, a
+  supertrait's `'static`; RT-308, RT-364, RT-421). Stricter than
+  rustc: a `fn` value (not an item) relates every argument to its
+  result, as before; HRTB bounds (`for<'a>`) are not parsed (RT-207).
+  *Cases:* the tags, `rust_b_fn_value_r6_ok`, `rust_b_fn_value_r6_std_ok`,
+  `rust_b_fn_value_r6_held_ok`, `rust_b_err_fn_value_r6_drop`,
+  `rust_b_err_fn_value_r6_given`, `rust_b_err_fn_value_r6_as_value`,
+  `rust_b_err_fn_value_r6_reassign`, `rust_b_err_fn_value_static_through_bound`,
+  `rust_b_err_fn_ptr_mut_ref_fn_bound`.
 - R7 Constant index projections `P[k]` vs `P[k']` with `k ≠ k'` were
   disjoint (D1.5), so `&mut a[0]` and `&mut a[1]` could coexist on an
   array and through a `&mut [T]`, and so could `a[i]` and `a[j]` by
@@ -1998,6 +2089,12 @@ outside the holes named below.
   (0.27.5) Narrowed by D2.8: a promotable rvalue's temporary is the
   body's, so a borrow of one used after its statement or branch is
   accepted; one that escapes the function is still refused.
+  (0.30.2, RT-383) A field typed `&'static T` binds its literal's part
+  to 'static, so `V { a: &7 }` and a const's `Vs { n: &[4, 11] }`
+  (a const's value is made again where it is used) are
+  `borrowck.dropped_borrowed` too; before, no region of a literal of a
+  type without regions was related, and the reference pointed into the
+  using function's frame.
 - L3 Temporaries' scopes are vole's (the statement; the block for `let
   r = &f(x)`), not Rust 2024's tail-expression rule: a difference only
   in `match`/block tail temporaries. (0.27.5) Nor rustc's extension of a `let`
@@ -2054,7 +2151,12 @@ outside the holes named below.
   read when the callee does not store it. Sound (the callee's real
   signature relates at most these regions); ends with `for<'a>` `fn`
   types (0.29). Case `rust_b_err_fn_value_arg_flow_strict`
-  (`// RUSTC: accepts L13`).
+  (`// RUSTC: accepts L13`). (0.30.2) So a `fn` value given for a bound
+  whose input is the call's own region is refused (R6's strict records,
+  `borrowck.fn_value_bound`) though its type names the lifetime its
+  result borrows: `g: fn(&mut i64, &'b i64) -> Option<&'b i64>` given to
+  scan, whose result would borrow the state's `&mut` too, case
+  `rust_b_err_fn_value_r6_via_erased`.
 - L14 (0.27.2.1) An instance's type argument whose trait impl has an
   equality bound is not read with it (D4.6 (d) reads the bounds of the
   function's own parameters only): in `Copied<Chain<Iter<'x, T>,
@@ -2183,7 +2285,8 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.return_local` | D6.2.2 | E0515 | none; the help suggests returning an owned value |
 | `borrowck.outlives` | D6.2.1; D19.10 case 1 | E0621, E0623, E0521 | "add `'a: 'b`", or "name the lifetime `'a` on `x`" when the blame path ends at two parameters of elided regions (E2 failed): `fix --suggested` writes `<'a>` on both |
 | `borrowck.param_outlives` | D4.5 (0.30.1) | E0310 | none mechanical; the help says to add `T: 'static` |
-| `borrowck.fn_value_static` | D4.7 (0.30.1) | E0308 | none mechanical; the help says to call it by name, or take `&T` |
+| `borrowck.fn_value_static` | D4.7 (0.30.1) | E0308; E0597 where rustc carries the `'static` to the argument (0.30.2) | none mechanical; the help says to call it by name, or take `&T` |
+| `borrowck.fn_value_bound` | R6 (0.30.2) | E0308 ("one type is more general than the other"); "implementation of `Fn*` is not general enough" | none mechanical; the help says to pass a closure that does not borrow the argument, or the function by its name |
 | `borrowck.elision` | E4 at the signature (ir271) | E0106 | writes `<'a>` and `&'a` on the only reference parameter when there is one |
 | `borrowck.unused_param` | D5.3 (ir271) | E0392 | adds a `PhantomData<&'a ()>` field |
 | `borrowck.use_moved` | M1, M5 | E0382 | `.clone()` when `Clone` (as `own.moved`'s) |
@@ -2671,6 +2774,25 @@ decided by where `'a` and `'v` are:
    universals of `F`'s substitution), and D19.5's call rule includes
    them in the callee's order.
 
+(0.30.2, RT-44) The closures a body made while the bodies are built
+(the `drop` instance of a generic Drop impl, made where a value of its
+type is dropped, places/shim.vl drop_fn, with what it calls: a generic
+function, a trait's default method, a generic trait's impl method, a
+const's initializer) get D19.1-D19.6 as every closure does, and their
+bodies are built before the bodies that make them, innermost first:
+`places/mod.vl: place_late_closures`, after every body run_places
+builds. Before, they had no `X_C` (a closure's signature indexed
+`CSLOTS` past its type's slots: a compiler panic) and no D19.2 (a
+capture its body moved stayed a borrow: a double drop). Cases
+`rt_044_*`.
+(0.30.2, RT-91) A closure type's slots are its env's and its `X_C`
+(`slot_count`), so a closure's `X_C` is made after the `X_C` of every
+closure its signature or its env holds (`front/closures/kinds.vl:
+sig_slots_ordered`, depth first over the types). Before, they were made
+in the closures' order, and an outer closure made before the inner one
+its result holds (`flat_map(|y| v.iter().map(|x| ..))`) counted the
+inner type's slots without them. Cases `rt_091_*`.
+
 *Soundness.* No position of `slots(Env(C))` is contravariant (a `fn`
 type has no slot, R6); `X_C`'s have `fn` variance. Every later value
 of type `C` is reached from the aggregate's destination by `sub` with
@@ -2831,6 +2953,71 @@ traits leak: `O_f: Send` iff `H_f: Send` (AT4). A method or a call of
 body needs `H_f` while it is being found (a recursive call's method): 
 `opaque.cycle` (E0720). No `use<..>`: every input lifetime is captured.
 `-> impl Fn*(A..) -> R` is the returned-closure case (D19.8).
+
+**D21.5 (layout, drop, moves: the hidden type; what a caller may do:
+the bounds).** (0.30.2, RT-145, RT-79, RT-147) `O_f` is `H_f` for
+layout, for drop and for its own Copy. One function decides what a
+distinct type is for its kind and its glue, `front/opaque.vl
+decided_type`: its underlying type, for `O_f` the hidden type (a nested
+opaque result decided in turn), 0 while `H_f` is not known (f not
+checked yet, or being checked: a caller checked before f, functions
+that call each other). `front/kinds.vl type_kind` is the one place every
+kind and glue question passes through (`has_glue` asks it first): a
+kind that reads a 0 there is returned but not kept (`kind_unknown`), and
+neither is the kind of any type holding it (an `Option<O_f>`, an `(O_f,
+i64)`, a struct, a Vec, an array, an enum: whatever type_kind reaches
+through a field, an element, a variant or a type argument), nor its glue
+(`kind_kept`). (A type reached again while its kind is computed reads
+as plain there, through a reference only, the same before and after
+`H_f` is known: the cycle rule of every type, not an answer kept from
+before.) The places IR is built when every function is
+checked, so what it drops is decided from the hidden types: a closure
+that owns a Vec or a D, an iterator struct holding one, a tuple or an
+Option of them is dropped as rustc drops it (v0.30.1 dropped none;
+0.30.2's first try kept the Option's and the tuple's answer from before
+f was checked). decided_type does not check f to know `H_f` (a kind
+asked there would check functions in another order and meet a cycle
+rustc has not). A move is `rust_copy`'s: `O_f` is Copy only when a bound
+says `Copy`, whatever `H_f` is (a captureless closure is Copy, its
+`impl Fn` is not). `check_distinct_kinds` skips opaque types
+(distinct.kind refused every `H_f` that owns memory, RT-79); a
+projection of `O_f` (`<O_f as Iterator>::Item`) is `H_f`'s; a reference
+to `O_f` has std's impls for references through `O_f`'s bounds (`&impl
+Fn` is Fn, `&mut impl FnMut` is FnMut, `&mut impl Iterator` is an
+Iterator, RT-166), as a blanket impl over `F: Fn` covers `O_f` by its
+bound (RT-196) and `flat_map` takes `O_f` as an IntoIterator (RT-200).
+*Anchor:* `front/opaque.vl: decided_type, reveal_type, fn_bound_type`,
+`front/kinds.vl: type_kind, kind_kept`,
+`places/glue.vl: has_glue, glue_of`, `front/traits.vl: implements`.
+*Cases:* `rt_145_opaque_*`.
+
+**D21.6 (the call kind is the bound's).** (0.30.2, RT-213, RT-79c,
+RT-334) A call of a closure value has one call kind, decided in
+`synth_call`: the `Fn*` bound of the callee's type (`opaque_call_kind`,
+read after the autoderef, so for every callee shape: a local, a field,
+a tuple field, an element, a reference, a binding the value was moved
+to, a closure calling it), else a parameter's bound (`value_call_kind`);
+never the hidden closure's. `closure_call` applies it: called as
+`FnOnce`, the call consumes its callee (`CALL_CONSUMES`: moved as its
+opaque type, Copy only by its bounds, into a temporary of the call that
+its env borrows, `lower_arg`, or with no env kept as the call's callee,
+`lower_call`; a closure that is FnOnce itself is its env, moved so) and
+needs no `mut` (RT-334); called as `FnMut`, the callee must be a mutable
+place (E0596) and its env is a `&mut` borrow (`CALL_AS_FN_MUT`, E0502
+against a live shared borrow). Through a reference that its bound does
+not call through, an `impl FnOnce` (any reference, E0507) or an `impl
+FnMut` (a shared one, E0596) is refused (`through_ref_kind`), and
+neither meets a stricter bound (`fn_bound_satisfied` refuses an `impl
+FnOnce` for `F: Fn`, E0277). A callee is autoderefed through any
+references to a callable base (`callable_through_ref`: `(&&c)(1)`,
+`(&mut &mut g)()`, `&mut &&impl Fn`, RT-195), and `&&F`, `&mut &F`,
+`&mut &mut F` meet a bound as the inner reference does (std's impls for
+references; `&&mut F` is no `Fn*`). *Anchor:* `front/opaque.vl:
+opaque_call_kind`, `front/closures/fn_bounds.vl: fn_bound_satisfied,
+value_call_kind, callable_through_ref`, `front/check/calls/paths.vl:
+synth_call, through_ref_kind`, `front/closures/mod.vl: closure_call`,
+`places/build.vl: lower_call, lower_arg`. *Cases:*
+`rt_213_opaque_call_kinds`, `rt_213*`, `rt_195*`, `rt_166*`, `rt_334*`.
 
 - **L10** (0.27.2.1) One opaque type per function, at the top of its
   result; the hidden type's associated types are seen by the caller

@@ -164,6 +164,7 @@ base::ctx::Ctx.st_all	off: --stats; the totals, behind a lock
 base::ctx::Ctx.print_regalloc	off: --print-regalloc
 base::ctx::Ctx.verify_regalloc	off: --verify-regalloc
 base::ctx::Ctx.plant_rt_cg_7	off: --verify-regalloc (set only under it, from VOLE_PLANT_RT_CG_7 before the tasks; 0 otherwise)
+base::ctx::Ctx.plant_limit	key: VOLE_PLANT_LIMIT is in the environment cc_args hashes (args_h); read once, when the context is made, before the tasks
 base::ctx::Ctx.x86_alloc_acd	key: options_hash
 base::BUFS	own: the context'"'"'s buffers
 base::BUF_CAP	own: buf_new on internal errors and printers

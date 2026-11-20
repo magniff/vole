@@ -56,8 +56,8 @@ use crate::base::{
     _setjmp, buf_at, buf_bytes, buf_copy, buf_fmt, buf_len, buf_new, get_src, intern_c,
 };
 use crate::base::diag::{
-    err_begin, err_end, err_fix, err_help, err_str, err_sym, err_try_fmt, error_at, error_count,
-    errors_forget, errors_mark, exit_if_errors, recover_enter, recover_leave,
+    err_begin, err_end, err_end_soft, err_fix, err_help, err_str, err_sym, err_try_fmt, error_at,
+    error_count, errors_forget, errors_mark, exit_if_errors, recover_enter, recover_leave,
 };
 use crate::front::ast::{
     FN_BODY_FAILED, FN_DEFAULT_COPY, FN_INTRINSIC, FN_LAZY, FN_OPAQUE_DONE, FN_SIG_FAILED,
@@ -85,8 +85,8 @@ use crate::front::traits::{
     init_traits, trait_named,
 };
 use crate::front::types::{
-    REF_MUT, REF_SHARED, TY_BOOL, TY_I64, TY_U8, TyKind, buf_type, err_type, is_integer, is_numeric,
-    is_ref, is_vector, type_elem, type_size,
+    REF_MUT, REF_SHARED, TY_BOOL, TY_I32, TY_I64, TY_U8, TyKind, buf_type, err_type, is_integer,
+    is_numeric, is_ref, is_vector, type_elem, type_size,
 };
 use crate::tools::fiximports::report_legacy_imports;
 
@@ -111,6 +111,7 @@ use crate::front::embed::wgsl::WgslCx;
 use crate::front::features::ctx::features_cx_new;
 use crate::front::lexer::Tok;
 use crate::front::threads::threads_cx_new;
+use crate::middle::lower::ssa::HMap;
 use crate::places::ir::body_new;
 
 // What an identifier names.
@@ -180,6 +181,10 @@ fn mismatch_help(n: i64, expected: i64, actual: i64, pcx: &mut Ctx<Comp>) {
         || actual == pcx.ty_error {
         return;
     }
+    // (0.30.2: an integer variable still free is an integer to the helps
+    // below, as 0.30.1's i32 literal was: `3 != 0` for a condition)
+    let solved = crate::front::check::infer::follow(actual, pcx);
+    let actual = if crate::front::check::infer::is_int_var(solved, pcx) { TY_I32 } else { solved };
     let text = &get_src()[
         pcx.nodes[n as usize].start as usize..pcx.nodes[n as usize].end as usize];
     // (an operator's operand: what binds looser than `as` and `!=`)
@@ -592,6 +597,42 @@ pub fn type_error_got(n: i64, message: *const u8, t: i64, pcx: &mut Ctx<Comp>) -
     err_end(pcx)
 }
 
+// (0.30.1) Refuses type t at node n when it does not fit: its size is
+// TYPE_TOO_BIG, 2^61 bytes or more (front::types::TYPE_SIZE_LIMIT), or a sum or product of its
+// parts' that overflows (rustc's "values of the type are too big for the
+// current architecture"). Asked where an array or a tuple type is made
+// from what is written (resolve_type, an array or tuple expression), and
+// before code is made of every type (front::types::lay_out_types);
+// RT-M2-9: the size was wrapped modulo 2^64.
+pub fn refuse_too_big(t: i64, n: i64, pcx: &mut Ctx<Comp>) {
+    if too_big_begin(t, pcx.nodes[n as usize].start, pcx) {
+        err_end(pcx)
+    }
+}
+
+// The same, the work going on after it (a struct or an enum: at its
+// declaration, check_struct_cycles, or where an instance is made); whether
+// it is too big.
+pub fn too_big_error(t: i64, pos: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if too_big_begin(t, pos, pcx) {
+        err_end_soft(pcx);
+        return true;
+    }
+    false
+}
+
+// Starts the error at pos when t does not fit; whether it does not.
+fn too_big_begin(t: i64, pos: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if crate::front::types::type_size(t, pcx) != crate::front::types::TYPE_TOO_BIG {
+        return false;
+    }
+    err_begin(pos, pcx);
+    err_str(c"values of the type '", pcx);
+    err_type(t, pcx);
+    err_str(c"' are too big for the target: its size is 2^61 bytes or more", pcx);
+    true
+}
+
 pub fn name_error(pos: i64, before: *const u8, name: i64, after: *const u8, pcx: &mut Ctx<Comp>) -> ! {
     err_begin(pos, pcx);
     err_str(before, pcx);
@@ -671,6 +712,11 @@ pub fn check_program(program: i64, pcx: &mut Ctx<Comp>, wgx: &mut WgslCx<Arena<G
     crate::front::features::multiversion::expand_multiversion(&mut fcx, pcx);
     crate::front::contracts::expand::expand_contracts(&mut kcx, pcx);
     lazy_std(program, pcx);
+    // (0.30.1: set again by check_struct_cycles, phase 7)
+    pcx.layouts_finite = false;
+    // RULE: F34.4 (0.30.2, RT-302: every constant's value, where it is
+    // written, before the declarations evaluate any: its tree only)
+    crate::front::check::names::check_const_bodies(pcx);
     for phase in 0..PHASE_COUNT {
         collect_phase(phase, pcx);
     }
@@ -682,6 +728,8 @@ pub fn check_program(program: i64, pcx: &mut Ctx<Comp>, wgx: &mut WgslCx<Arena<G
     }
     // (0.15: `fn main() -> Result<(), E>`)
     // (0.16: `fn main(gpa: Gpa)`)
+    // (0.30.2, RT-47: main's signature, its forms only)
+    crate::front::convert::check_main_signature(pcx);
     main_gpa(pcx);
     main_result_wrapper(pcx);
     // (0.26.3: allocation as a capability, check/alloc_rules)
@@ -725,6 +773,8 @@ pub fn check_program(program: i64, pcx: &mut Ctx<Comp>, wgx: &mut WgslCx<Arena<G
     // (0.30.1, review 5: a Drop impl as general as its type, E0366/E0367)
     crate::front::traits::check_drop_impls(pcx);
     crate::front::traits::check_copy_fields(pcx);
+    // (0.30.2, RT-43: no union field needs drop, E0740)
+    crate::front::traits::check_union_fields(pcx);
     crate::front::contracts::check_contract_olds(pcx);
     // (0.26.0: the places IR, every checked body: places/; before the
     // effects, which see the own pass's drops as before)
@@ -809,7 +859,11 @@ fn collect_phase(phase: i64, pcx: &mut Ctx<Comp>) {
             5 => resolve_all_uses(pcx),
             6 => collect_aliases(pcx),
             7 => check_struct_cycles(pcx),
-            8 => collect_impls(pcx),
+            // (0.30.2: before anything walks the supertraits)
+            8 => {
+                crate::front::traits::check_super_cycles(pcx);
+                collect_impls(pcx)
+            }
             9 => collect_methods(pcx),
             10 => collect_functions(pcx),
             11 => check_impl_signatures(pcx),
@@ -942,6 +996,7 @@ pub fn check_nested(item: i64, pcx: &mut Ctx<Comp>) {
 // to make it (a bound Ω does not meet) leaves it out.
 pub fn opaque_instance(f: i64, item: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let depth = pcx.recover_depth;
+    let sure0 = pcx.opaque_sure;
     let state = save_check_state(pcx);
     let mut made: i64 = -1;
     // UNSAFE: the checker's error recovery is setjmp/longjmp (err_jump), a
@@ -960,6 +1015,7 @@ pub fn opaque_instance(f: i64, item: i64, pcx: &mut Ctx<Comp>) -> i64 {
             pcx.tscratch.push(t);
         }
         pcx.opaque_assume = true;
+        pcx.opaque_header_sure = crate::front::traits::wp_start(item, pcx) < 0;
         made = fn_instance(f, m, item, pcx);
         pcx.opaque_assume = false;
     } else {
@@ -967,6 +1023,8 @@ pub fn opaque_instance(f: i64, item: i64, pcx: &mut Ctx<Comp>) -> i64 {
     }
     recover_leave(depth, pcx);
     pcx.opaque_assume = false;
+    pcx.opaque_header_sure = false;
+    pcx.opaque_sure = sure0;
     made
 }
 
@@ -1196,6 +1254,13 @@ fn simple_targ(p: i64, gpa: i64, pcx: &mut Ctx<Comp>) -> i64 {
     tp_count: i64,
     inst: i64, ret: i64, tscratch: i64, scratch: i64, const_context: bool, env_floor: i64,
     unsafe_depth: i64, wrap: i64, loop_base: i64, cur_fn: i64, closures: i64,
+    // (0.30.2, RT-272: the nesting of trait searches, which an error that
+    // jumps out of one leaves raised: each later search cut short sooner)
+    assoc_depth: i64,
+    const_value: i64,
+    // (0.30.2, RT-138: the constants being made, which an error that jumps
+    // out of one would leave marked: a later use of it read as a cycle)
+    const_stack: i64,
 }
 
 fn save_check_state(pcx: &Ctx<Comp>) -> CheckState {
@@ -1212,6 +1277,9 @@ fn save_check_state(pcx: &Ctx<Comp>) -> CheckState {
         unsafe_depth: pcx.unsafe_depth,
         wrap: pcx.wrap_node, loop_base: pcx.loop_base, cur_fn: pcx.cur_fn,
         closures: pcx.closure_stack.len() as i64,
+        assoc_depth: pcx.assoc_depth,
+        const_value: pcx.const_value,
+        const_stack: pcx.const_stack.len() as i64,
     }
 }
 
@@ -1234,8 +1302,11 @@ fn restore_check_state(s: CheckState, pcx: &mut Ctx<Comp>) {
     pcx.unsafe_depth = s.unsafe_depth;
     pcx.wrap_node = s.wrap;
     pcx.loop_base = s.loop_base;
+    pcx.const_value = s.const_value;
+    cut_back(&mut pcx.const_stack, s.const_stack);
     pcx.cur_fn = s.cur_fn;
     cut_back(&mut pcx.closure_stack, s.closures);
+    pcx.assoc_depth = s.assoc_depth;
     pcx.or_mode = false;
     pcx.self_bound_pos = -1;
     pcx.unify_self = 0;
@@ -1266,7 +1337,7 @@ fn cut_back(v: &mut Vec<i64, Comp>, n: i64) {
 
 // What `attempt` does.
 #[derive(Clone, Copy, PartialEq, Eq)] pub enum Try {
-    Name, Type, Method, Static, Const, Use, Impl, Bound, Discr, StaticCall,
+    Name, Type, Method, Static, Const, Use, Impl, Bound, Discr, StaticCall, OmegaUnion,
 }
 
 // Does `what` for `arg` with a recovery point: whether it went through
@@ -1296,6 +1367,7 @@ pub fn attempt(what: Try, arg: i64, pcx: &mut Ctx<Comp>) -> bool {
             Try::Bound => pcx.try_result = trait_named(arg, pcx),
             Try::Discr => pcx.try_result = eval_discriminant(arg, pcx),
             Try::StaticCall => static_call_value(arg, pcx),
+            Try::OmegaUnion => crate::front::traits::omega_union(arg, pcx),
         }
     } else {
         restore_check_state(state, pcx);
@@ -1338,48 +1410,110 @@ pub fn resolve_type_or_error(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
 }
 
 // Whether type t is or holds the error type (a type that failed).
+// (0.30.2) Linear in the types t reaches: a type is a graph whose nodes
+// are shared (`(a, a)` names one type twice), so a walk of it as a tree
+// is exponential in its depth (40 nested pairs, 2^40 nodes). A small type
+// is walked as a tree (ERROR_TREE_NODES at most, the common case, no
+// allocation); past that, as a graph, each type once (error_in_graph).
 pub fn has_error_type(t: i64, pcx: &Ctx<Comp>) -> bool {
-    if t == pcx.ty_error {
-        return true;
+    let mut left: i64 = ERROR_TREE_NODES;
+    let r = error_in_tree(t, &mut left, pcx);
+    if r >= 0 {
+        return r == 1;
     }
+    error_in_graph(t, pcx)
+}
+
+// The nodes a tree walk of has_error_type visits before it walks the graph.
+const ERROR_TREE_NODES: i64 = 256;
+
+// has_error_type's walk as a tree: 1 an error found, 0 none, -1 more
+// than `left` nodes.
+fn error_in_tree(t: i64, left: &mut i64, pcx: &Ctx<Comp>) -> i64 {
+    if t == pcx.ty_error {
+        return 1;
+    }
+    *left -= 1;
+    if *left < 0 {
+        return -1;
+    }
+    for i in 0..error_child_count(t, pcx) {
+        let r = error_in_tree(error_child(t, i, pcx), left, pcx);
+        if r != 0 {
+            return r;
+        }
+    }
+    0
+}
+
+// has_error_type's walk as a graph: each type reached once.
+fn error_in_graph(t: i64, pcx: &Ctx<Comp>) -> bool {
+    let mut seen = HMap { keys: 0 as *mut i64, vals: 0 as *mut i64, size: 0, count: 0 };
+    let mut work: Vec<i64, Comp> = Vec::new_in(Comp {});
+    seen.put(t + 1, 1);
+    work.push(t);
+    let mut found = false;
+    while !found && work.len() > 0 {
+        let u = work[work.len() - 1];
+        work.truncate(work.len() - 1);
+        if u == pcx.ty_error {
+            found = true;
+        } else {
+            for i in 0..error_child_count(u, pcx) {
+                let c = error_child(u, i, pcx);
+                if seen.get(c + 1) == 0 {
+                    seen.put(c + 1, 1);
+                    work.push(c);
+                }
+            }
+        }
+    }
+    seen.release();
+    found
+}
+
+// The types has_error_type looks into from t: a pointer's, slice's or
+// array's element; a distinct type's or a function's `a` (its base, its
+// result), then its elements; a tuple's elements; a generic struct's or
+// enum's type arguments.
+fn error_child_count(t: i64, pcx: &Ctx<Comp>) -> i64 {
     let kind = pcx.types[t as usize].kind;
     if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
-        return has_error_type(pcx.types[t as usize].a, pcx);
+        return 1;
     }
-    if kind == TyKind::Distinct && has_error_type(pcx.types[t as usize].a, pcx) {
-        return true;
+    if kind == TyKind::Distinct || kind == TyKind::Fn {
+        return 1 + pcx.types[t as usize].count;
     }
-    if kind == TyKind::Fn && has_error_type(pcx.types[t as usize].a, pcx) {
-        return true;
+    if kind == TyKind::Tuple {
+        return pcx.types[t as usize].count;
     }
-    // (0.14: `Option<{error}>`, from an associated type an impl lacks)
     if kind == TyKind::Struct && pcx.structs[pcx.types[t as usize].a as usize].tmpl != 0 {
+        return pcx.structs[pcx.types[t as usize].a as usize].targ_count;
+    }
+    if kind == TyKind::Enum && pcx.enums[pcx.types[t as usize].a as usize].tmpl != 0 {
+        return pcx.enums[pcx.types[t as usize].a as usize].targ_count;
+    }
+    0
+}
+
+// The i-th of error_child_count's types of t.
+fn error_child(t: i64, i: i64, pcx: &Ctx<Comp>) -> i64 {
+    let kind = pcx.types[t as usize].kind;
+    if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
+        return pcx.types[t as usize].a;
+    }
+    if kind == TyKind::Distinct || kind == TyKind::Fn {
+        return if i == 0 { pcx.types[t as usize].a } else { type_elem(t, i - 1, pcx) };
+    }
+    if kind == TyKind::Tuple {
+        return type_elem(t, i, pcx);
+    }
+    if kind == TyKind::Struct {
         let s = pcx.types[t as usize].a;
-        for i in 0..pcx.structs[s as usize].targ_count {
-            if has_error_type(
-                (pcx.tlists[(pcx.structs[s as usize].targs + i) as usize]), pcx) {
-                return true;
-            }
-        }
+        return pcx.tlists[(pcx.structs[s as usize].targs + i) as usize];
     }
-    if kind == TyKind::Enum && (pcx.enums[pcx.types[t as usize].a as usize]).tmpl != 0 {
-        let e = pcx.types[t as usize].a;
-        for i in 0..(pcx.enums[e as usize]).targ_count {
-            if has_error_type(
-                (pcx.tlists[((pcx.enums[e as usize]).targs + i) as usize]),
-                pcx) {
-                return true;
-            }
-        }
-    }
-    if kind == TyKind::Tuple || kind == TyKind::Fn || kind == TyKind::Distinct {
-        for i in 0..pcx.types[t as usize].count {
-            if has_error_type(type_elem(t, i, pcx), pcx) {
-                return true;
-            }
-        }
-    }
-    false
+    let e = pcx.types[t as usize].a;
+    pcx.tlists[(pcx.enums[e as usize].targs + i) as usize]
 }
 
 // After an error in statement `stmt`: the names its `let` binds stand for

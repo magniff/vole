@@ -50,8 +50,8 @@ use crate::front::check::resolve::{resolve_type, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::closures::fn_bounds::{fn_bound_error, fn_bound_satisfied};
 use crate::front::convert::{
-    bound_args, buf_bound, collect_trait_params, err_bound, impl_trait_args, implements_with,
-    same_trait_args, trait_param_count,
+    bound_args, buf_bound, collect_trait_params, err_bound, impl_trait_args, same_trait_args,
+    trait_param_count,
 };
 use crate::front::derive::derive_conflict_help;
 use crate::front::derive::intrinsic::{tuple_implements, tuple_operator};
@@ -253,26 +253,103 @@ pub fn trait_supers(tr: i64, pcx: &Ctx<Comp>) -> i64 {
     if tr < 0 { 0 } else { pcx.nodes[pcx.traits[tr as usize].node as usize].h }
 }
 
-// (0.27.2) Whether trait tr or one of its supertraits, to any depth
-// (bounded by MAX_ASSOC_DEPTH), declares function `name`. RULE: F2.2
-pub fn trait_declares_closure(tr: i64, name: i64, pcx: &mut Ctx<Comp>) -> bool {
-    if trait_declares(tr, name, pcx) {
-        return true;
-    }
-    let supers = trait_supers(tr, pcx);
-    if supers == 0 || pcx.assoc_depth >= crate::front::assoc::MAX_ASSOC_DEPTH {
-        return false;
-    }
-    pcx.assoc_depth += 1;
-    let mut found = false;
-    for i in 0..pcx.nodes[supers as usize].count {
-        let s = bound_trait(child(supers, i, pcx), pcx);
-        if s >= 0 && trait_declares_closure(s, name, pcx) {
-            found = true;
+// RULE: F2.2 (0.30.2, RT-171; re-review: a cycle stops the checking)
+// Error trait.cycle at each supertrait bound that closes a cycle (`trait
+// A: B {} trait B: A {}`, rustc E0391), at the declaration, whether or not
+// a path walks it. Depth-first over the traits, each once: a supertrait on
+// the walk's stack closes a cycle. That bound then names no trait (its
+// bound_trait is -1, as a bound whose trait is an error), so the graph of
+// supertraits every later walk reads has no cycle, also in the tools that
+// go on after an error (query, the LSP); and the checking stops here, as
+// rustc's does at E0391. No walk of the supertraits (super_closure, and
+// those that carry arguments: qualified::reached_all,
+// obligations::elaborate, regions::super_refs) needs a depth limit or
+// arguments that repeat to end: a walk of a finite graph without cycles
+// ends.
+pub fn check_super_cycles(pcx: &mut Ctx<Comp>) {
+    let count = pcx.traits.len();
+    let mut state: Vec<i64, Comp> = Vec::new_in(Comp {});
+    state.resize(count, 0);
+    let mut cycles: i64 = 0;
+    for tr in 0..count as i64 {
+        if state[tr as usize] == 0 {
+            super_cycle_walk(tr, &mut state, &mut cycles, pcx);
         }
     }
-    pcx.assoc_depth -= 1;
-    found
+    if cycles > 0 {
+        crate::base::diag::exit_if_errors(pcx);
+    }
+}
+
+// (state: 0 not seen, 1 on the walk, 2 done; cycles: the bounds cut)
+fn super_cycle_walk(tr: i64, state: &mut Vec<i64, Comp>, cycles: &mut i64, pcx: &mut Ctx<Comp>) {
+    state[tr as usize] = 1;
+    let supers = trait_supers(tr, pcx);
+    let count: i64 = if supers > 0 { pcx.nodes[supers as usize].count } else { 0 };
+    for i in 0..count {
+        let b = child(supers, i, pcx);
+        let st = bound_trait(b, pcx);
+        if st < 0 || st as usize >= state.len() {
+            continue;
+        }
+        if state[st as usize] == 1 {
+            let saved_kind = pcx.err_kind;
+            pcx.err_kind = c"trait.cycle";
+            crate::base::diag::err_begin(pcx.nodes[pcx.traits[st as usize].node as usize].start,
+                pcx);
+            crate::base::diag::err_str(c"cycle detected: the supertraits of trait '", pcx);
+            crate::base::diag::err_sym(pcx.traits[st as usize].name, pcx);
+            crate::base::diag::err_str(c"' lead back to it (rustc E0391)", pcx);
+            crate::base::diag::err_help(
+                c"a trait cannot be its own supertrait: remove one bound of the cycle", pcx);
+            crate::base::diag::err_end_soft(pcx);
+            pcx.err_kind = saved_kind;
+            // (the bound that closes it names no trait from here on)
+            pcx.nodes[b as usize].x = -1;
+            *cycles += 1;
+        } else if state[st as usize] == 0 {
+            super_cycle_walk(st, state, cycles, pcx);
+        }
+    }
+    state[tr as usize] = 2;
+}
+
+// RULE: F2.2 (0.30.2, re-review: RT-353, RT-360) Trait tr and its
+// supertraits, to every depth, each once, pushed onto out depth-first in
+// the order they are written, tr first (a bound that names no trait left
+// out; what out holds already is not walked again, so a caller may gather
+// several bounds' in one out). It needs no depth limit: the graph has no
+// cycle (check_super_cycles), and a trait in out is not walked again, so
+// a diamond (`trait T2: T1 + T0`) is walked once, in time linear in its
+// traits. Every walk of the supertraits by trait alone is this one.
+pub fn super_closure(tr: i64, out: &mut Vec<i64, Comp>, pcx: &mut Ctx<Comp>) {
+    if tr < 0 || out.contains(&tr) {
+        return;
+    }
+    out.push(tr);
+    let supers = trait_supers(tr, pcx);
+    let count: i64 = if supers > 0 { pcx.nodes[supers as usize].count } else { 0 };
+    for i in 0..count {
+        let st = bound_trait(child(supers, i, pcx), pcx);
+        super_closure(st, out, pcx);
+    }
+}
+
+// (0.27.2) Whether trait tr or one of its supertraits, to any depth,
+// declares function `name` (0.30.2: super_closure, no depth limit; a cut
+// read as no refused RT-360's 34-deep chain). RULE: F2.2
+pub fn trait_declares_closure(tr: i64, name: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if tr < 0 {
+        return true;
+    }
+    let mut reached: Vec<i64, Comp> = Vec::new_in(Comp {});
+    super_closure(tr, &mut reached, pcx);
+    for k in 0..reached.len() {
+        if trait_fn(reached[k], name, pcx) != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 // (0.27.2) Whether the `where` predicates of item (a Fn node) hold for
@@ -294,11 +371,44 @@ pub fn where_preds_hold(item: i64, self_ty: i64, pos: i64, report: bool,
     ok
 }
 
+// (0.30.2, RT-269) Whether the `where` predicates of impl node `node` on
+// other subjects hold for its type t, the impl's parameters bound by the
+// caller (impl_applies, obligations::candidate): asked while an impl is
+// chosen, so quietly. A subject that does not resolve (`I::Item` for an I
+// without it) does not hold; the errors met are forgotten, and with them
+// the opaque instance's unsureness they gave (one select gave without an
+// error is kept).
+pub fn impl_preds_hold(node: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mark = crate::base::diag::errors_mark(pcx);
+    let unsure = pcx.opaque_unsure;
+    let mut ok = true;
+    let mut next = wp_start(node, pcx);
+    while ok && next >= 0 {
+        let k = next;
+        next = wp_after(k, pcx);
+        let subject = pcx.where_preds[k as usize].subject;
+        let saved_self = pcx.self_type;
+        let saved_mod = pcx.cur_mod;
+        pcx.self_type = t;
+        pcx.cur_mod = module_of(subject, pcx);
+        let resolved = crate::front::check::attempt(crate::front::check::Try::Type, subject, pcx)
+            && pcx.try_result > 0 && !has_error_type(pcx.try_result, pcx);
+        pcx.self_type = saved_self;
+        pcx.cur_mod = saved_mod;
+        ok = resolved && pred_holds(node, k, t, 0, false, pcx);
+    }
+    let erred = crate::base::diag::errors_mark(pcx) > mark;
+    crate::base::diag::errors_forget(mark, pcx);
+    if erred {
+        pcx.opaque_unsure = unsure;
+    }
+    ok
+}
+
 // Whether `where` predicate k (WHERE_PREDS) of item holds, as
 // where_preds_hold's; a subject of the error type holds (reported).
 fn pred_holds(item: i64, k: i64, self_ty: i64, pos: i64, report: bool,
     pcx: &mut Ctx<Comp>) -> bool {
-    let mut ok = true;
     let subject = pcx.where_preds[k as usize].subject;
     let bounds = pcx.where_preds[k as usize].bounds;
     let saved_self = pcx.self_type;
@@ -306,11 +416,22 @@ fn pred_holds(item: i64, k: i64, self_ty: i64, pos: i64, report: bool,
     pcx.self_type = self_ty;
     pcx.cur_mod = module_of(subject, pcx);
     let t = resolve_type_or_error(subject, pcx);
-    pcx.self_type = saved_self;
     pcx.cur_mod = saved_mod;
     if has_error_type(t, pcx) {
+        pcx.self_type = saved_self;
         return true;
     }
+    // (0.30.2: Self is self_ty in the bounds too, `where i64: Conv<Self>`)
+    let ok = pred_bounds_hold(item, k, subject, bounds, t, pos, report, pcx);
+    pcx.self_type = saved_self;
+    ok
+}
+
+// (pred_holds) Whether predicate k's bounds hold of t, its subject
+// resolved, with Self bound by the caller.
+fn pred_bounds_hold(item: i64, k: i64, subject: i64, bounds: i64, t: i64, pos: i64,
+    report: bool, pcx: &mut Ctx<Comp>) -> bool {
+    let mut ok = true;
     // RULE: F10.2, D4.5 (0.30.1: `Self: 'static`, `I::Item: 'static`, as
     // a parameter's: rustc E0310)
     if !where_outlives_hold(item, subject, t, pos, report, pcx) {
@@ -321,10 +442,7 @@ fn pred_holds(item: i64, k: i64, self_ty: i64, pos: i64, report: bool,
         let tr = bound_trait(b, pcx);
         let mut holds = if pcx.nodes[b as usize].kind
             == NodeKind::TyFn { fn_bound_satisfied(b, t, pcx) }
-            else if pcx.nodes[b as usize].g != 0 {
-                crate::front::convert::implements_with(tr, t, bound_args(b, pcx), pcx)
-            }
-            else { implements(tr, t, pcx) };
+            else { crate::front::convert::bound_holds(b, t, pcx) };
         if holds && pcx.nodes[b as usize].h != 0 && !assoc_constraints_hold(b, t, pcx) {
             holds = false;
         }
@@ -426,6 +544,20 @@ pub fn copy_where_preds(from: i64, to: i64, pcx: &mut Ctx<Comp>) {
         let bounds = pcx.where_preds[k as usize].bounds;
         k = wp_after(k, pcx);
         wp_push(WherePred { owner: to, subject: subject, bounds: bounds }, pcx);
+    }
+}
+
+// (0.30.2, RT-211 review 2) The `where` predicates WHERE_PREDS[from..to]
+// of an impl's header on a subject that is no parameter of it (parsed
+// before its node: owner 0, which nothing checks) are impl node n's too,
+// kept under owner -n: the places read them where the impl is chosen
+// (places::regions::impl_where_ties), as a fn's are read at its call.
+pub fn own_impl_where_preds(from: i64, to: i64, n: i64, pcx: &mut Ctx<Comp>) {
+    for k in from..to {
+        let p = pcx.where_preds[k as usize];
+        if p.owner == 0 {
+            wp_push(WherePred { owner: -n, subject: p.subject, bounds: p.bounds }, pcx);
+        }
     }
 }
 
@@ -767,6 +899,9 @@ pub fn collect_impls(pcx: &mut Ctx<Comp>) {
             if bounds != 0 {
                 for j in 0..pcx.nodes[bounds as usize].count {
                     bound_trait(child(bounds, j, pcx), pcx);
+                    // (0.30.2, review of M2, R2: its arguments against the
+                    // trait's parameters, rustc E0107)
+                    crate::front::convert::bound_arity(child(bounds, j, pcx), pcx);
                 }
             }
         }
@@ -1055,7 +1190,7 @@ fn check_impl_statics(i: i64, pcx: &mut Ctx<Comp>) {
     }
     let saved_mod = pcx.cur_mod;
     pcx.cur_mod = pcx.traits_impls[i as usize].module;
-    if trait_static(tr, 0, pcx) {
+    if trait_static(tr, pcx) {
         let bad = non_static_in(pcx.nodes[inode as usize].b, inode, 0, false, 0, pcx);
         if bad != 0 {
             impl_static_error(tr, bad, c"its type", pcx);
@@ -1379,7 +1514,7 @@ fn param_static(p: i64, pcx: &mut Ctx<Comp>) -> bool {
     }
     let bounds = pcx.nodes[p as usize].h;
     for e in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
-        if trait_static(bound_trait(child(bounds, e, pcx), pcx), 0, pcx) {
+        if trait_static(bound_trait(child(bounds, e, pcx), pcx), pcx) {
             return true;
         }
     }
@@ -1396,12 +1531,12 @@ fn param_static(p: i64, pcx: &mut Ctx<Comp>) -> bool {
 fn param_assoc_static(p: i64, name: i64, qtrait: i64, pcx: &mut Ctx<Comp>) -> bool {
     let mut statics: i64 = 0;
     if qtrait >= 0 {
-        return assoc_static_in(qtrait, name, 0, &mut statics, pcx) && statics > 0;
+        return assoc_static_in(qtrait, name, &mut statics, pcx) && statics > 0;
     }
     let bounds = pcx.nodes[p as usize].h;
     for e in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
         let btr = bound_trait(child(bounds, e, pcx), pcx);
-        if btr >= 0 && !assoc_static_in(btr, name, 0, &mut statics, pcx) {
+        if btr >= 0 && !assoc_static_in(btr, name, &mut statics, pcx) {
             return false;
         }
     }
@@ -1409,29 +1544,22 @@ fn param_assoc_static(p: i64, name: i64, qtrait: i64, pcx: &mut Ctx<Comp>) -> bo
 }
 
 // Whether every declaration of associated type `name` in trait tr and its
-// supertraits is bounded 'static (each one counted in statics).
-fn assoc_static_in(tr: i64, name: i64, depth: i64, statics: &mut i64, pcx: &mut Ctx<Comp>) -> bool {
-    if tr < 0 || depth > pcx.traits.len() as i64 {
-        return true;
-    }
-    let declared = pcx.nodes[pcx.traits[tr as usize].node as usize].b;
-    for k in 0..(if declared > 0 { pcx.nodes[declared as usize].count } else { 0 }) {
-        let d = child(declared, k, pcx);
-        if pcx.nodes[d as usize].kind == NodeKind::AssocType && pcx.nodes[d as usize].a == name {
-            if pcx.nodes[d as usize].h > 0 && static_outlives(pcx.nodes[d as usize].h, pcx) {
-                *statics += 1;
-            } else {
-                return false;
-            }
-        }
-    }
-    let supers = trait_supers(tr, pcx);
-    for k in 0..(if supers > 0 { pcx.nodes[supers as usize].count } else { 0 }) {
-        let b = child(supers, k, pcx);
-        if pcx.nodes[b as usize].kind == NodeKind::TyName {
-            let st = bound_trait(b, pcx);
-            if !assoc_static_in(st, name, depth + 1, statics, pcx) {
-                return false;
+// supertraits (super_closure, each once) is bounded 'static (each one
+// counted in statics).
+fn assoc_static_in(tr: i64, name: i64, statics: &mut i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mut reached: Vec<i64, Comp> = Vec::new_in(Comp {});
+    super_closure(tr, &mut reached, pcx);
+    for r in 0..reached.len() {
+        let declared = pcx.nodes[pcx.traits[reached[r] as usize].node as usize].b;
+        for k in 0..(if declared > 0 { pcx.nodes[declared as usize].count } else { 0 }) {
+            let d = child(declared, k, pcx);
+            if pcx.nodes[d as usize].kind == NodeKind::AssocType
+                && pcx.nodes[d as usize].a == name {
+                if pcx.nodes[d as usize].h > 0 && static_outlives(pcx.nodes[d as usize].h, pcx) {
+                    *statics += 1;
+                } else {
+                    return false;
+                }
             }
         }
     }
@@ -1513,6 +1641,7 @@ pub fn check_impl_signatures(pcx: &mut Ctx<Comp>) {
         let ty = pcx.traits_impls[i as usize].ty;
         let tr = pcx.traits_impls[i as usize].tr;
         check_impl_statics(i, pcx);
+        check_concrete_where(i, pcx);
         crate::front::coherence::check_constrained(i, pcx);
         if ty == 0 && pcx.traits_impls[i as usize].tpl != TPL_NONE {
             crate::front::coherence::check_generic_obligations(i, pcx);
@@ -1552,10 +1681,12 @@ pub fn check_impl_signatures(pcx: &mut Ctx<Comp>) {
                 for m in 0..pcx.nodes[bounds as usize].count {
                     let b = child(bounds, m, pcx);
                     let s = bound_trait(b, pcx);
-                    let holds = if pcx.nodes[b as usize].g != 0 {
-                        crate::front::convert::implements_with(s, ta, bound_args(b, pcx),
-                            pcx)
-                    } else { implements(s, ta, pcx) };
+                    // (0.30.2, RT-271: `Self` in it, `type Out: Tr<Self>`, the
+                    // impl's type, as in the trait's other text)
+                    let saved_self = pcx.self_type;
+                    pcx.self_type = ty;
+                    let holds = s < 0 || crate::front::convert::bound_holds(b, ta, pcx);
+                    pcx.self_type = saved_self;
                     if !holds {
                         let saved_kind = pcx.err_kind;
                         pcx.err_kind = c"trait.unmet";
@@ -1581,9 +1712,7 @@ pub fn check_impl_signatures(pcx: &mut Ctx<Comp>) {
         for k in 0..(if supers == 0 { 0 } else { pcx.nodes[supers as usize].count }) {
             let b = child(supers, k, pcx);
             let s = bound_trait(b, pcx);
-            let holds = if pcx.nodes[b as usize].g != 0 {
-                crate::front::convert::implements_with(s, ty, bound_args(b, pcx), pcx)
-            } else { implements(s, ty, pcx) };
+            let holds = s < 0 || crate::front::convert::bound_holds(b, ty, pcx);
             if !holds {
                 let saved_kind = pcx.err_kind;
                 pcx.err_kind = c"trait.unmet";
@@ -1865,36 +1994,6 @@ fn impl_generics_error(f: i64, tr: i64, has: i64, wants: i64, pcx: &mut Ctx<Comp
     pcx.err_kind = saved;
 }
 
-// (0.30.1, review 2) Whether trait tr has an impl for every type, `impl<T>
-// Tr for T` with no bound on T and no `where`: a bound on it holds of any
-// Omega.
-fn blanket_all(tr: i64, pcx: &Ctx<Comp>) -> bool {
-    for i in 0..pcx.traits_impls.len() as i64 {
-        if pcx.traits_impls[i as usize].tr != tr {
-            continue;
-        }
-        let inode = pcx.traits_impls[i as usize].node;
-        if inode <= 0 {
-            continue;
-        }
-        let g = pcx.nodes[inode as usize].g;
-        let st = pcx.nodes[inode as usize].b;
-        if g <= 0 || st <= 0 || pcx.nodes[st as usize].kind != NodeKind::TyName
-            || pcx.nodes[st as usize].list != 0 || pcx.nodes[st as usize].g != 0 {
-            continue;
-        }
-        for k in 0..pcx.nodes[g as usize].count {
-            let p = child(g, k, pcx);
-            if pcx.nodes[p as usize].a == pcx.nodes[st as usize].a && pcx.nodes[p as usize].h == 0
-                && crate::front::parser::rust::outlives_of(p, 0, pcx) == 0
-                && wp_start(inode, pcx) < 0 {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 // RULE: F5.5 (0.30.1, rustc E0276) The bounds of the type parameters of impl
 // function f (an opaque instance: from impl_count in its generics ig) are
 // no stronger than those trait function decl declares for them (dg): each
@@ -1945,6 +2044,14 @@ fn impl_bounds_hold(f: i64, tr: i64, decl: i64, i: i64, trait_targs: i64, pcx: &
             pcx.tp_types.push(pcx.tlists[(trait_targs + k) as usize]);
         }
     }
+    // (0.30.2, review of M1: the trait's Ωs read their bounds in the trait
+    // function's scope, its parameters and the trait's, with the impl's
+    // Self; front::obligations::param_preds)
+    for k in 0..dcount {
+        crate::front::obligations::set_home(omegas[k as usize], dg, targs + impl_count, dcount,
+            pcx.self_type, if tcount != 0 && trait_targs >= 0 { pcx.traits[tr as usize].params }
+                else { 0 }, trait_targs, tcount, pcx);
+    }
     let (saved_impl, saved_atr, saved_atargs) = (pcx.self_impl, pcx.assoc_trait, pcx.assoc_targs);
     pcx.self_impl = i;
     pcx.assoc_trait = tr;
@@ -1974,18 +2081,18 @@ fn impl_bounds_hold(f: i64, tr: i64, decl: i64, i: i64, trait_targs: i64, pcx: &
                 continue;
             }
             let holds = if kind == NodeKind::TyFn {
-                let ft = crate::front::opaque::fn_bound_type(t, pcx.nodes[b as usize].start, pcx);
-                fn_bound_satisfied(b, ft, pcx) && fn_bound_lifetimes(b, pd, pcx.self_impl, pcx)
+                let _ = crate::front::opaque::fn_bound_type(t, pcx.nodes[b as usize].start, pcx);
+                fn_bound_satisfied(b, t, pcx) && fn_bound_lifetimes(b, pd, pcx.self_impl, pcx)
             } else {
                 let btr = bound_trait(b, pcx);
                 if btr < 0 {
                     true
                 } else if crate::front::auto_traits::is_auto(btr, pcx) {
                     crate::front::auto_traits::holds_auto(btr, t, pcx)
-                } else if pcx.nodes[b as usize].g != 0 {
-                    crate::front::convert::implements_with(btr, t, bound_args(b, pcx), pcx)
                 } else {
-                    implements(btr, t, pcx) || blanket_all(btr, pcx)
+                    // (0.30.2, review of M1: an impl for every type, `impl<T> Tr for T`,
+                    // is one select tries for an Ω: no rule of its own)
+                    crate::front::convert::bound_holds(b, t, pcx)
                 }
             };
             if !holds {
@@ -2256,7 +2363,16 @@ fn header_in_order(node: i64, g: i64, pcx: &Ctx<Comp>) -> bool {
 // the template's instances, bound by position; a pattern impl
 // (TPL_PATTERN) by match_type over its header. The bounds are not
 // checked here (impl_applies). RULE: F0.3
+// RULE: F18.5 (0.30.2) A probe: what its matching binds is undone at its
+// end (infer::probe_begin), whichever candidate it accepts or rejects.
 pub fn impl_bindings(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mark = crate::front::check::infer::probe_begin(pcx);
+    let r = impl_bindings_in(i, t, pcx);
+    crate::front::check::infer::probe_end(mark, pcx);
+    r
+}
+
+fn impl_bindings_in(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let ty = pcx.traits_impls[i as usize].ty;
     let tpl = pcx.traits_impls[i as usize].tpl;
     if ty != 0 {
@@ -2313,6 +2429,10 @@ pub fn impl_bindings(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
             free_param = true;
         }
     }
+    if ok && free_param && pcx.assoc_depth >= crate::front::assoc::MAX_ASSOC_DEPTH {
+        // (0.30.2: a search cut short, never recorded as a no, obligations)
+        pcx.depth_cuts += 1;
+    }
     if ok && free_param && pcx.assoc_depth < crate::front::assoc::MAX_ASSOC_DEPTH {
         // RULE: F14.1 (0.27.2: a parameter the header leaves free that a
         // bound's constraint fixes, Copied's T from I's Item, as
@@ -2349,10 +2469,19 @@ pub fn impl_bindings(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // by MAX_ASSOC_DEPTH (F0.3), as the associated types' is. RULE: F0.3, F0.4(c)
 pub fn impl_applies(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let b = impl_bindings(i, t, pcx);
-    if b < 0 || pcx.traits_impls[i as usize].ty != 0 {
+    if b < 0 {
         return b;
     }
-    if pcx.assoc_depth >= crate::front::assoc::MAX_ASSOC_DEPTH {
+    if pcx.traits_impls[i as usize].ty != 0 {
+        // (0.30.2, review of M2, R1: an impl for one type, `impl Tr for W
+        // where Bx<i64>: Conv`, has its `where` predicates required too,
+        // under the parameters its header binds when it binds them all;
+        // obligations::candidate, under the whole binding otherwise)
+        return if concrete_impl_preds_hold(i, b, t, pcx) { b } else { -1 };
+    }
+    if pcx.assoc_depth >= crate::front::assoc::MAX_IMPL_DEPTH {
+        // (0.30.2: a search cut short, never recorded as a no, obligations)
+        pcx.depth_cuts += 1;
         return -1;
     }
     let params = pcx.nodes[pcx.traits_impls[i as usize].node as usize].g;
@@ -2376,15 +2505,114 @@ pub fn impl_applies(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
             ok = false;
         }
     }
+    // RULE: F10.2 (0.30.2, RT-269: the impl's `where` predicates on other
+    // subjects, `where W: Conv<U>`, Self the type it is chosen for, as
+    // its parameters' bounds are: required where it is chosen)
+    let node = pcx.traits_impls[i as usize].node;
+    if ok && all_bound && wp_start(node, pcx) >= 0 && !impl_preds_hold(node, t, pcx) {
+        ok = false;
+    }
     env_leave(saved, pcx);
     pcx.assoc_depth -= 1;
     if ok { b } else { -1 }
 }
 
+// (0.30.2, review of M2, R1) For impl i of one type t (ImplInfo.ty set),
+// its bindings b: whether its `where` predicates on other subjects hold,
+// when it has them and its header binds every parameter (else the caller
+// checks them under the whole binding); bounded by the depth limit as
+// impl_applies' search is.
+fn concrete_impl_preds_hold(i: i64, b: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let node = pcx.traits_impls[i as usize].node;
+    if wp_start(node, pcx) < 0 {
+        return true;
+    }
+    let params = pcx.nodes[node as usize].g;
+    let count: i64 = if params > 0 { pcx.nodes[params as usize].count } else { 0 };
+    for k in 0..count {
+        if pcx.tlists[(b + k) as usize] == 0 {
+            return true;
+        }
+    }
+    if pcx.assoc_depth >= crate::front::assoc::MAX_IMPL_DEPTH {
+        pcx.depth_cuts += 1;
+        return false;
+    }
+    pcx.assoc_depth += 1;
+    let saved = env_enter(params, b, count, pcx);
+    let ok = impl_preds_hold(node, t, pcx);
+    env_leave(saved, pcx);
+    pcx.assoc_depth -= 1;
+    ok
+}
+
+// RULE: F10.2 (0.30.2, review of M2, RT-393) The `where` predicates of
+// impl i, one with no type parameters (`impl Tr for W where Bx<i64>:
+// Conv`), at the impl: each must hold of its types, as rustc's E0277 at
+// the clause (a predicate on no parameter cannot become true for some
+// use); one whose proof meets the depth limit (two such impls needing
+// each other) is trait.overflow, E0275.
+fn check_concrete_where(i: i64, pcx: &mut Ctx<Comp>) {
+    let node = pcx.traits_impls[i as usize].node;
+    let ty = pcx.traits_impls[i as usize].ty;
+    let params = pcx.nodes[node as usize].g;
+    if ty == 0 || params > 0 && pcx.nodes[params as usize].count > 0 {
+        return;
+    }
+    let mut next = wp_start(node, pcx);
+    while next >= 0 {
+        let k = next;
+        next = wp_after(k, pcx);
+        let subject = pcx.where_preds[k as usize].subject;
+        let cuts = pcx.depth_cuts;
+        if impl_preds_hold_one(node, k, ty, pcx) {
+            continue;
+        }
+        let pos = pcx.nodes[subject as usize].start;
+        let saved_self = pcx.self_type;
+        let saved_mod = pcx.cur_mod;
+        pcx.self_type = ty;
+        pcx.cur_mod = module_of(subject, pcx);
+        let t = resolve_type_or_error(subject, pcx);
+        pcx.self_type = saved_self;
+        pcx.cur_mod = saved_mod;
+        let bounds = pcx.where_preds[k as usize].bounds;
+        let b = child(bounds, 0, pcx);
+        let tr = bound_trait(b, pcx);
+        if pcx.depth_cuts != cuts && tr >= 0 {
+            crate::front::obligations::obligation_error(true, false, tr, t, pos, pcx);
+            continue;
+        }
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"trait.unmet";
+        err_begin(pos, pcx);
+        err_fmt(format_args("the impl's `where` clause '{}' does not hold: '",
+            &str::from_utf8(
+                get_src()[
+                    pcx.nodes[subject as usize].start as usize..pcx.nodes[bounds as usize].end as usize]).unwrap()), pcx);
+        err_type(t, pcx);
+        err_str(c"' does not implement it", pcx);
+        err_help(
+            c"rustc E0277: a predicate on no type parameter of the impl must hold of its types",
+            pcx);
+        err_end_soft(pcx);
+        pcx.err_kind = saved_kind;
+    }
+}
+
+// Whether where predicate k of impl node `node` holds for its type ty,
+// quietly (impl_preds_hold's, for one).
+fn impl_preds_hold_one(node: i64, k: i64, ty: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mark = crate::base::diag::errors_mark(pcx);
+    let ok = pred_holds(node, k, ty, 0, false, pcx);
+    crate::base::diag::errors_forget(mark, pcx);
+    ok
+}
+
 // Whether parameter node p has a bound with type arguments or
 // constraints (`From<U>`, `Iterator<Item = U>`), which may name another
 // parameter.
-fn generic_bounds(p: i64, pcx: &Ctx<Comp>) -> bool {
+pub fn generic_bounds(p: i64, pcx: &Ctx<Comp>) -> bool {
     let bounds = pcx.nodes[p as usize].h;
     if bounds == 0 {
         return false;
@@ -2451,7 +2679,16 @@ pub fn impl_targs_for(i: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
 // index of every parameter of f's merged generics (the impl's first,
 // its own 0), with the impl's bounds holding for what the header
 // bound; -1 when the header does not match t. RULE: F0.3, F0.5(i)
+// RULE: F18.5 (0.30.2) A probe: what its matching binds is undone at its
+// end (infer::probe_begin), whichever candidate it accepts or rejects.
 pub fn fn_pattern_bindings(f: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mark = crate::front::check::infer::probe_begin(pcx);
+    let r = fn_pattern_bindings_in(f, t, pcx);
+    crate::front::check::infer::probe_end(mark, pcx);
+    r
+}
+
+fn fn_pattern_bindings_in(f: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let item = pcx.fns[f as usize].node;
     let params = pcx.nodes[item as usize].g;
     let count = pcx.nodes[params as usize].count;
@@ -2471,6 +2708,10 @@ pub fn fn_pattern_bindings(f: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let ok = crate::front::generics::instantiate::match_type(params, bound,
         module, pcx.nodes[item as usize].h, t, pcx);
     let mut r: i64 = -1;
+    if ok && pcx.assoc_depth >= crate::front::assoc::MAX_ASSOC_DEPTH {
+        // (0.30.2: a search cut short, never recorded as a no, obligations)
+        pcx.depth_cuts += 1;
+    }
     if ok && pcx.assoc_depth < crate::front::assoc::MAX_ASSOC_DEPTH {
         // RULE: F14.1 (0.27.2: a parameter the header leaves free and a
         // bound's constraint fixes, `impl<'a, T, I: Iterator<Item = &'a T>>
@@ -2504,18 +2745,10 @@ pub fn has_impl(tr: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
     // (0.27.2.1: the impls of tr only, by its chain)
     // RULE: D22.1 (0.27.3: an Ω has its bounds' traits, the operators'
     // among them, `a + b` with `T: Add<Output = T>`, FL11)
-    if crate::front::opaque::is_omega(t, pcx) && crate::front::opaque::implements(tr, t, pcx) {
-        return true;
-    }
-    let mut next_impl = crate::front::traits::impls_start(tr, pcx);
-    while next_impl >= 0 {
-        let i = next_impl;
-        next_impl = crate::front::traits::impls_after(i, pcx);
-        if pcx.traits_impls[i as usize].tr == tr && impl_applies(i, t, pcx) >= 0 {
-            return true;
-        }
-    }
-    false
+    // (0.30.2, obligations M1: the impl select chooses, by the one
+    // function every caller asks; for an Ω its own predicates first, the
+    // Param candidate)
+    crate::front::obligations::holds(crate::front::obligations::select(tr, t, -1, pcx))
 }
 
 // RULE: F2.6 (0.28.0, the rust edition) A type with a destructor is not
@@ -3084,6 +3317,150 @@ fn copy_field_error(ty: i64, field: i64, fty: i64, variant: i64, index: i64,
     err_end_soft(pcx);
 }
 
+// RULE: F19.8 (0.30.2, RT-43; rustc E0740) A union's field never needs
+// drop: its type is Copy, a reference (`&mut T` too), std's
+// `ManuallyDrop<T>`, or a tuple or an array of such types. A union drops
+// none of its fields (F19.7): which one holds a value is the program's to
+// know, so a field that needed drop would be dropped by nothing, or, as
+// it was, by an assignment to a part of it, `u.p.d = v`, which dropped
+// the old `d` read from the bytes another field wrote (places/elab.vl
+// within_union is that drop's own guard). Every union the program has is
+// asked, an instance of a generic one too (an opaque instance's field
+// `T` is Copy only by its bounds); std's ManuallyDrop, the one union whose
+// field may need drop, is known by its path (front/known.vl), not its
+// name. The error is at the field, once for a declaration.
+pub fn check_union_fields(pcx: &mut Ctx<Comp>) {
+    let copy = std_trait(c"Copy", pcx);
+    let md = manually_drop_struct(pcx);
+    // (each generic union of the program, std's under `check --std`, by
+    // its Ω instance too: omega_union)
+    let templates = pcx.structs.len() as i64;
+    for s in 0..templates {
+        let info = pcx.structs[s as usize];
+        if (info.repr & crate::front::ast::REPR_UNION) != 0 && info.generic != 0
+            && info.tmpl == 0 && info.closure == 0 && info.node > 0 && s != md
+            && (crate::front::conv::user_at(pcx.nodes[info.node as usize].start, pcx)
+                || pcx.check_std) {
+            let mark = crate::base::diag::errors_mark(pcx);
+            if !attempt(Try::OmegaUnion, s, pcx) {
+                crate::base::diag::errors_forget(mark, pcx);
+            }
+        }
+    }
+    let mut seen: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for s in 0..pcx.structs.len() as i64 {
+        let info = pcx.structs[s as usize];
+        if (info.repr & crate::front::ast::REPR_UNION) == 0 || info.generic != 0
+            || info.closure != 0 || info.node <= 0
+            || pcx.nodes[info.node as usize].kind != NodeKind::Struct
+            || info.field_count != pcx.nodes[info.node as usize].count
+            || seen.contains(&info.node) || md >= 0 && (s == md || info.tmpl - 1 == md) {
+            continue;
+        }
+        for k in 0..info.field_count {
+            let fty = pcx.fields[(info.fields + k) as usize].ty;
+            if !union_field_ok(fty, copy, md, pcx) {
+                union_field_error(s, child(info.node, k, pcx), fty, pcx);
+                seen.push(info.node);
+                break;
+            }
+        }
+    }
+}
+
+// The struct of std's `ManuallyDrop` (its template), or -1.
+fn manually_drop_struct(pcx: &mut Ctx<Comp>) -> i64 {
+    if pcx.std_module < 0 {
+        return -1;
+    }
+    let key = std_item_key(intern_c(c"ManuallyDrop", pcx), pcx);
+    if key < 0 { -1 } else { pcx.sym_struct[key as usize] - 1 }
+}
+
+// RULE: F19.8, D22.1 (0.30.2) Generic union template s's opaque instance,
+// each type parameter an Ω (front/opaque.vl: a type with the parameter's
+// bounds only), for check_union_fields to ask: rustc checks a union's
+// declaration (`union U<T> { t: T }` without `T: Copy` is E0740) whether
+// or not an instance is used. Made only when every parameter is a plain
+// type parameter, as build_opaque_instances' functions; an error in
+// making it is the model's, forgotten (check_union_fields).
+pub fn omega_union(s: i64, pcx: &mut Ctx<Comp>) {
+    let node = pcx.structs[s as usize].node;
+    let g = pcx.nodes[node as usize].g;
+    if g <= 0 || pcx.nodes[g as usize].count != pcx.structs[s as usize].generic {
+        return;
+    }
+    for k in 0..pcx.nodes[g as usize].count {
+        let p = child(g, k, pcx);
+        if pcx.nodes[p as usize].kind != NodeKind::TyName
+            || crate::front::generics::instantiate::array_len_name(p, pcx) != 0
+            || pcx.nodes[p as usize].end <= pcx.nodes[p as usize].start {
+            return;
+        }
+    }
+    let mut omegas = Vec::<i64, Comp>::new_in(Comp {});
+    for k in 0..pcx.nodes[g as usize].count {
+        omegas.push(crate::front::opaque::omega_of(child(g, k, pcx), pcx));
+    }
+    let m = pcx.tscratch.len() as i64;
+    for &t in omegas.as_slice() {
+        pcx.tscratch.push(t);
+    }
+    crate::front::generics::template_instance(s + 1, m, pcx.nodes[node as usize].start, pcx);
+}
+
+// rustc's allowed_union_field: a reference, a tuple or an array of
+// allowed types, a ManuallyDrop (template md), a Copy type, or one whose
+// error was reported.
+fn union_field_ok(t: i64, copy: i64, md: i64, pcx: &mut Ctx<Comp>) -> bool {
+    if t <= 0 || has_error_type(t, pcx) {
+        return true;
+    }
+    let u = crate::places::ir::undistinct(t, pcx);
+    let k = pcx.types[u as usize].kind;
+    if (k == TyKind::Ptr || k == TyKind::Slice)
+        && (pcx.types[u as usize].b == crate::front::types::REF_SHARED
+            || pcx.types[u as usize].b == crate::front::types::REF_MUT) {
+        return true;
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[u as usize].count {
+            if !union_field_ok(type_elem(u, i, pcx), copy, md, pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == TyKind::Array {
+        return union_field_ok(pcx.types[u as usize].a, copy, md, pcx);
+    }
+    if k == TyKind::Struct && md >= 0 {
+        let s = pcx.types[u as usize].a;
+        if s == md || pcx.structs[s as usize].tmpl - 1 == md {
+            return true;
+        }
+    }
+    copy >= 0 && implements(copy, t, pcx)
+}
+
+// "a union's field must be Copy, a reference or a `ManuallyDrop<T>`:
+// field 'p' of union 'U' has type 'P' (rustc E0740)", at the field.
+fn union_field_error(s: i64, field: i64, fty: i64, pcx: &mut Ctx<Comp>) {
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"union.field";
+    err_begin(pcx.nodes[field as usize].start, pcx);
+    err_fmt(
+        format_args("a union's field must be Copy, a reference or a `ManuallyDrop<T>`: field '{}' of union '",
+            str::from_utf8(sym_text(pcx.nodes[field as usize].a, pcx)).unwrap()), pcx);
+    err_sym(pcx.structs[s as usize].name, pcx);
+    err_str(c"' has type '", pcx);
+    err_type(fty, pcx);
+    err_str(c"' (rustc E0740)", pcx);
+    err_help(c"a union drops none of its fields, so a field's type may not need drop: wrap it, `std::mem::ManuallyDrop<T>` (its value is dropped by `ManuallyDrop::drop` or `into_inner`, when the program knows the field holds it), or make the type Copy", pcx);
+    err_end_soft(pcx);
+    pcx.err_kind = saved_kind;
+}
+
 // (0.15) For t an instance of a generic type with an impl of tr: 0 when
 // the impl's bounds hold, else the type argument that misses them (`U` of
 // `Vec<U>` for Eq), or t when none alone does. 0 too when no generic
@@ -3198,9 +3575,34 @@ pub fn implements(tr: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
         return has_error_type(t, pcx) || t == TY_NEVER
             || crate::front::auto_traits::holds_auto(tr, t, pcx);
     }
-    // RULE: D21.3 (an `impl Tr` result: its bounds' traits only)
+    // RULE: F18.5 (0.30.2: an integer variable still free implements a
+    // trait some integer type implements, as rustc's obligation on it waits:
+    // `impl<A: Step> Iterator for Range<A>` is Range<{integer}>'s, its Item
+    // the variable; the type it takes is decided at the function's end, and
+    // an instance made with it checks its bounds again then)
+    if crate::front::check::infer::int_free(t, pcx) {
+        return tr < 0 || crate::front::check::infer::int_some_impl(tr, pcx);
+    }
+    // (one solved: its solution's, a variable being a distinct type marked
+    // opaque, below)
+    if crate::front::check::infer::is_int_var(t, pcx) {
+        let s = crate::front::check::infer::follow(t, pcx);
+        if s != t {
+            return implements(tr, s, pcx);
+        }
+    }
+    // RULE: D21.3 (an `impl Tr` result: its bounds' traits, and, 0.30.2,
+    // RT-196, RT-200, what an impl gives every type its bounds meet,
+    // `impl<I: Iterator> IntoIterator for I`, `impl<F: Fn(i64) -> i64>
+    // Apply for F`, as for an Ω: has_impl, whose impls name a type
+    // parameter there, never the hidden type)
+    // (0.30.2, review of M1: an Ω, a template's parameter, by select, its
+    // own predicates read whole, then the impls that cover it)
+    if crate::front::opaque::is_omega(t, pcx) {
+        return tr < 0 || has_impl(tr, t, pcx);
+    }
     if crate::front::opaque::is_opaque(t, pcx) {
-        return tr < 0 || crate::front::opaque::implements(tr, t, pcx);
+        return tr < 0 || crate::front::opaque::implements(tr, t, pcx) || has_impl(tr, t, pcx);
     }
     tr < 0 || has_error_type(t, pcx) || t == TY_NEVER || has_impl(tr, t, pcx)
         || intrinsic(tr, t, pcx)
@@ -3215,9 +3617,8 @@ pub fn satisfies(p: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
     for i in 0..pcx.nodes[bounds as usize].count {
         let b = child(bounds, i, pcx);
         // (0.15: `From<U>`, a generic trait's bound)
-        if pcx.nodes[b as usize].g != 0
-            && !implements_with(bound_trait(b, pcx), t, bound_args(b, pcx), pcx)
-            || pcx.nodes[b as usize].g == 0 && !implements(bound_trait(b, pcx), t, pcx) {
+        // (0.30.2, RT-270: its whole reference, the defaults too)
+        if !crate::front::convert::bound_holds(b, t, pcx) {
             return false;
         }
         // (0.14: `Fn(A) -> R`, and constraints `Iterator<Item = A>`)
@@ -3242,6 +3643,55 @@ pub fn check_later_bounds(pcx: &mut Ctx<Comp>) {
         i += 5;
     }
     pcx.bounds_later.clear();
+}
+
+// RULE: F18.5 (0.30.2: infer.vl int_fallback) The type arguments of
+// instance f of template tf, made with a type variable (its bounds are
+// checked when it is made again with the solutions): each that holds an integer variable still free takes the one
+// integer type its bounds admit, and so does each such variable that is
+// the trait argument of one of its bounds (`S: Sum<{integer}>`), as
+// check_bounds does where the types are known: before the fallback.
+pub fn int_bound_vars(f: i64, tf: i64, pcx: &mut Ctx<Comp>) {
+    let params = pcx.nodes[pcx.fns[tf as usize].node as usize].g;
+    if params == 0 {
+        return;
+    }
+    let targs = pcx.fns[f as usize].targs;
+    let count = pcx.fns[f as usize].targ_count;
+    // (in the instance's module, its Self the one it was made with, as
+    // fn_instance checks its bounds: `S: Sum<Self::Item>`)
+    let (saved_mod, saved_self, saved_impl) = (pcx.cur_mod, pcx.self_type, pcx.self_impl);
+    pcx.cur_mod = pcx.fns[f as usize].module;
+    pcx.self_type = pcx.fns[f as usize].self_ty;
+    pcx.self_impl = impl_of_fn(tf, pcx);
+    let saved = env_enter(params, targs, count, pcx);
+    for k in 0..count {
+        let p = child(params, k, pcx);
+        let bounds = pcx.nodes[p as usize].h;
+        if bounds == 0 {
+            continue;
+        }
+        let t = pcx.tlists[(targs + k) as usize];
+        if crate::front::check::infer::int_open(t, pcx) {
+            crate::front::check::infer::int_bounds(t, p, true, pcx);
+        }
+        if crate::front::check::infer::int_open(t, pcx) {
+            continue;
+        }
+        let rt = crate::front::check::infer::resolve(t, pcx);
+        for i in 0..pcx.nodes[bounds as usize].count {
+            let b = child(bounds, i, pcx);
+            let tr = bound_trait(b, pcx);
+            if tr >= 0 && pcx.nodes[b as usize].g != 0 {
+                let bargs = crate::front::convert::bound_ref(b, rt, pcx);
+                crate::front::check::infer::int_trait_args(tr, rt, bargs, pcx);
+            }
+        }
+    }
+    env_leave(saved, pcx);
+    pcx.cur_mod = saved_mod;
+    pcx.self_type = saved_self;
+    pcx.self_impl = saved_impl;
 }
 
 // The type arguments TLISTS[targs..] of generic item `what` (its name),
@@ -3276,9 +3726,29 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
         if bounds == 0 {
             continue;
         }
-        let t = (pcx.tlists[(targs + k) as usize]);
+        let mut t = (pcx.tlists[(targs + k) as usize]);
         if t == pcx.ty_error && pcx.check_unchecked {
             continue;
+        }
+        // (with the solutions so far: a variable solved, `T = {integer}`
+        // that a later use made i64, is its type here, not itself)
+        if pcx.infer_live {
+            t = crate::front::check::infer::resolve(t, pcx);
+        }
+        // RULE: F18.5 (0.30.2: a type that is or holds an integer variable,
+        // `T = {integer}`, `I = Range<{integer}>`: the one integer type that
+        // satisfies the bounds there is the variable's; one several satisfy
+        // is checked when the instance is made again with its type)
+        // (an instance's body checked with one, `-> impl Show` of `id(3)`:
+        // checked when it is made again, as the variable's function's end)
+        if crate::front::check::infer::int_open(t, pcx) {
+            if pcx.infer_live {
+                crate::front::check::infer::int_bounds(t, p, true, pcx);
+            }
+            if crate::front::check::infer::int_open(t, pcx) {
+                continue;
+            }
+            t = crate::front::check::infer::resolve(t, pcx);
         }
         // RULE: F18.6 (g) (a free variable, `Vec::<u8, _>::new_in(gpa)`'s
         // `_`, is checked when it is solved: its instance is made again)
@@ -3296,8 +3766,10 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
             if pcx.nodes[b as usize].kind == NodeKind::TyFn {
                 let saved = env_enter(params, targs, count, pcx);
                 // RULE: D21.3 (an `impl Fn*` result: its hidden closure)
-                let ft = crate::front::opaque::fn_bound_type(t, pos, pcx);
-                let ok = fn_bound_satisfied(b, ft, pcx);
+                // (its hidden type found here, where a cycle is reported;
+                // fn_bound_satisfied reads it within the opaque bound)
+                let _ = crate::front::opaque::fn_bound_type(t, pos, pcx);
+                let ok = fn_bound_satisfied(b, t, pcx);
                 env_leave(saved, pcx);
                 if !ok {
                     fn_bound_error(b, t, pcx.nodes[p as usize].a, what, pos, pcx);
@@ -3311,14 +3783,47 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
             let tr = bound_trait(b, pcx);
             // RULE: AT3 (`T: Send`: sync.not_send, with the failing part)
             if crate::front::auto_traits::is_auto(tr, pcx) {
-                crate::front::auto_traits::check_bound(tr, t, p, what, pos, pcx);
+                // (0.30.2, review of M2, RT-401: an auto trait's bound of the
+                // header, `struct G<T: Send>` of `impl<A> G<A>`, as any other's)
+                let sure = pcx.opaque_sure;
+                let own = header_sure(t, pcx);
+                if own {
+                    pcx.opaque_sure = true;
+                }
+                crate::front::auto_traits::check_bound(tr, t, p, what, pos, own, pcx);
+                pcx.opaque_sure = sure;
                 continue;
             }
             // (0.15: `From<U>`, a generic trait's bound)
-            let bargs: i64 = if pcx.nodes[b as usize].g != 0 { bound_args(b, pcx) } else { -1 };
-            let holds = if bargs >= 0 { implements_with(tr, t, bargs, pcx) }
-                else { implements(tr, t, pcx) };
-            if !holds {
+            let bargs: i64 = if pcx.nodes[b as usize].g
+                != 0 { crate::front::convert::bound_ref(b, t, pcx) } else { -1 };
+            // RULE: F18.5 (0.30.2: a trait argument that is an integer
+            // variable, `S: Sum<{integer}>` of `(1..4).sum()` into an i64:
+            // the one integer type an impl gives it, else checked when the
+            // instance is made again with its type)
+            if bargs >= 0 && pcx.infer_live
+                && !crate::front::check::infer::int_trait_args(tr, t, bargs, pcx)
+                && (0..count).any(|i| crate::front::check::infer::mentions(
+                    pcx.tlists[(targs + i) as usize], true, pcx)) {
+                continue;
+            }
+            let cuts = pcx.depth_cuts;
+            let holds = crate::front::convert::bound_holds(b, t, pcx);
+            // RULE: O-M1 (0.30.2) a search the depth limit cut short is
+            // trait.overflow, never "not implemented" (rustc E0275)
+            if !holds && pcx.depth_cuts != cuts {
+                crate::front::obligations::obligation_error(true, true, tr, t, pos, pcx);
+            } else if !holds {
+                // RULE: D22.2 (0.30.2, RT-275: an Ω of the template's own
+                // parameter, while its opaque instance is made, that does
+                // not meet its header's bound, `impl<A: Tr<i32>> G<A>` of
+                // `struct G<T: Tr<i64>>`: its bounds are all it has when the
+                // template has no other predicate, and select said no
+                // without a cut or an unread bound: the program's error,
+                // recorded, never the model's, forgotten)
+                if header_sure(t, pcx) {
+                    pcx.opaque_sure = true;
+                }
                 err_begin(pos, pcx);
                 err_str(c"the trait '", pcx);
                 if bargs >= 0 {
@@ -3348,6 +3853,17 @@ pub fn check_bounds(params: i64, targs: i64, count: i64, what: i64, pos: i64, pc
         }
     }
     env_leave(saved, pcx);
+}
+
+// RULE: D22.2 (0.30.2, RT-275, RT-401) Whether a bound of a template's
+// header that t does not meet is the program's error, not the model's:
+// while its opaque instance is made, t an Ω of the template's own
+// parameter, the template with no other predicate, and select's no
+// without a cut or an unread bound.
+fn header_sure(t: i64, pcx: &Ctx<Comp>) -> bool {
+    pcx.opaque_assume && pcx.opaque_header_sure && !pcx.opaque_unsure
+        && crate::front::opaque::is_omega(t, pcx)
+        && pcx.nodes[pcx.types[t as usize].b as usize].x == 0
 }
 
 // RULE: D4.5, F10.2 (0.30.1, rustc E0310) Type parameter p's bounds
@@ -3548,7 +4064,7 @@ fn omega_static(node: i64, pcx: &mut Ctx<Comp>) -> bool {
     }
     for i in 0..pcx.nodes[bounds as usize].count {
         let b = child(bounds, i, pcx);
-        if trait_static(bound_trait(b, pcx), 0, pcx) {
+        if trait_static(bound_trait(b, pcx), pcx) {
             return true;
         }
     }
@@ -3572,23 +4088,14 @@ fn static_outlives(n: i64, pcx: &Ctx<Comp>) -> bool {
     }
 }
 
-// Whether trait tr, or a supertrait of it, is bounded `'static` (`trait
-// St: 'static`); (review 3: no limit says no: a chain longer than the
-// number of traits is a cycle, an error of its own)
-fn trait_static(tr: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
-    if tr < 0 || depth > pcx.traits.len() as i64 {
-        return false;
-    }
-    let supers = trait_supers(tr, pcx);
-    if supers <= 0 {
-        return false;
-    }
-    if static_outlives(supers, pcx) {
-        return true;
-    }
-    for i in 0..pcx.nodes[supers as usize].count {
-        let b = child(supers, i, pcx);
-        if trait_static(bound_trait(b, pcx), depth + 1, pcx) {
+// Whether trait tr, or a supertrait of it (super_closure), is bounded
+// `'static` (`trait St: 'static`).
+fn trait_static(tr: i64, pcx: &mut Ctx<Comp>) -> bool {
+    let mut reached: Vec<i64, Comp> = Vec::new_in(Comp {});
+    super_closure(tr, &mut reached, pcx);
+    for k in 0..reached.len() {
+        let supers = trait_supers(reached[k], pcx);
+        if supers > 0 && static_outlives(supers, pcx) {
             return true;
         }
     }

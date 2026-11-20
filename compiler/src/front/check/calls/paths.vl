@@ -16,11 +16,9 @@ use crate::front::ast::NodeKind::{Ident, Path, VariantLit};
 use crate::front::check::{Res, has_error_type, lookup_local, name_error};
 use crate::front::check::arch::{check_intrinsic_call, check_raw_form};
 use crate::front::check::args::{arity_help, normalize_args};
-use crate::front::check::calls::{method_of, offer_template_methods, path_member_error};
+use crate::front::check::calls::{offer_template_methods, path_member_error};
 use crate::front::check::check_mode::check_expr;
-use crate::front::check::collect::{
-    find_generic_method, gm_after, gm_start, template_of_type_node, template_variant_named,
-};
+use crate::front::check::collect::{find_generic_method, template_variant_named};
 use crate::front::check::format::format_call;
 use crate::front::check::interp::{direct_call, direct_kind};
 use crate::front::check::names::{
@@ -34,7 +32,7 @@ use crate::front::check::vectors::{make_vecop, sym_is_c, vector_assoc_call};
 use crate::front::check::widen::{float_const, float_const_bits, float_const_error, int_limit};
 use crate::front::closures::{closure_call, closure_of_type};
 use crate::front::contracts::is_distinct;
-use crate::front::convert::{generic_trait_call, template_trait_call};
+use crate::front::convert::template_trait_call;
 use crate::front::generics::{
     TPL_DISTINCT, TPL_NONE, TPL_PATTERN, check_arg, check_call_arg, env_lookup, hint_for,
     instance_of, instance_targs, targ_count_error, template_instance, template_name,
@@ -51,8 +49,8 @@ use crate::front::modules::lookup::{
 };
 use crate::front::traits::{bounded_param, require_in_bounds};
 use crate::front::types::{
-    TY_F32, TY_F64, TyKind, buf_type, enum_type, err_type, find_variant, is_ffi_safe, is_fn_type,
-    is_integer, is_pointer, is_vector, item_node_of, type_elem, variant_field,
+    TY_F32, TY_F64, TY_NEVER, TyKind, buf_type, enum_type, err_type, find_variant, is_ffi_safe,
+    is_fn_type, is_integer, is_pointer, is_vector, item_node_of, type_elem, variant_field,
 };
 use crate::tools::query::command_line::{qnote, qnote_module};
 
@@ -61,8 +59,9 @@ fn is_variadic_arg_type(t: i64, pcx: &Ctx<Comp>) -> bool {
 }
 
 pub fn synth_call(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let callee = pcx.nodes[n as usize].a;
-    if callee == 0 && pcx.nodes[n as usize].x != 0 {
+    let mut callee = pcx.nodes[n as usize].a;
+    if (callee == 0 || (pcx.nodes[n as usize].p & crate::front::ast::CALL_CONSUMES) != 0)
+        && pcx.nodes[n as usize].x != 0 {
         // A method call, already checked (and made a call), when a rewrite
         // checks an expression again (`for x in v.items()`).
         return pcx.fns[(pcx.nodes[n as usize].x - 1) as usize].ret;
@@ -126,13 +125,56 @@ pub fn synth_call(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             pcx.nodes[callee as usize].g, pcx);
     }
     pcx.callee_pos = pcx.nodes[callee as usize].start;
-    let callee_ty0 = synth_expr(callee, pcx);
+    let mut callee_ty0 = synth_expr(callee, pcx);
+    // RULE: D19.5 (0.30.2, RT-195: a callee is autoderefed, as rustc's, to
+    // the one reference std's `Fn*` impls for references call through:
+    // `rr(2)` with `rr: &&C`, `gmm(4)` with `gmm: &mut &mut F`)
+    while callee_ty0 > 0 && pcx.types[callee_ty0 as usize].kind == TyKind::Ptr
+        && pcx.types[callee_ty0 as usize].b != 0
+        && crate::front::closures::fn_bounds::callable_through_ref(
+            pcx.types[callee_ty0 as usize].a, pcx) {
+        let inner = pcx.types[callee_ty0 as usize].a;
+        let u = new_node(NodeKind::Unary, pcx.nodes[callee as usize].start,
+            pcx.nodes[callee as usize].end, pcx);
+        pcx.nodes[u as usize].op = Tok::Star;
+        pcx.nodes[u as usize].b = callee;
+        pcx.nodes[u as usize].ty = inner;
+        pcx.nodes[u as usize].p |= crate::front::ast::NODE_CHECKED;
+        pcx.nodes[n as usize].a = u;
+        callee = u;
+        callee_ty0 = inner;
+    }
+    let own_kind = crate::front::opaque::opaque_call_kind(callee_ty0, pcx);
+    let own_ty = callee_ty0;
+    through_ref_kind(callee, callee_ty0, pcx);
     // RULE: D21.3 (an `impl Fn*` result called: its hidden closure)
     let callee_ty0 = crate::front::opaque::reveal_callee(callee, callee_ty0, pcx);
     let callee_ty = crate::front::closures::fn_through_ref(n, callee_ty0, pcx);
     if closure_of_type(callee_ty, pcx) != 0
         || crate::front::closures::closure_through_ref(callee_ty, pcx) {
-        return closure_call(n, callee_ty, pcx);
+        // RULE: D21.6 (0.30.2, RT-213) the call kind: a parameter's bound
+        // (the body was written against it: `call_once<F: FnOnce>` given an
+        // `impl FnMut` calls it once), else the bound of the callee's type,
+        // an `impl Fn*` (own_kind, read from the type after autoderef, so
+        // for every callee shape: a local, a field, an element, a
+        // reference, a binding it was moved to); never the hidden
+        // closure's (closure_call)
+        // (a parameter of a reference type is called through std's impls
+        // for references, which call what it points to by that one's own
+        // kind: its bound is the reference's, `apply<F: FnOnce>(&mut c)`)
+        let mut kind: i64 = 0;
+        if pcx.nodes[callee as usize].kind == NodeKind::Ident
+            && pcx.nodes[callee as usize].res == Res::Local && pcx.cur_fn >= 0
+            && !(callee_ty0 > 0 && pcx.types[callee_ty0 as usize].kind == TyKind::Ptr) {
+            kind = crate::front::closures::fn_bounds::value_call_kind(pcx.cur_fn,
+                pcx.nodes[callee as usize].y, pcx);
+        }
+        if kind == 0 {
+            kind = own_kind;
+        }
+        // (an opaque value moves as its type, Copy only by its bounds)
+        let move_ty = if own_kind != 0 { own_ty } else { 0 };
+        return closure_call(n, callee_ty, kind, move_ty, pcx);
     }
     if !is_fn_type(callee_ty, pcx) {
         err_begin(pcx.nodes[callee as usize].start, pcx);
@@ -166,6 +208,37 @@ pub fn synth_call(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         pcx.rust_arg = saved;
     }
     pcx.types[callee_ty as usize].a
+}
+
+// RULE: D21.6 (0.30.2, RT-213) A callee of type t, a reference to an
+// opaque type O with an `Fn*` bound that the autoderef did not call
+// through (synth_call): what the bound lets a caller do through it, as
+// std's `Fn*` impls for references, which the bound test reads too
+// (opaque.vl fn_bound_type): an `impl FnOnce` is called by value only,
+// its call moves it (rustc E0507), and an `impl FnMut` through a `&mut`
+// only, its call changes it (rustc E0596); whatever its hidden closure is.
+fn through_ref_kind(callee: i64, t: i64, pcx: &mut Ctx<Comp>) {
+    if t <= 0 || pcx.types[t as usize].kind != TyKind::Ptr || pcx.types[t as usize].b == 0 {
+        return;
+    }
+    let k = crate::front::opaque::opaque_call_kind(pcx.types[t as usize].a, pcx);
+    let shared = pcx.types[t as usize].b == crate::front::types::REF_SHARED;
+    if k == crate::front::closures::kinds::KIND_FN_ONCE {
+        err_begin(pcx.nodes[callee as usize].start, pcx);
+        err_str(c"cannot call '", pcx);
+        err_type(pcx.types[t as usize].a, pcx);
+        err_str(c"' through a reference: calling it moves it (rustc E0507)", pcx);
+        crate::base::diag::err_help(c"call the value itself, or bound the result by `Fn` (`impl Fn`) to call it through a reference", pcx);
+        err_end(pcx);
+    } else if k == crate::front::closures::kinds::KIND_FN_MUT && shared {
+        err_begin(pcx.nodes[callee as usize].start, pcx);
+        err_str(c"cannot call '", pcx);
+        err_type(pcx.types[t as usize].a, pcx);
+        err_str(c"' through a shared reference: calling it changes it (rustc E0596)", pcx);
+        crate::base::diag::err_help(
+            c"call it through a `&mut`, or bound the result by `Fn` (`impl Fn`)", pcx);
+        err_end(pcx);
+    }
 }
 
 // A direct call of function f (a template is instantiated first, with
@@ -298,7 +371,9 @@ pub fn check_direct_call(n: i64, f: i64, pcx: &mut Ctx<Comp>) -> i64 {
     for i in params..count {
         let arg = child(n, i, pcx);
         let ty = synth_expr(arg, pcx);
-        if !is_variadic_arg_type(ty, pcx) {
+        // (0.30.2: an integer variable's value is passed in the type the
+        // variable has when the function's check ends)
+        if !is_variadic_arg_type(ty, pcx) && !crate::front::check::infer::int_free(ty, pcx) {
             err_begin(pcx.nodes[arg as usize].start, pcx);
             err_str(c"cannot pass value of type '", pcx);
             err_type(ty, pcx);
@@ -318,6 +393,16 @@ fn path_target(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
         // ... of a generic enum (0.6): its template.
         pcx.path_tpl = pcx.nodes[n as usize].y;
         return -1;
+    }
+    // RULE: F8.4 (0.30.2, RT-93) `<X as Tr>::f` of any type X
+    // (`<<S as A>::Out as C>::f`): X's type, as written; a name too, read
+    // as a type (the second re-review: `<W as Tr>::f`, W generic, is
+    // E0107, as `let x: W` is; `<D as Tr>::f`, D's parameters defaulted,
+    // D's)
+    let sn = crate::front::parser::rust::lifetimes_of(
+        crate::front::parser::rust::qpath_self_key(n), pcx);
+    if sn != 0 {
+        return crate::front::check::resolve::resolve_type(sn, pcx);
     }
     let name = pcx.nodes[n as usize].a;
     let member = pcx.nodes[n as usize].b;
@@ -544,14 +629,25 @@ pub fn synth_path(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             return t;
         }
     }
-    let mut f = method_of(t, member, pcx);
+    // RULE: F8.4, F8.3, F9.3 (0.30.2, RT-C301-8: the function or constant
+    // is of the trait the path names, qualified::path_trait, `<S as B>::m`
+    // B's, `<S as A>::K` A's, `T::K` its bound's, D22.1 an Ω's; else an
+    // inherent one; else of the one trait whose impl for t has it,
+    // qualified::concrete_trait, two being E0034; never a trait's item
+    // found by its name alone, as 0.30.1's method_of and
+    // assoc_const_value did)
+    let mut pt = crate::front::check::calls::qualified::path_trait(n, t, member, pcx);
+    let mut f: i64 = -1;
+    if pt.tr < 0 {
+        f = crate::front::check::calls::qualified::inherent_fn(t, member, pcx);
+    }
     // (0.15: `i64::MAX`, `u8::MIN`, a literal)
-    if f < 0 && is_integer(t)
+    if pt.tr < 0 && f < 0 && is_integer(t)
         && (sym_is_c(member, c"MAX", pcx) || sym_is_c(member, c"MIN", pcx)) {
         return int_limit(n, t, sym_is_c(member, c"MAX", pcx), pcx);
     }
     // (0.25.2.1: `f64::EPSILON`, `f32::NAN`, a literal)
-    if f < 0 && (t == TY_F32 || t == TY_F64) {
+    if pt.tr < 0 && f < 0 && (t == TY_F32 || t == TY_F64) {
         let r = float_const(n, t, member, false, pcx);
         if r >= 0 {
             return r;
@@ -560,21 +656,28 @@ pub fn synth_path(n: i64, pcx: &mut Ctx<Comp>) -> i64 {
             float_const_error(pcx.nodes[n as usize].start, t, member, false, pcx);
         }
     }
-    // RULE: F3.2 (0.27.2: `t::N`, an associated constant)
-    if f < 0 {
-        let mut r = crate::front::assoc::inherent_const_value(n, t, member, pcx);
-        if r < 0 {
-            r = crate::front::assoc::assoc_const_value(n, t, member, pcx);
-        }
+    // RULE: F3.1 (0.27.2: `t::N`, an inherent constant; 0.30.2, RT-302:
+    // each constant used is checked for exits in its value, const_use)
+    if pt.tr < 0 && f < 0 {
+        let r = crate::front::assoc::inherent_const_value(n, t, member, pcx);
         if r >= 0 {
-            return r;
+            return crate::front::check::names::const_use(n, r, pcx);
         }
+        pt = crate::front::check::calls::qualified::concrete_trait(n, t, member, pcx);
     }
-    // RULE: D22.1 (0.27.3: `Ω::NAME`, a bound's associated constant, FL11)
-    if f < 0 && crate::front::opaque::is_omega(t, pcx) {
-        let r = crate::front::opaque::omega_const(n, t, member, pcx);
+    // RULE: F3.2, D22.1 (0.27.2: `t::N`, a trait's associated constant;
+    // 0.27.3: `Ω::NAME`, a bound's, FL11)
+    if pt.tr >= 0 {
+        // (an `impl Tr` result's: its hidden type's, impl_self)
+        t = crate::front::check::calls::qualified::impl_self(n, t, pt, pcx);
+        pt = crate::front::check::calls::qualified::args_from_fn_hint(pt, member, hint, pcx);
+        let r = crate::front::check::calls::qualified::trait_const_of(n, t, pt, member, pcx);
         if r >= 0 {
-            return r;
+            return crate::front::check::names::const_use(n, r, pcx);
+        }
+        f = crate::front::check::calls::qualified::trait_fn_of(n, t, pt, member, pcx);
+        if f == -2 {
+            crate::front::check::calls::qualified::several_impls(n, t, pt, member, pcx);
         }
     }
     if f < 0 {
@@ -641,7 +744,7 @@ fn bind_impl_params(f: i64, t: i64, pcx: &mut Ctx<Comp>) {
 // (0.27.2) The trait a path callee names (`Tr::f`, `a::b::Tr::f`), its
 // index + 1, or 0: neither a local nor a primitive, an item that is a
 // trait. RULE: F8.2
-fn trait_path_key(callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
+pub fn trait_path_key(callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let segments = pcx.nodes[callee as usize].count;
     let mut key: i64 = -1;
     if segments == 0 {
@@ -727,69 +830,111 @@ fn self_in_result(ret: i64, expected: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i
     0
 }
 
-// RULE: F8.2 (0.27.6) The type a trait function's Self is from call n's
-// arguments, for a function without a receiver whose parameter's written
-// type holds Self (`Self`, `&Self`, `&mut Self`, `&[Self]`, `[Self]`):
-// from the type the argument has without being checked (a local, `&e`,
-// `&mut e`, `e[a..b]` of one), as rustc infers it (`Hash::hash_slice(self,
-// state)` with `self: &[T]` is `<T as Hash>::hash_slice`); 0 when none says.
-fn self_from_args(f: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
+// RULE: F8.2 (0.30.2, RT-159) The type Self is in `Tr::f(args)`, a
+// trait's function f by a path that names no Self: the type of the first
+// argument whose parameter's written type holds Self (`self`, `&self`,
+// `&mut self`, `Self`, `&Self`, `&[Self]`), that argument synthesized as
+// written and then checked as the call's (check_arg: no autoref, no
+// autoderef, no `&` for `&mut`; only the coercions any argument has).
+// rustc's inference: `Tr::h(&s)` of `h(&self)` is `<S as Tr>::h`,
+// `Tr::f(&s)` of `f(self)` `<&S as Tr>::f`, `Hash::hash_slice(v, state)`
+// with `v: &[T]` `<T as Hash>::hash_slice`. An argument without the
+// parameter's shape (`Tr::h(s)` of `h(&self)`, rustc E0308) is an error,
+// and -1 then; 0 when no parameter holds Self, or its argument is a
+// closure (typed from its parameter).
+fn self_from_written_args(f: i64, n: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let count = if pcx.nodes[n as usize].count
         < pcx.nodes[f as usize].count { pcx.nodes[n as usize].count }
         else { pcx.nodes[f as usize].count };
     for i in 0..count {
-        let param_ty = pcx.nodes[child(f, i, pcx) as usize].b;
-        let t = quiet_type(child(n, i, pcx), 0, pcx);
-        let s = self_in_param(param_ty, t, 0, pcx);
-        if s > 0 {
-            return s;
+        let p = child(f, i, pcx);
+        let param_ty = pcx.nodes[p as usize].b;
+        // (`self` by value: Self itself)
+        let by_value_self = param_ty == 0 && pcx.nodes[p as usize].a == pcx.self_sym;
+        if !by_value_self && !holds_self(param_ty, 0, pcx) {
+            continue;
         }
+        let arg = child(n, i, pcx);
+        if crate::front::closures::fn_bounds::is_deferred_arg(arg, pcx) {
+            return 0;
+        }
+        let t = synth_expr(arg, pcx);
+        crate::front::generics::mark_synthed(arg, pcx);
+        if t <= 0 || t == TY_NEVER || crate::front::check::has_error_type(t, pcx) {
+            return -1;
+        }
+        let s = if by_value_self { t } else { self_in_param(param_ty, t, 0, pcx) };
+        if s <= 0 {
+            err_begin(pcx.nodes[arg as usize].start, pcx);
+            err_str(c"mismatched types: the argument is '", pcx);
+            err_type(t, pcx);
+            err_str(c"', not of the parameter's shape (a reference where it is `&self` or `&Self`): a path call takes Self from its argument as written, and takes or removes no reference (rustc E0308)", pcx);
+            err_help(c"pass the argument the parameter's type: `&x` for `&self`, `&mut x` for `&mut self`, `x` for `self`", pcx);
+            err_end(pcx);
+        }
+        return s;
     }
     0
 }
 
-// The type of expression e known without checking it: a local's, `&e` and
-// `&mut e` of one, `e[a..b]` of an array, a slice or a Vec; 0 otherwise.
-fn quiet_type(e: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    if e <= 0 || depth > 4 {
-        return 0;
+// RULE: D21.3 (0.30.2) Path call n of trait tr's `member` whose self type,
+// opaque type o, qualified::impl_self revealed h: each argument whose
+// parameter in the trait's declaration holds Self (declared_fn), of type
+// o or a reference to o, is h's, as a method's receiver is
+// (opaque::reveal_receiver): `{:?}` of an `impl Debug`, `Tr::m(&o)`,
+// `<T as Tr>::m(x)` in an instance whose T is o. The others are checked
+// as any argument.
+fn reveal_self_args(n: i64, tr: i64, member: i64, o: i64, h: i64, pcx: &mut Ctx<Comp>) {
+    let f = crate::front::check::calls::qualified::declared_fn(tr, member, pcx);
+    if f == 0 {
+        return;
     }
-    let k = pcx.nodes[e as usize].kind;
-    if k == NodeKind::Ident && pcx.nodes[e as usize].count == 0 {
-        return match lookup_local(pcx.nodes[e as usize].a, pcx) {
-            Option::Some(l) => pcx.locals[l as usize].ty,
-            Option::None => 0,
-        };
-    }
-    if k == NodeKind::Unary && pcx.nodes[e as usize].op == Tok::Amp {
-        let t = quiet_type(pcx.nodes[e as usize].b, depth + 1, pcx);
-        if t <= 0 {
-            return 0;
+    let count = if pcx.nodes[n as usize].count
+        < pcx.nodes[f as usize].count { pcx.nodes[n as usize].count }
+        else { pcx.nodes[f as usize].count };
+    for i in 0..count {
+        let p = child(f, i, pcx);
+        let param_ty = pcx.nodes[p as usize].b;
+        let by_value_self = param_ty == 0 && pcx.nodes[p as usize].a == pcx.self_sym;
+        if !by_value_self && !holds_self(param_ty, 0, pcx) {
+            continue;
         }
-        if pcx.types[t as usize].kind == TyKind::Slice {
-            return t;
+        let arg = child(n, i, pcx);
+        if crate::front::closures::fn_bounds::is_deferred_arg(arg, pcx) {
+            continue;
         }
-        return crate::front::types::ref_to(t,
-            if (pcx.nodes[e as usize].p & NODE_REF_MUT) != 0 { crate::front::types::REF_MUT }
-            else { crate::front::types::REF_SHARED }, pcx);
-    }
-    if k == NodeKind::Index && pcx.nodes[pcx.nodes[e as usize].b as usize].kind == NodeKind::Range {
-        let mut t = quiet_type(pcx.nodes[e as usize].a, depth + 1, pcx);
-        while t > 0 && pcx.types[t as usize].kind == TyKind::Ptr {
-            t = pcx.types[t as usize].a;
+        if pcx.synthed.get(arg + 1) == 0 {
+            synth_expr(arg, pcx);
+            crate::front::generics::mark_synthed(arg, pcx);
         }
-        if t > 0
-            && (pcx.types[t as usize].kind == TyKind::Array
-                || pcx.types[t as usize].kind == TyKind::Slice) {
-            return crate::front::types::slice_of(pcx.types[t as usize].a, pcx);
+        let at = pcx.nodes[arg as usize].ty;
+        if at > 0 && crate::front::opaque::opaque_in(at, pcx) == o {
+            pcx.nodes[arg as usize].ty = crate::front::opaque::revealed(at, o, h, pcx);
         }
     }
-    0
+}
+
+// Whether the written type ty holds Self where self_in_param finds it.
+fn holds_self(ty: i64, depth: i64, pcx: &Ctx<Comp>) -> bool {
+    if ty <= 0 || depth > 4 {
+        return false;
+    }
+    let k = pcx.nodes[ty as usize].kind;
+    if k == NodeKind::TyName {
+        return pcx.nodes[ty as usize].a == pcx.self_type_sym && pcx.nodes[ty as usize].count == 0
+            && pcx.nodes[ty as usize].g == 0;
+    }
+    if k == NodeKind::TyPtr || k == NodeKind::TySlice {
+        return holds_self(pcx.nodes[ty as usize].a, depth + 1, pcx);
+    }
+    false
 }
 
 // The type Self is when a parameter written `ty` (a type node) takes a
-// value of type t: `Self` itself, through `&`, `&mut` and `[..]`; 0 when
-// ty does not hold Self in those.
+// value of type t: `Self` itself, through `&`, `&mut` and `[..]` (`&[Self]`
+// of a slice view `&[S]`); 0 when ty does not hold Self in those, or t
+// lacks their shape. The reference's kind is not compared: the argument
+// is checked against the parameter after (check_arg).
 fn self_in_param(ty: i64, t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if ty <= 0 || t <= 0 || depth > 4 {
         return 0;
@@ -802,33 +947,23 @@ fn self_in_param(ty: i64, t: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if k == NodeKind::TyPtr && pcx.types[t as usize].kind == TyKind::Ptr {
         return self_in_param(pcx.nodes[ty as usize].a, pcx.types[t as usize].a, depth + 1, pcx);
     }
+    // (`&[Self]`: a slice is its own view type)
+    if k == NodeKind::TyPtr && pcx.types[t as usize].kind == TyKind::Slice
+        && pcx.nodes[pcx.nodes[ty as usize].a as usize].kind == NodeKind::TySlice {
+        return self_in_param(pcx.nodes[ty as usize].a, t, depth + 1, pcx);
+    }
+    // (`&Self` of a view, `&str`, `&[T]`: Self is the place it refers to,
+    // `str`, `[T]`, as rustc's `<str as AsRef<U>>`)
+    if k == NodeKind::TyPtr {
+        let place = crate::front::types::place_of_view(t, pcx);
+        if place > 0 {
+            return self_in_param(pcx.nodes[ty as usize].a, place, depth + 1, pcx);
+        }
+    }
     if k == NodeKind::TySlice && pcx.types[t as usize].kind == TyKind::Slice {
         return self_in_param(pcx.nodes[ty as usize].a, pcx.types[t as usize].a, depth + 1, pcx);
     }
     0
-}
-
-// RULE: Z9.1c (0.27.6) The trait of a bound of type parameter `name` (of
-// the instance being checked) that declares `member` with a `self`
-// receiver, or -1.
-fn bound_method_trait(name: i64, member: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    let p = bounded_param(name, pcx);
-    if p == 0 {
-        return -1;
-    }
-    let bounds = pcx.nodes[p as usize].h;
-    for i in 0..pcx.nodes[bounds as usize].count {
-        let tr = crate::front::traits::bound_trait(child(bounds, i, pcx), pcx);
-        if tr < 0 {
-            continue;
-        }
-        let f = crate::front::traits::trait_fn(tr, member, pcx);
-        if f != 0 && pcx.nodes[f as usize].count > 0
-            && pcx.nodes[child(f, 0, pcx) as usize].a == pcx.self_sym {
-            return tr;
-        }
-    }
-    -1
 }
 
 // `T::m(args)`: a variant with fields, or a call of an associated function
@@ -841,85 +976,37 @@ fn synth_path_call(n: i64, callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
         return vector_assoc_call(n, callee,
             (pcx.sym_primitive[pcx.nodes[callee as usize].a as usize]), pcx);
     }
-    // RULE: F8.2 (0.27.2: `Tr::m(x, args)`, a trait's method with its
-    // receiver explicit, is `x.m(args)`, probed as a method call is;
-    // 0.27.2 M3: by its path too, `std::clone::Clone::clone(x)`, as
-    // the derives write it, F17.1)
-    // RULE: F8.4 (0.30.1: `<S as Tr>::f`, the trait's function for S, as
-    // rustc's: with a receiver `Tr::f(x)`'s, through Tr only; without
-    // one, S's impl of Tr below)
+    // RULE: F8.2, F8.4 (0.30.2, RT-159: `Tr::f(args)`, a trait's function
+    // by a path, std::clone::Clone::clone(x) as the derives write it too,
+    // is `<Self as Tr>::f(args)`: Self the expected type's
+    // (trait_assoc_self, before) or the first argument's whose parameter
+    // holds Self, as written; the item is then qualified::path_trait's,
+    // below, and its arguments are checked as any call's, with no autoref,
+    // autoderef or `&` taken for `&mut`. 0.27.2 to 0.30.1 made `Tr::m(x,
+    // args)` the method call `x.m(args)`, whose probe adjusts a receiver:
+    // `Tr::g(&s)` of a `g(&mut self)` mutated s through a `&`, and
+    // `Tr::h(s)` of an `h(&self)` borrowed s. A path call is never a method
+    // call: no MethodCall is made of it, and nothing tells the probe of
+    // one)
+    // RULE: F8.4 (0.30.2: `<S as Tr>::f(args)` likewise, its arguments as
+    // written; 0.30.1 dropped the trait's arguments, `<S as
+    // Conv<i64>>::c(&s)` was ambiguous)
     let qn = crate::front::parser::rust::lifetimes_of(crate::front::parser::rust::qpath_key(callee),
         pcx);
-    let qtr: i64 = if qn != 0 { crate::front::traits::bound_trait(qn, pcx) } else { -1 };
-    if pcx.nodes[callee as usize].y == 0 && pcx.nodes[n as usize].count > 0 {
-        let mut tr = if qtr >= 0 { qtr + 1 } else { trait_path_key(callee, pcx) };
-        // RULE: Z9.1c (0.27.6: `A::m(x, args)` of a bounded parameter A
-        // whose bound declares the method m, with a receiver: `Tr::m(x,
-        // args)`, the bound's method of the type A stands for, as rustc
-        // resolves it on the generic body; `A::clone(&a)` with A = &Gpa
-        // is `<&Gpa as Clone>::clone`)
-        if tr == 0 && pcx.nodes[callee as usize].count == 0 {
-            tr = bound_method_trait(pcx.nodes[callee as usize].a, pcx.nodes[callee as usize].b,
-                pcx) + 1;
-        }
-        // RULE: F8.2 (0.27.6: a function of the trait without a receiver,
-        // its Self from an argument, `Hash::hash_slice(self, state)`:
-        // `<T as Hash>::hash_slice`, path_target reads y)
-        let f: i64 = if tr
-            != 0 { crate::front::traits::trait_fn(tr - 1, pcx.nodes[callee as usize].b, pcx) }
-            else { 0 };
-        let receiver = f != 0 && pcx.nodes[f as usize].count > 0
-            && pcx.nodes[child(f, 0, pcx) as usize].a == pcx.self_sym;
-        if qtr >= 0 && !receiver {
-            tr = 0;
-        }
-        let s: i64 = if f != 0 && !receiver && qtr < 0 { self_from_args(f, n, pcx) } else { 0 };
-        if s > 0 {
-            pcx.nodes[callee as usize].y = s;
-            tr = 0;
-        }
-        // RULE: F8.2 (0.30.1) A method with a receiver: Self is what the
-        // argument's type is against the receiver's written type (`&Self`,
-        // `&mut Self`, `Self`), as rustc unifies them, with no autoderef:
-        // `Tr::f(&r)` of an `r: &S` is `<&S as Tr>::f`, `Tr::g(&s)` of a
-        // `g(self)` `<&S as Tr>::g`. When that Self is a reference, the
-        // method probe below would find S's impl first (0.27.2: it did, and
-        // `Tr::g(&d)` moved d out); so the argument stays the receiver as
-        // written, `(&r).f()`, probed through Tr only (via_trait: not
-        // `<&S as Display>` for `Debug::fmt`). Any other Self is what the
-        // probe finds from the argument without its `&`.
-        let mut self_ref = false;
-        if tr != 0 && receiver {
-            let t = quiet_type(child(n, 0, pcx), 0, pcx);
-            let rs = self_in_param(pcx.nodes[child(f, 0, pcx) as usize].b, t, 0, pcx);
-            self_ref = rs > 0 && pcx.types[rs as usize].kind == TyKind::Ptr
-                && crate::front::types::is_ref(rs, pcx);
-        }
-        if tr != 0 {
-            let mut first = child(n, 0, pcx);
-            // (`Display::fmt(&x, f)`: the receiver x, the method's
-            // `&self` borrows it again; 0.30.1: not a `self` taken by
-            // value, whose Self is then the reference, `Tr::g(&v[0])` the
-            // impl for &T, which the probe finds first for `(&v[0]).g()`)
-            let by_value = f != 0 && receiver && pcx.nodes[child(f, 0, pcx) as usize].b > 0
-                && pcx.nodes[pcx.nodes[child(f, 0, pcx) as usize].b as usize].kind
-                != NodeKind::TyPtr;
-            if pcx.nodes[first as usize].kind == NodeKind::Unary
-                && pcx.nodes[first as usize].op == Tok::Amp && !by_value && !self_ref {
-                first = pcx.nodes[first as usize].b;
+    if qn == 0 && pcx.nodes[callee as usize].y == 0 && pcx.nodes[n as usize].count > 0 {
+        let tr = trait_path_key(callee, pcx);
+        let f: i64 = if tr != 0 {
+            crate::front::check::calls::qualified::declared_fn(tr - 1,
+                pcx.nodes[callee as usize].b, pcx)
+        } else { 0 };
+        if f != 0 {
+            let s = self_from_written_args(f, n, pcx);
+            if s < 0 {
+                return pcx.ty_error;
             }
-            let mark = list_begin(pcx);
-            for k in 1..pcx.nodes[n as usize].count {
-                list_push(child(n, k, pcx), pcx);
+            if s > 0 {
+                pcx.nodes[callee as usize].y = s;
             }
-            list_end(n, mark, pcx);
-            pcx.nodes[n as usize].kind = NodeKind::MethodCall;
-            pcx.nodes[n as usize].a = first;
-            pcx.nodes[n as usize].b = pcx.nodes[callee as usize].b;
-            pcx.nodes[n as usize].g = pcx.nodes[callee as usize].h;
-            pcx.via_node = n;
-            pcx.via_trait = tr - 1;
-            return synth_expr(n, pcx);
         }
     }
     let mut t = path_target(callee, pcx);
@@ -943,12 +1030,10 @@ fn synth_path_call(n: i64, callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
         if tpl < 0 && template_variant_named(-tpl - 1, member, pcx) {
             t = infer_enum(tpl, 0, member, n, pcx.nodes[callee as usize].start, pcx);
         } else {
-            let mut f = find_generic_method(tpl, member, pcx);
-            if f < 0 {
-                // RULE: F5.1 (`HashMap::new_in(a)` of `impl<K, V, A>
-                // HashMap<K, V, A, FixedState>`: a pattern impl on tpl)
-                f = pattern_fn_of_template(tpl, member, pcx);
-            }
+            // RULE: F8.4, F9.3 (0.30.2: `<W as Tr>::f(..)` Tr's, and of two
+            // traits' functions neither by its name alone: qualified)
+            let mut f = crate::front::check::calls::qualified::template_fn(callee, tpl, member,
+                pcx);
             // (0.26.3: `W::scalar(x)`, which only `impl W<ScopedArena>`
             // has: that instance's, below)
             let inst: i64 = if f < 0 { sole_instance_with(tpl, member, pcx) } else { 0 };
@@ -957,8 +1042,18 @@ fn synth_path_call(n: i64, callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
             } else {
                 if f < 0 {
                     // (0.15: `W::from(x)`, a generic trait's impl for W)
-                    let r = template_trait_call(n, tpl, member, pcx);
+                    // (0.30.2: of `<W as Tr>`, Tr's impls only)
+                    let wpt = if crate::front::parser::rust::lifetimes_of(
+                        crate::front::parser::rust::qpath_key(callee), pcx) != 0 {
+                        crate::front::check::calls::qualified::path_trait(callee, 0, member,
+                            pcx)
+                    } else { crate::front::check::calls::qualified::no_trait() };
+                    let r = template_trait_call(n, tpl, member, wpt.tr, wpt.args, wpt.nargs,
+                        pcx);
                     if r >= 0 {
+                        // (0.30.2: of `<W as Tr>`, Tr's function only)
+                        crate::front::check::calls::qualified::check_template_dispatched(n, callee,
+                            tpl, member, pcx);
                         return r;
                     }
                     // (0.26.3: `Vec::new()`: `Vec::new_in(gpa)`)
@@ -1043,33 +1138,55 @@ fn synth_path_call(n: i64, callee: i64, pcx: &mut Ctx<Comp>) -> i64 {
             return t;
         }
     }
-    let mut f = method_of(t, member, pcx);
-    if qtr >= 0 {
-        let g: i64 = if f >= 0 {
-            crate::front::check::calls::trait_method_choice(n, t,
-                crate::front::check::calls::method_template(t, pcx), member, f, qtr, pcx)
-        } else { -1 };
-        let gi: i64 = if g >= 0 { crate::front::traits::impl_of_fn(g, pcx) } else { -1 };
-        f = if gi >= 0 && pcx.traits_impls[gi as usize].tr == qtr { g }
-            else { crate::front::check::calls::pattern_method_via(t, member, qtr, pcx) };
+    // RULE: F8.4, F8.3, F9.3 (0.30.2, RT-C301-8: the function is of the
+    // trait the path names, qualified::path_trait, `<S as B>::m` B's, `T::m`
+    // its bound's, D22.1a an Ω's virtual one; else an inherent one, F5.1 a
+    // pattern impl's too; else of the one trait whose impl for t has it,
+    // qualified::concrete_trait, two being E0034; never a trait's function
+    // found by its name alone, as 0.30.1's method_of did)
+    let mut pt = crate::front::check::calls::qualified::path_trait(callee, t, member, pcx);
+    let mut f: i64 = -1;
+    if pt.tr < 0 {
+        f = crate::front::check::calls::qualified::inherent_fn(t, member, pcx);
+        if f < 0 {
+            pt = crate::front::check::calls::qualified::concrete_trait(callee, t, member, pcx);
+        }
     }
-    // RULE: F5.1 (0.29.0: `HashMap::<K, V, Gpa, FixedState>::new_in(a)`,
-    // a pattern impl's function by its type written whole, as
-    // `HashMap::new_in(a)` finds it by the template)
-    if f < 0 {
-        f = crate::front::check::calls::pattern_method_of(t, member, pcx);
+    // RULE: F18.5 (0.30.2: `Display::fmt(&v, f)`, `<_ as Tr>::m(a)` with
+    // Self an integer variable still free: rustc's `<{integer} as Tr>`, its
+    // impl selected when the variable's type is known; calls::int_path_fn)
+    if pt.tr >= 0 && pcx.infer_live && crate::front::check::infer::int_free(t, pcx)
+        && pt.tr != crate::front::traits::std_trait(c"From", pcx) {
+        let (t2, vf) = crate::front::check::calls::int_path_fn(n, t, pt.tr, member, pcx);
+        if t2 == pcx.ty_error {
+            for i in 0..pcx.nodes[n as usize].count {
+                synth_expr(child(n, i, pcx), pcx);
+            }
+            return pcx.ty_error;
+        }
+        t = t2;
+        f = vf;
     }
-    // RULE: D22.1a (0.27.3: `Ω::f(args)`, a bound's associated function,
-    // `T::default()`: its virtual function, FL11)
-    if f < 0 && crate::front::opaque::is_omega(t, pcx) {
-        f = crate::front::opaque::virtual_fn(t, member, pcx);
-    }
-    if f < 0 {
-        // (0.15: `T::from(x)`, a function of a generic trait's impl)
-        let r = generic_trait_call(n, t, member, pcx);
-        if r >= 0 {
+    if pt.tr >= 0 && f < 0 {
+        // (an `impl Tr` result's: its hidden type's, impl_self)
+        let o = t;
+        t = crate::front::check::calls::qualified::impl_self(callee, t, pt, pcx);
+        if t != o {
+            reveal_self_args(n, pt.tr, member, o, t, pcx);
+        }
+        f = crate::front::check::calls::qualified::trait_fn_of(callee, t, pt, member, pcx);
+        if f == -2 {
+            // (0.15: `T::from(x)`, impls of a generic trait the path names
+            // without its arguments: the call's arguments choose, of that
+            // trait's only)
+            let r = crate::front::convert::trait_call(n, t, member, pt.tr, pt.args, pt.nargs,
+                pcx);
+            crate::front::check::calls::qualified::check_dispatched(n, callee, t, pt, member, r,
+                pcx);
             return r;
         }
+    }
+    if f < 0 {
         path_member_error(callee, t, member, pcx);
     }
     crate::front::check::sealed::check_method_private(n, f, pcx);
@@ -1097,35 +1214,4 @@ fn sole_instance_with(tpl: i64, name: i64, pcx: &Ctx<Comp>) -> i64 {
         }
     }
     found
-}
-
-// (0.27.2) The function `name` of a rust-edition pattern impl (TPL_PATTERN)
-// whose header names template tpl (`impl<K, V, A> HashMap<K, V, A,
-// FixedState>`, for `HashMap::new_in(a)`), or -1: its header's arguments
-// are inferred as the call's. RULE: F5.1
-fn pattern_fn_of_template(tpl: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    if tpl == TPL_NONE || tpl == TPL_PATTERN {
-        return -1;
-    }
-    let mut i = gm_start(TPL_PATTERN, name, pcx);
-    while i >= 0 {
-        let at = i;
-        i = gm_after(i, pcx);
-        if pcx.gmethods[at as usize].ty != TPL_PATTERN || pcx.gmethods[at as usize].name != name {
-            continue;
-        }
-        let f = pcx.gmethods[at as usize].f;
-        let header = pcx.nodes[pcx.fns[f as usize].node as usize].h;
-        if header == 0 || pcx.nodes[header as usize].kind != crate::front::ast::NodeKind::TyName {
-            continue;
-        }
-        let saved = pcx.cur_mod;
-        pcx.cur_mod = pcx.fns[f as usize].module;
-        let t = template_of_type_node(header, pcx);
-        pcx.cur_mod = saved;
-        if t == tpl {
-            return f;
-        }
-    }
-    -1
 }

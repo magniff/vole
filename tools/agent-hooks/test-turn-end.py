@@ -272,5 +272,29 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
+# (0.30.2) A case that fails on purpose is the test, not an unchecked
+# change: `// ERROR:` (a refusal it expects) and `// XFAIL:` (a known bug
+# kept as a test, its wrong refusal included); a program outside tests/
+# with the same lines, and a plain case, are checked as ever.
+import importlib.util
+_spec = importlib.util.spec_from_file_location("turn_end", os.path.join(HERE, "turn-end.py"))
+_te = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_te)
+etmp = tempfile.mkdtemp()
+try:
+    def expects(rel, text):
+        p = os.path.join(etmp, rel)
+        write(p, text)
+        return _te.expects_errors(p)
+    xf = "// XFAIL: RT-51: refused where rustc builds it (0.30.2)\n// EXPECT: 1\nfn main() {}\n"
+    case("an XFAIL case's errors are its test",
+         (expects("tests/run/x.vl", xf),
+          expects("tests/run/e.vl", "// ERROR: cannot assign\nfn main() {}\n"),
+          expects("tests/run/plain.vl", "// EXPECT: 1\nfn main() {}\n"),
+          expects("prog/x.vl", xf)),
+         (True, True, False, False))
+finally:
+    shutil.rmtree(etmp, ignore_errors=True)
+
 print("total", "ok" if FAILED == 0 else f"{FAILED} failed")
 sys.exit(1 if FAILED else 0)

@@ -103,6 +103,11 @@
 # compiler/src and std without // UNSAFE: and // SAFETY:, `volec query
 # unsafe`; 0.29: none of them, and no unsafe block of compiler/src with
 # nothing unsafe inside, each one named; --quick too);
+# redteam-cases (tests/redteam_cases.sh, 0.30.2: every red-team finding,
+# a `## RT-...` heading of the notes beside the main checkout, has its
+# case in tests/, open or fixed, after a canary it must catch; then
+# tests/redteam/run.sh, the red team's shell cases; --quick
+# too; a SKIP where there are no notes);
 # borrowck-twin (tools/borrowck-twin.sh, 0.27.1: every rust_b_ case's
 # verdict against rustc's, accept or reject, and its code; a divergence
 # only when the case names its class; skipped without rustc; --quick too);
@@ -323,7 +328,7 @@ MFZ=$FZ
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-moves fuzz-moves-vec fuzz-moves-x86 fuzz-moves-vec-x86 fuzz-moves-frame fuzz-moves-frame-x86 fuzz-seed fuzz-sem"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost e18-loans main-stack unsafe-audit borrowck-twin stdtools std-check std-tests cachediff"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost e18-loans main-stack unsafe-audit redteam-cases borrowck-twin stdtools std-check std-tests cachediff"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
 # rebuild compilers rather than test one
 RELEASE_STEPS="chain-diverse chain-fresh"
@@ -340,7 +345,7 @@ OTHER_STEPS="valgrind $INSIDE_SMOKE_STEPS"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
     quick)
-        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost e18-loans main-stack unsafe-audit borrowck-twin stdtools std-tests cachediff"
+        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost e18-loans main-stack unsafe-audit redteam-cases borrowck-twin stdtools std-tests cachediff"
         [ $LINUX -eq 1 ] && STEPS="$SMOKE_STEPS $STEPS" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
@@ -435,7 +440,7 @@ held_slots() { # <step>
             suite-*|stress-grow|e18-loans) hs=2 ;;
             cachediff|std-check) hs=4 ;;
             chain-diverse|chain-fresh|selftest-nest) hs=$JOBS ;;
-            layout|debug|unsafe-audit|borrowck-twin|stdtools|voltty-fuzz|compile-cost|main-stack) hs=1 ;;
+            layout|debug|unsafe-audit|redteam-cases|borrowck-twin|stdtools|voltty-fuzz|compile-cost|main-stack) hs=1 ;;
         esac
     fi
     hs_max=$JOBS
@@ -990,6 +995,8 @@ run_step() {
             && sh "$ROOT/tests/e18_loans.sh" -c "$C" -j 2 ;;
         main-stack) sh "$ROOT/tests/main_stack.sh" -c "$C" ;;
         unsafe-audit) sh "$ROOT/tests/unsafe_audit.sh" -c "$C" ;;
+        # (0.30.2) every red-team finding has its case in the tree
+        redteam-cases) sh "$ROOT/tests/redteam_cases.sh" && sh "$ROOT/tests/redteam/run.sh" -c "$C" ;;
         # (0.30) std inside the tools, in a copy of compiler/std (also a
         # suite of tests/run.sh)
         stdtools) sh "$ROOT/tests/stdtools.sh" -c "$C" ;;
@@ -1607,8 +1614,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*|smoke-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff|e18-loans|main-stack)
-            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|borrowck-twin|stdtools|std-check|std-tests|cachediff|e18-loans|main-stack):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit|redteam-cases|borrowck-twin|stdtools|std-check|std-tests|cachediff|e18-loans|main-stack)
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit|redteam-cases|borrowck-twin|stdtools|std-check|std-tests|cachediff|e18-loans|main-stack):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         # (no rows: it failed before the container's steps, e.g. docker)

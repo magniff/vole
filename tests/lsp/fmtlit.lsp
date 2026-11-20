@@ -11,7 +11,7 @@
 > {"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":5,"character":15}}}
 < {"jsonrpc":"2.0","id":2,"result":{"contents":{"kind":"markdown","value":"```vole\n()\n```\n"},"range":{"start":{"line":5,"character":14},"end":{"line":5,"character":19}}}}
 > {"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":5,"character":37}}}
-< {"jsonrpc":"2.0","id":3,"result":{"contents":{"kind":"markdown","value":"```vole\ni32\n```\n"},"range":{"start":{"line":5,"character":36},"end":{"line":5,"character":41}}}}
+< {"jsonrpc":"2.0","id":3,"result":{"contents":{"kind":"markdown","value":"```vole\nusize\n```\n"},"range":{"start":{"line":5,"character":36},"end":{"line":5,"character":41}}}}
 > {"jsonrpc":"2.0","id":4,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":5,"character":50}}}
 < {"jsonrpc":"2.0","id":4,"result":{"contents":{"kind":"markdown","value":"```vole\ni64\n```\n"},"range":{"start":{"line":5,"character":48},"end":{"line":5,"character":53}}}}
 > {"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":5,"character":22}}}

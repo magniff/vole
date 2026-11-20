@@ -16,6 +16,7 @@ global allocator and no default `A`.
 | Rust | vole |
 |---|---|
 | `fn main()` | `fn main(gpa: Gpa)`: the program's allocator, passed down (`fn main()` when nothing allocates) |
+| `fn main()`, `-> Result<(), E>` | (0.30.2) also C's `fn main(argc: i32, argv: *mut *mut u8)` (`*const` too), `gpa: Gpa` last after them; results `()`, `i32`, `i64`, `!`, `Result<(), E: Debug>`; any other signature is `main.signature` or `main.result` (rustc E0580, E0277) |
 | `Vec<T>`, `String`, `HashMap<K, V>`, `Box<T>` | `Vec<T, Gpa>`, `String<Gpa>`, `HashMap<K, V, Gpa, FixedState>` (the hasher is written too, `hash.default`; `FixedState` is in the prelude), `Box<T, Gpa>`; generic code writes `A: Allocator` (`use std::alloc::Allocator`). `Vec<T>` is `alloc.default` |
 | `Vec::new()`, `String::new()`, `Box::new(x)`, `Arc::new(x)` | `Vec::new_in(gpa)`, `String::new_in(gpa)`, `Box::new_in(x, gpa)`, `Arc::new_in(x, gpa)`: the allocator last. `Vec::new()` is `alloc.no_in` |
 | `x.to_string()`, `format!("{a}-{b}")`, `iter.collect()` | `x.to_string_in(gpa)`, `format_in("{a}-{b}", gpa)`, `iter.collect_in(gpa)`: what returns owned memory ends in `_in` |
@@ -62,7 +63,10 @@ Vole adds two things to a signature, both checked.
 - **Contracts**: `requires COND else "code: message"` and `ensures
   COND` (with `result`) after the signature. A caller that breaks a
   `requires` stops at its own line with the message, exit 101 (`guide
-  contracts`).
+  contracts`). A clause writes nothing it did not make: it reads the
+  parameters and `result` as through `&`, whatever their types are
+  written as, and writes through no cell, nor a raw pointer that may
+  point to what it did not make (0.30.2).
 
 ```vole
 fn half(x: i64) -> i64
@@ -117,16 +121,15 @@ fn main() {
   `f64` does too. `i64::from(a)` is accepted as in Rust.
   An index is not widened to: it is a `usize`, as in Rust (`v[i as
   usize]` of an `i: u32`).
-- **Not an i32 computed from untyped literals** (0.30.1,
-  `type.widen_i32`): an integer literal nothing gives a type is i32,
-  and Rust types it from the later use instead. So `let a = [2000000000,
-  2]; let s = a[0] + a[0];` passed to an `i64` parameter is an error,
-  not an i32 sum widened after it overflowed: write the type where the
-  value is made (`let a: [i64; 2]`, `let mut n: i64 = 0`,
-  `s.parse::<i64>()`), or `i64::from(s)` when i32 is meant. A literal,
-  an element, a loop's binding and an i32 whose type is written (a
-  parameter, a field, a function's result) widen as before: their value
-  is the same in either type.
+- **An integer literal's type comes from its uses, as in Rust**
+  (0.30.2): an unsuffixed literal nothing types where it is written is
+  `{integer}` until a later use in the function types it (through a
+  closure, an `Option`, a generic call, a branch, an array, a trait
+  method such as `m.max(3)`), and `i32` if none does. `let a =
+  2000000000; let s = Some(a).map(|x| x + x).unwrap(); take(s)` with
+  `take(x: i64)` adds in i64. An i32 computed from literals is not
+  widened to i64 (`type.widen_i32`): write the type (`let m: i64 =
+  3`).
 - **Overflow** panics at `-O0` (`attempt to add with overflow`) and
   wraps at `-O2`, as Rust's debug and release builds do; `wrapping_add`
   and its family always wrap.
@@ -155,6 +158,23 @@ fn main() {
 - A slice has no fields (0.29): its length is `s.len()`, its pointer
   `s.as_ptr()` or `s.as_mut_ptr()`.
 - Raw pointers are for `unsafe` code, as in Rust (`guide unsafe`).
+- A `fn(&T) -> &U` value names no lifetimes of its own: a call through
+  it, or through an `F: Fn(..)` it is given for, ties its result to
+  every argument. A function given by its name is read by its
+  signature (0.30.2): `v.first().map(st)` with `fn st(x: &i64) ->
+  &'static i64` keeps no borrow of v; one whose result borrows an
+  argument the bound lends for the call alone (`sort_by_key(idr)`) is
+  `borrowck.fn_value_bound`, as rustc's E0308.
+- A union's field is Copy, a reference or a `std::mem::ManuallyDrop<T>`,
+  as in Rust (E0740, 0.30.2; a generic `T` needs `T: Copy`). One
+  difference: `u.m.k = v` through a ManuallyDrop field's `DerefMut`,
+  which rustc refuses, is allowed in `unsafe`, and drops the old `k` as
+  rustc's `(*u.m).k = v` does.
+- A borrowed literal is not promoted to a static: `&7` lives in the
+  function that makes it, so `let r: &'static u64 = &7;` and a
+  `&'static` field set to `&7` (or to a const's `&[1, 2]`) are refused;
+  borrow a `static` instead (`static SEVEN: u64 = 7;` then `&SEVEN`). A
+  string literal is `&'static str`, as in Rust.
 
 ## C
 
@@ -190,6 +210,16 @@ conversions#reading-input`),
 `std::gpu`, `std::window` and `std::objc` (`guide gpu`, `guide
 window`), the arenas of `std::alloc`, and `embed wgsl` blocks with
 `#[repr(wgsl)]` structs.
+
+## Constants
+
+A `const` whose value calls a function is made at each use, at run
+time (rustc needs a `const fn` and computes it once). So `[C; N]` of a
+constant whose type is not Copy makes each element from the constant,
+one call per element, any length; any other `[x; N]`, N above 1, needs
+x Copy, as in Rust (`trait.repeat_copy`), in a static's value too. A
+constant's value is a body of its own, as in Rust: a `return`, `?`,
+`break` or `continue` in it cannot leave it.
 
 ## Not in the language
 

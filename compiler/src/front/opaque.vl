@@ -31,7 +31,7 @@ use crate::front::ast::{
     FN_BODY_FAILED, FN_INTRINSIC, FN_SIG_FAILED, NodeKind, TY_OMEGA, TY_OPAQUE, child, list_begin,
     list_end, list_push, new_node,
 };
-use crate::front::traits::{bound_trait, trait_supers};
+use crate::front::traits::bound_trait;
 use crate::front::types::{TY_NEVER, TY_UNIT, TyKind, err_type, make_type, ref_to, type_elem};
 
 pub fn is_opaque_node(n: i64, pcx: &Ctx<Comp>) -> bool {
@@ -43,6 +43,11 @@ pub fn is_opaque_node(n: i64, pcx: &Ctx<Comp>) -> bool {
 pub fn is_opaque(t: i64, pcx: &Ctx<Comp>) -> bool {
     t > 0 && pcx.types[t as usize].kind == TyKind::Distinct
         && is_opaque_node(pcx.types[t as usize].b, pcx)
+        // (0.30.2: an integer variable, F18.5, is marked opaque as a type
+        // variable is; it stands for an integer type, neither an opaque
+        // type nor an Ω: 'static, its methods an integer type's)
+        && (pcx.nodes[pcx.types[t as usize].b as usize].p
+            & crate::front::check::infer::TY_INT_VAR) == 0
 }
 
 // RULE: D21.1 The opaque result type of function f (resolve_signature: its
@@ -89,6 +94,40 @@ fn active(f: i64, pcx: &Ctx<Comp>) -> bool {
 // needs: f's body checked first when it is not yet (check_nested); f's own
 // body being checked is opaque.cycle.
 pub fn hidden(t: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    // RULE: F18.5 (0.30.2: the result of an instance made with a type
+    // variable, `id(e)` of `id<T: Show>(t: T) -> impl Show` with e an
+    // integer literal's: that instance is never checked; the hidden type is
+    // that of the instance of the solutions, the one the call is made again
+    // to, infer.vl remake_calls; with one still free, rustc's E0282)
+    let vf = opaque_fn(t, pcx);
+    if vf >= 0 && (pcx.fns[vf as usize].attrs & crate::front::ast::FN_QUERY_ONLY) != 0
+        && pcx.fns[vf as usize].tmpl > 0 && pcx.infer_live {
+        let mark = pcx.tscratch.len() as i64;
+        for i in 0..pcx.fns[vf as usize].targ_count {
+            let a = crate::front::check::infer::resolve(
+                pcx.tlists[(pcx.fns[vf as usize].targs + i) as usize], pcx);
+            pcx.tscratch.push(a);
+        }
+        if crate::front::check::infer::targs_mention(mark, pcx)
+            || pcx.fns[vf as usize].ret != t {
+            pcx.tscratch.truncate(mark as usize);
+            err_begin(pos, pcx);
+            err_str(c"type annotations needed: the type of this '", pcx);
+            err_type(t, pcx);
+            err_str(c"' is not known here (rustc E0282)", pcx);
+            err_help(c"it is made with an integer literal whose type a later use gives: write the literal's type where it is made (`3i64`)", pcx);
+            err_end(pcx);
+        }
+        let g = crate::front::generics::instantiate::fn_instance(pcx.fns[vf as usize].tmpl - 1,
+            mark, pcx.fns[vf as usize].origin, pcx);
+        let r = pcx.fns[g as usize].ret;
+        if is_opaque(r, pcx) {
+            let h = hidden(r, pos, pcx);
+            pcx.types[t as usize].a = h;
+            return h;
+        }
+        return r;
+    }
     if pcx.types[t as usize].a != 0 {
         return pcx.types[t as usize].a;
     }
@@ -114,6 +153,69 @@ fn cycle_error(t: i64, pos: i64, pcx: &mut Ctx<Comp>) -> ! {
     err_end_soft(pcx);
     pcx.err_kind = saved;
     err_jump(pcx)
+}
+
+// RULE: D21.5 (0.30.2, RT-145, RT-147, RT-79) What opaque type t is: its
+// hidden type, through every opaque type that is itself one (`fn outer()
+// -> impl Fn() { inner() }`: outer's is inner's, whose is the closure),
+// so an opaque type is its hidden type for drops, layout, an associated
+// type and the call of a method of its bounds; an Ω (a type parameter)
+// stands for itself. A function not checked yet is checked first; 0 when
+// the hidden type is not known (asked inside its own function's check:
+// a cycle, which `hidden` reports where a use needs it). t when t is no
+// opaque type.
+pub fn reveal_type(t: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut u = t;
+    // (each step is another function's result: a chain ends, as a cycle
+    // is refused, opaque.cycle)
+    while is_opaque(u, pcx) && !is_omega(u, pcx) {
+        if pcx.types[u as usize].a == 0 {
+            let f = opaque_fn(u, pcx);
+            if f < 0 || active(f, pcx) {
+                return 0;
+            }
+            crate::front::check::check_nested(pcx.fns[f as usize].node, pcx);
+            if pcx.types[u as usize].a == 0 {
+                return 0;
+            }
+        }
+        u = pcx.types[u as usize].a;
+    }
+    u
+}
+
+// RULE: D21.5 (0.30.2, RT-145) The one decider of what distinct type t is
+// for its kind and its drop glue (front/kinds.vl type_kind, places/glue.vl
+// glue_of): its underlying type, for an opaque result type its hidden
+// type (another opaque type is decided in turn); 0 while that is not
+// known (its function not checked yet, or being checked). Whatever reads
+// a 0 keeps no answer (kinds.vl kind_unknown, glue.vl has_glue), so a
+// type holding t is decided again once it is known: by the places IR,
+// built when every function is checked. It does not check t's function
+// to know it (reveal_type does, for a call or a method of the value): a
+// kind asked there would check functions in another order, and meet a
+// cycle rustc has not (a calls b, which holds an `(a(n), 1)`).
+pub fn decided_type(t: i64, pcx: &Ctx<Comp>) -> i64 {
+    pcx.types[t as usize].a
+}
+
+// RULE: D21.5 hidden, through every opaque type it is (reveal_type): the
+// type whose method or call a use of opaque type t reaches.
+fn hidden_deep(t: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut u = hidden(t, pos, pcx);
+    while is_opaque(u, pcx) && !is_omega(u, pcx) {
+        u = hidden(u, pos, pcx);
+    }
+    u
+}
+
+// hidden_deep at pos; pos < 0: reveal_type, t itself while not known.
+fn reveal_at(t: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    if pos >= 0 {
+        return hidden_deep(t, pos, pcx);
+    }
+    let h = reveal_type(t, pcx);
+    if h > 0 { h } else { t }
 }
 
 // ---- The definition side (check/body.vl) ----
@@ -323,24 +425,15 @@ pub fn check_hidden_bounds(f: i64, pcx: &mut Ctx<Comp>) {
 
 // ---- The caller side ----
 
-// Whether trait b is tr or has it among its supertraits (F2.2).
-fn entails(b: i64, tr: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
+// Whether trait b is tr or has it among its supertraits (F2.2; 0.30.2:
+// traits::super_closure, to every depth: a cut at 8 was a no).
+fn entails(b: i64, tr: i64, pcx: &mut Ctx<Comp>) -> bool {
     if b < 0 {
         return false;
     }
-    if b == tr {
-        return true;
-    }
-    let supers = trait_supers(b, pcx);
-    if supers == 0 || depth > 8 {
-        return false;
-    }
-    for i in 0..pcx.nodes[supers as usize].count {
-        if entails(bound_trait(child(supers, i, pcx), pcx), tr, depth + 1, pcx) {
-            return true;
-        }
-    }
-    false
+    let mut reached: Vec<i64, Comp> = Vec::new_in(Comp {});
+    crate::front::traits::super_closure(b, &mut reached, pcx);
+    reached.contains(&tr)
 }
 
 // RULE: D21.3 Whether opaque type t implements trait tr: one of its bounds
@@ -348,41 +441,7 @@ fn entails(b: i64, tr: i64, depth: i64, pcx: &mut Ctx<Comp>) -> bool {
 pub fn implements(tr: i64, t: i64, pcx: &mut Ctx<Comp>) -> bool {
     let bounds = pcx.nodes[pcx.types[t as usize].b as usize].h;
     for i in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
-        if entails(bound_trait(child(bounds, i, pcx), pcx), tr, 0, pcx) {
-            return true;
-        }
-    }
-    false
-}
-
-// RULE: D22.1 (0.27.3, FL11) Whether opaque type t implements generic trait
-// tr with arguments targs (a TLISTS index): a bound of t names tr with
-// those arguments (`S: AsRef<str>`, resolved in the template's scope; one
-// it cannot resolve, or with fewer written, holds), or a bound's trait
-// has tr among its supertraits.
-pub fn implements_with(tr: i64, t: i64, targs: i64, pcx: &mut Ctx<Comp>) -> bool {
-    let bounds = pcx.nodes[pcx.types[t as usize].b as usize].h;
-    for i in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
-        let b = child(bounds, i, pcx);
-        let bt = bound_trait(b, pcx);
-        if bt != tr {
-            if bt >= 0 && entails(bt, tr, 0, pcx) {
-                return true;
-            }
-            continue;
-        }
-        let g = pcx.nodes[b as usize].g;
-        let mut same = true;
-        for k in 0..(if g > 0 { pcx.nodes[g as usize].count } else { 0 }) {
-            let saved = pcx.cur_mod;
-            pcx.cur_mod = crate::front::modules::module_of(b, pcx);
-            let a = resolve_quietly(child(g, k, pcx), pcx);
-            pcx.cur_mod = saved;
-            if a > 0 && a != pcx.ty_error && a != pcx.tlists[(targs + k) as usize] {
-                same = false;
-            }
-        }
-        if same {
+        if entails(bound_trait(child(bounds, i, pcx), pcx), tr, pcx) {
             return true;
         }
     }
@@ -402,19 +461,22 @@ fn bound_method(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> bool {
 }
 
 // The opaque type receiver type rt is or points to, or 0.
-fn opaque_in(rt: i64, pcx: &Ctx<Comp>) -> i64 {
-    if is_opaque(rt, pcx) {
+pub fn opaque_in(rt: i64, pcx: &Ctx<Comp>) -> i64 {
+    // (0.30.2: an integer variable, F18.5, a distinct type marked opaque
+    // for what reads types, is none: its methods are calls::int_var_method's)
+    if is_opaque(rt, pcx) && !crate::front::check::infer::is_int_var(rt, pcx) {
         return rt;
     }
     if rt > 0 && pcx.types[rt as usize].kind == TyKind::Ptr && pcx.types[rt as usize].b != 0
-        && is_opaque(pcx.types[rt as usize].a, pcx) {
+        && is_opaque(pcx.types[rt as usize].a, pcx)
+        && !crate::front::check::infer::is_int_var(pcx.types[rt as usize].a, pcx) {
         return pcx.types[rt as usize].a;
     }
     0
 }
 
 // rt with opaque type o (rt itself or what it points to) made h.
-fn revealed(rt: i64, o: i64, h: i64, pcx: &mut Ctx<Comp>) -> i64 {
+pub fn revealed(rt: i64, o: i64, h: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if rt == o { h } else { ref_to(h, pcx.types[rt as usize].b, pcx) }
 }
 
@@ -455,7 +517,7 @@ pub fn reveal_receiver(n: i64, receiver: i64, rt: i64, name: i64, pcx: &mut Ctx<
         err_help(c"an `impl Trait` result has its bounds' methods only: add the trait that has it to the function's result, `-> impl Tr + Other`", pcx);
         err_end(pcx);
     }
-    let h = hidden(o, pcx.nodes[n as usize].start, pcx);
+    let h = hidden_deep(o, pcx.nodes[n as usize].start, pcx);
     let r = revealed(rt, o, h, pcx);
     pcx.nodes[receiver as usize].ty = r;
     r
@@ -480,23 +542,61 @@ pub fn reveal_callee(callee: i64, ct: i64, pcx: &mut Ctx<Comp>) -> i64 {
         }
         return ct;
     }
-    let h = hidden(o, pcx.nodes[callee as usize].start, pcx);
+    let h = hidden_deep(o, pcx.nodes[callee as usize].start, pcx);
     let r = revealed(ct, o, h, pcx);
     pcx.nodes[callee as usize].ty = r;
     r
 }
 
 // RULE: D21.3 A `Fn*` bound on a value of type t: an opaque type with an
-// `Fn*` bound of its own is checked as its hidden closure.
+// `Fn*` bound of its own is checked as its hidden closure. (0.30.2) pos
+// < 0: asked by fn_bound_satisfied, the one test of an `Fn*` bound, with
+// no position: a hidden type not known yet leaves t as it is.
 pub fn fn_bound_type(t: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
     if is_omega(t, pcx) {
         let sig = fn_bound_sig(t, pcx);
         return if sig != 0 { sig } else { t };
     }
     if is_opaque(t, pcx) && fn_bound(pcx.types[t as usize].b, pcx) != 0 {
-        return hidden(t, pos, pcx);
+        return reveal_at(t, pos, pcx);
+    }
+    // RULE: D21.5 (0.30.2, RT-166: `&O`, `&mut O` of such an opaque type
+    // O: a reference to its hidden closure, which std's `Fn*` impls for
+    // references call through, as for any closure, fn_bound_satisfied;
+    // when O's own bound lets a caller do so: `&O` of an `impl Fn`, `&mut
+    // O` of an `impl Fn` or `impl FnMut`, d 2 and 3; an `impl FnOnce` is
+    // no `&F` callee whatever its closure is)
+    if t > 0 && pcx.types[t as usize].kind == TyKind::Ptr && pcx.types[t as usize].b != 0 {
+        let o = pcx.types[t as usize].a;
+        let fnb: i64 = if is_opaque(o, pcx) && !is_omega(o, pcx) {
+            fn_bound(pcx.types[o as usize].b, pcx)
+        } else { 0 };
+        let most: i64 = if pcx.types[t as usize].b == crate::front::types::REF_MUT { 3 } else { 2 };
+        if fnb != 0 && pcx.nodes[fnb as usize].d <= most {
+            let h = reveal_at(o, pos, pcx);
+            return if h == o { t } else { ref_to(h, pcx.types[t as usize].b, pcx) };
+        }
     }
     t
+}
+
+// RULE: D21.6 (0.30.2, RT-213) The call kind opaque type t gives a value
+// of it: its `Fn*` bound's (2 `Fn`, 3 `FnMut`, 4 `FnOnce`), whatever its
+// hidden closure is, as a caller sees only the bound (rustc: an `impl
+// FnOnce` is called once, an `impl FnMut` through a `mut` binding, and
+// neither meets a bound of a stricter kind); 0 when t is no such type.
+pub fn opaque_call_kind(t: i64, pcx: &Ctx<Comp>) -> i64 {
+    if !is_opaque(t, pcx) || is_omega(t, pcx) {
+        return 0;
+    }
+    let b = fn_bound(pcx.types[t as usize].b, pcx);
+    if b > 0 { pcx.nodes[b as usize].d } else { 0 }
+}
+
+// (0.30.2, RT-195) Whether t is an opaque type or an Ω with an `Fn*`
+// bound: a value a call takes.
+pub fn fn_bounded(t: i64, pcx: &Ctx<Comp>) -> bool {
+    is_opaque(t, pcx) && fn_bound(pcx.types[t as usize].b, pcx) != 0
 }
 
 // The fn type of Ω t's `Fn*` bound (its types in the scope it is used
@@ -769,7 +869,7 @@ fn bound_declaring(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> (i64, i64) {
     let bounds = pcx.nodes[pcx.types[t as usize].b as usize].h;
     for i in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
         let b = child(bounds, i, pcx);
-        let tr = declaring(bound_trait(b, pcx), name, 0, pcx);
+        let tr = declaring(bound_trait(b, pcx), name, pcx);
         if tr >= 0 {
             return (tr, b);
         }
@@ -777,29 +877,34 @@ fn bound_declaring(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> (i64, i64) {
     (-1, 0)
 }
 
-fn declaring(tr: i64, name: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    if tr < 0 || depth > 8 {
-        return -1;
-    }
-    if crate::front::traits::trait_fn(tr, name, pcx) != 0 {
-        return tr;
-    }
-    let supers = trait_supers(tr, pcx);
-    for i in 0..(if supers > 0 { pcx.nodes[supers as usize].count } else { 0 }) {
-        let s = declaring(bound_trait(child(supers, i, pcx), pcx), name, depth + 1, pcx);
-        if s >= 0 {
-            return s;
+// The trait, tr or one of its supertraits, whose own function `name` is,
+// the first in traits::super_closure's order, or -1.
+fn declaring(tr: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let mut reached: Vec<i64, Comp> = Vec::new_in(Comp {});
+    crate::front::traits::super_closure(tr, &mut reached, pcx);
+    for k in 0..reached.len() {
+        if crate::front::traits::trait_fn(reached[k], name, pcx) != 0 {
+            return reached[k];
         }
     }
     -1
 }
 
-// RULE: D22.1a The virtual function `Tr::name⟨Self := Ω⟩` of Ω type t, made
-// once (a method of t, find_method): the trait's declaration of it without
-// a body, its signature resolved with Self = t; -1 when no bound of t
-// declares it.
+// RULE: D22.1a The virtual function `Tr::name⟨Self := Ω⟩` of Ω type t, of
+// the first bound of t that declares it (virtual_fn_of); -1 when none does.
 pub fn virtual_fn(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let (tr, b) = bound_declaring(t, name, pcx);
+    virtual_fn_of(t, tr, b, name, pcx)
+}
+
+// RULE: D22.1a, F8.4 (0.30.2) The virtual function `Tr::name⟨Self := Ω⟩`
+// of Ω type t for trait tr (b: the bound of t naming tr, whose arguments
+// are tr's, or 0 for a supertrait's), made once per (t, tr, name): the
+// trait's declaration of it without a body, its signature resolved with
+// Self = t, a method of t whose trait pcx.virtual_trait records (two
+// bounds' functions of one name are two, `<T as B>::m` B's); -1 when tr
+// is -1.
+pub fn virtual_fn_of(t: i64, tr: i64, b: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
     // (0.27.3, FL11: a generic method of a generic trait, `contains<U>` of
     // RangeBounds<T>, is instantiated without the trait's arguments: a gap
     // of the model, its instance unsure)
@@ -812,14 +917,29 @@ pub fn virtual_fn(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
             pcx.opaque_unsure = true;
         }
     }
-    let had = crate::front::types::find_method(t, name, pcx);
-    if had >= 0 {
-        return had;
-    }
     if tr < 0 {
         return -1;
     }
+    let mut i = crate::front::check::collect::meth_start(t, name, pcx);
+    while i >= 0 {
+        let at = i;
+        i = crate::front::check::collect::meth_after(at, pcx);
+        let f = pcx.methods[at as usize].f;
+        if pcx.methods[at as usize].ty == t && pcx.methods[at as usize].name == name
+            && f < pcx.virtual_trait.len() as i64 && pcx.virtual_trait[f as usize] == tr + 1 {
+            return f;
+        }
+    }
     let targs = trait_args_of(tr, b, t, pcx);
+    make_virtual(t, tr, targs, name, pcx)
+}
+
+// RULE: D22.1a, F18.5 (0.30.2: virtual_fn; calls/mod.vl
+// int_virtual_method, Self an integer variable) The virtual function
+// `Tr::name⟨Self := t⟩` (tr's arguments TLISTS[targs..]), a method of t:
+// the trait's declaration without a body, its signature resolved with
+// Self = t.
+pub fn make_virtual(t: i64, tr: i64, targs: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let decl = crate::front::traits::trait_fn(tr, name, pcx);
     let item = crate::front::generics::instantiate::clone_node(decl, pcx);
     pcx.nodes[item as usize].c = 0;
@@ -836,6 +956,10 @@ pub fn virtual_fn(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let f = pcx.fns.len() as i64 - 1;
     pcx.fns[f as usize].module = pcx.traits[tr as usize].module;
     pcx.fns[f as usize].self_ty = t;
+    while pcx.virtual_trait.len() as i64 <= f {
+        pcx.virtual_trait.push(0);
+    }
+    pcx.virtual_trait[f as usize] = tr + 1;
     if pcx.fns[f as usize].generic == 0 {
         let (saved_mod, saved_self, saved_impl) = (pcx.cur_mod, pcx.self_type, pcx.self_impl);
         pcx.cur_mod = pcx.traits[tr as usize].module;
@@ -844,7 +968,14 @@ pub fn virtual_fn(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
         let tg = pcx.nodes[pcx.traits[tr as usize].node as usize].g;
         let count: i64 = if tg > 0 { pcx.nodes[tg as usize].count } else { 0 };
         let env = crate::front::generics::env_enter(tg, targs, count, pcx);
+        // (0.30.2: read as tr's declaration, `Self::Out` tr's, F8.1;
+        // assoc::resolve_projection_node)
+        let (saved_tr, saved_targs) = (pcx.assoc_trait, pcx.assoc_targs);
+        pcx.assoc_trait = tr;
+        pcx.assoc_targs = targs;
         crate::front::check::resolve::resolve_signature(f, pcx);
+        pcx.assoc_trait = saved_tr;
+        pcx.assoc_targs = saved_targs;
         crate::front::generics::env_leave(env, pcx);
         pcx.cur_mod = saved_mod;
         pcx.self_type = saved_self;
@@ -856,30 +987,54 @@ pub fn virtual_fn(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
     f
 }
 
-// RULE: D22.1 (0.27.3, FL11) Path n is `Ω::NAME` (t an Ω), NAME an
-// associated constant a bound's trait declares (`A::FREES` with `A:
-// Allocator`): its type, from the declaration with Self = t; n a literal
-// of it (the opaque instance is never lowered: only its type counts), or
-// of the error type when the constant is no integer or bool (what uses it
-// is not checked). -1 when no bound declares NAME.
-pub fn omega_const(n: i64, t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+// RULE: F8.4 (0.30.2) The bound of Ω t through which trait tr is t's: the
+// first bound naming tr (its arguments tr's), 0 when only a bound's
+// supertrait is tr (F2.2), -1 when no bound reaches tr.
+pub fn omega_bound_for(t: i64, tr: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let bounds = pcx.nodes[pcx.types[t as usize].b as usize].h;
-    let mut decl: i64 = 0;
-    for i in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
-        let bt = bound_trait(child(bounds, i, pcx), pcx);
-        let d = assoc_decl(bt, name, 0, pcx);
-        if d != 0 && (pcx.nodes[d as usize].p & crate::front::ast::NODE_ASSOC_CONST) != 0 {
-            decl = d;
-            break;
+    let count: i64 = if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 };
+    for i in 0..count {
+        if bound_trait(child(bounds, i, pcx), pcx) == tr {
+            return child(bounds, i, pcx);
         }
     }
-    if decl == 0 {
+    for i in 0..count {
+        if reaches(bound_trait(child(bounds, i, pcx), pcx), tr, pcx) {
+            return 0;
+        }
+    }
+    -1
+}
+
+// Whether trait from is tr or has it among its supertraits
+// (traits::super_closure).
+fn reaches(from: i64, tr: i64, pcx: &mut Ctx<Comp>) -> bool {
+    entails(from, tr, pcx)
+}
+
+// RULE: D22.1, F8.4 (0.27.3, FL11; 0.30.2: of trait tr, which
+// qualified::path_trait chose, `<T as B>::K` B's, never the first bound's
+// of the name) Path n is `Ω::NAME` (t an Ω), NAME an associated constant
+// trait tr, a bound's trait or its supertrait, declares (`A::FREES` with
+// `A: Allocator`): its type, from the declaration with Self = t; n a
+// literal of it (the opaque instance is never lowered: only its type
+// counts), or of the error type when the constant is no integer or bool
+// (what uses it is not checked). -1 when tr declares no constant NAME.
+pub fn omega_const_of(n: i64, t: i64, tr: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let decl = assoc_in_trait(tr, name, pcx);
+    if decl == 0 || (pcx.nodes[decl as usize].p & crate::front::ast::NODE_ASSOC_CONST) == 0 {
         return -1;
     }
     let (saved_mod, saved_self) = (pcx.cur_mod, pcx.self_type);
     pcx.cur_mod = crate::front::modules::module_of(decl, pcx);
     pcx.self_type = t;
+    // (read as tr's declaration: `Self::Out` tr's, F8.1)
+    let (saved_tr, saved_targs) = (pcx.assoc_trait, pcx.assoc_targs);
+    pcx.assoc_trait = tr;
+    pcx.assoc_targs = -1;
     let ty = resolve_quietly(pcx.nodes[decl as usize].b, pcx);
+    pcx.assoc_trait = saved_tr;
+    pcx.assoc_targs = saved_targs;
     pcx.cur_mod = saved_mod;
     pcx.self_type = saved_self;
     let (start, end) = (pcx.nodes[n as usize].start, pcx.nodes[n as usize].end);
@@ -927,23 +1082,53 @@ fn trait_args_of(tr: i64, b: i64, t: i64, pcx: &mut Ctx<Comp>) -> i64 {
     crate::front::generics::take_targs(mark, pcx)
 }
 
-// RULE: D22.1 `Ω::name` (`<Ω as Tr>::name`): the bound's equality when one
-// of t's bounds has it (`Iterator<Item = X>`), else 0 (no such type).
-pub fn omega_projection(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
+// RULE: D22.1 `Ω::name`: omega_projection_of the one of t's bounds'
+// traits that declares it (two: E0221, at pos).
+pub fn omega_projection(t: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    omega_projection_of(t, -1, name, pos, pcx)
+}
+
+// RULE: D22.1, F8.1 (0.30.2: of trait tr, `<Ω as Tr>::name` Tr's, and an
+// unqualified `Ω::name` of the one bound's trait that declares it, E0221
+// for two; 0.27.3 took the first bound's of the name for both)
+// `<Ω as Tr>::name`: the equality of a bound of t that reaches Tr when one
+// has it (`Iterator<Item = X>`), else a fresh Ω of Tr's declaration, made
+// once per (t, Tr, name); 0 when Tr declares no such type, or no bound of
+// t reaches it.
+pub fn omega_projection_of(t: i64, tr0: i64, name: i64, pos: i64, pcx: &mut Ctx<Comp>) -> i64 {
+    let bounds = pcx.nodes[pcx.types[t as usize].b as usize].h;
+    let count: i64 = if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 };
+    let mut tr = tr0;
+    if tr < 0 {
+        tr = crate::front::check::calls::qualified::bound_assoc_trait(
+            pcx.nodes[pcx.types[t as usize].b as usize].a, bounds, name, pos, pcx);
+    }
+    if tr < 0 || omega_bound_for(t, tr, pcx) < 0 {
+        return 0;
+    }
+    // (keyed by the trait that declares it, `<I as DoubleEndedIterator>`'s
+    // `Item` Iterator's: one Ω however the path names the trait, and the
+    // equality met first, under the instance's parameters, is the one)
+    tr = crate::front::check::calls::qualified::trait_type_declaring(tr, name, pos, pcx);
+    if tr < 0 {
+        return 0;
+    }
     // (each once, under the instance's parameters: places asks again,
-    // without them)
+    // without them; keyed by the trait too: `<T as A>::Out` and `<T as
+    // B>::Out` are two)
+    let key = name + ((tr + 1) << 32);
     let mut k: i64 = 0;
     while k + 2 < pcx.assoc_omegas.len() as i64 {
-        if pcx.assoc_omegas[k as usize] == t && pcx.assoc_omegas[(k + 1) as usize] == name {
+        if pcx.assoc_omegas[k as usize] == t && pcx.assoc_omegas[(k + 1) as usize] == key {
             return pcx.assoc_omegas[(k + 2) as usize];
         }
         k += 3;
     }
-    let bounds = pcx.nodes[pcx.types[t as usize].b as usize].h;
-    for i in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
+    for i in 0..count {
         let b = child(bounds, i, pcx);
         let holder = pcx.nodes[b as usize].h;
-        if pcx.nodes[b as usize].kind != NodeKind::TyName || holder <= 0 {
+        if pcx.nodes[b as usize].kind != NodeKind::TyName || holder <= 0
+            || !reaches(bound_trait(b, pcx), tr, pcx) {
             continue;
         }
         for j in 0..pcx.nodes[holder as usize].count {
@@ -954,7 +1139,7 @@ pub fn omega_projection(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
                 // again; `Self` there is the Ω whose associated type t is)
                 let slot = pcx.assoc_omegas.len() as i64;
                 pcx.assoc_omegas.push(t);
-                pcx.assoc_omegas.push(name);
+                pcx.assoc_omegas.push(key);
                 pcx.assoc_omegas.push(0);
                 let saved = pcx.cur_mod;
                 let saved_self = pcx.self_type;
@@ -972,13 +1157,16 @@ pub fn omega_projection(t: i64, name: i64, pcx: &mut Ctx<Comp>) -> i64 {
         }
     }
     // (none: a fresh Ω for `Ω::name`, with the declaration's bounds, F11.2)
-    for i in 0..(if bounds > 0 { pcx.nodes[bounds as usize].count } else { 0 }) {
-        let decl = assoc_decl(bound_trait(child(bounds, i, pcx), pcx), name, 0, pcx);
-        if decl != 0 {
-            return assoc_omega(t, name, decl, pcx);
-        }
+    let decl = assoc_in_trait(tr, name, pcx);
+    if decl == 0 || (pcx.nodes[decl as usize].p & crate::front::ast::NODE_ASSOC_CONST) != 0 {
+        return 0;
     }
-    0
+    // (named `<T as Tr>::name` when another bound's trait declares a
+    // `name` too, else `T::name`)
+    let shown = if crate::front::check::calls::qualified::bound_assoc_count(bounds, name, pcx) > 1 {
+        tr
+    } else { -1 };
+    assoc_omega(t, key, name, shown, decl, pcx)
 }
 
 // The Ω whose associated type Ω t is (`T` of `T::Item`), or 0.
@@ -988,9 +1176,10 @@ fn assoc_owner(t: i64, pcx: &Ctx<Comp>) -> i64 {
     if pcx.nodes[node as usize].x > 0 { pcx.nodes[node as usize].x - 1 } else { 0 }
 }
 
-// The AssocType node trait tr (or a supertrait) declares `name` with, or 0.
-fn assoc_decl(tr: i64, name: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
-    if tr < 0 || depth > 8 {
+// (0.30.2) The AssocType node trait tr itself (not a supertrait) declares
+// `name` with, or 0.
+pub fn assoc_in_trait(tr: i64, name: i64, pcx: &Ctx<Comp>) -> i64 {
+    if tr < 0 {
         return 0;
     }
     let h = pcx.nodes[pcx.traits[tr as usize].node as usize].b;
@@ -1000,31 +1189,35 @@ fn assoc_decl(tr: i64, name: i64, depth: i64, pcx: &mut Ctx<Comp>) -> i64 {
             return c;
         }
     }
-    let supers = trait_supers(tr, pcx);
-    for i in 0..(if supers > 0 { pcx.nodes[supers as usize].count } else { 0 }) {
-        let d = assoc_decl(bound_trait(child(supers, i, pcx), pcx), name, depth + 1, pcx);
-        if d != 0 {
-            return d;
-        }
-    }
     0
 }
 
-// RULE: D22.1 The Ω of `t::name` (t an Ω), made once: named `T::Item`,
-// bounded by the declaration's bounds (its h, when a Generics holder).
-fn assoc_omega(t: i64, name: i64, decl: i64, pcx: &mut Ctx<Comp>) -> i64 {
+// RULE: D22.1 The Ω of `t::name` (t an Ω) of the trait key names
+// (omega_projection_of), made once: named `T::Item`, bounded by the
+// declaration's bounds (its h, when a Generics holder).
+fn assoc_omega(t: i64, key: i64, name: i64, shown: i64, decl: i64, pcx: &mut Ctx<Comp>) -> i64 {
     let mut i: i64 = 0;
     while i + 2 < pcx.assoc_omegas.len() as i64 {
-        if pcx.assoc_omegas[i as usize] == t && pcx.assoc_omegas[(i + 1) as usize] == name {
+        if pcx.assoc_omegas[i as usize] == t && pcx.assoc_omegas[(i + 1) as usize] == key {
             return pcx.assoc_omegas[(i + 2) as usize];
         }
         i += 3;
     }
     let node = new_node(NodeKind::TyName, pcx.nodes[decl as usize].start,
         pcx.nodes[decl as usize].end, pcx);
-    pcx.nodes[node as usize].a = crate::front::modules::join_sym(
-        pcx.nodes[pcx.types[t as usize].b as usize].a, c"::",
-        name, pcx);
+    pcx.nodes[node as usize].a = if shown >= 0 {
+        let out = crate::base::buf_new();
+        crate::base::buf_fmt(out, format_args("<{} as {}>::{}",
+            str::from_utf8(crate::base::sym_text(pcx.nodes[pcx.types[t as usize].b as usize].a,
+                pcx))
+                .unwrap(),
+            str::from_utf8(crate::base::sym_text(pcx.traits[shown as usize].name, pcx)).unwrap(),
+            str::from_utf8(crate::base::sym_text(name, pcx)).unwrap()));
+        crate::base::intern_buf(out, pcx)
+    } else {
+        crate::front::modules::join_sym(pcx.nodes[pcx.types[t as usize].b as usize].a, c"::", name,
+            pcx)
+    };
     let h = pcx.nodes[decl as usize].h;
     pcx.nodes[node as usize].h = if h > 0 && pcx.nodes[h as usize].kind == NodeKind::Generics { h }
         else { 0 };
@@ -1034,8 +1227,12 @@ fn assoc_omega(t: i64, name: i64, decl: i64, pcx: &mut Ctx<Comp>) -> i64 {
     pcx.nodes[node as usize].z = r;
     pcx.nodes[node as usize].x = t + 1;
     pcx.assoc_omegas.push(t);
-    pcx.assoc_omegas.push(name);
+    pcx.assoc_omegas.push(key);
     pcx.assoc_omegas.push(r);
+    // (0.30.2, review of M1: its declaration's bounds read with Self t,
+    // front::obligations::param_preds)
+    let own: i64 = if pcx.nodes[node as usize].h > 0 { pcx.nodes[h as usize].count } else { 0 };
+    crate::front::obligations::set_assoc_home(r, t, own, pcx);
     r
 }
 
@@ -1051,6 +1248,7 @@ pub fn build_opaque_instances(program: i64, pcx: &mut Ctx<Comp>) {
     pcx.opaque_phase = true;
     let mut made_fns = Vec::<i64, Comp>::new_in(Comp {});
     let mut unsure_fns = Vec::<i64, Comp>::new_in(Comp {});
+    let mut unmade_fns = Vec::<i64, Comp>::new_in(Comp {});
     for i in 0..pcx.nodes[program as usize].count {
         let item = child(program, i, pcx);
         if pcx.nodes[item as usize].kind != NodeKind::Fn || pcx.nodes[item as usize].x == 0
@@ -1113,6 +1311,8 @@ pub fn build_opaque_instances(program: i64, pcx: &mut Ctx<Comp>) {
             // (0.30.1: its `where` predicates are its Ωs' bounds,
             // assume_where_preds; one it cannot give made it unsure)
             unsure_fns.push(if pcx.opaque_unsure { 1 } else { 0 });
+        } else {
+            unmade_fns.push(f);
         }
     }
     // RULE: D22.2 (0.27.3, FL11) Each queued instance checked, as
@@ -1195,11 +1395,23 @@ pub fn build_opaque_instances(program: i64, pcx: &mut Ctx<Comp>) {
         // (not after an error: the program is fixed first, and an error in
         // the template's own text makes its check unsure too)
         if !used && pcx.error_count == 0 {
-            let tnode = pcx.fns[(tf - 1) as usize].node;
-            let at = pcx.nodes[tnode as usize].start;
-            crate::base::diag::report_warning(at, 0, c"generic.unchecked",
-                c"this generic function is not checked for every type: its generic check meets a form the opaque model does not cover (a `where` predicate on a compound type, a generic method of a generic trait called through a bound, a type whose declaration bounds a parameter the function does not), and it has no instance to check",
-                c"its errors would be found at an instance, each checked whole; call it, write the predicate on the type parameter itself, or declare the bound the type needs", pcx);
+            unchecked_warning(tf - 1, pcx);
+        }
+    }
+    // RULE: D22.2 (0.30.2, RT-275) A template whose opaque instance could not
+    // be made (a bound of its header an Ω does not meet, the model's gap
+    // where it is not the program's error, check_bounds) and that has no
+    // concrete instance is checked nowhere: the same warning, never silence.
+    for &tf in unmade_fns.as_slice() {
+        let mut used = false;
+        for g in 0..first_fn {
+            if pcx.fns[g as usize].tmpl == tf + 1 {
+                used = true;
+                break;
+            }
+        }
+        if !used && pcx.error_count == 0 {
+            unchecked_warning(tf, pcx);
         }
     }
     // (the templates whose instance checked: not one the model left out)
@@ -1209,4 +1421,12 @@ pub fn build_opaque_instances(program: i64, pcx: &mut Ctx<Comp>) {
         }
     }
     pcx.opaque_phase = false;
+}
+
+// RULE: D22.2 The warning generic.unchecked at template tf (a FUNCS index).
+fn unchecked_warning(tf: i64, pcx: &mut Ctx<Comp>) {
+    let at = pcx.nodes[pcx.fns[tf as usize].node as usize].start;
+    crate::base::diag::report_warning(at, 0, c"generic.unchecked",
+        c"this generic function is not checked for every type: its generic check meets a form the opaque model does not cover (a `where` predicate on a compound type, a generic method of a generic trait called through a bound, a type whose declaration bounds a parameter the function does not), and it has no instance to check",
+        c"its errors would be found at an instance, each checked whole; call it, write the predicate on the type parameter itself, or declare the bound the type needs", pcx);
 }
